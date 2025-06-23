@@ -1031,6 +1031,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              float     kq_scale) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
+    const auto n_seqs = cparams.n_seq_virt > 1 ? ubatch.n_seqs_unq : 1;
+
+    q = ggml_reshape_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_seqs, n_seqs);
+
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
@@ -1079,7 +1083,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 #endif
         }
 
-        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens*n_seqs);
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
 
@@ -1124,7 +1128,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
 
-        cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
+        cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens*n_seqs);
 
         if (!cparams.offload_kqv) {
             // all nodes between the KV store and the attention output are run on the CPU
@@ -1203,11 +1207,12 @@ llm_graph_input_attn_kv_unified * llm_graph_context::build_attn_inp_kv_unified()
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_unified_iswa for SWA");
 
         const auto n_kv = mctx_cur->get_n_kv();
+        const auto n_seqs = cparams.n_seq_virt > 1 ? ubatch.n_seqs_unq : 1;
 
         inp->self_kv_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
         ggml_set_input(inp->self_kv_idxs);
 
-        inp->self_kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
+        inp->self_kq_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, GGML_PAD(n_tokens/n_seqs, GGML_KQ_MASK_PAD), n_seqs);
         //cb(inp->self_kq_mask, "KQ_mask", -1);
         ggml_set_input(inp->self_kq_mask);
 

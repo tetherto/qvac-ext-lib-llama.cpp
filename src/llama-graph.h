@@ -254,8 +254,8 @@ public:
     // TODO: should this be I64?
     ggml_tensor * self_kv_idxs = nullptr; // I32 [n_batch]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch]
-    ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch]
+    ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_seqs, n_seqs]
+    ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_seqs, n_seqs]
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
@@ -285,10 +285,10 @@ public:
     ggml_tensor * self_kv_idxs     = nullptr; // I32 [n_batch]
     ggml_tensor * self_kv_idxs_swa = nullptr; // I32 [n_batch]
 
-    ggml_tensor * self_kq_mask         = nullptr; // F32 [n_kv, n_batch]
-    ggml_tensor * self_kq_mask_cnv     = nullptr; //     [n_kv, n_batch]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32 [n_kv, n_batch]
-    ggml_tensor * self_kq_mask_swa_cnv = nullptr; //     [n_kv, n_batch]
+    ggml_tensor * self_kq_mask         = nullptr; // F32 [n_kv, n_batch/n_seqs, n_seqs]
+    ggml_tensor * self_kq_mask_cnv     = nullptr; //     [n_kv, n_batch/n_seqs, n_seqs]
+    ggml_tensor * self_kq_mask_swa     = nullptr; // F32 [n_kv, n_batch/n_seqs, n_seqs]
+    ggml_tensor * self_kq_mask_swa_cnv = nullptr; //     [n_kv, n_batch/n_seqs, n_seqs]
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;

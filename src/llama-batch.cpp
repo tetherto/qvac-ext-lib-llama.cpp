@@ -460,6 +460,8 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
 llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch) {
     std::vector<seq_set_t> cur_seq_set;
 
+    llama_seq_id last_seq_id = -1;
+
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         if (used[i]) {
@@ -476,8 +478,13 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch) {
             }
         }
 
+        // accept only increasing sequence ids
+        add = add && (cur_seq_set.empty() || batch.seq_id[i][0] == last_seq_id + 1);
+
         if (add) {
             cur_seq_set.push_back(seq_set[i]);
+
+            last_seq_id = batch.seq_id[i][0];
 
             if (cur_seq_set.size() > n_ubatch) {
                 break;

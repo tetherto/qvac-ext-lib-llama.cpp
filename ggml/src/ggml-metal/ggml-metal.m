@@ -4882,6 +4882,7 @@ static bool ggml_metal_encode_node(
                     /*.nb22          =*/ nb22,
                     /*.nb23          =*/ nb23,
                     /*.nb31          =*/ nb31,
+                    /*.nb32          =*/ nb32,
                     /*.ne1           =*/ ne1,
                     /*.ne2           =*/ ne2,
                     /*.scale         =*/ scale,

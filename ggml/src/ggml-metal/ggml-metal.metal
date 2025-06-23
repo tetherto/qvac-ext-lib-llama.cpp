@@ -3645,7 +3645,7 @@ kernel void kernel_flash_attn_ext(
                 // load the mask in shared memory
                 #pragma unroll(Q)
                 for (short j = 0; j < Q; ++j) {
-                    device const half * pm = (device const half *) ((device const char *) mask + (iq1 + j)*args.nb31);
+                    device const half * pm = (device const half *) ((device const char *) mask + (iq1 + j)*args.nb31 + iq3*args.nb32);
 
                     const float m = pm[ic + tiisg];
 
@@ -4131,7 +4131,7 @@ kernel void kernel_flash_attn_ext_vec(
         const bool has_mask = mask != q;
 
         // pointer to the mask
-        device const half * pm = (device const half *) (mask + iq1*args.nb31);
+        device const half * pm = (device const half *) (mask + iq1*args.nb31 + iq3*args.nb32);
 
         float slope = 1.0f;
 
