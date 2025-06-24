@@ -779,9 +779,9 @@ static json oaicompat_chat_params_parse(
 
     /* Append assistant prefilled message */
     if (prefill_assistant_message) {
-        if (last_message.content.is_array()) {
-            for (auto & p : last_message.content) {
-                chat_params.prompt += p["text"];
+        if (!last_message.content_parts.empty()) {
+            for (auto & p : last_message.content_parts) {
+                chat_params.prompt += p.text;
             }
         } else {
             chat_params.prompt += last_message.content;
