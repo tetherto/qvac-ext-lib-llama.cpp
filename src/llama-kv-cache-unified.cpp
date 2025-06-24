@@ -908,10 +908,12 @@ ggml_tensor * llama_kv_cache_unified::get_k(ggml_context * ctx, int32_t il, uint
 
     auto * k = layers[ikv].k;
 
-    const auto ns = sinfo.s1 - sinfo.s0 + 1;
+    assert(sinfo.s1 >= sinfo.s0);
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     assert(ns > 0);
-    assert(ns <= (int) n_seq_virt);
+    assert(ns <= n_seq_virt);
 
     const uint64_t size_virt = ggml_row_size(k->type, hparams.n_embd_k_gqa(il)*get_size());
 
@@ -928,7 +930,7 @@ ggml_tensor * llama_kv_cache_unified::get_v(ggml_context * ctx, int32_t il, uint
 
     auto * v = layers[ikv].v;
 
-    const auto ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     assert(ns > 0);
     assert(ns <= n_seq_virt);
