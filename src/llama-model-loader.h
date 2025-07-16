@@ -126,8 +126,7 @@ struct llama_model_loader {
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
-        const std::string & fname,
-        std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
+        load_input_t load_input,
         FILE * file,
         bool use_mmap,
         bool use_direct_io,
