@@ -55,9 +55,7 @@ static std::string llama_format_win_err(DWORD err) {
 }
 #endif
 
-// llama_file
-
-struct llama_file::impl {
+struct llama_file_disk::impl {
 #if defined(_WIN32)
     HANDLE fp_win32;
     std::string GetErrorMessageWin32(DWORD error_code) const {
@@ -387,20 +385,18 @@ struct llama_file::impl {
     bool owns_fp = true;
 };
 
-llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io) :
+llama_file_disk::llama_file_disk(const char * fname, const char * mode, const bool use_direct_io) :
     pimpl(std::make_unique<impl>(fname, mode, use_direct_io)) {}
+llama_file_disk::llama_file_disk(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
+llama_file_disk::~llama_file_disk() = default;
 
-llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
+size_t llama_file_disk::tell() const { return pimpl->tell(); }
+size_t llama_file_disk::size() const { return pimpl->size; }
 
-llama_file::~llama_file() = default;
+size_t llama_file_disk::read_alignment() const { return pimpl->read_alignment(); }
+bool llama_file_disk::has_direct_io() const { return pimpl->has_direct_io(); }
 
-size_t llama_file::tell() const { return pimpl->tell(); }
-size_t llama_file::size() const { return pimpl->size; }
-
-size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
-bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
-
-int llama_file::file_id() const {
+int llama_file_disk::file_id() const {
 #ifdef _WIN32
     return _fileno(pimpl->fp);
 #else
@@ -415,18 +411,20 @@ int llama_file::file_id() const {
 #endif
 }
 
-void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
-void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+void llama_file_disk::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
+void llama_file_disk::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #ifdef _WIN32
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #else
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
+void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
 #endif
 
-uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
+void llama_file_disk::read_aligned_chunk(void * dest, size_t size) { pimpl->read_aligned_chunk(dest, size); }
 
-void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
-void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
+uint32_t llama_file_disk::read_u32() { return pimpl->read_u32(); }
+
+void llama_file_disk::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
+void llama_file_disk::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 // llama_mmap
 
