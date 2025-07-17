@@ -79,7 +79,6 @@ extern "C" {
     GGML_API struct gguf_context * gguf_init_empty(void);
     GGML_API struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params);
     GGML_API struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params);
-    //GGML_API struct gguf_context * gguf_init_from_buffer(..);
 
     GGML_API void gguf_free(struct gguf_context * ctx);
 
@@ -201,4 +200,9 @@ extern "C" {
 
 #ifdef  __cplusplus
 }
+#endif
+
+#ifdef __cplusplus
+#include <ios>
+GGML_API struct gguf_context * gguf_init_from_buffer(std::basic_streambuf<uint8_t>& streambuf, struct gguf_init_params params);
 #endif
