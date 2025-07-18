@@ -1264,22 +1264,14 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params) {
-    common_init_result_ptr res(new common_init_result(params));
-
-    llama_model * model = res->model();
-    if (model == NULL) {
-        LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
-        return res;
-    }
+common_init_result_ptr common_init_from_model_and_params(llama_model* model, common_init_result_ptr res, common_params & params) {
+    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     llama_context * lctx = res->context();
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
         return res;
     }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
@@ -1380,6 +1372,18 @@ common_init_result_ptr common_init_from_params(common_params & params) {
 }
 
 common_init_result::~common_init_result() = default;
+
+common_init_result_ptr common_init_from_params(common_params & params) {
+    common_init_result_ptr res(new common_init_result(params));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
+        return res;
+    }
+
+    return common_init_from_model_and_params(model, std::move(res), params);
+}
 
 std::string get_model_endpoint() {
     const char * model_endpoint_env = getenv("MODEL_ENDPOINT");
