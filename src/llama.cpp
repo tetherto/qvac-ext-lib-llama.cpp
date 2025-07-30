@@ -1126,18 +1126,26 @@ struct llama_model * llama_model_load_from_file(
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
 }
 
-struct llama_model * llama_model_load_from_splits(
-        const char ** paths,
-        size_t n_paths,
-        struct llama_model_params params) {
+static std::vector<std::string> splits_from_c_paths(const char ** paths, size_t n_paths) {
     std::vector<std::string> splits;
     if (n_paths == 0) {
         LLAMA_LOG_ERROR("%s: list of splits is empty\n", __func__);
-        return nullptr;
+        return splits;
     }
     splits.reserve(n_paths);
     for (size_t i = 0; i < n_paths; ++i) {
         splits.push_back(paths[i]);
+    }
+    return splits;
+}
+
+struct llama_model * llama_model_load_from_splits(
+        const char ** paths,
+        size_t n_paths,
+        struct llama_model_params params) {
+    std::vector<std::string> splits = splits_from_c_paths(paths, n_paths);
+    if (splits.empty()) {
+        return nullptr;
     }
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, splits.front(), splits, /*file*/ nullptr, params);
 }
