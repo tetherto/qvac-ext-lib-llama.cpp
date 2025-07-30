@@ -5,6 +5,7 @@
 #include "gguf.h"
 #include "llama-hparams.h"
 #include "llama-model-load-input.h"
+#include "llama-mmap.h"
 #include "llama-model-load.h"
 
 #include <algorithm>
@@ -558,6 +559,8 @@ llama_model_loader::llama_model_loader(
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
+    std::optional<std::set<std::string>> tensor_list = load_input_variant::parse_tensor_list_from_future(load_input);
+
     bool fname_empty = true;
     if (std::holds_alternative<load_input_variant::fname_load_input>(load_input)) {
         load_input_variant::fname_load_input finput = std::get<load_input_variant::fname_load_input>(load_input);
@@ -568,7 +571,12 @@ llama_model_loader::llama_model_loader(
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
         gguf_file_load main_gguf(&ctx, load_input);
-        process_loaded_gguf(ctx, main_gguf, 0);
+
+        if (load_input_variant::variant_supports_split_load_from_memory(load_input)) {
+            incremental_splits_tensor_load.emplace(ctx, *this, main_gguf, std::move(*tensor_list));
+        } else {
+            process_loaded_gguf(ctx, main_gguf, 0);
+        }
 
         metadata_ptr = std::move(main_gguf.meta);
         metadata = metadata_ptr.get();
@@ -598,7 +606,6 @@ llama_model_loader::llama_model_loader(
         // Load additional GGML contexts
         if (load_input_variant::variant_supports_split_load(load_input) && n_split > 1) {
             load_input_variant::fname_load_input base_split = load_input_variant::split_name_from_variant(load_input);
-            std::vector<std::string> &           splits     = base_split.splits;
 
             // make sure the main file is loaded first
             uint16_t idx = 0;
@@ -609,13 +616,13 @@ llama_model_loader::llama_model_loader(
             }
 
             // generate list of splits if needed
-            if (splits.empty()) {
-                splits = llama_get_list_splits(base_split.fname, idx, n_split);
+            if (base_split.splits.empty()) {
+                base_split.splits = llama_get_list_splits(base_split.fname, idx, n_split);
             }
 
             // in case user give a custom list of splits, check if it matches the expected number
-            if (n_split != (uint16_t)splits.size()) {
-                throw std::runtime_error(format("invalid split count, given: %zu splits, but expected %d", splits.size(), n_split));
+            if (n_split != (uint16_t)base_split.splits.size()) {
+                throw std::runtime_error(format("invalid split count, given: %zu splits, but expected %d", base_split.splits.size(), n_split));
             }
 
             if (trace > 0) {
@@ -624,30 +631,19 @@ llama_model_loader::llama_model_loader(
 
             // load other splits
             for (idx = 1; idx < n_split; idx++) {
-                const char * fname_split = splits[idx].c_str();
+                SplitLoad split_load(load_input, base_split, idx, kv_split_no);
 
-                gguf_file_load split_gguf(&ctx, load_input_variant::fname_load_input{fname_split, splits});
-                gguf_context_ptr& split_meta = split_gguf.meta;
-
-                // check idx
-                {
-                    const int kid = gguf_find_key(split_meta.get(), kv_split_no.c_str());
-                    if (kid < 0) {
-                        throw std::runtime_error(format("missing key %s in GGUF split %s", kv_split_no.c_str(), fname_split));
-                    }
-                    int idx_gguf = gguf_get_val_u16(split_meta.get(), kid);
-                    if (idx_gguf != idx) {
-                        throw std::runtime_error(format("invalid split file idx: %d (file: %s), expected %d", idx_gguf, fname_split, idx));
-                    }
+                if(incremental_splits_tensor_load.has_value()) {
+                    incremental_splits_tensor_load->add_split(std::move(split_load));
+                } else {
+                    split_load.load(*this);
                 }
-
-                process_loaded_gguf(ctx, split_gguf, idx);
             }
 
             get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
 
-            // sanity check
-            {
+            // sanity check (the incremental loader does the check after loading the last split)
+            if(!incremental_splits_tensor_load.has_value()) {
                 const int n_tensors_loaded = (int) weights_map.size();
                 if (n_tensors != n_tensors_loaded) {
                     throw std::runtime_error(format("corrupted model: %d tensors expected but %d found", n_tensors, n_tensors_loaded));
@@ -692,7 +688,14 @@ llama_model_loader::llama_model_loader(
     }
 
     n_kv      = gguf_get_n_kv(metadata);
-    n_tensors = weights_map.size();
+
+    if (incremental_splits_tensor_load.has_value()) {
+        n_tensors = incremental_splits_tensor_load->expected_n_tensors();
+        LLAMA_LOG_CMAKE_DEBUG("%s: n_tensors (expected from summary list): %d\n", __func__, n_tensors);
+    } else {
+        n_tensors = weights_map.size();
+        LLAMA_LOG_CMAKE_DEBUG("%s: exact n_tensors: %d\n", __func__,  n_tensors);
+    }
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
@@ -701,7 +704,7 @@ llama_model_loader::llama_model_loader(
 
     // determine file type based on the number of tensors for each quantization and print meta data
     // TODO: make optional
-    {
+    if(!incremental_splits_tensor_load.has_value()) {
         std::map<enum ggml_type, uint32_t> n_type;
 
         uint32_t n_type_max = 0;
@@ -1039,7 +1042,8 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        std::optional<uint16_t> split_idx, std::function<ggml_context *(ggml_backend_buffer_type_t)> get_ctx_for_split_buft) {
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
@@ -1248,7 +1252,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
     }
-    ggml_context * ctx = ctx_for_buft(buft);
+    ggml_context * ctx = split_idx.has_value() ? get_ctx_for_split_buft(buft) : ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {

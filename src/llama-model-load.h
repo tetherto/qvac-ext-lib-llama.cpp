@@ -97,7 +97,7 @@ struct IncrementalSplitsTensorLoad {
             }
 
             ctx_split_map[key] = ctx;
-            model_impl->ctxs.emplace_back(ctx);
+            // model_impl->ctxs.emplace_back(ctx);
 
             return ctx;
         }
