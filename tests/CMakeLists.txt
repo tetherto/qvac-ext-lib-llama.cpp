@@ -309,10 +309,12 @@ if (NOT GGML_BACKEND_DL)
 endif()
 
 # libmtmd
-set(LLAMA_TEST_NAME test-mtmd-c-api)
-llama_build_and_test(test-mtmd-c-api.c)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
-unset(LLAMA_TEST_NAME)
+if (LLAMA_MTMD)
+    set(LLAMA_TEST_NAME test-mtmd-c-api)
+    llama_build_and_test(test-mtmd-c-api.c)
+    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+    unset(LLAMA_TEST_NAME)
+endif()
 
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
