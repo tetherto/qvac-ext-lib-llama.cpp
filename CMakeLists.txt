@@ -111,6 +111,9 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 
+# specific extras
+option(LLAMA_MTMD "llama: multimodal support" ${LLAMA_BUILD_TOOLS})
+
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
@@ -216,6 +219,8 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
+elseif (LLAMA_MTMD)
+    add_subdirectory(tools/mtmd)
 endif()
 
 # Automatically add all files from the 'licenses' directory
@@ -267,6 +272,16 @@ if (LLAMA_BUILD_COMMON)
     EXPORT llama-targets
     PUBLIC_HEADER
       DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
+
+endif()
+
+if (LLAMA_MTMD)
+
+  install(
+    TARGETS mtmd
+    EXPORT llama-targets
+    PUBLIC_HEADER
+      DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/mtmd)
 
 endif()
 
