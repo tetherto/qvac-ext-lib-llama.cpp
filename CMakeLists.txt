@@ -239,7 +239,7 @@ endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of header  files")
+set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header  files")
 set(LLAMA_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
 set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
 
@@ -251,19 +251,46 @@ set_target_properties(llama
     PROPERTIES
         PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
 
-install(TARGETS llama LIBRARY PUBLIC_HEADER)
+install(
+  TARGETS llama
+  EXPORT llama-targets
+  PUBLIC_HEADER
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR})
+
+if (LLAMA_BUILD_COMMON)
+
+  if (NOT LLAMA_CURL)
+    install(
+      TARGETS cpp-httplib
+      EXPORT llama-targets)
+  endif()
+
+  install(
+    TARGETS llama-common llama-common-base
+    EXPORT llama-targets
+    PUBLIC_HEADER
+      DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
+
+endif()
+
+install(
+  EXPORT llama-targets
+  FILE llama-targets.cmake
+  NAMESPACE llama::
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+
+install(
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 if (LLAMA_BUILD_COMMON)
     install(TARGETS llama-common LIBRARY)
 endif()
 
 configure_package_config_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama
-    PATH_VARS LLAMA_INCLUDE_INSTALL_DIR
-              LLAMA_LIB_INSTALL_DIR
-              LLAMA_BIN_INSTALL_DIR )
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 write_basic_package_version_file(
         ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
@@ -272,7 +299,7 @@ write_basic_package_version_file(
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama)
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
