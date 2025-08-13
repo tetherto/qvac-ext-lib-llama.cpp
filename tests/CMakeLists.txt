@@ -261,10 +261,12 @@ if (NOT GGML_BACKEND_DL)
 endif()
 
 # libmtmd
-set(LLAMA_TEST_NAME test-mtmd-c-api)
-llama_build_and_test(test-mtmd-c-api.c)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
-unset(LLAMA_TEST_NAME)
+if (LLAMA_MTMD)
+    set(LLAMA_TEST_NAME test-mtmd-c-api)
+    llama_build_and_test(test-mtmd-c-api.c)
+    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+    unset(LLAMA_TEST_NAME)
+endif()
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

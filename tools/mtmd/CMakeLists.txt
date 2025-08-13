@@ -50,7 +50,12 @@ set_target_properties(mtmd PROPERTIES
 
 target_link_libraries     (mtmd PUBLIC ggml llama)
 target_link_libraries     (mtmd PRIVATE Threads::Threads)
-target_include_directories(mtmd PUBLIC  .)
+target_include_directories(
+  mtmd
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
 target_include_directories(mtmd PRIVATE ../..)
 target_include_directories(mtmd PRIVATE ../../vendor)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
@@ -74,8 +79,6 @@ set_target_properties(mtmd
     PROPERTIES
     PRIVATE_HEADER debug/mtmd-debug.h)
 
-install(TARGETS mtmd LIBRARY PUBLIC_HEADER)
-
 if (NOT MSVC)
     # for stb_image.h and miniaudio.h
     target_compile_options(mtmd PRIVATE -Wno-cast-qual)
@@ -95,6 +98,7 @@ if (TARGET mtmd)
     endif()
 endif()
 
+if (LLAMA_BUILD_TOOLS)
 add_executable(llama-llava-cli    deprecation-warning.cpp)
 add_executable(llama-gemma3-cli   deprecation-warning.cpp)
 add_executable(llama-minicpmv-cli deprecation-warning.cpp)
@@ -114,3 +118,4 @@ add_executable(llama-mtmd-debug debug/mtmd-debug.cpp)
 set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
 target_link_libraries(llama-mtmd-debug PRIVATE common mtmd Threads::Threads)
 target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
+endif()
