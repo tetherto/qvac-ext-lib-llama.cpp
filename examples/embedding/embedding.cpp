@@ -1,14 +1,22 @@
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <thread>
+#include <vector>
+
 #include "arg.h"
 #include "common.h"
+#include "llama-cpp.h"
 #include "log.h"
-#include "llama.h"
-
-#include <ctime>
-#include <algorithm>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+#include "load_into_memory.h"
 
 static std::vector<std::string> split_lines(const std::string & s, const std::string & separator = "\n") {
     std::vector<std::string> lines;
@@ -94,7 +102,15 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     // load the model
-    common_init_result llama_init = common_init_from_params(params);
+    common_init_result llama_init;
+    if (memory_configuration_env_is_set()) {
+        llama_model_params mparams = common_model_params_to_llama(params);
+        common_init_result iparams;
+        llama_model *      model = load_model_from_memory_configuration(params.model.path.c_str(), mparams);
+        llama_init               = common_init_from_model_and_params(model, std::move(iparams), params);
+    } else {
+        llama_init = common_init_from_params(params);
+    }
 
     llama_model * model = llama_init.model.get();
     llama_context * ctx = llama_init.context.get();

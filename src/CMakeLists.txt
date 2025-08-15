@@ -26,6 +26,8 @@ add_library(llama
             llama-memory-hybrid.cpp
             llama-memory-recurrent.cpp
             llama-mmap.cpp
+            llama-model-load-input.cpp
+            llama-model-load.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
@@ -35,6 +37,7 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            uint8-buff-stream.cpp
             )
 
 target_include_directories(llama PRIVATE .)
