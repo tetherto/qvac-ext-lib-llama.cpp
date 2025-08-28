@@ -111,6 +111,9 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 
+# specific extras
+option(LLAMA_MTMD "llama: multimodal support" OFF)
+
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
@@ -231,6 +234,10 @@ if (LLAMA_BUILD_COMMON)
     license_generate(common)
 endif()
 
+if (LLAMA_MTMD)
+  add_subdirectory(tools/mtmd)
+endif()
+
 #
 # install
 #
@@ -270,7 +277,7 @@ if (LLAMA_BUILD_COMMON)
 
 endif()
 
-if (LLAMA_BUILD_TOOLS)
+if (LLAMA_MTMD)
 
   install(
     TARGETS mtmd
