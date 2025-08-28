@@ -235,12 +235,14 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
-llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
-llama_build_and_test(test-autorelease.cpp       LABEL "model")
-llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
+llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")
+llama_build_and_test(test-model-load-disk.cpp         LABEL "model")
+llama_build_and_test(test-model-load-memory.cpp       LABEL "model")
+llama_build_and_test(test-model-load-memory-split.cpp LABEL "model")
+llama_build_and_test(test-autorelease.cpp             LABEL "model")
+llama_build_and_test(test-backend-sampler.cpp         LABEL "model")
 
 # Test for state restore with fragmented KV cache
-# Requires a model, uses same args pattern as test-thread-safety
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
