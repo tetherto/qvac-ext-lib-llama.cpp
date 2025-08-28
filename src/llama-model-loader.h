@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-arch.h"
 #include "llama-mmap.h"
+#include "llama-model-load.h"
 
 #include "ggml-cpp.h"
 
@@ -81,6 +82,9 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+
+    std::optional<IncrementalSplitsTensorLoad> incremental_splits_tensor_load;
+
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -94,9 +98,10 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    void process_loaded_gguf(struct ggml_context * ctx, gguf_file_load & gguf_load, uint16_t idx);
+
     llama_model_loader(
-        const std::string & fname,
-        std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
+        load_input_t load_input,
         bool use_mmap,
         bool use_direct_io,
         bool check_tensors,
@@ -163,12 +168,8 @@ struct llama_model_loader {
     void load_data_for(struct ggml_tensor * cur) const;
 
     // Returns false if cancelled by progress_callback
-    bool load_all_data(
-            struct ggml_context * ctx,
-            llama_buf_map & bufs,
-            llama_mlocks * lmlocks,
-            llama_progress_callback progress_callback,
-            void * progress_callback_user_data);
+    bool load_all_data(size_t size_data, struct ggml_context * ctx, llama_buf_map & bufs, llama_mlocks * lmlocks,
+                       llama_progress_callback progress_callback, void * progress_callback_user_data);
 
     std::string ftype_name() const;
 

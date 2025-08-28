@@ -774,7 +774,10 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    friend common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params);
+
 private:
+    common_init_result(); // default constructor for from_model factory
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
@@ -782,6 +785,7 @@ private:
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params);
+common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params);
 
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
