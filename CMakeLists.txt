@@ -219,6 +219,8 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
+elseif (LLAMA_MTMD)
+    add_subdirectory(tools/mtmd)
 endif()
 
 # Automatically add all files from the 'licenses' directory
@@ -232,10 +234,6 @@ endforeach()
 
 if (LLAMA_BUILD_COMMON)
     license_generate(common)
-endif()
-
-if (LLAMA_MTMD)
-  add_subdirectory(tools/mtmd)
 endif()
 
 #
