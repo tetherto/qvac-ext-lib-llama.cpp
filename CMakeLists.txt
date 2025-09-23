@@ -112,7 +112,7 @@ option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_
 option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 
 # specific extras
-option(LLAMA_MTMD "llama: multimodal support" OFF)
+option(LLAMA_MTMD "llama: multimodal support" ${LLAMA_BUILD_TOOLS})
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
