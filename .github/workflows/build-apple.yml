@@ -100,6 +100,7 @@ jobs:
             -DLLAMA_BUILD_BORINGSSL=ON \
             -DGGML_METAL=OFF \
             -DGGML_RPC=ON \
+            -DGGML_BLAS=OFF \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
           time cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
 
