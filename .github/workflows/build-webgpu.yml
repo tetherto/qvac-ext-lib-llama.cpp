@@ -109,12 +109,12 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: webgpu-ubuntu-24.04
-          evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      # - name: ccache
+      #   uses: ggml-org/ccache-action@v1.2.21
+      #   with:
+      #     key: webgpu-ubuntu-24.04
+      #     evict-old-files: 1d
+      #     save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
       - name: Dependencies
         id: depends
