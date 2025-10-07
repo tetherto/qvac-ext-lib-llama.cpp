@@ -210,6 +210,7 @@ int main(int argc, char ** argv) {
         /*param_filter_ud =*/ nullptr,
         /*get_opt_pars    =*/ ggml_opt_get_constant_optimizer_params,
         /*get_opt_pars_ud =*/ &optimizer_params,
+        /*optimizer_type  =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
     };
     llama_opt_init(ctx.get(), model.get(), lopt_params);
 
