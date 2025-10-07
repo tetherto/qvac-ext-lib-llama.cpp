@@ -26,7 +26,12 @@
 #include <functional>
 #include <float.h>
 
-struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
+// TODO: allow to pass callback from user code
+struct clip_logger_state g_logger_state = {
+    GGML_LOG_LEVEL_CONT,           // verbosity_thold
+    clip_log_callback_default,     // log_callback
+    NULL                           // log_callback_user_data
+};
 
 //#define CLIP_DEBUG_FUNCTIONS
 
