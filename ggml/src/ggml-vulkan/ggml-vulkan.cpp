@@ -281,6 +281,7 @@ enum vk_device_architecture {
     INTEL_XE2,
     NVIDIA_PRE_TURING,
     NVIDIA_TURING,
+    QUALCOMM_ADRENO,
 };
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -391,6 +392,8 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
                 return vk_device_architecture::NVIDIA_TURING;
             }
         }
+    } else if (props.vendorID == VK_VENDOR_ID_QUALCOMM) {
+        return vk_device_architecture::QUALCOMM_ADRENO;
     }
     return vk_device_architecture::OTHER;
 }
