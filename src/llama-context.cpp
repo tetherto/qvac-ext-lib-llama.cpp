@@ -119,6 +119,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
+    cparams.training                = params.training;
     cparams.warmup                  = false;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -3367,7 +3368,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         }
     }
 
-    if (lopt_params.load_optimizer_state && lopt_params.checkpoint_path) {        
+    if (lopt_params.load_optimizer_state && lopt_params.checkpoint_path) {
         if (opt_load_state(lopt_params.checkpoint_path)) {
             pending_optimizer_checkpoint_path = lopt_params.checkpoint_path;
             should_load_optimizer_tensors = true;
@@ -3608,6 +3609,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.training                    =*/ false,
     };
 
     return result;

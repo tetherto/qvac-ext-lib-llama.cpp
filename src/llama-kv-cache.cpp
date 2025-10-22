@@ -1389,6 +1389,27 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
 }
 
+ggml_tensor * llama_kv_cache::get_k_lora(ggml_context * ctx, ggml_tensor * k_cur, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(il);
+    GGML_UNUSED(n_kv);
+    GGML_UNUSED(sinfo);
+
+    // Training always uses a single unified stream, so sinfo.s0 is always 0
+    // There is no cached "past" for a different stream to concatenate, so 
+    // k_cur is the full, correct, gradient-connected tensor.
+    return k_cur;
+}
+
+ggml_tensor * llama_kv_cache::get_v_lora(ggml_context * ctx, ggml_tensor * v_cur, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(il);
+    GGML_UNUSED(n_kv);
+    GGML_UNUSED(sinfo);
+
+    return v_cur;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -2604,6 +2625,14 @@ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_lora(ggml_context * ctx, ggml_tensor * k_cur, int32_t il) const {
+    return kv->get_k_lora(ctx, k_cur, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_lora(ggml_context * ctx, ggml_tensor * v_cur, int32_t il) const {
+    return kv->get_v_lora(ctx, v_cur, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
