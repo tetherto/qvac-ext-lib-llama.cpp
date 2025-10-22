@@ -52,6 +52,7 @@ llama_context::llama_context(
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
+    cparams.training         = params.training;
     cparams.warmup           = false;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
@@ -2735,7 +2736,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         }
     }
 
-    if (lopt_params.load_optimizer_state && lopt_params.checkpoint_path) {        
+    if (lopt_params.load_optimizer_state && lopt_params.checkpoint_path) {
         if (opt_load_state(lopt_params.checkpoint_path)) {
             pending_optimizer_checkpoint_path = lopt_params.checkpoint_path;
             should_load_optimizer_tensors = true;
@@ -2971,6 +2972,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.training                    =*/ false,
     };
 
     return result;
