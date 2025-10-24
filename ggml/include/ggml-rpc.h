@@ -6,12 +6,18 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    5
+// qvac fork: downstream ggml_op insertions shift the serialized op ids
+// relative to upstream, so the wire format is incompatible with stock
+// llama.cpp peers even though the message framing is unchanged. Keep the
+// major version offset (+100) from upstream's so mismatched peers are
+// rejected at the HELLO handshake instead of misdecoding graphs. The
+// HELLO fields are uint8_t on the wire, so the value must stay <= 255.
+#define RPC_PROTO_MAJOR_VERSION    105
 #define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
