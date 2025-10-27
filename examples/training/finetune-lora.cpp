@@ -4,7 +4,12 @@
 #include "llama.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <vector>
 #include <fstream>
 #include <filesystem>
@@ -16,6 +21,115 @@
 
 struct checkpoint_callback_data;
 static checkpoint_callback_data* g_checkpoint_data = nullptr;
+
+enum class lora_lr_schedule_type : std::uint8_t {
+    CONSTANT,
+    COSINE,
+    LINEAR,
+};
+
+struct lora_lr_scheduler_state {
+    lora_lr_schedule_type schedule = lora_lr_schedule_type::CONSTANT;
+    float lr_init = 1e-5f;
+    float lr_min = 0.0f;
+    float weight_decay = 0.0f;
+    int64_t total_steps = 0;
+    int64_t current_step = 0;
+    float last_lr = 0.0f;
+};
+
+static bool lora_lr_scheduler_type_from_string(const std::string & name, lora_lr_schedule_type & out) {
+    auto equals = [](const std::string & lhs, const char * rhs) {
+        const size_t rhs_len = std::strlen(rhs);
+        if (lhs.size() != rhs_len) {
+            return false;
+        }
+        for (size_t i = 0; i < rhs_len; ++i) {
+            if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
+                std::tolower(static_cast<unsigned char>(rhs[i]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (equals(name, "constant")) {
+        out = lora_lr_schedule_type::CONSTANT;
+        return true;
+    }
+    if (equals(name, "cosine")) {
+        out = lora_lr_schedule_type::COSINE;
+        return true;
+    }
+    if (equals(name, "linear")) {
+        out = lora_lr_schedule_type::LINEAR;
+        return true;
+    }
+    return false;
+}
+
+static const char * lora_lr_scheduler_type_to_cstr(lora_lr_schedule_type type) {
+    switch (type) {
+        case lora_lr_schedule_type::LINEAR: return "linear";
+        case lora_lr_schedule_type::COSINE: return "cosine";
+        case lora_lr_schedule_type::CONSTANT: return "constant";
+    }
+    return "constant";
+}
+
+static float lora_scheduler_lr_for_step(const lora_lr_scheduler_state & state, int64_t step) {
+
+    if (state.total_steps <= 0) {
+        return std::max(state.lr_init, 0.0f);
+    }
+
+    const int64_t clamped_step = std::min<int64_t>(std::max<int64_t>(step, 0), state.total_steps);
+    float lr = state.lr_init;
+
+    switch (state.schedule) {
+        case lora_lr_schedule_type::CONSTANT:
+            lr = state.lr_init;
+            break;
+        case lora_lr_schedule_type::COSINE: {
+            constexpr float kPi = 3.14159265358979323846f;
+            const float progress = static_cast<float>(clamped_step) / static_cast<float>(state.total_steps);
+            const float cosine = 0.5f * (1.0f + std::cos(progress * kPi));
+            lr = state.lr_min + (state.lr_init - state.lr_min) * cosine;
+            break;
+        }
+        case lora_lr_schedule_type::LINEAR: {
+            const float progress = static_cast<float>(clamped_step) / static_cast<float>(state.total_steps);
+            lr = state.lr_init + (state.lr_min - state.lr_init) * progress;
+            break;
+        }
+    }
+
+    return std::max(lr, 0.0f);
+}
+
+static struct ggml_opt_optimizer_params lora_scheduler_get_optimizer_params(void * userdata) {
+    auto * scheduler = static_cast<lora_lr_scheduler_state *>(userdata);
+    struct ggml_opt_optimizer_params params = ggml_opt_get_default_optimizer_params(nullptr);
+
+    if (!scheduler) {
+        return params;
+    }
+
+    const float lr = lora_scheduler_lr_for_step(*scheduler, scheduler->current_step);
+    scheduler->last_lr = lr;
+
+    params.adamw.alpha = lr;
+    params.adamw.wd = scheduler->weight_decay;
+
+    params.sgd.alpha = lr;
+    params.sgd.wd = scheduler->weight_decay;
+
+    if (scheduler->current_step < scheduler->total_steps) {
+        scheduler->current_step++;
+    }
+
+    return params;
+}
 
 static uint32_t parse_lora_modules(const std::string& modules_str) {
     if (modules_str.empty()) {
@@ -135,6 +249,10 @@ static void print_lora_usage() {
     printf("  --assistant-loss-only      Use JSON dataset format with masked loss (ChatML/conversation format)\n");
     printf("                             Only computes loss on assistant responses, not system/user prompts\n");
     printf("  --chat-template PATH  Optional Jinja chat template to render JSON dataset (matches HF apply_chat_template)\n");
+    printf("  --learning-rate F          AdamW learning rate (default: 1e-5)\n");
+    printf("  --weight-decay F           AdamW weight decay (default: 1e-2)\n");
+    printf("  --lr-scheduler TYPE        Learning rate scheduler: constant, cosine, linear (default: constant)\n");
+    printf("  --lr-min F                 Minimum LR for cosine/linear schedulers (default: 0)\n");
     printf("\nCheckpointing Options:\n");
     printf("  --checkpoint-save-steps N  Save checkpoint every N training steps (default: 100)\n");
     printf("  --checkpoint-save-dir PATH Directory for checkpoints (default: ./checkpoints)\n");
@@ -281,6 +399,7 @@ struct checkpoint_callback_data {
     float lora_alpha;
     uint32_t target_modules;
     float learning_rate;
+    lora_lr_scheduler_state * lr_scheduler;
     std::string model_path;
     std::string dataset_path;
 };
@@ -303,7 +422,11 @@ static void checkpoint_progress_callback(
         LOG_ERR("Checkpoint callback data is null!\n");
         return;
     }
-    
+
+    if (cb_data->lr_scheduler) {
+        cb_data->learning_rate = lora_scheduler_lr_for_step(*cb_data->lr_scheduler, cb_data->lr_scheduler->current_step);
+    }
+
     if (cb_data->checkpoint_save_steps <= 0) {
         return;
     }
@@ -341,9 +464,13 @@ struct finetune_params {
     float lora_alpha = 16.0f;
     std::string lora_modules_str;
     std::string output_adapter_path;
-    
+
     int32_t num_epochs = 1;
-    
+    float learning_rate = 1e-5f;
+    float lr_min = 0.0f;
+    float weight_decay = 0.01f;
+    std::string lr_scheduler = "constant";
+
     int32_t checkpoint_save_steps = 100;
     std::string checkpoint_save_dir = "./checkpoints";
     std::string resume_from_checkpoint;
@@ -396,6 +523,22 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
             ft_params.num_epochs = std::atoi(argv[i + 1]);
             remove_arg_pair(i);
             i--;
+        } else if (strcmp(argv[i], "--learning-rate") == 0 && i + 1 < argc) {
+            ft_params.learning_rate = std::atof(argv[i + 1]);
+            remove_arg_pair(i);
+            i--;
+        } else if (strcmp(argv[i], "--weight-decay") == 0 && i + 1 < argc) {
+            ft_params.weight_decay = std::atof(argv[i + 1]);
+            remove_arg_pair(i);
+            i--;
+        } else if (strcmp(argv[i], "--lr-scheduler") == 0 && i + 1 < argc) {
+            ft_params.lr_scheduler = argv[i + 1];
+            remove_arg_pair(i);
+            i--;
+        } else if (strcmp(argv[i], "--lr-min") == 0 && i + 1 < argc) {
+            ft_params.lr_min = std::atof(argv[i + 1]);
+            remove_arg_pair(i);
+            i--;
         } else if (strcmp(argv[i], "--checkpoint-save-steps") == 0 && i + 1 < argc) {
             ft_params.checkpoint_save_steps = std::atoi(argv[i + 1]);
             remove_arg_pair(i);
@@ -439,6 +582,36 @@ int main(int argc, char ** argv) {
     parse_finetune_args(argc, argv, ft_params);
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
+        return 1;
+    }
+
+    lora_lr_schedule_type scheduler_type;
+    if (!lora_lr_scheduler_type_from_string(ft_params.lr_scheduler, scheduler_type)) {
+        LOG_ERR("Unknown learning rate scheduler: %s (expected: constant, cosine, linear)\n", ft_params.lr_scheduler.c_str());
+        return 1;
+    }
+
+    if (ft_params.num_epochs <= 0) {
+        LOG_ERR("Number of epochs must be > 0, got %d\n", ft_params.num_epochs);
+        return 1;
+    }
+    if (ft_params.learning_rate <= 0.0f) {
+        LOG_ERR("Learning rate must be > 0, got %.4e\n", ft_params.learning_rate);
+        return 1;
+    }
+    if (ft_params.weight_decay < 0.0f) {
+        LOG_ERR("Weight decay must be >= 0, got %.4e\n", ft_params.weight_decay);
+        return 1;
+    }
+    if (ft_params.lr_min < 0.0f) {
+        LOG_ERR("Minimum learning rate must be >= 0, got %.4e\n", ft_params.lr_min);
+        return 1;
+    }
+    const bool scheduler_uses_lr_min = scheduler_type == lora_lr_schedule_type::COSINE ||
+                                       scheduler_type == lora_lr_schedule_type::LINEAR;
+    if (scheduler_uses_lr_min && ft_params.lr_min > ft_params.learning_rate) {
+        LOG_ERR("For %s scheduler lr-min (%.4e) cannot exceed learning-rate (%.4e)\n",
+                lora_lr_scheduler_type_to_cstr(scheduler_type), ft_params.lr_min, ft_params.learning_rate);
         return 1;
     }
 
@@ -571,6 +744,35 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const int64_t total_datapoints = ggml_opt_dataset_ndata(dataset);
+    const int64_t idata_split = static_cast<int64_t>(total_datapoints * (1.0f - val_split));
+    const int64_t training_batches_per_epoch = idata_split;
+
+    if (training_batches_per_epoch <= 0) {
+        LOG_ERR("Training split is empty. Adjust --val-split or dataset size.\n");
+        return 1;
+    }
+
+    lora_lr_scheduler_state lr_scheduler;
+    lr_scheduler.schedule = scheduler_type;
+    lr_scheduler.lr_init = ft_params.learning_rate;
+    lr_scheduler.lr_min = (scheduler_type == lora_lr_schedule_type::CONSTANT) ? ft_params.learning_rate : ft_params.lr_min;
+    lr_scheduler.weight_decay = ft_params.weight_decay;
+    lr_scheduler.total_steps = std::max<int64_t>(1, static_cast<int64_t>(ft_params.num_epochs) * training_batches_per_epoch);
+    lr_scheduler.current_step = 0;
+    lr_scheduler.last_lr = lora_scheduler_lr_for_step(lr_scheduler, lr_scheduler.current_step);
+
+    LOG_INF("Training split: datapoints=%lld, batches_per_epoch=%lld\n",
+        (long long) total_datapoints, (long long) training_batches_per_epoch);
+    LOG_INF("Optimizer: adamw scheduler=%s lr=%.4e wd=%.4e total_steps=%lld\n",
+            lora_lr_scheduler_type_to_cstr(lr_scheduler.schedule), lr_scheduler.lr_init,
+            lr_scheduler.weight_decay, (long long) lr_scheduler.total_steps);
+    if (lr_scheduler.schedule == lora_lr_schedule_type::COSINE) {
+        LOG_INF("Cosine scheduler: lr-min=%.4e\n", lr_scheduler.lr_min);
+    } else if (lr_scheduler.schedule == lora_lr_schedule_type::LINEAR) {
+        LOG_INF("Linear scheduler: lr-min=%.4e\n", lr_scheduler.lr_min);
+    }
+
     int start_epoch = 0;
     int64_t start_step = 0;
     checkpoint_metadata checkpoint_meta = {};
@@ -582,12 +784,12 @@ int main(int argc, char ** argv) {
             checkpoint_loaded = true;
             
             if (checkpoint_meta.lora_rank != ft_params.lora_rank) {
-                LOG_ERR("Checkpoint LoRA rank (%d) doesn't match current rank (%d). Use --resume-from to manually specify a compatible checkpoint.\n", 
+                LOG_ERR("Checkpoint LoRA rank (%d) doesn't match current rank (%d). Use --resume-from to manually specify a compatible checkpoint.\n",
                         checkpoint_meta.lora_rank, ft_params.lora_rank);
                 return 1;
             }
             if (checkpoint_meta.lora_alpha != ft_params.lora_alpha) {
-                LOG_ERR("Checkpoint LoRA alpha (%.3f) doesn't match current alpha (%.3f)\n", 
+                LOG_ERR("Checkpoint LoRA alpha (%.3f) doesn't match current alpha (%.3f)\n",
                         checkpoint_meta.lora_alpha, ft_params.lora_alpha);
                 return 1;
             }
@@ -601,10 +803,6 @@ int main(int argc, char ** argv) {
         }
     }
 
-    struct ggml_opt_optimizer_params optimizer_params = ggml_opt_get_default_optimizer_params(nullptr);
-    optimizer_params.adamw.alpha = 1e-5f; // learning rate
-    optimizer_params.adamw.wd = 0.01f;
-
     std::string optimizer_checkpoint_path;
     if (checkpoint_loaded && !ft_params.resume_from_checkpoint.empty()) {
         std::filesystem::path checkpoint_dir(ft_params.resume_from_checkpoint);
@@ -615,8 +813,8 @@ int main(int argc, char ** argv) {
         /*n_ctx_train          =*/  0,
         /*param_filter         =*/  llama_opt_param_filter_lora,
         /*param_filter_ud      =*/  nullptr,
-        /*get_opt_pars         =*/  ggml_opt_get_constant_optimizer_params,
-        /*get_opt_pars_ud      =*/  &optimizer_params,
+        /*get_opt_pars         =*/  lora_scheduler_get_optimizer_params,
+        /*get_opt_pars_ud      =*/  &lr_scheduler,
         /*optimizer_type       =*/  GGML_OPT_OPTIMIZER_TYPE_ADAMW,
         /*checkpoint_path      =*/  checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr,
         /*load_optimizer_state =*/  checkpoint_loaded,
@@ -628,18 +826,20 @@ int main(int argc, char ** argv) {
     if (checkpoint_loaded) {
         start_step = llama_opt_get_iter(ctx);
     }
-    
+
+    lr_scheduler.current_step = std::min<int64_t>(start_step, lr_scheduler.total_steps);
+    lr_scheduler.last_lr = lora_scheduler_lr_for_step(lr_scheduler, lr_scheduler.current_step);
+
     if (!trained_adapter) {
         LOG_ERR("No trained adapter available for checkpointing\n");
         return 1;
     }
-    
-    const int64_t idata_split = ggml_opt_dataset_ndata(dataset) * (1.0f - val_split);
-    const int64_t training_batches_per_epoch = idata_split;
 
     if (start_step > 0) {
         int64_t completed_epochs = start_step / training_batches_per_epoch;
         start_epoch = (int)completed_epochs;
+        LOG_INF("Resuming training from global step %lld (lr=%.4e)\n",
+                (long long) start_step, lr_scheduler.last_lr);
     }
 
     checkpoint_callback_data cb_data = {
@@ -653,7 +853,8 @@ int main(int argc, char ** argv) {
         /*lora_rank             =*/ ft_params.lora_rank,
         /*lora_alpha            =*/ ft_params.lora_alpha,
         /*target_modules        =*/ target_modules,
-        /*learning_rate         =*/ optimizer_params.adamw.alpha,
+        /*learning_rate         =*/ lr_scheduler.last_lr,
+        /*lr_scheduler          =*/ &lr_scheduler,
         /*model_path            =*/ params.model.path,
         /*dataset_path          =*/ params.prompt_file,
     };
@@ -663,17 +864,20 @@ int main(int argc, char ** argv) {
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
 
     for (int epoch = start_epoch; epoch < ft_params.num_epochs; ++epoch) {
-        LOG_INF("Starting epoch %d (step %ld)\n", epoch, cb_data.global_step);
+        if (cb_data.lr_scheduler) {
+            cb_data.learning_rate = lora_scheduler_lr_for_step(*cb_data.lr_scheduler, cb_data.lr_scheduler->current_step);
+        }
+        LOG_INF("Starting epoch %d (step %lld, lr=%.4e)\n", epoch, (long long)cb_data.global_step, cb_data.learning_rate);
         cb_data.current_epoch = epoch;
         
         int64_t resume_batch = 0;
         if (start_step > 0 && epoch == start_epoch) {
             resume_batch = start_step % training_batches_per_epoch;
         }
-        
-        ggml_opt_epoch_callback train_callback = (ft_params.checkpoint_save_steps <= 0) ? 
+
+        ggml_opt_epoch_callback train_callback = (ft_params.checkpoint_save_steps <= 0) ?
             ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
-        ggml_opt_epoch_callback eval_callback = (ft_params.checkpoint_save_steps <= 0) ? 
+        ggml_opt_epoch_callback eval_callback = (ft_params.checkpoint_save_steps <= 0) ?
             ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
 
         if (resume_batch > 0) {
