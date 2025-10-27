@@ -13,6 +13,7 @@
 #include <vector>
 #include <fstream>
 #include <filesystem>
+#include <cstdlib>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -36,6 +37,8 @@ struct lora_lr_scheduler_state {
     int64_t total_steps = 0;
     int64_t current_step = 0;
     float last_lr = 0.0f;
+    float warmup_ratio = 0.0f;
+    int64_t warmup_steps = 0;
 };
 
 static bool lora_lr_scheduler_type_from_string(const std::string & name, lora_lr_schedule_type & out) {
@@ -84,6 +87,21 @@ static float lora_scheduler_lr_for_step(const lora_lr_scheduler_state & state, i
     }
 
     const int64_t clamped_step = std::min<int64_t>(std::max<int64_t>(step, 0), state.total_steps);
+    const int64_t warmup_steps = std::min<int64_t>(std::max<int64_t>(state.warmup_steps, 0), state.total_steps);
+
+    if (warmup_steps > 0 && clamped_step < warmup_steps) {
+        const float warmup_progress = static_cast<float>(clamped_step) / static_cast<float>(warmup_steps);
+        const float lr = state.lr_init * warmup_progress;
+        return std::max(lr, 0.0f);
+    }
+
+    const int64_t adjusted_step = clamped_step - warmup_steps;
+    int64_t remaining_steps = state.total_steps - warmup_steps;
+    if (remaining_steps <= 0) {
+        remaining_steps = 1;
+    }
+
+    const float progress = std::min<float>(static_cast<float>(adjusted_step) / static_cast<float>(remaining_steps), 1.0f);
     float lr = state.lr_init;
 
     switch (state.schedule) {
@@ -92,13 +110,11 @@ static float lora_scheduler_lr_for_step(const lora_lr_scheduler_state & state, i
             break;
         case lora_lr_schedule_type::COSINE: {
             constexpr float kPi = 3.14159265358979323846f;
-            const float progress = static_cast<float>(clamped_step) / static_cast<float>(state.total_steps);
             const float cosine = 0.5f * (1.0f + std::cos(progress * kPi));
             lr = state.lr_min + (state.lr_init - state.lr_min) * cosine;
             break;
         }
         case lora_lr_schedule_type::LINEAR: {
-            const float progress = static_cast<float>(clamped_step) / static_cast<float>(state.total_steps);
             lr = state.lr_init + (state.lr_min - state.lr_init) * progress;
             break;
         }
@@ -253,6 +269,8 @@ static void print_lora_usage() {
     printf("  --weight-decay F           AdamW weight decay (default: 1e-2)\n");
     printf("  --lr-scheduler TYPE        Learning rate scheduler: constant, cosine, linear (default: constant)\n");
     printf("  --lr-min F                 Minimum LR for cosine/linear schedulers (default: 0)\n");
+    printf("  --warmup-ratio F           Fraction of total steps for LR warmup (default: 0.0)\n");
+    printf("  --warmup-steps N           Explicit warmup steps (overrides warmup-ratio)\n");
     printf("\nCheckpointing Options:\n");
     printf("  --checkpoint-save-steps N  Save checkpoint every N training steps (default: 100)\n");
     printf("  --checkpoint-save-dir PATH Directory for checkpoints (default: ./checkpoints)\n");
@@ -470,6 +488,10 @@ struct finetune_params {
     float lr_min = 0.0f;
     float weight_decay = 0.01f;
     std::string lr_scheduler = "constant";
+    float warmup_ratio = 0.0f;
+    int64_t warmup_steps = 0;
+    bool warmup_ratio_set = false;
+    bool warmup_steps_set = false;
 
     int32_t checkpoint_save_steps = 100;
     std::string checkpoint_save_dir = "./checkpoints";
@@ -537,6 +559,16 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
             i--;
         } else if (strcmp(argv[i], "--lr-min") == 0 && i + 1 < argc) {
             ft_params.lr_min = std::atof(argv[i + 1]);
+            remove_arg_pair(i);
+            i--;
+        } else if (strcmp(argv[i], "--warmup-ratio") == 0 && i + 1 < argc) {
+            ft_params.warmup_ratio = std::atof(argv[i + 1]);
+            ft_params.warmup_ratio_set = true;
+            remove_arg_pair(i);
+            i--;
+        } else if (strcmp(argv[i], "--warmup-steps") == 0 && i + 1 < argc) {
+            ft_params.warmup_steps = std::atoll(argv[i + 1]);
+            ft_params.warmup_steps_set = true;
             remove_arg_pair(i);
             i--;
         } else if (strcmp(argv[i], "--checkpoint-save-steps") == 0 && i + 1 < argc) {
@@ -759,6 +791,20 @@ int main(int argc, char ** argv) {
     lr_scheduler.lr_min = (scheduler_type == lora_lr_schedule_type::CONSTANT) ? ft_params.learning_rate : ft_params.lr_min;
     lr_scheduler.weight_decay = ft_params.weight_decay;
     lr_scheduler.total_steps = std::max<int64_t>(1, static_cast<int64_t>(ft_params.num_epochs) * training_batches_per_epoch);
+    if (ft_params.warmup_steps_set) {
+        lr_scheduler.warmup_steps = std::min<int64_t>(ft_params.warmup_steps, lr_scheduler.total_steps);
+    } else if (ft_params.warmup_ratio_set) {
+        const double warmup_from_ratio = static_cast<double>(lr_scheduler.total_steps) * static_cast<double>(ft_params.warmup_ratio);
+        lr_scheduler.warmup_steps = std::min<int64_t>(static_cast<int64_t>(warmup_from_ratio), lr_scheduler.total_steps);
+    } else {
+        lr_scheduler.warmup_steps = 0;
+    }
+    lr_scheduler.warmup_steps = std::max<int64_t>(lr_scheduler.warmup_steps, 0);
+    if (lr_scheduler.total_steps > 0) {
+        lr_scheduler.warmup_ratio = static_cast<float>(lr_scheduler.warmup_steps) / static_cast<float>(lr_scheduler.total_steps);
+    } else {
+        lr_scheduler.warmup_ratio = 0.0f;
+    }
     lr_scheduler.current_step = 0;
     lr_scheduler.last_lr = lora_scheduler_lr_for_step(lr_scheduler, lr_scheduler.current_step);
 
@@ -771,6 +817,12 @@ int main(int argc, char ** argv) {
         LOG_INF("Cosine scheduler: lr-min=%.4e\n", lr_scheduler.lr_min);
     } else if (lr_scheduler.schedule == lora_lr_schedule_type::LINEAR) {
         LOG_INF("Linear scheduler: lr-min=%.4e\n", lr_scheduler.lr_min);
+    }
+    if (lr_scheduler.warmup_steps > 0) {
+        LOG_INF("Warmup: steps=%lld ratio=%.4f\n", (long long) lr_scheduler.warmup_steps, lr_scheduler.warmup_ratio);
+    } else if (ft_params.warmup_ratio_set) {
+        LOG_WRN("Warmup ratio %.4f produced 0 warmup steps (total_steps=%lld); no warmup applied\n",
+            ft_params.warmup_ratio, (long long) lr_scheduler.total_steps);
     }
 
     int start_epoch = 0;
