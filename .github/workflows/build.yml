@@ -7,7 +7,10 @@ on:
       - master
     paths: [
       '.github/workflows/build.yml',
-      '.github/workflows/build-cmake-pkg.yml',
+      '.github/workflows/build-linux-cross.yml',
+      # Disable. There are some modifications in the fork
+      # so that ggml dynamic builds work with vcpkg.
+      # '.github/workflows/build-cmake-pkg.yml',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -28,7 +31,10 @@ on:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build.yml',
-      '.github/workflows/build-cmake-pkg.yml',
+      '.github/workflows/build-linux-cross.yml',
+      # Disable. There are some modifications in the fork
+      # so that ggml dynamic builds work with vcpkg.
+      # '.github/workflows/build-cmake-pkg.yml',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -57,8 +63,10 @@ env:
   LLAMA_LOG_TIMESTAMPS: 1
 
 jobs:
-  build-cmake-pkg:
-    uses: ./.github/workflows/build-cmake-pkg.yml
+  # Disable. There are some modifications in the fork
+  # so that ggml dynamic builds work with vcpkg.
+  # build-cmake-pkg:
+  #   uses: ./.github/workflows/build-cmake-pkg.yml
 
   macOS-latest-arm64:
     runs-on: macos-latest
