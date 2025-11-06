@@ -307,6 +307,34 @@ jobs:
           cd build
           ctest -L main --verbose
 
+  ubuntu-latest-llguidance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Dependencies
+        id: depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libssl-dev
+
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -B build \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_LLGUIDANCE=ON
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          ctest -L main --verbose --timeout 900
+
   ubuntu-24-vulkan:
     strategy:
       matrix:
