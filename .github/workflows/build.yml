@@ -371,6 +371,7 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
+      # Reduce false pass/failure on CI
       # - name: ccache
       #   uses: ggml-org/ccache-action@v1.2.16
       #   with:
@@ -404,12 +405,13 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
-        with:
-          key: ubuntu-24-cmake-vulkan-deb
-          evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      # Reduce false pass/failure on CI
+      # - name: ccache
+      #   uses: ggml-org/ccache-action@v1.2.16
+      #   with:
+      #     key: ubuntu-24-cmake-vulkan-deb
+      #     evict-old-files: 1d
+      #     save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
       - name: Dependencies
         id: depends
@@ -496,12 +498,13 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
-        with:
-          key: ubuntu-24-cmake-webgpu
-          evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      # Reduce false pass/failure on CI
+      # - name: ccache
+      #   uses: ggml-org/ccache-action@v1.2.16
+      #   with:
+      #     key: ubuntu-24-cmake-webgpu
+      #     evict-old-files: 1d
+      #     save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
       - name: Dependencies
         id: depends
@@ -615,12 +618,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev libssl-dev rocwmma-dev
 
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.16
-        with:
-          key: ubuntu-22-cmake-hip
-          evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      # Reduce false pass/failure on CI
+      # - name: ccache
+      #   uses: ggml-org/ccache-action@v1.2.16
+      #   with:
+      #     key: ubuntu-22-cmake-hip
+      #     evict-old-files: 1d
+      #     save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
       - name: Build with native CMake HIP support
         id: cmake_build
