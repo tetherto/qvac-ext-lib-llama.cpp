@@ -7945,14 +7945,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 }
 
 bool llama_model::create_split_backend_buffers(
-    const uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context *> & ctx_split_map,
+    const uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context_ptr> & ctx_split_map,
     llama_model_loader & ml, const bool use_mmap_buffer, const bool use_mlock, const int32_t n_gpu_layers) {
     // Extract contexts for the given split index from ctx_split_map into a new map
-    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
-    for (const auto & [buft_split_idx, ctx] : ctx_split_map) {
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    for (auto it = ctx_split_map.begin(); it != ctx_split_map.end();) {
+        const auto & [buft_split_idx, ctx_ptr] = *it;
         const auto & [buft, split_idx] = buft_split_idx;
         if (split_idx == idx) {
-            ctx_map[buft] = ctx;
+            // Move the context from ctx_split_map to ctx_map
+            ctx_map[buft] = std::move(it->second);
+            // Remove from ctx_split_map since ownership has been transferred
+            it = ctx_split_map.erase(it);
+        } else {
+            ++it;
         }
     }
 
@@ -7961,6 +7967,9 @@ bool llama_model::create_split_backend_buffers(
     constexpr bool do_print_backend_buffers_info = false;
     const bool     creation_success = create_backend_buffers(split_data_size, ml, use_mmap_buffer, use_mlock,
                                                              n_gpu_layers, do_print_backend_buffers_info);
+    
+    // Note: create_backend_buffers moves the contexts into ctxs_bufs, taking ownership
+    // The contexts in ctx_map are now empty after the move, which is expected
 
     return creation_success;
 }
