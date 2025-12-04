@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "llama-mmap.h"
 #include "llama-model-load-input.h"
+#include "llama-impl.h"
 
 struct llama_model_loader;
 
@@ -74,8 +75,7 @@ struct IncrementalSplitsTensorLoad {
     /// same type of an individual split. The context can be used to instantiate the
     /// final model tensors and and attach to them backend buffers.
     /// @tparam impl The model implementation type where the context will be stored.
-    template <typename impl>
-    ggml_context * get_model_ctx_for_split_buft(ggml_backend_buffer_type_t buft, uint16_t split, impl * model_impl) {
+    ggml_context * get_model_ctx_for_split_buft(ggml_backend_buffer_type_t buft, uint16_t split) {
         auto key = std::make_pair(buft, split);
         auto it  = ctx_split_map.find(key);
         if (it == ctx_split_map.end()) {
