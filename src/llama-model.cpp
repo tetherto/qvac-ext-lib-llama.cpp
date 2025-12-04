@@ -2970,7 +2970,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
             ggml_context * ctx =
                 split_idx.has_value() ?
-                    ml.incremental_splits_tensor_load->get_model_ctx_for_split_buft(buft, *split_idx, pimpl.get()) :
+                    ml.incremental_splits_tensor_load->get_model_ctx_for_split_buft(buft, *split_idx) :
                     ctx_for_buft(buft);
 
             // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -7770,7 +7770,7 @@ bool llama_model::create_split_backend_buffers(
     constexpr bool do_print_backend_buffers_info = false;
     const bool     creation_success = create_backend_buffers(split_data_size, ctx_map, ml, use_mmap_buffer, use_mlock,
                                                              n_gpu_layers, do_print_backend_buffers_info);
-    
+
     // Note: create_backend_buffers moves the contexts into ctxs_bufs, taking ownership
     // The contexts in ctx_map are now empty after the move, which is expected
 
