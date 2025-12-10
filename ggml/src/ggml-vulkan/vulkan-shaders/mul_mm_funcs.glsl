@@ -220,6 +220,69 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair,     d * (FLOAT_TYPEV2(bits & 3u, (bits >> 2u) & 3u) - FLOAT_TYPEV2(1.0f)));
             store_a(col, k_pair + 1, d * (FLOAT_TYPEV2((bits >> 4u) & 3u, bits >> 6u) - FLOAT_TYPEV2(1.0f)));
+#elif defined(DATA_A_TQ1_0)
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+            const uint ib = idx / 128;
+            const uint iqs = idx % 128;
+
+            const float d = float(data_a[ib].d);
+
+            const uint pow3[6] = uint[6](1u, 3u, 9u, 27u, 81u, 243u);
+
+            const uint e0 = 2u * iqs;
+            const uint e1 = e0 + 1u;
+
+            float v0;
+            if (e0 < 160u) {
+                const uint n0 = e0 / 32u;
+                const uint m0 = e0 % 32u;
+                const uint q0 = uint(data_a[ib].qs[m0]);
+                const uint xi0 = (((q0 * pow3[n0]) & 255u) * 3u) >> 8;
+                v0 = float(int(xi0) - 1);
+            } else if (e0 < 240u) {
+                const uint ee0 = e0 - 160u;
+                const uint n0 = ee0 / 16u;
+                const uint m0 = ee0 % 16u;
+                const uint q0 = uint(data_a[ib].qs[32u + m0]);
+                const uint xi0 = (((q0 * pow3[n0]) & 255u) * 3u) >> 8;
+                v0 = float(int(xi0) - 1);
+            } else {
+                const uint ee0 = e0 - 240u;
+                const uint n0 = ee0 / (QUANT_K / 64u);
+                const uint j0 = ee0 % (QUANT_K / 64u);
+                const uint q0 = uint(data_a[ib].qh[j0]);
+                const uint xi0 = (((q0 * pow3[n0]) & 255u) * 3u) >> 8;
+                v0 = float(int(xi0) - 1);
+            }
+
+            float v1;
+            if (e1 < 160u) {
+                const uint n1 = e1 / 32u;
+                const uint m1 = e1 % 32u;
+                const uint q1 = uint(data_a[ib].qs[m1]);
+                const uint xi1 = (((q1 * pow3[n1]) & 255u) * 3u) >> 8;
+                v1 = float(int(xi1) - 1);
+            } else if (e1 < 240u) {
+                const uint ee1 = e1 - 160u;
+                const uint n1 = ee1 / 16u;
+                const uint m1 = ee1 % 16u;
+                const uint q1 = uint(data_a[ib].qs[32u + m1]);
+                const uint xi1 = (((q1 * pow3[n1]) & 255u) * 3u) >> 8;
+                v1 = float(int(xi1) - 1);
+            } else {
+                const uint ee1 = e1 - 240u;
+                const uint n1 = ee1 / (QUANT_K / 64u);
+                const uint j1 = ee1 % (QUANT_K / 64u);
+                const uint q1 = uint(data_a[ib].qh[j1]);
+                const uint xi1 = (((q1 * pow3[n1]) & 255u) * 3u) >> 8;
+                v1 = float(int(xi1) - 1);
+            }
+
+            const vec2 v = d * vec2(v0, v1);
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
 #elif defined(DATA_A_Q2_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
