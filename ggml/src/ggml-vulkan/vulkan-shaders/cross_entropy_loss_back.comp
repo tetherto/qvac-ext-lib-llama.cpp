@@ -2,8 +2,8 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 
-#include "generic_head.comp"
-#include "types.comp"
+#include "generic_head.glsl"
+#include "types.glsl"
 
 #define FLOAT_TYPE float
 
