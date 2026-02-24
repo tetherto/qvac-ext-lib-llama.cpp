@@ -3561,6 +3561,7 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
         /* sect_2      =*/ sect_2,
         /* sect_3      =*/ sect_3,
         /* src2        =*/ op->src[2] != nullptr,
+        /* sin_sign    =*/ 1.0f,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_rope(lib, op);
