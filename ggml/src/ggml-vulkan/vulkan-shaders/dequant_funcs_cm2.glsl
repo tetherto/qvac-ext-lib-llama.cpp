@@ -671,20 +671,18 @@ layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ2
    block_tq2_0 block;
 };
 
+#define TQ2_CM2 1
+#include "tq_utils.comp"
+#undef TQ2_CM2
+
 float16_t dequantFuncTQ2_0(const in decodeBufTQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
 {
     const float16_t d = bl.block.d;
     const uint idx = coordInBlock[1];
 
-    const uint iqs = idx % 128u;
-    const uint upper = idx / 128u;
+    const int val = tq2_dequantize(bl, idx);
 
-    const uint byte_idx = (upper * 32u) + (iqs % 32u);
-
-    const uint qsshift = (iqs / 32u) * 2u;
-
-    const uint c = (uint(bl.block.qs[byte_idx]) >> qsshift) & 3u;
-    return d * float16_t(float(c) - 1.0f);
+    return d * float16_t(val);
 }
 #endif
 
@@ -702,20 +700,20 @@ float16_t dequantFuncTQ1_0(const in decodeBufTQ1_0 bl, const in uint blockCoords
 
     uint xi;
     if (idx < 160u) {
-        const uint n = idx / 32u;         // 0..4
-        const uint m = idx % 32u;         // 0..31
+        const uint n = idx / 32u;
+        const uint m = idx % 32u;
         const uint q = uint(bl.block.qs[m]);
         xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
     } else if (idx < 240u) {
-        const uint ee = idx - 160u;       // 0..79
-        const uint n = ee / 16u;          // 0..4
-        const uint m = ee % 16u;          // 0..15
+        const uint ee = idx - 160u;
+        const uint n = ee / 16u;
+        const uint m = ee % 16u;
         const uint q = uint(bl.block.qs[32u + m]);
         xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
     } else {
-        const uint ee = idx - 240u;       // 0..15
-        const uint n = ee / 4u;           // 0..3
-        const uint j = ee % 4u;           // 0..3
+        const uint ee = idx - 240u;
+        const uint n = ee / 4u;
+        const uint j = ee % 4u;
         const uint q = uint(bl.block.qh[j]);
         xi = (((q * pow3[n]) & 255u) * 3u) >> 8u;
     }
@@ -753,6 +751,8 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
 #define dequantFuncA dequantFuncQ5_1
 #elif defined(DATA_A_Q8_0)
 #define dequantFuncA dequantFuncQ8_0
+#elif defined(DATA_A_TQ2_0)
+#define dequantFuncA dequantFuncTQ2_0
 #elif defined(DATA_A_Q2_K)
 #define dequantFuncA dequantFuncQ2_K
 #elif defined(DATA_A_Q3_K)

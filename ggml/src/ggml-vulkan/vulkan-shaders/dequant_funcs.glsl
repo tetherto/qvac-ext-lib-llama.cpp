@@ -469,30 +469,6 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_TQ2_0)
-// TQ2_0 ternary dequantization: {0,1,2} -> {-1,0,+1} via (q-1) mapping
-vec2 dequantize(uint ib, uint iqs, uint a_offset) {
-    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
-    const uint c0 = (vui >> 0) & 3;
-    const uint c1 = (vui >> 2) & 3;
-    const float q0 = float(c0) - 1.0f;
-    const float q1 = float(c1) - 1.0f;
-    return vec2(q0, q1);
-}
-vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
-    const uint c0 = (vui >> 0) & 3;
-    const uint c1 = (vui >> 2) & 3;
-    const uint c2 = (vui >> 4) & 3;
-    const uint c3 = (vui >> 6) & 3;
-    const float q0 = float(c0) - 1.0f;
-    const float q1 = float(c1) - 1.0f;
-    const float q2 = float(c2) - 1.0f;
-    const float q3 = float(c3) - 1.0f;
-    return vec4(q0, q1, q2, q3);
-}
-#endif
-
 #if defined(DATA_A_MXFP4)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
@@ -502,6 +478,22 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
     vec2 v0 = dequantize(ib, iqs, a_offset);
     vec2 v1 = dequantize(ib, iqs + 1, a_offset);
     return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+#endif
+
+#if defined(DATA_A_TQ2_0)
+#include "tq_utils.comp"
+
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(tq2_dequantize(ib + a_offset, iqs), tq2_dequantize(ib + a_offset, iqs + 1));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(
+        tq2_dequantize(ib + a_offset, iqs + 0),
+        tq2_dequantize(ib + a_offset, iqs + 1),
+        tq2_dequantize(ib + a_offset, iqs + 2),
+        tq2_dequantize(ib + a_offset, iqs + 3)
+    );
 }
 #endif
 
