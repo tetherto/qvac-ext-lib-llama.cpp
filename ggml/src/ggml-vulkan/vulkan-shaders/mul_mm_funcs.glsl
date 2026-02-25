@@ -1,3 +1,7 @@
+#if defined(DATA_A_TQ2_0)
+#include "tq_utils.glsl"
+#endif
+
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
@@ -190,17 +194,18 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
 
-            const uint ib = idx / 128;                              // 2 values per idx (like Q2_K)
-            const uint iqs = idx % 128;                             // 0..127
-            const uint qsi = (iqs / 64) * 32 + (iqs % 16) * 2;      // Q2_K indexing pattern
-            const uint qsshift = ((iqs % 64) / 16) * 2;             // Q2_K shift: 0,2,4,6
+            const uint ib = idx / 128;                 // 2 values per idx
+            const uint iqs = idx % 128;                // 0..127
 
             const float d = float(data_a[ib].d);
 
-            const uvec2 qs = uvec2(data_a[ib].qs[qsi], data_a[ib].qs[qsi + 1]);
-            const vec2 v = d * (vec2((qs >> qsshift) & 3) - 1.0f);  // (q-1)*d
+            const uint e0 = 2 * iqs;
+            const uint e1 = e0 + 1;
 
-            buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
+            const float v0 = d * float(tq2_dequantize(ib, e0));
+            const float v1 = d * float(tq2_dequantize(ib, e1));
+
+            buf_a[buf_idx] = FLOAT_TYPEV2(v0, v1);
 #elif defined(DATA_A_TQ1_0)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
