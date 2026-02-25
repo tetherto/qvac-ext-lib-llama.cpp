@@ -1,36 +1,26 @@
 #version 450
 
-#extension GL_EXT_shader_16bit_storage : require
+#include "dequant_head.glsl"
 
-#include "types.glsl"
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
-layout (push_constant) uniform parameter {
-    uint ne;
-} p;
-
-layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#include "tq_utils.comp"
 
 void main() {
-    const uint i = gl_GlobalInvocationID.x * 4;
-    
-    if (i >= p.ne) {
-        return;
-    }
-    
-    const uint ib = i / QUANT_K;            // block index
-    const uint iqs = (i % QUANT_K) / 4;     // quant index within block (byte index)
-    const uint bit_pos_base = (i % 4) * 2;  // bit position within byte
-    
-    const float d = float(data_a[ib].d);
-    
-    for (uint j = 0; j < 4 && (i + j) < p.ne; ++j) {
-        const uint local_iqs = ((i + j) % QUANT_K) / 4; // byte index for this element
-        const uint bit_pos = ((i + j) % 4) * 2;         // bit position for this element
-        const uint vui = uint(data_a[ib].qs[local_iqs]);
-        const uint q = (vui >> bit_pos) & 3;
-        data_b[i + j] = D_TYPE(d * (float(q) - 1.0f));
+    [[unroll]] for (uint wgy = 0; wgy < 256; wgy += gl_WorkGroupSize.x) {
+        const uint ib = gl_WorkGroupID.x;
+
+        if (ib >= p.nel / QUANT_K) {
+            return;
+        }
+
+        const uint e = wgy + gl_LocalInvocationID.x;
+
+        const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib].d);
+
+        data_b[ib * QUANT_K + e] = D_TYPE(d * FLOAT_TYPE(tq2_dequantize(ib, e)));
     }
 }
