@@ -771,6 +771,10 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         }
     }
 
+    if (params.kv_only) {
+        return ctx;
+    }
+
     // read the tensor info
     for (int64_t i = 0; ok && i < n_tensors; ++i) {
         struct gguf_tensor_info info;
