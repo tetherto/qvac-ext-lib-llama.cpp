@@ -14839,20 +14839,6 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
     };
 
-    int num_small_nodes = 0;
-    int num_counted_nodes = 0;
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        if (!is_empty(graph->nodes[i]) &&
-            graph->nodes[i]->op != GGML_OP_SET_ROWS) {
-            if (ggml_nrows(graph->nodes[i]) <= 8) {
-                num_small_nodes++;
-            }
-            num_counted_nodes++;
-        }
-    }
-    if (num_small_nodes < num_counted_nodes / 2) {
-        return;
-    }
 
     auto const &is_src_of = [](const ggml_tensor *dst, const ggml_tensor *src) -> bool {
         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
