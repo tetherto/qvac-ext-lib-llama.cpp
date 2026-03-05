@@ -1613,6 +1613,7 @@ extern "C" {
         float    alpha;
         float    dropout;
         float    init_std;
+        uint32_t seed;       // seed for reproducible weight initialization (0 = non-deterministic)
     };
 
     // Initialize LoRA training with the given parameters
