@@ -1584,6 +1584,8 @@ extern "C" {
         bool assistant_loss_only;
     };
 
+    LLAMA_API struct llama_opt_params llama_opt_default_params(void);
+
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
     LLAMA_API void llama_opt_epoch(
