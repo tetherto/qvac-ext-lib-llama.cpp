@@ -862,18 +862,14 @@ int main(int argc, char ** argv) {
         optimizer_checkpoint_path = (checkpoint_dir / "optimizer.gguf").string();
     }
 
-    struct llama_opt_params lopt_params {
-        /*n_ctx_train          =*/  0,
-        /*param_filter         =*/  llama_opt_param_filter_lora,
-        /*param_filter_ud      =*/  nullptr,
-        /*get_opt_pars         =*/  lora_scheduler_get_optimizer_params,
-        /*get_opt_pars_ud      =*/  &lr_scheduler,
-        /*optimizer_type       =*/  GGML_OPT_OPTIMIZER_TYPE_ADAMW,
-        /*checkpoint_path      =*/  checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr,
-        /*load_optimizer_state =*/  checkpoint_loaded,
-        /*assistant_loss_only  =*/  ft_params.assistant_loss_only,
-    };
-    
+    struct llama_opt_params lopt_params = llama_opt_default_params();
+    lopt_params.param_filter         = llama_opt_param_filter_lora;
+    lopt_params.get_opt_pars         = lora_scheduler_get_optimizer_params;
+    lopt_params.get_opt_pars_ud      = &lr_scheduler;
+    lopt_params.checkpoint_path      = checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr;
+    lopt_params.load_optimizer_state = checkpoint_loaded;
+    lopt_params.assistant_loss_only  = ft_params.assistant_loss_only;
+
     llama_opt_init(ctx, model, lopt_params);
     
     if (checkpoint_loaded) {
