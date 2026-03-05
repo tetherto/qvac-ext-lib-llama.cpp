@@ -1622,7 +1622,7 @@ extern "C" {
         LLAMA_LORA_TARGET_FFN_UP    = 1 << 5,
         LLAMA_LORA_TARGET_FFN_DOWN  = 1 << 6,
         LLAMA_LORA_TARGET_OUTPUT    = 1 << 7,
-        LLAMA_LORA_TARGET_ALL       = 0x1FF,
+        LLAMA_LORA_TARGET_ALL       = UINT32_MAX,
     };
 
     struct llama_lora_training_params {
