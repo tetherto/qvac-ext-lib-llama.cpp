@@ -11560,12 +11560,17 @@ static void ggml_vk_op_f32_cross_entropy_loss_masked_back(ggml_backend_vk_contex
 }
 
 static void ggml_vk_cross_entropy_loss_masked_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * grad   = dst->src[0];
     const ggml_tensor * logits = dst->src[1];
 
     const int64_t nclasses = logits->ne[0];
     const int64_t nrows = ggml_nrows(logits);
 
     float upstream_grad = 1.0f;
+    if (grad && grad->data) {
+        ggml_backend_tensor_get(grad, &upstream_grad, 0, sizeof(float));
+    }
+
     ggml_vk_op_f32_cross_entropy_loss_masked_back(ctx, subctx, dst, {
         (uint32_t)nclasses,
         (uint32_t)nrows,
