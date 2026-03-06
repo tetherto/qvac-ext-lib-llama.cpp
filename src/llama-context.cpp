@@ -1962,6 +1962,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
+    // Note: inference mode would only need (1024u, 8u*n_tensors), but these values
+    // are bumped to support LoRA finetuning which requires more graph nodes.
     return std::max<uint32_t>(2048u, 32u*model.n_tensors());
 }
 
