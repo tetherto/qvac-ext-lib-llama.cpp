@@ -375,7 +375,7 @@ jobs:
           time cmake --build build -j $(nproc)
 
   ubuntu-24-webgpu:
-    runs-on: ubuntu-24.04
+    runs-on: ai-run-linux-gpu
 
     steps:
       - name: Clone
