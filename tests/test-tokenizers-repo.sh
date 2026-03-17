@@ -19,26 +19,29 @@ fi
 repo=$1
 folder=$2
 
-git lfs install 2>/dev/null
-
 if [ -d $folder ] && [ -d $folder/.git ]; then
-    (cd $folder; git pull && git lfs pull)
+    (cd $folder; git pull)
 else
-    git clone $repo $folder
-    (cd $folder; git lfs pull)
+    GIT_LFS_SKIP_SMUDGE=1 git clone $repo $folder
+fi
 
-    # byteswap models if on big endian
-    if [ "$(uname -m)" = s390x ]; then
-        for f in $folder/*/*.gguf; do
-            echo YES | python3 "$(dirname $0)/../gguf-py/gguf/scripts/gguf_convert_endian.py" $f big
-        done
-    fi
+shopt -s globstar
+for gguf in $folder/**/*.gguf; do
+    if head -c 4 "$gguf" | grep -q 'GGUF'; then continue; fi
+    rel="${gguf#$folder/}"
+    printf "Downloading LFS file via curl: %s\n" "$rel"
+    curl -fL -o "$gguf" "$repo/resolve/main/$rel"
+done
+
+if [ "$(uname -m)" = s390x ]; then
+    for f in $folder/*/*.gguf; do
+        echo YES | python3 "$(dirname $0)/../gguf-py/gguf/scripts/gguf_convert_endian.py" $f big
+    done
 fi
 
 fail=0
 pass=0
 
-shopt -s globstar
 for gguf in $folder/**/*.gguf; do
     if [ -f $gguf.inp ] && [ -f $gguf.out ]; then
         if ! head -c 3 "$gguf" | grep -q 'GGUF'; then
