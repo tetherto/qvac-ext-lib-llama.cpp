@@ -1,7 +1,18 @@
 name: CI
 
 on:
-  workflow_dispatch: # allows manual triggering
+  workflow_dispatch:
+    inputs:
+      job_filter:
+        description: 'Job to run (e.g. ubuntu-24-cmake-vulkan). Leave empty to run all jobs.'
+        required: false
+        default: ''
+        type: string
+      test_filter:
+        description: 'Test name regex for ctest -R (e.g. test-opt). Leave empty to run all tests.'
+        required: false
+        default: ''
+        type: string
   push:
     branches:
       - master
@@ -60,6 +71,7 @@ env:
 
 jobs:
   macOS-latest-cmake-arm64:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'macOS-latest-cmake-arm64'
     runs-on: macos-latest
 
     steps:
@@ -93,9 +105,12 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L 'main|curl' --verbose --timeout 900
+          CTEST_ARGS="-L 'main|curl' --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
   macOS-latest-cmake-x64:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'macOS-latest-cmake-x64'
     runs-on: macos-15-intel
 
     steps:
@@ -130,9 +145,12 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose --timeout 900
+          CTEST_ARGS="-L main --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
   macOS-latest-cmake-arm64-webgpu:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'macOS-latest-cmake-arm64-webgpu'
     runs-on: macos-latest
 
     steps:
@@ -171,9 +189,12 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose --timeout 900
+          CTEST_ARGS="-L main --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
   ubuntu-cpu-cmake:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-cpu-cmake'
     strategy:
       matrix:
         include:
@@ -236,11 +257,13 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L 'main|curl' --verbose --timeout 900
+          CTEST_ARGS="-L 'main|curl' --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
       - name: Test llama2c conversion
         id: llama2c_test
-        if: ${{ matrix.build != 's390x' }}
+        if: ${{ matrix.build != 's390x' && inputs.test_filter == '' }}
         run: |
           cd build
           echo "Fetch tokenizer"
@@ -252,7 +275,7 @@ jobs:
 
       - name: Test llama2c (s390x)
         id: llama2c_test_s390x
-        if: ${{ matrix.build == 's390x' }}
+        if: ${{ matrix.build == 's390x' && inputs.test_filter == '' }}
         run: |
           cd build
           echo "Fetch llama2c big-endian model"
@@ -260,6 +283,7 @@ jobs:
           ./bin/llama-cli -m stories260K-be.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
   ubuntu-latest-cmake-sanitizer:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-latest-cmake-sanitizer'
     runs-on: ubuntu-latest
 
     continue-on-error: true
@@ -326,9 +350,12 @@ jobs:
           MSAN_OPTIONS: "verbosity=1:abort_on_error=1:print_stats=1"
         run: |
           cd build
-          ctest -L main --verbose --timeout 900
+          CTEST_ARGS="-L main --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
   ubuntu-latest-llguidance:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-latest-llguidance'
     runs-on: ubuntu-latest
 
     steps:
@@ -358,9 +385,12 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose --timeout 900
+          CTEST_ARGS="-L main --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
   ubuntu-latest-cmake-rpc:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-latest-cmake-rpc'
     runs-on: ubuntu-latest
 
     continue-on-error: true
@@ -396,9 +426,12 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose
+          CTEST_ARGS="-L main --verbose"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose"; fi
+          eval ctest $CTEST_ARGS
 
   ubuntu-24-cmake-vulkan-deb:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-24-cmake-vulkan-deb'
     runs-on: ubuntu-24.04
 
     steps:
@@ -435,6 +468,7 @@ jobs:
           cmake --build build -j $(nproc)
 
   ubuntu-24-cmake-vulkan:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-24-cmake-vulkan'
     runs-on: ai-run-linux-gpu
 
     steps:
@@ -491,9 +525,12 @@ jobs:
           export GGML_VK_VISIBLE_DEVICES=0
           export GGML_VK_DISABLE_F16=1
           # This is using llvmpipe and runs slower than other backends
-          ctest -L main --verbose --timeout 4200
+          CTEST_ARGS="-L main --verbose --timeout 4200"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 4200"; fi
+          eval ctest $CTEST_ARGS
 
   ubuntu-24-cmake-webgpu:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-24-cmake-webgpu'
     runs-on: ubuntu-24.04
 
     steps:
@@ -564,9 +601,12 @@ jobs:
         run: |
           cd build
           # This is using llvmpipe and runs slower than other backends
-          ctest -L main --verbose --timeout 3600
+          CTEST_ARGS="-L main --verbose --timeout 3600"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 3600"; fi
+          eval ctest $CTEST_ARGS
 
   ubuntu-24-wasm-webgpu:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-24-wasm-webgpu'
     runs-on: ubuntu-24.04
 
     steps:
@@ -607,6 +647,7 @@ jobs:
           cmake --build build-wasm --target test-backend-ops -j $(nproc)
 
   ubuntu-22-cmake-hip:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-22-cmake-hip'
     runs-on: ubuntu-22.04
     container: rocm/dev-ubuntu-22.04:6.1.2
 
@@ -640,6 +681,7 @@ jobs:
           cmake --build build --config Release -j $(nproc)
 
   ubuntu-22-cmake-musa:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-22-cmake-musa'
     runs-on: ubuntu-22.04
     container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
 
@@ -670,6 +712,7 @@ jobs:
           cmake --build build --config Release -j $(nproc)
 
   ubuntu-22-cmake-sycl:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-22-cmake-sycl'
     runs-on: ubuntu-22.04
 
     continue-on-error: true
@@ -720,6 +763,7 @@ jobs:
           cmake --build build --config Release -j $(nproc)
 
   ubuntu-22-cmake-sycl-fp16:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-22-cmake-sycl-fp16'
     runs-on: ubuntu-22.04
 
     continue-on-error: true
@@ -771,6 +815,7 @@ jobs:
           cmake --build build --config Release -j $(nproc)
 
   build-linux-cross:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'build-linux-cross'
     uses: ./.github/workflows/build-linux-cross.yml
 
   # Disable. There are some modifications in the fork
@@ -779,6 +824,7 @@ jobs:
   #   uses: ./.github/workflows/build-cmake-pkg.yml
 
   macOS-latest-cmake-ios:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'macOS-latest-cmake-ios'
     runs-on: macos-latest
 
     steps:
@@ -810,6 +856,7 @@ jobs:
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
   macOS-latest-cmake-tvos:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'macOS-latest-cmake-tvos'
     runs-on: macos-latest
 
     steps:
@@ -841,6 +888,7 @@ jobs:
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
   macOS-latest-cmake-visionos:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'macOS-latest-cmake-visionos'
     runs-on: macos-latest
 
     steps:
@@ -866,6 +914,7 @@ jobs:
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
   macOS-latest-swift:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'macOS-latest-swift'
     runs-on: macos-latest
     needs: ios-xcode-build
 
@@ -906,6 +955,7 @@ jobs:
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
 
   windows-msys2:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'windows-msys2'
     runs-on: windows-2025
 
     strategy:
@@ -956,6 +1006,7 @@ jobs:
             cmake --build build --config ${{ matrix.build }} -j $(nproc)
 
   windows-latest-cmake:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'windows-latest-cmake'
     runs-on: windows-2025
 
     env:
@@ -1058,9 +1109,12 @@ jobs:
       - name: Test
         id: cmake_test
         if: ${{ matrix.arch == 'x64' }}
+        shell: bash
         run: |
           cd build
-          ctest -L main -C Release --verbose --timeout 900
+          CTEST_ARGS="-L main -C Release --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' -C Release --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
       # TODO: disabled for now, consider adding tests for all CPU variants instead
       # - name: Test (Intel SDE)
@@ -1077,6 +1131,7 @@ jobs:
       #     & $sde -future -- ctest -L main -C Release --verbose --timeout 900
 
   ubuntu-latest-cmake-cuda:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-latest-cmake-cuda'
     runs-on: ubuntu-latest
     container: nvidia/cuda:12.6.2-devel-ubuntu24.04
 
@@ -1112,6 +1167,7 @@ jobs:
             cmake --build build
 
   windows-2022-cmake-cuda:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'windows-2022-cmake-cuda'
     runs-on: windows-2022
 
     strategy:
@@ -1159,6 +1215,7 @@ jobs:
           cmake --build build --config Release
 
   windows-latest-cmake-sycl:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'windows-latest-cmake-sycl'
     runs-on: windows-2022
 
     defaults:
@@ -1192,6 +1249,7 @@ jobs:
         run:  examples/sycl/win-build-sycl.bat
 
   windows-latest-cmake-hip:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'windows-latest-cmake-hip'
     runs-on: windows-2022
 
     env:
@@ -1261,6 +1319,7 @@ jobs:
           cmake --build build -j ${env:NUMBER_OF_PROCESSORS}
 
   ios-xcode-build:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ios-xcode-build'
     runs-on: macos-latest
 
     steps:
@@ -1307,6 +1366,7 @@ jobs:
           xcodebuild -project examples/llama.swiftui/llama.swiftui.xcodeproj -scheme llama.swiftui -sdk iphoneos CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= -destination 'generic/platform=iOS' FRAMEWORK_FOLDER_PATH=./build-ios build
 
   android-build:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'android-build'
     runs-on: ubuntu-latest
 
     steps:
@@ -1337,6 +1397,7 @@ jobs:
           ./gradlew build --no-daemon
 
   android-ndk-build:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'android-ndk-build'
     runs-on: ubuntu-latest
 
     env:
@@ -1412,7 +1473,7 @@ jobs:
           echo "FIXME: test on devices"
 
   openEuler-latest-cmake-cann:
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'Ascend NPU') }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'openEuler-latest-cmake-cann') && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'Ascend NPU')) }}
     defaults:
       run:
         shell: bash -el {0}
@@ -1445,6 +1506,7 @@ jobs:
 # TODO: simplify the following workflows using a matrix
 # TODO: run lighter CI on PRs and the full CI only on master (if needed)
   ggml-ci-x64-cpu-low-perf:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-x64-cpu-low-perf'
     runs-on: ubuntu-22.04
 
     steps:
@@ -1470,6 +1532,7 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-arm64-cpu-low-perf:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-arm64-cpu-low-perf'
     runs-on: ubuntu-22.04-arm
 
     steps:
@@ -1495,6 +1558,7 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-x64-cpu-high-perf:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-x64-cpu-high-perf'
     runs-on: ubuntu-22.04
 
     steps:
@@ -1520,6 +1584,7 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-arm64-cpu-high-perf:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-arm64-cpu-high-perf'
     runs-on: ubuntu-22.04-arm
 
     steps:
@@ -1545,6 +1610,7 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_NO_SVE=1 GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-arm64-cpu-high-perf-sve:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-arm64-cpu-high-perf-sve'
     runs-on: ubuntu-22.04-arm
 
     steps:
@@ -1570,6 +1636,7 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ggml-ci-x64-nvidia-cuda:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-x64-nvidia-cuda'
     runs-on: [self-hosted, Linux, X64, NVIDIA]
 
     steps:
@@ -1584,6 +1651,7 @@ jobs:
           GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
 
   ggml-ci-x64-nvidia-vulkan-cm:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-x64-nvidia-vulkan-cm'
     runs-on: [self-hosted, Linux, X64, NVIDIA]
 
     steps:
@@ -1598,6 +1666,7 @@ jobs:
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
 
   ggml-ci-x64-nvidia-vulkan-cm2:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-x64-nvidia-vulkan-cm2'
     runs-on: [self-hosted, Linux, X64, NVIDIA, COOPMAT2]
 
     steps:
@@ -1612,6 +1681,7 @@ jobs:
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
 
   ggml-ci-x64-cpu-amx:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-x64-cpu-amx'
     runs-on: [self-hosted, Linux, X64, CPU, AMX]
 
     steps:
@@ -1625,6 +1695,7 @@ jobs:
           bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
 
   ggml-ci-x64-amd-vulkan:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-x64-amd-vulkan'
     runs-on: [self-hosted, Linux, X64, AMD]
 
     steps:
@@ -1639,6 +1710,7 @@ jobs:
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
 
   ggml-ci-x64-amd-rocm:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-x64-amd-rocm'
     runs-on: [self-hosted, Linux, X64, AMD]
 
     steps:
@@ -1653,6 +1725,7 @@ jobs:
           GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp /mnt/llama.cpp
 
   ggml-ci-mac-metal:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-mac-metal'
     runs-on: [self-hosted, macOS, ARM64]
 
     steps:
@@ -1666,6 +1739,7 @@ jobs:
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   ggml-ci-mac-vulkan:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-mac-vulkan'
     runs-on: [self-hosted, macOS, ARM64]
 
     steps:
@@ -1680,6 +1754,7 @@ jobs:
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   ggml-ci-arm64-cpu-kleidiai:
+     if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-arm64-cpu-kleidiai'
      runs-on: ubuntu-22.04-arm
 
      steps:
@@ -1705,6 +1780,7 @@ jobs:
            GG_BUILD_KLEIDIAI=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
   ubuntu-cpu-cmake-riscv64-native:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-cpu-cmake-riscv64-native'
     runs-on: RISCV64
 
     steps:
@@ -1781,7 +1857,9 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L 'main|curl' --verbose --timeout 900
+          CTEST_ARGS="-L 'main|curl' --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
       - name: Test llama2c conversion
         id: llama2c_test
@@ -1795,6 +1873,7 @@ jobs:
           ./bin/llama-cli -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
   ubuntu-cmake-sanitizer-riscv64-native:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-cmake-sanitizer-riscv64-native'
     runs-on: RISCV64
 
     continue-on-error: true
@@ -1891,10 +1970,13 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose --timeout 900
+          CTEST_ARGS="-L main --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
 
   ubuntu-llguidance-riscv64-native:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-llguidance-riscv64-native'
     runs-on: RISCV64
     steps:
       - name: Install dependencies
@@ -1960,10 +2042,13 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose --timeout 900
+          CTEST_ARGS="-L main --verbose --timeout 900"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          eval ctest $CTEST_ARGS
 
 
   ubuntu-cmake-rpc-riscv64-native:
+    if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ubuntu-cmake-rpc-riscv64-native'
     runs-on: RISCV64
 
     continue-on-error: true
@@ -2033,9 +2118,12 @@ jobs:
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose
+          CTEST_ARGS="-L main --verbose"
+          if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose"; fi
+          eval ctest $CTEST_ARGS
 
   ggml-ci-arm64-graviton4-kleidiai:
+     if: github.event_name != 'workflow_dispatch' || inputs.job_filter == '' || inputs.job_filter == 'ggml-ci-arm64-graviton4-kleidiai'
      runs-on: ah-ubuntu_22_04-c8g_8x
 
      steps:
