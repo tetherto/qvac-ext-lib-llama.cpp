@@ -19,10 +19,13 @@ fi
 repo=$1
 folder=$2
 
+git lfs install 2>/dev/null
+
 if [ -d $folder ] && [ -d $folder/.git ]; then
-    (cd $folder; git pull)
+    (cd $folder; git pull && git lfs pull)
 else
     git clone $repo $folder
+    (cd $folder; git lfs pull)
 
     # byteswap models if on big endian
     if [ "$(uname -m)" = s390x ]; then
@@ -32,12 +35,29 @@ else
     fi
 fi
 
+fail=0
+pass=0
+
 shopt -s globstar
 for gguf in $folder/**/*.gguf; do
     if [ -f $gguf.inp ] && [ -f $gguf.out ]; then
-        $toktest $gguf
+        if ! head -c 3 "$gguf" | grep -q 'GGUF'; then
+            printf "WARNING: $gguf is not a valid GGUF file (LFS pointer or corrupt), skipping...\n"
+            continue
+        fi
+        if $toktest $gguf; then
+            pass=$((pass + 1))
+        else
+            printf "FAILED: $gguf\n"
+            fail=$((fail + 1))
+        fi
     else
         printf "Found \"$gguf\" without matching inp/out files, ignoring...\n"
     fi
 done
+
+printf "\nResults: $pass passed, $fail failed\n"
+if [ $fail -gt 0 ]; then
+    exit 1
+fi
 
