@@ -9,8 +9,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const bool src0_is_quantized = (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16);
-    const bool src1_is_quantized = (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16);
+    const bool src0_requires_fp32 = src0->type != GGML_TYPE_F32;
+    const bool src1_requires_fp32 = src1->type != GGML_TYPE_F32;
 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -25,34 +25,33 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool_alloc<float> src0_alloc(pool);
     ggml_cuda_pool_alloc<float> src1_alloc(pool);
 
-    if (src0_is_quantized) {
+    if (src0_requires_fp32) {
         const size_t src0_size = ggml_nelements(src0);
         src0_alloc.alloc(src0_size);
         src0_f32 = src0_alloc.ptr;
         allocated_src0 = true;
 
-        // Dequantize
-        auto dequantize_fn = ggml_get_to_fp32_cuda(src0->type);
-        if (dequantize_fn) {
-            dequantize_fn(src0->data, src0_f32, ggml_nelements(src0), stream);
+        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
+        if (to_fp32_cuda != nullptr) {
+            to_fp32_cuda(src0->data, src0_f32, ggml_nelements(src0), stream);
         } else {
-            GGML_ABORT("Unsupported quant type for src0");
+            GGML_ABORT("Unsupported type for src0 in ggml_cuda_out_prod");
         }
     } else {
         src0_f32 = (float *) src0->data;
     }
 
-    if (src1_is_quantized) {
+    if (src1_requires_fp32) {
         const size_t src1_size = ggml_nelements(src1);
         src1_alloc.alloc(src1_size);
         src1_f32 = src1_alloc.ptr;
         allocated_src1 = true;
 
-        auto dequantize_fn = ggml_get_to_fp32_cuda(src1->type);
-        if (dequantize_fn) {
-            dequantize_fn(src1->data, src1_f32, ggml_nelements(src1), stream);
+        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1->type);
+        if (to_fp32_cuda != nullptr) {
+            to_fp32_cuda(src1->data, src1_f32, ggml_nelements(src1), stream);
         } else {
-            GGML_ABORT("Unsupported quant type for src1");
+            GGML_ABORT("Unsupported type for src1 in ggml_cuda_out_prod");
         }
     } else {
         src1_f32 = (float *) src1->data;

@@ -4388,10 +4388,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 const ggml_tensor * src0 = op->src[0];
                 const ggml_tensor * src1 = op->src[1];
-                return op->type == GGML_TYPE_F32 &&
-                    src0 != nullptr && src1 != nullptr &&
-                    src0->type == GGML_TYPE_F32 &&
-                    src1->type == GGML_TYPE_F32;
+                const bool src0_supported = src0 != nullptr &&
+                    (src0->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(src0->type) != nullptr);
+                const bool src1_supported = src1 != nullptr &&
+                    (src1->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(src1->type) != nullptr);
+                return op->type == GGML_TYPE_F32 && src0_supported && src1_supported;
             } break;
         case GGML_OP_GET_ROWS:
             {
