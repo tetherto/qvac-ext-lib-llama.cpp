@@ -13,6 +13,11 @@ on:
         required: false
         default: ''
         type: string
+      test_exclude:
+        description: 'Test name regex for ctest -E to exclude (e.g. test-thread-safety|test-opt). Leave empty to exclude none.'
+        required: false
+        default: ''
+        type: string
   push:
     branches:
       - master
@@ -107,6 +112,7 @@ jobs:
           cd build
           CTEST_ARGS="-L 'main|curl' --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
   macOS-latest-cmake-x64:
@@ -147,6 +153,7 @@ jobs:
           cd build
           CTEST_ARGS="-L main --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
   macOS-latest-cmake-arm64-webgpu:
@@ -191,6 +198,7 @@ jobs:
           cd build
           CTEST_ARGS="-L main --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
   ubuntu-cpu-cmake:
@@ -280,6 +288,7 @@ jobs:
           cd build
           CTEST_ARGS="-L 'main|curl' --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
       - name: Diagnose failures
@@ -407,6 +416,7 @@ jobs:
           cd build
           CTEST_ARGS="-L main --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
   ubuntu-latest-llguidance:
@@ -442,6 +452,7 @@ jobs:
           cd build
           CTEST_ARGS="-L main --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
   ubuntu-latest-cmake-rpc:
@@ -483,6 +494,7 @@ jobs:
           cd build
           CTEST_ARGS="-L main --verbose"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
   ubuntu-24-cmake-vulkan-deb:
@@ -582,6 +594,7 @@ jobs:
           # This is using llvmpipe and runs slower than other backends
           CTEST_ARGS="-L main --verbose --timeout 4200"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 4200"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
   ubuntu-24-cmake-webgpu:
@@ -658,6 +671,7 @@ jobs:
           # This is using llvmpipe and runs slower than other backends
           CTEST_ARGS="-L main --verbose --timeout 3600"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 3600"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
   ubuntu-24-wasm-webgpu:
@@ -1169,6 +1183,7 @@ jobs:
           cd build
           CTEST_ARGS="-L main -C Release --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' -C Release --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
       # TODO: disabled for now, consider adding tests for all CPU variants instead
@@ -1914,6 +1929,7 @@ jobs:
           cd build
           CTEST_ARGS="-L 'main|curl' --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
       - name: Test llama2c conversion
@@ -2027,6 +2043,7 @@ jobs:
           cd build
           CTEST_ARGS="-L main --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
 
@@ -2099,6 +2116,7 @@ jobs:
           cd build
           CTEST_ARGS="-L main --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
 
@@ -2175,6 +2193,7 @@ jobs:
           cd build
           CTEST_ARGS="-L main --verbose"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose"; fi
+          if [ -n "${{ inputs.test_exclude }}" ]; then CTEST_ARGS="$CTEST_ARGS -E '${{ inputs.test_exclude }}'"; fi
           eval ctest $CTEST_ARGS
 
   ggml-ci-arm64-graviton4-kleidiai:
