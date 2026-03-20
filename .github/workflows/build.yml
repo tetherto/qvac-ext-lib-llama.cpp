@@ -243,6 +243,20 @@ jobs:
             echo YES | python3 gguf-py/gguf/scripts/gguf_convert_endian.py $f big
           done
 
+      - name: System Info
+        id: system_info
+        run: |
+          echo "=== CPU Info ==="
+          lscpu
+          echo "=== CPU Flags ==="
+          grep -m1 '^flags' /proc/cpuinfo || true
+          echo "=== Kernel ==="
+          uname -a
+          echo "=== GCC Target ==="
+          gcc -march=native -Q --help=target 2>/dev/null | head -50 || true
+          echo "=== GCC march=native defines ==="
+          echo | gcc -march=native -dM -E - 2>/dev/null | grep -E '__(AVX|SSE|FMA|F16C|BMI|POPCNT)' | sort || true
+
       - name: Build
         id: cmake_build
         run: |
@@ -260,6 +274,40 @@ jobs:
           CTEST_ARGS="-L 'main|curl' --verbose --timeout 900"
           if [ -n "${{ inputs.test_filter }}" ]; then CTEST_ARGS="-R '${{ inputs.test_filter }}' --verbose --timeout 900"; fi
           eval ctest $CTEST_ARGS
+
+      - name: Diagnose failures
+        id: diagnose_failures
+        if: failure() && steps.cmake_test.outcome == 'failure'
+        run: |
+          echo "=== Diagnosing test failures ==="
+          cd build
+          sudo apt-get install -y -qq gdb 2>/dev/null || true
+          FAILED_TESTS=$(ctest --rerun-failed -N 2>/dev/null | grep 'Test #' | sed 's/.*: //' || true)
+          if [ -z "$FAILED_TESTS" ]; then
+            echo "No failed tests identified"
+            exit 0
+          fi
+          echo "Failed tests: $FAILED_TESTS"
+          for test_name in $FAILED_TESTS; do
+            echo ""
+            echo "=== Diagnosing: $test_name ==="
+            test_bin=$(find bin -name "$test_name" -type f 2>/dev/null | head -1)
+            if [ -z "$test_bin" ]; then
+              echo "Binary not found for $test_name, skipping"
+              continue
+            fi
+            echo "--- binary info ---"
+            file "$test_bin" || true
+            echo "--- linked shared libraries ---"
+            ldd "$test_bin" 2>/dev/null || true
+            echo "--- AVX-512 instructions in binary and linked libs ---"
+            for lib in "$test_bin" $(ldd "$test_bin" 2>/dev/null | grep 'build/' | awk '{print $3}'); do
+              count=$(objdump -d "$lib" 2>/dev/null | grep -cE '\{%k[0-7]\}|%zmm|evex' || echo 0)
+              echo "  $lib: $count AVX-512/EVEX instructions"
+            done
+            echo "--- re-running under gdb to get crash location ---"
+            gdb -batch -ex run -ex 'bt full' -ex 'info registers' -ex 'disas' --args ./"$test_bin" -hf ggml-org/models -hff tinyllamas/stories15M-q4_0.gguf -ngl 0 -p "hello" -n 1 -c 64 -np 1 -t 1 2>&1 | tail -120 || true
+          done
 
       - name: Test llama2c conversion
         id: llama2c_test
