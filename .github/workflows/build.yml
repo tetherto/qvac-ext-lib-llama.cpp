@@ -514,7 +514,7 @@ jobs:
           ctest -L main --verbose --timeout 4200 2>&1 | tee ctest_output.log
           CTEST_EXIT=${PIPESTATUS[0]}
           if [ "$CTEST_EXIT" -ne 0 ] && [ "$IS_T4" = true ]; then
-            NON_SEGFAULT=$(grep -E 'The following tests FAILED:' -A 100 ctest_output.log | grep -v 'SegFault' | grep -c -E 'Exception|Failed|Timeout' || true)
+            NON_SEGFAULT=$(sed -n '/The following tests FAILED:/,$p' ctest_output.log | grep -E '^\s+[0-9]' | grep -vic 'segfault' || true)
             if [ "$NON_SEGFAULT" -eq 0 ]; then
               echo "::warning::All test failures are SegFault-on-exit (NVIDIA T4 driver bug) -- treating as success"
               exit 0

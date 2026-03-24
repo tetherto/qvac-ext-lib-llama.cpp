@@ -29,7 +29,7 @@ else
         if head -c 4 "$gguf" | grep -q 'GGUF'; then continue; fi
         rel="${gguf#$folder/}"
         printf "Downloading LFS file via curl: %s\n" "$rel"
-        curl -fL -o "$gguf" "$repo/resolve/main/$rel"
+        curl -fL -o "$gguf" "$repo/resolve/main/$rel" || { printf "ERROR: failed to download %s\n" "$rel" >&2; exit 1; }
     done
 
     # byteswap models if on big endian
