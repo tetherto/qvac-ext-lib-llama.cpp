@@ -202,11 +202,18 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
+      - name: CPU feature hash
+        id: cpu_info
+        run: |
+          CPU_HASH=$(echo | gcc -march=native -dM -E - 2>/dev/null | sort | md5sum | cut -d' ' -f1)
+          echo "cpu_hash=${CPU_HASH}" >> "$GITHUB_OUTPUT"
+          echo "CPU feature hash: ${CPU_HASH}"
+
       - name: ccache
         if: ${{ matrix.build != 's390x' && matrix.build != 'ppc64le' }}
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: ubuntu-cpu-${{ matrix.build }}
+          key: ubuntu-cpu-cmake-${{ matrix.build }}-${{ steps.cpu_info.outputs.cpu_hash }}
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
