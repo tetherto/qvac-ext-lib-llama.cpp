@@ -774,7 +774,7 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
-    friend common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params);
+    friend std::unique_ptr<common_init_result> common_init_from_model_and_params(llama_model * model, common_params & params);
 
 private:
     common_init_result(); // default constructor for from_model factory
