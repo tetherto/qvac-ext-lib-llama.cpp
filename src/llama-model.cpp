@@ -7879,6 +7879,10 @@ bool llama_model::create_backend_buffers(std::size_t                            
         }
     }
 
+    if (ml.no_alloc) {
+        return true;
+    }
+
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(size_data, ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
@@ -7920,31 +7924,6 @@ void llama_model::print_backend_buffers_info(const int32_t n_gpu_layers) {
         }
     }
 
-    // populate tensors_by_name
-    for (auto & [ctx, _] : pimpl->ctxs_bufs) {
-        for (auto * cur = ggml_get_first_tensor(ctx.get()); cur != NULL; cur = ggml_get_next_tensor(ctx.get(), cur)) {
-            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
-        }
-    }
-
-    if (ml.no_alloc) {
-        return true;
-    }
-
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
-        }
-    }
-
-    if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
-        }
-    }
-
-    return true;
 }
 
 std::string llama_model::arch_name() const {

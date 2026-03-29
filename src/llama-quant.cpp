@@ -557,7 +557,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     std::vector<std::string> splits = {};
     load_input_variant::fname_load_input inp{fname_inp, splits};
-    llama_model_loader                   ml(inp, use_mmap, /*check_tensors*/ true, kv_overrides, nullptr);
+    llama_model_loader                   ml(inp, use_mmap, /*use_direct_io*/ false, /*check_tensors*/ true, /*no_alloc*/ false, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
 
     llama_model model(llama_model_default_params());

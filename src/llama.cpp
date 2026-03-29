@@ -1032,8 +1032,8 @@ struct llama_model * llama_load_model_from_file(
 static llama_model_loader create_disk_fileloader(const char * path_model, std::vector<std::string> & splits,
                                                  struct llama_model_params params) {
     load_input_variant::fname_load_input loader_input{ path_model, splits };
-    return llama_model_loader(loader_input, params.use_mmap, params.check_tensors, params.kv_overrides,
-                              params.tensor_buft_overrides);
+    return llama_model_loader(loader_input, params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
+                              params.kv_overrides, params.tensor_buft_overrides);
 }
 
 struct llama_model * llama_model_load_from_file(const char * path_model, struct llama_model_params params) {
@@ -1054,7 +1054,7 @@ void override_and_disable_mmap(struct llama_model_params & params) {
 struct llama_model * llama_model_load_from_buffer(std::vector<uint8_t> && data, struct llama_model_params params) {
     std::unique_ptr<std::basic_streambuf<uint8_t>> streambuf = std::make_unique<Uint8BufferStreamBuf>(std::move(data));
     override_and_disable_mmap(params);
-    llama_model_loader ml(load_input_variant::buffer_load_input{ streambuf }, params.use_mmap, params.check_tensors,
+    llama_model_loader ml(load_input_variant::buffer_load_input{ streambuf }, params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
                           params.kv_overrides, params.tensor_buft_overrides);
     return llama_model_load_from_file_impl(ml, params);
 }
@@ -1095,8 +1095,8 @@ struct llama_model * llama_model_load_from_split_futures(const char ** paths, si
 
     load_input_variant::buffer_future_load_input loader_input{ splits.front(), context, splits, tensor_list_file_str };
     override_and_disable_mmap(params);
-    llama_model_loader ml(loader_input, params.use_mmap, params.check_tensors, params.kv_overrides,
-                          params.tensor_buft_overrides);
+    llama_model_loader ml(loader_input, params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
+                          params.kv_overrides, params.tensor_buft_overrides);
     return llama_model_load_from_file_impl(ml, params);
 }
 
