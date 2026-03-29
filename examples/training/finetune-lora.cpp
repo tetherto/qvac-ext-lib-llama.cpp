@@ -494,9 +494,9 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
     params.training = true;
 
-    common_init_result llama_init = common_init_from_params(params);
-    llama_model_ptr   & model = llama_init.model;
-    llama_context_ptr & ctx   = llama_init.context;
+    auto llama_init = common_init_from_params(params);
+    auto * model = llama_init->model();
+    auto * ctx   = llama_init->context();
 
     if (model == NULL) {
         LOG_ERR("%s: unable to load model\n", __func__);
@@ -546,7 +546,7 @@ int main(int argc, char ** argv) {
         LOG_INF("LoRA configuration: rank=%d, alpha=%.1f (scaling=%.3f)\n",
                 lora_params.rank, lora_params.alpha, lora_params.alpha / lora_params.rank);
 
-        trained_adapter = llama_lora_training_init(ctx.get(), model.get(), &lora_params);
+        trained_adapter = llama_lora_training_init(ctx, model, &lora_params);
         if (!trained_adapter) {
             LOG_ERR("%s: LoRA training initialization failed\n", __func__);
             return 1;
@@ -559,11 +559,11 @@ int main(int argc, char ** argv) {
     
     if (ft_params.assistant_loss_only) {
         LOG_INF("Using JSON dataset with chat template and assistant-only loss\n");
-        dataset = common_opt_sft_dataset_init(ctx.get(), params.prompt, llama_n_ctx(ctx.get())/2, ft_params.chat_template_path);
+        dataset = common_opt_sft_dataset_init(ctx, params.prompt, llama_n_ctx(ctx)/2, ft_params.chat_template_path);
     } else {
-        std::vector<llama_token> tokens = common_tokenize(ctx.get(), params.prompt, true);
+        std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
         LOG_INF("Using standard next-token prediction mode\n");
-        dataset = common_opt_dataset_init(ctx.get(), tokens, llama_n_ctx(ctx.get())/2);
+        dataset = common_opt_dataset_init(ctx, tokens, llama_n_ctx(ctx)/2);
     }
     
     if (dataset == nullptr) {
@@ -623,10 +623,10 @@ int main(int argc, char ** argv) {
         /*assistant_loss_only  =*/  ft_params.assistant_loss_only,
     };
     
-    llama_opt_init(ctx.get(), model.get(), lopt_params);
+    llama_opt_init(ctx, model, lopt_params);
     
     if (checkpoint_loaded) {
-        start_step = llama_opt_get_iter(ctx.get());
+        start_step = llama_opt_get_iter(ctx);
     }
     
     if (!trained_adapter) {
@@ -643,7 +643,7 @@ int main(int argc, char ** argv) {
     }
 
     checkpoint_callback_data cb_data = {
-        /*ctx                   =*/ ctx.get(),
+        /*ctx                   =*/ ctx,
         /*adapter               =*/ trained_adapter,
         /*checkpoint_save_steps =*/ ft_params.checkpoint_save_steps,
         /*checkpoint_save_dir   =*/ ft_params.checkpoint_save_dir,
@@ -684,7 +684,7 @@ int main(int argc, char ** argv) {
             LOG_INF("Checkpointing disabled, using standard progress callback\n");
         }
 
-        llama_opt_epoch(ctx.get(), dataset, result_train, result_eval, idata_split,
+        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
             train_callback, eval_callback, resume_batch);
         fprintf(stderr, "\n");
 
@@ -708,7 +708,7 @@ int main(int argc, char ** argv) {
     }
 
     if (trained_adapter) {
-        if (llama_lora_save_adapter(trained_adapter, adapter_filename.c_str(), model.get())) {
+        if (llama_lora_save_adapter(trained_adapter, adapter_filename.c_str(), model)) {
             std::ifstream adapter_file(adapter_filename, std::ios::binary | std::ios::ate);
             if (adapter_file.is_open()) {
                 std::streamsize adapter_size = adapter_file.tellg();
