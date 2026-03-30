@@ -49,6 +49,7 @@ else()
 endif()
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
+option(BUILD_LLAMA "Build, install LLAMA package artifacts as well." ON)
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
@@ -223,6 +224,9 @@ endif()
 # build the library
 #
 
+if (NOT BUILD_LLAMA)
+    message(STATUS "BUILD_LLAMA is OFF: skipping LLAMA targets.")
+else()
 add_subdirectory(src)
 
 #
@@ -273,6 +277,24 @@ if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
 endif()
 
+endif() # NOT BUILD_LLAMA
+
+# Automatically add all files from the 'licenses' directory
+file(GLOB EXTRA_LICENSES "${CMAKE_SOURCE_DIR}/licenses/LICENSE-*")
+
+foreach(FILE_PATH ${EXTRA_LICENSES})
+    get_filename_component(FILE_NAME "${FILE_PATH}" NAME)
+    string(REGEX REPLACE "^LICENSE-" "" NAME "${FILE_NAME}")
+    license_add_file("${NAME}" "${FILE_PATH}")
+endforeach()
+
+# TARGET check rather than LLAMA_BUILD_COMMON: with BUILD_LLAMA=OFF the
+# common/ subdirectory is never added, and license_generate() fatals on a
+# missing target
+if (TARGET llama-common)
+    license_generate(llama-common)
+endif()
+
 #
 # install
 #
@@ -280,6 +302,7 @@ endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+if (BUILD_LLAMA)
 set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header  files")
 set(LLAMA_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
 set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
@@ -377,3 +400,4 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+endif() # BUILD_LLAMA
