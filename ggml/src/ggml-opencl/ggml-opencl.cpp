@@ -28,6 +28,15 @@
 #include <memory>
 #include <charconv>
 #include <mutex>
+#include <chrono>
+
+#ifdef GGML_OPENCL_KERNEL_CACHE
+extern "C" {
+#include "sha256.h"
+}
+#include <cstdlib>
+#include <filesystem>
+#endif
 
 #undef MIN
 #undef MAX
@@ -730,7 +739,124 @@ inline std::string read_file(const std::string &path) {
   return text;
 }
 
+#ifdef GGML_OPENCL_KERNEL_CACHE
+namespace {
+
+std::string ggml_opencl_kernel_cache_dir() {
+    const char * env_disable = std::getenv("GGML_OPENCL_KERNEL_CACHE");
+    if (env_disable && env_disable[0] == '0' && env_disable[1] == '\0') {
+        return {};
+    }
+    const char * override_dir = std::getenv("GGML_OPENCL_CACHE_DIR");
+    if (override_dir && override_dir[0]) {
+        return std::string(override_dir);
+    }
+    return {};
+}
+
+void ggml_opencl_cache_save_program_binary(const std::string & path, const std::vector<unsigned char> & bin) {
+    try {
+        namespace fs = std::filesystem;
+        fs::path p(path);
+        fs::create_directories(p.parent_path());
+        const std::string tmp = path + ".tmp";
+        std::ofstream ofs(tmp, std::ios::binary);
+        if (!ofs) {
+            return;
+        }
+        ofs.write((const char *) bin.data(), (std::streamsize) bin.size());
+        ofs.close();
+        fs::rename(tmp, path);
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("ggml_opencl: failed to save kernel cache to %s: %s\n", path.c_str(), e.what());
+    } catch (...) {
+        GGML_LOG_WARN("ggml_opencl: failed to save kernel cache to %s\n", path.c_str());
+    }
+}
+
+bool ggml_opencl_cache_read_file(const std::string & path, std::vector<unsigned char> & out) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        return false;
+    }
+    ifs.seekg(0, std::ios::end);
+    const auto sz = ifs.tellg();
+    if (sz <= 0) {
+        return false;
+    }
+    ifs.seekg(0);
+    out.resize((size_t) sz);
+    ifs.read((char *) out.data(), (std::streamsize) out.size());
+    return (bool) ifs;
+}
+
+} // namespace
+#endif // GGML_OPENCL_KERNEL_CACHE
+
 static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer, const std::string &compile_opts) {
+#ifdef GGML_OPENCL_KERNEL_CACHE
+    std::string cache_dir = ggml_opencl_kernel_cache_dir();
+    std::string cache_path;
+    if (!cache_dir.empty()) {
+        std::string key_material;
+        key_material.append(GGML_OPENCL_CACHE_VERSION);
+        key_material.push_back('\0');
+        key_material.append(compile_opts);
+        key_material.push_back('\0');
+
+        auto append_device_info = [&](cl_device_info param) {
+            size_t length = 0;
+            CL_CHECK(clGetDeviceInfo(dev, param, 0, NULL, &length));
+            if (length > 0) {
+                size_t offset = key_material.size();
+                // length includes the null terminator \0, we don't need an extra push_back call here
+                key_material.resize(offset + length);
+                CL_CHECK(clGetDeviceInfo(dev, param, length, &key_material[offset], NULL));
+            } else {
+                key_material.push_back('\0');
+            }
+        };
+        append_device_info(CL_DEVICE_NAME);
+        append_device_info(CL_DRIVER_VERSION);
+
+        key_material.append(program_buffer, program_buffer + strlen(program_buffer));
+
+        unsigned char digest[SHA256_DIGEST_SIZE];
+        sha256_hash(digest, (const unsigned char *) key_material.data(), key_material.size());
+
+        static const char * hexd = "0123456789abcdef";
+        char hex[SHA256_DIGEST_SIZE * 2 + 1];
+        for (int i = 0; i < SHA256_DIGEST_SIZE; i++) {
+            hex[i * 2]     = hexd[digest[i] >> 4];
+            hex[i * 2 + 1] = hexd[digest[i] & 15];
+        }
+        hex[SHA256_DIGEST_SIZE * 2] = '\0';
+        cache_path = cache_dir + "/" + hex + ".oclbin";
+
+        std::vector<unsigned char> cached_bin;
+        if (ggml_opencl_cache_read_file(cache_path, cached_bin) && !cached_bin.empty()) {
+            cl_int      err_bin  = CL_SUCCESS;
+            cl_int      bin_stat = CL_SUCCESS;
+            const unsigned char * bp = cached_bin.data();
+            size_t        sz         = cached_bin.size();
+            cl_program p_cache       = clCreateProgramWithBinary(ctx, 1, &dev, &sz, &bp, &bin_stat, &err_bin);
+            if (p_cache && err_bin == CL_SUCCESS && bin_stat == CL_SUCCESS) {
+                cl_int err_build = clBuildProgram(p_cache, 1, &dev, compile_opts.c_str(), NULL, NULL);
+                if (err_build == CL_SUCCESS) {
+                    static std::once_flag cache_log_once;
+                    std::call_once(cache_log_once, [&]() {
+                        GGML_LOG_INFO("ggml_opencl: using on-disk kernel cache under %s\n", cache_dir.c_str());
+                    });
+                    return p_cache;
+                }
+            }
+            if (p_cache) {
+                clReleaseProgram(p_cache);
+            }
+        }
+    }
+#endif // GGML_OPENCL_KERNEL_CACHE
+
     cl_program p;
     char *program_log;
     size_t program_size;
@@ -755,6 +881,39 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
         free(program_log);
         exit(1);
     }
+
+#ifdef GGML_OPENCL_KERNEL_CACHE
+    if (!cache_dir.empty() && !cache_path.empty() && p) {
+        cl_uint num_devices = 0;
+        if (clGetProgramInfo(p, CL_PROGRAM_NUM_DEVICES, sizeof(num_devices), &num_devices, NULL) == CL_SUCCESS &&
+            num_devices > 0) {
+            std::vector<size_t> bin_sizes(num_devices);
+            clGetProgramInfo(p, CL_PROGRAM_BINARY_SIZES, num_devices * sizeof(size_t), bin_sizes.data(), NULL);
+            std::vector<cl_device_id> pdevs(num_devices);
+            clGetProgramInfo(p, CL_PROGRAM_DEVICES, num_devices * sizeof(cl_device_id), pdevs.data(), NULL);
+            cl_uint idx = 0;
+            for (; idx < num_devices; ++idx) {
+                if (pdevs[idx] == dev) {
+                    break;
+                }
+            }
+            if (idx >= num_devices) {
+                idx = 0;
+            }
+            const size_t bin_size = bin_sizes[idx];
+            if (bin_size > 0) {
+                std::vector<std::vector<unsigned char>> bins_storage(num_devices);
+                std::vector<unsigned char *> ptrs(num_devices);
+                for (cl_uint i = 0; i < num_devices; i++) {
+                    bins_storage[i].resize(bin_sizes[i]);
+                    ptrs[i] = bins_storage[i].data();
+                }
+                clGetProgramInfo(p, CL_PROGRAM_BINARIES, num_devices * sizeof(unsigned char *), ptrs.data(), NULL);
+                ggml_opencl_cache_save_program_binary(cache_path, bins_storage[idx]);
+            }
+        }
+    }
+#endif
 
     return p;
 }
@@ -2506,7 +2665,7 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
 
     cl_platform_id platform_ids[NPLAT];
     if (clGetPlatformIDs(NPLAT, platform_ids, &n_platforms) != CL_SUCCESS) {
-        GGML_LOG_ERROR("ggml_opencl: plaform IDs not available.\n");
+        GGML_LOG_ERROR("ggml_opencl: platform IDs not available (clGetPlatformIDs failed).\n");
         return found_devices;
     }
 
@@ -2869,7 +3028,13 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
 
     // Load kernels
-    load_cl_kernels(backend_ctx.get(), opencl_c_version);
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        load_cl_kernels(backend_ctx.get(), opencl_c_version);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        GGML_LOG_INFO("ggml_opencl: kernel load time: %lld ms\n", (long long)ms);
+    }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // Allocate intermediate buffers and images
