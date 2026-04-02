@@ -1423,7 +1423,9 @@ bool llama_model_loader::load_all_data(
 
     size_t alignment = 1;
     for (const auto & file : files) {
-        alignment = std::max(file->read_alignment(), alignment);
+        if (file) {
+            alignment = std::max(file->read_alignment(), alignment);
+        }
     }
 
     // Buffer size: balance between memory usage and I/O efficiency
