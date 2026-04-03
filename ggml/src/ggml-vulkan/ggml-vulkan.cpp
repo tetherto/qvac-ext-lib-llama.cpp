@@ -953,14 +953,18 @@ struct vk_subbuffer {
 // event_wait and 'fence' for event_synchronize. Polling on an event for
 // event_synchronize wouldn't be sufficient to wait for command buffers to complete,
 // and would lead to validation errors.
-struct vk_event {
-    vk::Event event;
-    vk::Fence fence;
-};
-
 struct vk_semaphore {
     vk::Semaphore s;
     uint64_t value;
+};
+
+struct vk_event {
+    std::vector<vk::Event> events_free;
+    std::vector<vk::Event> events_submitted;
+    vk::Event event;
+    bool has_event = false;
+
+    vk_semaphore tl_semaphore;
 };
 
 struct vk_submission {
@@ -6670,14 +6674,15 @@ static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
 }
 
 static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
+    vk_context result;
     if (!ctx->compute_ctx.expired()) {
-        return ctx->compute_ctx.lock();
+        result = ctx->compute_ctx.lock();
+    } else {
+        result = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+
+        ctx->compute_ctx = result;
+        ggml_vk_ctx_begin(ctx->device, result);
     }
-
-    vk_context result = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
-
-    ctx->compute_ctx = result;
-    ggml_vk_ctx_begin(ctx->device, result);
 
     if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
         result->s->wait_semaphores.push_back(ctx->transfer_semaphore);
@@ -15391,16 +15396,26 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
-    // the backend interface doesn't have an explicit reset, so reset it here
-    // before we record the command to set it
-    ctx->device->device.resetEvent(vkev->event);
-    ctx->device->device.resetFences({ vkev->fence });
+    if (vkev->has_event) {
+        vkev->events_submitted.push_back(vkev->event);
+    }
+
+    if (vkev->events_free.empty()) {
+        vkev->event = ctx->device->device.createEvent({});
+    } else {
+        vkev->event = vkev->events_free.back();
+        vkev->events_free.pop_back();
+    }
+
+    vkev->has_event = true;
+    vkev->tl_semaphore.value++;
+    compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
 
     ggml_vk_set_event(compute_ctx, vkev->event);
 
     ggml_vk_ctx_end(compute_ctx);
 
-    ggml_vk_submit(compute_ctx, {vkev->fence});
+    ggml_vk_submit(compute_ctx, {});
     ctx->submit_pending = true;
     ctx->compute_ctx.reset();
 }
@@ -15412,9 +15427,9 @@ static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_even
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
-    ggml_vk_wait_events(compute_ctx, {vkev->event});
-    ggml_vk_ctx_end(compute_ctx);
-    ctx->compute_ctx.reset();
+    if (vkev->has_event) {
+        ggml_vk_wait_events(compute_ctx, { vkev->event });
+    }
 }
 
 // TODO: enable async and synchronize
@@ -16217,10 +16232,12 @@ static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t 
         return nullptr;
     }
 
-    // The event/fence is expected to initially be in the signaled state.
-    vkev->event = device->device.createEvent({});
-    vkev->fence = device->device.createFence({vk::FenceCreateFlagBits::eSignaled});
-    device->device.setEvent(vkev->event);
+    vkev->has_event = false;
+
+    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo ci{};
+    ci.setPNext(&tci);
+    vkev->tl_semaphore = { device->device.createSemaphore(ci), 0 };
 
     return new ggml_backend_event {
         /* .device  = */ dev,
@@ -16234,8 +16251,16 @@ static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backe
 
     vk_event *vkev = (vk_event *)event->context;
 
-    device->device.destroyFence(vkev->fence);
-    device->device.destroyEvent(vkev->event);
+    device->device.destroySemaphore(vkev->tl_semaphore.s);
+    for (auto& ev : vkev->events_free) {
+        device->device.destroyEvent(ev);
+    }
+    for (auto& ev : vkev->events_submitted) {
+        device->device.destroyEvent(ev);
+    }
+    if (vkev->has_event) {
+        device->device.destroyEvent(vkev->event);
+    }
     delete vkev;
     delete event;
 }
@@ -16246,7 +16271,18 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
     auto device = ggml_vk_get_device(ctx->device);
     vk_event *vkev = (vk_event *)event->context;
 
-    VK_CHECK(device->device.waitForFences({ vkev->fence }, true, UINT64_MAX), "event_synchronize");
+    if (vkev->has_event) {
+        vk::Semaphore sem = vkev->tl_semaphore.s;
+        uint64_t val = vkev->tl_semaphore.value;
+        vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
+        VK_CHECK(device->device.waitSemaphores(swi, UINT64_MAX), "event_synchronize");
+
+        for (auto& ev : vkev->events_submitted) {
+            device->device.resetEvent(ev);
+        }
+        vkev->events_free.insert(vkev->events_free.end(), vkev->events_submitted.begin(), vkev->events_submitted.end());
+        vkev->events_submitted.clear();
+    }
 }
 
 static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size) {
