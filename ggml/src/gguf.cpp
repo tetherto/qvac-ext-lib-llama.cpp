@@ -313,14 +313,8 @@ struct gguf_reader {
             if (n > SIZE_MAX / sizeof(uint64_t)) {
                 return false;
             }
-            if (nbytes_remain < n * sizeof(uint64_t)) {
-                return false;
-            }
         } else {
             if (n > SIZE_MAX / sizeof(T)) {
-                return false;
-            }
-            if (nbytes_remain < n * sizeof(T)) {
                 return false;
             }
         }
