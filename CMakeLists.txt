@@ -289,11 +289,9 @@ install(
 
 if (LLAMA_BUILD_COMMON)
 
-  if (NOT LLAMA_CURL)
-    install(
+  install(
       TARGETS cpp-httplib
       EXPORT llama-targets)
-  endif()
 
   # llama-common links these PUBLIC, so they must be exported regardless of
   # LLAMA_CURL
