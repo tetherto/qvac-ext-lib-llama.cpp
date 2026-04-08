@@ -5277,7 +5277,7 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         /*.nb3  =*/ nb3,
     };
 
-    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline_out_prod(lib, op);
+    auto pipeline = ggml_metal_library_get_pipeline_out_prod(lib, op);
 
     const int threads = ne0 < 1 ? 1 : (int) ne0;
     const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), threads);
@@ -5331,7 +5331,7 @@ int ggml_metal_op_soft_max_back(ggml_metal_op_t ctx, int idx) {
         /*.scale  =*/ scale,
     };
 
-    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline_soft_max_back(lib, op);
+    auto pipeline = ggml_metal_library_get_pipeline_soft_max_back(lib, op);
 
     int nth = 32; // SIMD width
 
@@ -5351,7 +5351,7 @@ int ggml_metal_op_soft_max_back(ggml_metal_op_t ctx, int idx) {
     nth = std::max(1, nth);
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
-    const size_t smem = ggml_metal_pipeline_get_smem(pipeline);
+    const size_t smem = pipeline.smem;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -5399,7 +5399,7 @@ int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
         /*.eps    =*/ eps,
     };
 
-    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline_rms_norm_back(lib, op);
+    auto pipeline = ggml_metal_library_get_pipeline_rms_norm_back(lib, op);
 
     int nth = 32; // SIMD width
 
@@ -5410,7 +5410,7 @@ int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
     nth = std::min(nth, ne00/4);
 
-    const size_t smem = ggml_metal_pipeline_get_smem(pipeline);
+    const size_t smem = pipeline.smem;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
