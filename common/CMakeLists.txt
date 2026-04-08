@@ -160,7 +160,7 @@ endif ()
 target_include_directories(
   ${TARGET}
   PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/common$<SEMICOLON>${CMAKE_SOURCE_DIR}/vendor>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}$<SEMICOLON>${CMAKE_CURRENT_SOURCE_DIR}/../vendor>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
