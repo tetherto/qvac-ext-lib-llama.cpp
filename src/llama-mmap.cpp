@@ -402,8 +402,8 @@ void llama_file_disk::read_raw(void * ptr, size_t len) const { pimpl->read_raw(p
 void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) const { pimpl->read_raw(ptr, len); }
 #else
 void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) const { pimpl->read_raw_unsafe(ptr, len); }
-#endif
 void llama_file_disk::read_aligned_chunk(void * dest, size_t size) const { pimpl->read_aligned_chunk(dest, size); }
+#endif
 
 uint32_t llama_file_disk::read_u32() const { return pimpl->read_u32(); }
 
