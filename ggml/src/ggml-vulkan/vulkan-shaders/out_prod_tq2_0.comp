@@ -3,7 +3,7 @@
 #include "types.glsl"
 #include "generic_binary_head.glsl"
 #include "dequant_funcs.glsl"
-#include "tq_utils.comp"
+#include "tq_utils.glsl"
 
 const uint num_threads = 256;
 layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
