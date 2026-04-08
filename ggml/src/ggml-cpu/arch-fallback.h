@@ -206,8 +206,7 @@
 #elif defined(__riscv)
 // quants.c
 #define quantize_row_q8_K_generic quantize_row_q8_K
-#define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
-#define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
+// tq1_0/tq2_0 are overridden by arch/riscv/quants.c, so keep _generic suffix
 #define ggml_vec_dot_tq2_0_q8_0_generic ggml_vec_dot_tq2_0_q8_0
 #define ggml_vec_dot_tq2_0_q8_1_generic ggml_vec_dot_tq2_0_q8_1
 #define ggml_vec_dot_iq2_xxs_q8_K_generic ggml_vec_dot_iq2_xxs_q8_K
