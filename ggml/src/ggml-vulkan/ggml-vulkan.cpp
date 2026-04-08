@@ -11217,7 +11217,7 @@ static void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx,
 }
 
 static void ggml_vk_geglu_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GEGLU_BACK, { (uint32_t)ggml_nelements(dst), (uint32_t)dst->ne[0], 0.0f, 0.0f });
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GEGLU_BACK, { (uint32_t)ggml_nelements(dst), (uint32_t)dst->ne[0], 0.0f, 0.0f, 0.0f, 0.0f });
 }
 
 static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -11489,6 +11489,8 @@ static void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_co
         (uint32_t)nclasses,
         (uint32_t)nrows,
         0.0f,
+        0.0f,
+        0.0f,
         0.0f
     });
 }
@@ -11544,6 +11546,8 @@ static void ggml_vk_cross_entropy_loss_masked_back(ggml_backend_vk_context * ctx
         (uint32_t)nclasses,
         (uint32_t)nrows,
         upstream_grad,
+        0.0f,
+        0.0f,
         0.0f
     });
 }
@@ -11555,6 +11559,8 @@ static void ggml_vk_count_equal_masked(ggml_backend_vk_context * ctx, vk_context
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, predictions, targets, mask, nullptr, dst, GGML_OP_COUNT_EQUAL_MASKED, {
         (uint32_t)n_elements,
         (uint32_t)vocab_size,
+        0.0f,
+        0.0f,
         0.0f,
         0.0f
     });
