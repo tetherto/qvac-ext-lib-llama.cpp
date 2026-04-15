@@ -5700,6 +5700,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
             allocatorCreateInfo.device = device->device;
             allocatorCreateInfo.instance = vk_instance.instance;
 
+            // Use smaller VMA block size on integrated/UMA GPUs.
+            if (device->uma) {
+                allocatorCreateInfo.preferredLargeHeapBlockSize = 64 * 1024 * 1024; // 64MB
+            }
+
 #ifdef VMA_DYNAMIC_VULKAN_FUNCTIONS
             static VmaVulkanFunctions vulkanFunctions = {};
             vulkanFunctions.vkGetInstanceProcAddr = &vkGetInstanceProcAddr;
@@ -14206,6 +14211,28 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
     ggml_vk_destroy_buffer(ctx->prealloc_tile);
+
+    // Release empty VMA memory blocks back to the driver.
+    {
+        VmaDefragmentationInfo defrag_info = {};
+        defrag_info.flags = VMA_DEFRAGMENTATION_FLAG_ALGORITHM_FAST_BIT;
+        defrag_info.pool  = VK_NULL_HANDLE; // all default pools
+
+        VmaDefragmentationContext defrag_ctx;
+        if (vmaBeginDefragmentation(ctx->device->allocator, &defrag_info, &defrag_ctx) == VK_SUCCESS) {
+            VmaDefragmentationPassMoveInfo pass_info = {};
+            VkResult res = vmaBeginDefragmentationPass(ctx->device->allocator, defrag_ctx, &pass_info);
+            if (res == VK_INCOMPLETE) {
+                vmaEndDefragmentationPass(ctx->device->allocator, defrag_ctx, &pass_info);
+            }
+            VmaDefragmentationStats stats = {};
+            vmaEndDefragmentation(ctx->device->allocator, defrag_ctx, &stats);
+            if (stats.deviceMemoryBlocksFreed > 0) {
+                VK_LOG_MEMORY("VMA defrag freed " << stats.deviceMemoryBlocksFreed
+                              << " blocks (" << stats.bytesFreed / (1024*1024) << " MB)");
+            }
+        }
+    }
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
 
