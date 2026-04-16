@@ -831,6 +831,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_out_prod_q4_0;
     vk_pipeline pipeline_out_prod_q8_0;
     vk_pipeline pipeline_out_prod_tq2_0;
+    vk_pipeline pipeline_out_prod_tiled_f32;
+    vk_pipeline pipeline_out_prod_tiled_f16_f32;
+    vk_pipeline pipeline_out_prod_tiled_q4_0;
+    vk_pipeline pipeline_out_prod_tiled_q8_0;
+    vk_pipeline pipeline_out_prod_tiled_tq2_0;
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
@@ -4634,6 +4639,12 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_q8_0, "out_prod_q8_0", out_prod_q8_0_len, out_prod_q8_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_tq2_0, "out_prod_tq2_0", out_prod_tq2_0_len, out_prod_tq2_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_out_prod_f16_f32, "out_prod_f16_f32", out_prod_f16_f32_len, out_prod_f16_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_tiled_f32, "out_prod_tiled_f32", out_prod_tiled_f32_len, out_prod_tiled_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_tiled_f16_f32, "out_prod_tiled_f16_f32", out_prod_tiled_f16_f32_len, out_prod_tiled_f16_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_tiled_q4_0, "out_prod_tiled_q4_0", out_prod_tiled_q4_0_len, out_prod_tiled_q4_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_tiled_q8_0, "out_prod_tiled_q8_0", out_prod_tiled_q8_0_len, out_prod_tiled_q8_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_out_prod_tiled_tq2_0, "out_prod_tiled_tq2_0", out_prod_tiled_tq2_0_len, out_prod_tiled_tq2_0_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
 
     for (uint32_t i = 0; i < num_argsort_pipelines; ++i) {
         uint32_t BLOCK_SIZE = 1u << std::min(i, device->max_workgroup_size_log2);
@@ -9919,6 +9930,15 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return nullptr;
         }
     case GGML_OP_OUT_PROD:
+        // Use a tiled shader for AMD RADV on embedded GPUs to avoid VK_ERROR_DEVICE_LOST due to slow threads.
+        if (ctx->device->uma && ctx->device->driver_id == vk::DriverId::eMesaRadv &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            if (src0->type == GGML_TYPE_F32) return ctx->device->pipeline_out_prod_tiled_f32;
+            if (src0->type == GGML_TYPE_F16) return ctx->device->pipeline_out_prod_tiled_f16_f32;
+            if (src0->type == GGML_TYPE_Q4_0) return ctx->device->pipeline_out_prod_tiled_q4_0;
+            if (src0->type == GGML_TYPE_Q8_0) return ctx->device->pipeline_out_prod_tiled_q8_0;
+            if (src0->type == GGML_TYPE_TQ2_0) return ctx->device->pipeline_out_prod_tiled_tq2_0;
+        }
         if (dst->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
             if (src0->type == GGML_TYPE_F32) return ctx->device->pipeline_out_prod_f32;
             if (src0->type == GGML_TYPE_Q4_0) return ctx->device->pipeline_out_prod_q4_0;
@@ -10486,7 +10506,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             }
 
             if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
-                pipeline == ctx->device->pipeline_cpy_transpose_16) {
+                pipeline == ctx->device->pipeline_cpy_transpose_16 ||
+                pipeline == ctx->device->pipeline_out_prod_tiled_f32 ||
+                pipeline == ctx->device->pipeline_out_prod_tiled_f16_f32 ||
+                pipeline == ctx->device->pipeline_out_prod_tiled_q4_0 ||
+                pipeline == ctx->device->pipeline_out_prod_tiled_q8_0 ||
+                pipeline == ctx->device->pipeline_out_prod_tiled_tq2_0) {
                 // 32x32 tiles
                 elements[0] = (uint32_t)CEIL_DIV(dst->ne[0], 32);
                 elements[1] = (uint32_t)CEIL_DIV(dst->ne[1], 32);
