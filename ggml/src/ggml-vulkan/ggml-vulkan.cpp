@@ -6359,9 +6359,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
         // KHR coopmat1 only supports fp16 inputs natively. The _cm1 f32xf32 shader
         // converts inputs to fp16 internally which causes precision loss and timeouts
-        // on embedded GPUs like Mali. We return nullptr to force a proper dequant to
+        // on embedded GPUs like Mali and Adreno. We return nullptr to force a proper dequant to
         // f16 for BOTH inputs before running the f16xf16 coopmat path.
-        if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+        if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
             return nullptr;
         }
         return ctx->device->pipeline_matmul_f32;
@@ -7435,7 +7435,7 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         }
         return aligned ? mmp->a_s : mmp->s;
     }
-    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+    if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
         if (src0_type == GGML_TYPE_F16) {
             return aligned ? mmp->a_l : mmp->l;
         }
@@ -8048,10 +8048,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
-    // Mali KHR_coopmat1 workaround: F16 x F16 path is the only safe coopmat path.
+    // Mali/Adreno KHR_coopmat1 workaround: F16 x F16 path is the only safe coopmat path.
     // Force both inputs to be dequantized/casted to F16.
     const bool is_tq = src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0;
-    if (ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2 && !is_tq) {
+    if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2 && !is_tq) {
         y_f32_kernel = false;
         quantize_y = false;
     }
@@ -8068,7 +8068,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool qx_needs_dequant = mmp == nullptr || x_non_contig;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
 
-    if (src0->type == GGML_TYPE_F32 && ctx->device->vendor_id == VK_VENDOR_ID_ARM && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+    if (src0->type == GGML_TYPE_F32 && (ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
         qx_needs_dequant = true;
     }
 
