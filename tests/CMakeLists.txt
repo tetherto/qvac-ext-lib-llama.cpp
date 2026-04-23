@@ -231,6 +231,9 @@ set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+
+llama_build(test-multi-instance-repro.cpp)
+
 llama_build_and_test(test-arg-parser.cpp)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
