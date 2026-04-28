@@ -676,6 +676,19 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    LLAMA_LOG_INFO("[DEBUG] ~llama_model: ctxs_bufs.size()=%zu\n", pimpl->ctxs_bufs.size());
+    {
+        FILE * f = fopen("/proc/self/status", "r");
+        if (f) {
+            char line[128];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "VmRSS:", 6) == 0 || strncmp(line, "VmSwap:", 7) == 0) {
+                    LLAMA_LOG_INFO("[DEBUG] %s", line);
+                }
+            }
+            fclose(f);
+        }
+    }
     for (auto * lora : loras) {
         delete lora;
     }
