@@ -132,6 +132,15 @@ if [ ! -z ${GG_BUILD_NO_SVE} ]; then
     CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.5-a+fp16+i8mm"
 fi
 
+# Disable native CPU optimizations for low-perf builds to ensure binary
+# compatibility with the (often heterogeneous) CI runner pool. Must be applied
+# at the top level so BOTH gg_run_ctest_debug and gg_run_ctest_release pick it
+# up — otherwise the debug build (which runs first) compiles with -march=native
+# and can SIGILL on a runner whose microarch is older than the build host.
+if [ ! -z ${GG_BUILD_LOW_PERF} ]; then
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_NATIVE=OFF"
+fi
+
 if [ -n "${GG_BUILD_KLEIDIAI}" ]; then
     echo ">>===== Enabling KleidiAI support"
 
@@ -249,11 +258,6 @@ function gg_run_ctest_release {
 
     # Check cmake, make and ctest are installed
     gg_check_build_requirements
-
-    # Disable native CPU optimizations for low-perf builds to ensure compatibility
-    if [ ! -z ${GG_BUILD_LOW_PERF} ]; then
-        CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_NATIVE=OFF"
-    fi
 
     (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
     (time make -j$(nproc)                                    ) 2>&1 | tee -a $OUT/${ci}-make.log

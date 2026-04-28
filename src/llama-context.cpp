@@ -3003,6 +3003,19 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
+    // TurboQuant: auto-select block=64 variant when head_dim=64
+    if (params.type_k == GGML_TYPE_TBQ3_0 && model->hparams.n_embd_head_k == 64) { params.type_k = GGML_TYPE_TBQ3_0_64; }
+    if (params.type_k == GGML_TYPE_TBQ4_0 && model->hparams.n_embd_head_k == 64) { params.type_k = GGML_TYPE_TBQ4_0_64; }
+    if (params.type_k == GGML_TYPE_PQ3_0 && model->hparams.n_embd_head_k == 64) { params.type_k = GGML_TYPE_PQ3_0_64; }
+    if (params.type_v == GGML_TYPE_TBQ3_0 && model->hparams.n_embd_head_v == 64) { params.type_v = GGML_TYPE_TBQ3_0_64; }
+    if (params.type_v == GGML_TYPE_TBQ4_0 && model->hparams.n_embd_head_v == 64) { params.type_v = GGML_TYPE_TBQ4_0_64; }
+    if (params.type_v == GGML_TYPE_PQ3_0 && model->hparams.n_embd_head_v == 64) { params.type_v = GGML_TYPE_PQ3_0_64; }
+    if (params.type_k == GGML_TYPE_PQ4_0 && model->hparams.n_embd_head_k == 64) { params.type_k = GGML_TYPE_PQ4_0_64; }
+    if (params.type_v == GGML_TYPE_PQ4_0 && model->hparams.n_embd_head_v == 64) { params.type_v = GGML_TYPE_PQ4_0_64; }
+
+    // TurboQuant V cache: GPU FA now supports TQ types (optRot moved Hadamard to graph level,
+    // FA shader does inline codebook dequant). No downgrade needed.
+
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         if (model->hparams.n_embd_head_k % blck_size != 0) {
