@@ -1032,9 +1032,13 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    // gemma4 has different head dimensions for SWA vs full-attention layers
+    const uint32_t head_k = (hparams.is_swa(il) && hparams.n_embd_head_k_swa > 0)
+        ? hparams.n_embd_head_k_swa : hparams.n_embd_head_k;
+
     return ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k, hparams.n_head_kv(il), n_kv, ns,
-            ggml_row_size(k->type, hparams.n_embd_head_k),
+            head_k, hparams.n_head_kv(il), n_kv, ns,
+            ggml_row_size(k->type, head_k),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
@@ -1053,11 +1057,15 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    // gemma4 has different head dimensions for SWA vs full-attention layers
+    const uint32_t head_v = (hparams.is_swa(il) && hparams.n_embd_head_v_swa > 0)
+        ? hparams.n_embd_head_v_swa : hparams.n_embd_head_v;
+
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
-                hparams.n_embd_head_v, hparams.n_head_kv(il), n_kv, ns,
-                ggml_row_size(v->type, hparams.n_embd_head_v),          // v->nb[1]
+                head_v, hparams.n_head_kv(il), n_kv, ns,
+                ggml_row_size(v->type, head_v),                         // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
@@ -1065,8 +1073,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
-            n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v, ns,
-            ggml_row_size(v->type, kv_size*hparams.n_embd_head_v),  // v->nb[1]
+            n_kv, hparams.n_head_kv(il), head_v, ns,
+            ggml_row_size(v->type, kv_size*head_v),                 // v->nb[1]
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);

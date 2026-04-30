@@ -79,13 +79,17 @@ uint32_t llama_hparams::n_embd_out() const {
 uint32_t llama_hparams::n_embd_k_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
 
-    return n_embd_head_k * n_head_kv;
+    // gemma4 has different head dimensions for SWA vs full-attention layers
+    const uint32_t head_k = (is_swa(il) && n_embd_head_k_swa > 0) ? n_embd_head_k_swa : n_embd_head_k;
+    return head_k * n_head_kv;
 }
 
 uint32_t llama_hparams::n_embd_v_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
 
-    return n_embd_head_v * n_head_kv;
+    // gemma4 has different head dimensions for SWA vs full-attention layers
+    const uint32_t head_v = (is_swa(il) && n_embd_head_v_swa > 0) ? n_embd_head_v_swa : n_embd_head_v;
+    return head_v * n_head_kv;
 }
 
 bool llama_hparams::is_n_embd_k_gqa_variable() const {

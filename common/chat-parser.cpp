@@ -798,6 +798,113 @@ static void common_chat_parse_llama_3_1(common_chat_msg_parser & builder, bool w
 
 }
 
+// Convert Gemma 4's tool-call argument syntax into JSON.
+// Gemma 4 uses <|"|>...<|"|> for strings instead of "..." and bare keys (no quotes).
+// This is a best-effort converter: it handles strings, numbers, booleans, null, nested
+// dicts/arrays, and a few common edge cases. For strict correctness on all inputs the
+// full upstream PEG parser would be needed.
+static std::string gemma4_args_to_json(const std::string & input) {
+    std::string out;
+    out.reserve(input.size() + 8);
+    size_t i = 0;
+    bool in_string  = false;
+
+    // Track where we are: 'k' expecting a dict key, 'v' expecting a value
+    auto at_key_start = [&]() {
+        // peek back to find nearest non-space structural char
+        for (int64_t j = (int64_t)out.size() - 1; j >= 0; --j) {
+            char c = out[j];
+            if (c == ' ' || c == '\n' || c == '\t' || c == '\r') continue;
+            return c == '{' || c == ',';
+        }
+        return false;
+    };
+
+    while (i < input.size()) {
+        // Detect gemma4 string quote <|"|>
+        if (!in_string && i + 5 <= input.size() && input.compare(i, 5, "<|\"|>") == 0) {
+            in_string = true;
+            out += '"';
+            i += 5;
+            continue;
+        }
+        if (in_string && i + 5 <= input.size() && input.compare(i, 5, "<|\"|>") == 0) {
+            in_string = false;
+            out += '"';
+            i += 5;
+            continue;
+        }
+
+        if (in_string) {
+            char c = input[i++];
+            if (c == '"') { out += "\\\""; }
+            else if (c == '\\') { out += "\\\\"; }
+            else if (c == '\n') { out += "\\n"; }
+            else if (c == '\r') { out += "\\r"; }
+            else if (c == '\t') { out += "\\t"; }
+            else { out += c; }
+            continue;
+        }
+
+        // Outside strings: quote bare dict keys before ':'
+        char c = input[i];
+        if ((std::isalpha((unsigned char)c) || c == '_') && at_key_start()) {
+            // Consume identifier
+            size_t j = i;
+            while (j < input.size() && (std::isalnum((unsigned char)input[j]) || input[j] == '_')) j++;
+            out += '"';
+            out.append(input, i, j - i);
+            out += '"';
+            i = j;
+            continue;
+        }
+
+        out += c;
+        i++;
+    }
+
+    return out;
+}
+
+// Parse Gemma 4's format: reasoning channel + tool calls.
+//   reasoning: <|channel>thought\n...\n<channel|>
+//   tool call: <|tool_call>call:name{args}<tool_call|>
+static void common_chat_parse_gemma4(common_chat_msg_parser & builder) {
+    // 1) Reasoning channel (thinking) — model-emitted
+    builder.try_parse_reasoning("<|channel>thought\n", "\n<channel|>");
+
+    if (!builder.syntax().parse_tool_calls) {
+        builder.add_content(builder.consume_rest());
+        return;
+    }
+
+    // 2) Tool calls. Use regex to find <|tool_call>call:NAME{ARGS}<tool_call|>
+    static const std::regex tool_call_re(R"(<\|tool_call>call:([^{]+)\{([\s\S]*?)\}<tool_call\|>)");
+
+    std::string rest = builder.consume_rest();
+    auto begin = std::sregex_iterator(rest.begin(), rest.end(), tool_call_re);
+    auto end   = std::sregex_iterator();
+
+    size_t last_end = 0;
+    for (auto it = begin; it != end; ++it) {
+        const auto & m = *it;
+        // Emit any plain content preceding the tool call
+        if ((size_t)m.position() > last_end) {
+            builder.add_content(rest.substr(last_end, m.position() - last_end));
+        }
+        std::string name = m[1].str();
+        std::string args_raw = m[2].str();
+        // Strip trailing whitespace from name
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\t' || name.back() == '\n')) name.pop_back();
+        std::string args_json = "{" + gemma4_args_to_json(args_raw) + "}";
+        builder.add_tool_call(name, /*id=*/"", args_json);
+        last_end = m.position() + m.length();
+    }
+    if (last_end < rest.size()) {
+        builder.add_content(rest.substr(last_end));
+    }
+}
+
 static void common_chat_parse_deepseek_r1(common_chat_msg_parser & builder) {
     builder.try_parse_reasoning("<think>", "</think>");
     if (!builder.syntax().parse_tool_calls) {
@@ -1527,6 +1634,9 @@ static void common_chat_parse(common_chat_msg_parser & builder) {
             break;
         case COMMON_CHAT_FORMAT_DEEPSEEK_R1:
             common_chat_parse_deepseek_r1(builder);
+            break;
+        case COMMON_CHAT_FORMAT_GEMMA4:
+            common_chat_parse_gemma4(builder);
             break;
         case COMMON_CHAT_FORMAT_DEEPSEEK_V3_1:
             common_chat_parse_deepseek_v3_1(builder);

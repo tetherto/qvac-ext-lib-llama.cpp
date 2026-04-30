@@ -271,6 +271,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_norm         = nullptr;
     struct ggml_tensor * ffn_norm_b       = nullptr;
     struct ggml_tensor * ffn_post_norm    = nullptr;
+    struct ggml_tensor * ffn_post_norm_1  = nullptr; // gemma4
+    struct ggml_tensor * ffn_post_norm_2  = nullptr; // gemma4
+    struct ggml_tensor * ffn_pre_norm_2   = nullptr; // gemma4
     struct ggml_tensor * layer_out_norm   = nullptr;
     struct ggml_tensor * layer_out_norm_b = nullptr;
     struct ggml_tensor * ffn_norm_exps    = nullptr;
@@ -286,6 +289,7 @@ struct llama_layer {
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
+    struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
@@ -387,6 +391,9 @@ struct llama_layer {
     struct ggml_tensor * rope_long  = nullptr;
     struct ggml_tensor * rope_short = nullptr;
     struct ggml_tensor * rope_freqs = nullptr;
+
+    // gemma4 layer output scale
+    struct ggml_tensor * out_scale = nullptr;
 
     // bitnet scale
     struct ggml_tensor * wq_scale       = nullptr;

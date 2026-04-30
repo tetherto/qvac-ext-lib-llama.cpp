@@ -740,6 +740,7 @@ const char * common_chat_format_name(common_chat_format format) {
         case COMMON_CHAT_FORMAT_XIAOMI_MIMO: return "Xiaomi MiMo";
         case COMMON_CHAT_FORMAT_SOLAR_OPEN: return "Solar Open";
         case COMMON_CHAT_FORMAT_EXAONE_MOE: return "EXAONE MoE";
+        case COMMON_CHAT_FORMAT_GEMMA4: return "Gemma 4";
         case COMMON_CHAT_FORMAT_PEG_SIMPLE: return "peg-simple";
         case COMMON_CHAT_FORMAT_PEG_NATIVE: return "peg-native";
         case COMMON_CHAT_FORMAT_PEG_CONSTRUCTED: return "peg-constructed";
@@ -1709,6 +1710,25 @@ static common_chat_params common_chat_params_init_apertus(const common_chat_temp
             "<|tools_suffix|>",
         };
     }
+    return data;
+}
+
+// Gemma 4 chat format initialization.
+// Gemma 4 uses a custom format:
+//  - Turns:       <|turn>role\n...<turn|>
+//  - Thinking:    <|channel>thought\n...\n<channel|>  (model-emitted reasoning)
+//  - Tool calls:  <|tool_call>call:name{arg:<|"|>value<|"|>,...}<tool_call|>
+//
+// This implementation provides basic reasoning channel extraction and regex-based
+// tool call parsing. For strict grammar-constrained tool call generation, the full
+// PEG parser from upstream is required; that is not ported here.
+static common_chat_params common_chat_params_init_gemma4(const common_chat_template & tmpl, const struct templates_params & inputs) {
+    common_chat_params data;
+    data.prompt = apply(tmpl, inputs);
+    data.format = COMMON_CHAT_FORMAT_GEMMA4;
+    // Gemma 4's thinking channel is model-emitted; "forced open" doesn't apply.
+    // No constrained grammar for tool calls in this minimal port — the model must emit
+    // the correct format on its own.
     return data;
 }
 
@@ -3264,6 +3284,12 @@ static common_chat_params common_chat_templates_apply_jinja(
     if (src.find("[TOOL_CALLS]") != std::string::npos) {
         workaround::func_args_not_string(params.messages);
         return common_chat_params_init_mistral_nemo(tmpl, params);
+    }
+
+    // Gemma 4: detect by the <|turn>...<turn|> token format
+    if ((src.find("<|turn>") != std::string::npos || src.find("<turn|>") != std::string::npos) &&
+        params.json_schema.is_null()) {
+        return common_chat_params_init_gemma4(tmpl, params);
     }
 
     // Generic fallback

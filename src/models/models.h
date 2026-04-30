@@ -246,6 +246,18 @@ struct llm_build_gemma3n_iswa : public llm_graph_context {
     ggml_tensor * altup_correct(ggml_tensor * predictions, ggml_tensor * activated, int il);
 };
 
+struct llm_build_gemma4_iswa : public llm_graph_context {
+    const llama_model & model;
+
+    const int64_t n_embd_per_layer;
+
+    llm_build_gemma4_iswa(const llama_model & model, const llm_graph_params & params);
+
+    // TODO: refactor in common "per-layer" functionality [TAG_PER_LAYER]
+    ggml_tensor * build_inp_per_layer();
+    ggml_tensor * project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer);
+};
+
 struct llm_build_gemma_embedding : public llm_graph_context {
     llm_build_gemma_embedding(const llama_model & model, const llm_graph_params & params);
 };

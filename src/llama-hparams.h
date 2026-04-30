@@ -47,6 +47,8 @@ struct llama_hparams {
     uint32_t n_rot;
     uint32_t n_embd_head_k; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
     uint32_t n_embd_head_v; // dimension of values (d_v) aka n_embd_head
+    uint32_t n_embd_head_k_swa = 0; // gemma4 SWA key dimension
+    uint32_t n_embd_head_v_swa = 0; // gemma4 SWA value dimension
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
     uint32_t n_rel_attn_bkts = 0;
@@ -200,6 +202,9 @@ struct llama_hparams {
 
     // qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
+
+    // gemma4 per-layer embedding
+    uint32_t n_embd_per_layer = 0;
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
