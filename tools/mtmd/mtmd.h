@@ -46,9 +46,6 @@
 #    define MTMD_API
 #endif
 
-// deprecated marker, use mtmd_default_marker() instead
-#define MTMD_DEFAULT_IMAGE_MARKER "<__image__>"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -91,6 +88,7 @@ struct mtmd_context_params {
     const char * media_marker;
     enum llama_flash_attn_type flash_attn_type;
     bool warmup; // whether to run a warmup encode pass after initialization
+    const char * backend_device; // optional GPU backend name (e.g. "CUDA", "Metal", "Vulkan"), if null will use env var or default
 
     // limit number of image tokens, only for vision models with dynamic resolution
     int image_min_tokens; // minimum number of tokens for image input (default: read from metadata)
@@ -99,8 +97,6 @@ struct mtmd_context_params {
     // callback function passed over to mtmd proper
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
-
-    const char * backend_device; // optional GPU backend name (e.g. "CUDA", "Metal", "Vulkan"), if null will use env var or default
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -115,16 +111,9 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
 
-// Set up logging to use llama's logging callback
-// This redirects all mtmd/clip logging through llama's logging system
-// Call this after llama_log_set to ensure mtmd uses the same logging callback
-// Example:
-//   llama_log_set(my_log_callback, my_user_data);
-//   mtmd_log_set_llama_callback(my_log_callback, my_user_data);
-MTMD_API void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_data);
-
 // whether we need to set non-causal mask before llama_decode
-MTMD_API bool mtmd_decode_use_non_causal(mtmd_context * ctx);
+// if chunk is nullptr, we assume the default case where chunk is an image chunk
+MTMD_API bool mtmd_decode_use_non_causal(mtmd_context * ctx, const mtmd_input_chunk * chunk);
 
 // whether the current model use M-RoPE for llama_decode
 MTMD_API bool mtmd_decode_use_mrope(mtmd_context * ctx);
@@ -135,9 +124,9 @@ MTMD_API bool mtmd_support_vision(mtmd_context * ctx);
 // whether the current model supports audio input
 MTMD_API bool mtmd_support_audio(mtmd_context * ctx);
 
-// get audio bitrate in Hz, for example 16000 for Whisper
+// get audio sample rate in Hz, for example 16000 for Whisper
 // return -1 if audio is not supported
-MTMD_API int mtmd_get_audio_bitrate(mtmd_context * ctx);
+MTMD_API int mtmd_get_audio_sample_rate(mtmd_context * ctx);
 
 // mtmd_bitmap
 //
@@ -195,11 +184,26 @@ MTMD_API void               mtmd_input_chunk_free(mtmd_input_chunk * chunk);
 // the instance will be constructed via mtmd_tokenize()
 // it will be freed along with mtmd_input_chunk
 MTMD_API size_t       mtmd_image_tokens_get_n_tokens(const mtmd_image_tokens * image_tokens); // TODO: deprecate
-MTMD_API size_t       mtmd_image_tokens_get_nx      (const mtmd_image_tokens * image_tokens);
-MTMD_API size_t       mtmd_image_tokens_get_ny      (const mtmd_image_tokens * image_tokens);
 MTMD_API const char * mtmd_image_tokens_get_id      (const mtmd_image_tokens * image_tokens); // TODO: deprecate
 // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
 MTMD_API llama_pos    mtmd_image_tokens_get_n_pos   (const mtmd_image_tokens * image_tokens); // TODO: deprecate
+
+DEPRECATED(MTMD_API size_t mtmd_image_tokens_get_nx(const mtmd_image_tokens * image_tokens),
+           "use mtmd_image_tokens_get_decoder_pos() instead");
+DEPRECATED(MTMD_API size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens),
+           "use mtmd_image_tokens_get_decoder_pos() instead");
+
+struct mtmd_decoder_pos {
+    uint32_t t;
+    uint32_t x;
+    uint32_t y;
+    uint32_t z; // unused for now, reserved for future use
+};
+// get position for decoder attention, to be used by M-RoPE models
+// i is the index of the embedding token, ranging from 0 to mtmd_image_tokens_get_n_tokens() - 1
+// pos_0 is the absolute position of the first token
+// return relative position (for example, embedding 0 will have position (0, 0, 0); remember to adjust it to the current absolute position)
+MTMD_API struct mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i);
 
 // tokenize an input text prompt and a list of bitmaps (images/audio)
 // the prompt must have the input image marker (default: "<__media__>") in it

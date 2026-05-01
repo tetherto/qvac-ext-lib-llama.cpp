@@ -38,9 +38,9 @@ struct clip_context_params {
     int image_min_tokens;
     int image_max_tokens;
     bool warmup;
+    const char * backend_device; // optional, if null will use env var or default GPU backend
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
-    const char * backend_device; // optional, if null will use env var or default GPU backend
 };
 
 struct clip_init_result {
@@ -97,9 +97,6 @@ struct clip_image_f32 * clip_image_f32_get_img(const struct clip_image_f32_batch
  * The memory layout is RGBRGBRGB..., input buffer length must be 3*nx*ny bytes
  */
 void clip_build_img_from_pixels(const unsigned char * rgb_pixels, int nx, int ny, struct clip_image_u8 * img);
-
-/** preprocess img and store the result in res_imgs, pad_to_square may be overridden to false depending on model configuration */
-bool clip_image_preprocess(struct clip_ctx * ctx, const struct clip_image_u8 * img, struct clip_image_f32_batch * res_imgs );
 
 struct ggml_tensor * clip_get_newline_tensor(const struct clip_ctx * ctx);
 
