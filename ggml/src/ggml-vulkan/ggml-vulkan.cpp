@@ -7889,9 +7889,19 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     }
     if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
+            // Mali / Adreno KHR_coopmat1: F16 accumulation overflows on wide reductions
+            // (e.g. bert encoder graphs at large batch). Force F32 accumulation.
+            if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+                return ctx->device->pipeline_matmul_f16_f32.f32acc;
+            }
             return ctx->device->pipeline_matmul_f16_f32.f16acc;
         }
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F16) {
+            // Mali / Adreno KHR_coopmat1: F16 accumulation overflows on wide reductions
+            // (e.g. bert encoder graphs at large batch). Force F32 accumulation.
+            if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+                return ctx->device->pipeline_matmul_f16.f32acc;
+            }
             return ctx->device->pipeline_matmul_f16.f16acc;
         }
     } else {
