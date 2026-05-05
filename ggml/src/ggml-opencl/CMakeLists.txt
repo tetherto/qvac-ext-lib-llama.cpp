@@ -119,6 +119,9 @@ set(GGML_OPENCL_KERNELS
     norm
     relu
     rms_norm
+    l2_norm
+    cumsum
+    diag
     rope
     scale
     set_rows
@@ -139,6 +142,8 @@ set(GGML_OPENCL_KERNELS
     upscale
     tanh
     expm1
+    exp
+    neg
     softplus
     pad
     repeat

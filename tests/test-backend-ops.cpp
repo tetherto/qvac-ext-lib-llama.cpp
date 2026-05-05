@@ -7217,6 +7217,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // EXP / NEG with Qwen3.5 / Qwen3-Next gated-DeltaNet shapes. The chunking path
+    // (build_delta_net_chunking in src/models/delta-net-base.cpp) runs ggml_exp on
+    // tensors of shape [CS, S_k, n_chunks, H_v*n_seqs] = [64, 64, 1, 16] and
+    // ggml_neg on the same shape. These shapes hit the OpenCL exp/neg kernels.
+    for (ggml_unary_op op : { GGML_UNARY_OP_EXP, GGML_UNARY_OP_NEG }) {
+        for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+            test_cases.emplace_back(new test_unary(op, type, { 64,  64, 1, 16}, 0));
+            test_cases.emplace_back(new test_unary(op, type, { 64,  64, 1, 16}, 1));
+            test_cases.emplace_back(new test_unary(op, type, {128,  16, 1,  1}, 0));
+        }
+    }
+
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
@@ -7790,6 +7802,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+            // Qwen3.5 gated-DeltaNet shape: q_conv / k_conv have shape
+            // [head_k_dim=128, num_v_heads=16, n_seq_tokens, n_seqs]. Exercises the
+            // OpenCL kernel_l2_norm subgroup-reduction path with ne[0]=128.
+            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { 128, 16, 1, 1 }, eps, false));
         }
     }
 
@@ -8430,6 +8446,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_leaky_relu());
 
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 10, 5, 4, 3 }));
+    // Qwen3.5 gated-DeltaNet shape: cumsum along CS=64. ne[0]=64 is exactly the
+    // boundary handled by the OpenCL single-subgroup scan kernel
+    // (kernel_cumsum_f32_sg) on Adreno (subgroup_size = 64).
+    test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 64, 16, 1, 16 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 127, 5, 4, 3 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 128, 5, 4, 3 }));
     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 128, 128, 4, 4 }));
@@ -8460,6 +8480,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_diag());
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 79, 1, 19, 13 }));
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 256, 1, 8, 16 }));
+    // Qwen3.5 gated-DeltaNet "identity" matrix used inside build_delta_net_chunking
+    // (ggml_diag of a 1D vector of length CS=64).
+    test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 64, 1, 1, 1 }));
 
     test_cases.emplace_back(new test_solve_tri());
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 11, 11, 1, 1 }, { 5, 11, 1, 1 }));
