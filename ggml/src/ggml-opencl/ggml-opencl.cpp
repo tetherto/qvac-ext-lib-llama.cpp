@@ -571,6 +571,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_upscale;
     cl_kernel kernel_upscale_bilinear;
     cl_kernel kernel_concat_f32;
+    cl_kernel kernel_concat_f32_flat;
     cl_kernel kernel_conv_2d_f16;
     cl_kernel kernel_conv_2d_f32;
     cl_kernel kernel_conv_2d_f16_f32;
@@ -2313,6 +2314,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         cl_program prog =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_concat_f32 = clCreateKernel(prog, "kernel_concat_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_concat_f32_flat = clCreateKernel(prog, "kernel_concat_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -8543,9 +8545,10 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     const cl_int dim = ((const int32_t *) dst->op_params)[0];
     GGML_ASSERT(dim >= 0 && dim <= 3);
 
-    int nth = MIN(64, ne0);
-
-    cl_kernel kernel = backend_ctx->kernel_concat_f32;
+    // Use the flat (1 thread per output element) variant so a small ne0
+    // (e.g. ne0=4 for the gated-DeltaNet conv-input concat) does not collapse
+    // the workgroup down to a 4-lane wave.
+    cl_kernel kernel = backend_ctx->kernel_concat_f32_flat;
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
@@ -8566,16 +8569,23 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb12));
     CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb13));
     CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne0));
-    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb0));
-    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &nb1));
-    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &nb2));
-    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nb3));
-    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_int),   &dim));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne1));
+    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne2));
+    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne3));
+    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_ulong), &nb3));
+    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_int),   &dim));
 
-    size_t global_work_size[] = {(size_t)ne1*nth, (size_t)ne2, (size_t)ne3};
-    size_t local_work_size[] = {(size_t)nth, 1, 1};
+    const size_t LX = 64;
+    const size_t flat01 = (size_t)ne0 * (size_t)ne1;
+    const size_t gx = ((flat01 + LX - 1) / LX) * LX;
+    const size_t gy = (size_t)ne2 * (size_t)ne3;
+    size_t global_work_size[] = {gx, gy, 1};
+    size_t local_work_size[]  = {LX, 1, 1};
 
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
 }
 
 static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {

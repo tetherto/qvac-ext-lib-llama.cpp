@@ -8349,6 +8349,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    // Qwen3.5 / Qwen3-Next gated-DeltaNet conv-input concat (autoregressive
+    // path in build_delta_net): ggml_concat along dim=0 with src0 ne[0]=3
+    // (conv_kernel_size-1) and src1 ne[0]=1 (n_seq_tokens during decode),
+    // ne[1]=conv_channels=6144, ne[2]=n_seqs=1. The small ne[0] is the
+    // shape that would collapse the original kernel_concat_f32 dispatch to
+    // a 4-lane workgroup; the new kernel_concat_f32_flat keeps full waves.
+    for (int v : { 0, 3 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 6144, 1, 1}, 1, /*dim=*/0, v));
+    }
+
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
