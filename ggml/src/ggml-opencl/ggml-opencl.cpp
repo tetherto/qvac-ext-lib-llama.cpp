@@ -8573,10 +8573,19 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     const cl_int dim = ((const int32_t *) dst->op_params)[0];
     GGML_ASSERT(dim >= 0 && dim <= 3);
 
-    // Use the flat (1 thread per output element) variant so a small ne0
-    // (e.g. ne0=4 for the gated-DeltaNet conv-input concat) does not collapse
-    // the workgroup down to a 4-lane wave.
-    cl_kernel kernel = backend_ctx->kernel_concat_f32_flat;
+    // Concat shape characteristics (Qwen3.5 gated-DeltaNet conv input):
+    //   * decode  (n_tokens=1)    -> ne0 = 3 + 1     = 4   (small)
+    //   * prefill (n_tokens>=64)  -> ne0 = 3 + tok   large (>=64)
+    // The original 3D-launch kernel iterates ne0 elements per workgroup with
+    // nth = MIN(64, ne0); for ne0=4 that collapses to a 4-lane workgroup
+    // (the pathology kernel_concat_f32_flat was written to escape). For
+    // ne0 >= 64 the original already gets full-width workgroups and is the
+    // faster path on Adreno because it avoids the per-element-thread launch
+    // shape of the flat kernel. Dispatch by ne0.
+    const bool use_flat = ne0 < 64;
+    cl_kernel kernel = use_flat
+        ? backend_ctx->kernel_concat_f32_flat
+        : backend_ctx->kernel_concat_f32;
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
@@ -8597,23 +8606,38 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
     CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb12));
     CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb13));
     CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne0));
-    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne1));
-    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne2));
-    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne3));
-    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nb0));
-    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &nb1));
-    CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_ulong), &nb2));
-    CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_ulong), &nb3));
-    CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_int),   &dim));
+    if (use_flat) {
+        CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &ne1));
+        CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &ne2));
+        CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &ne3));
+        CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nb0));
+        CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_ulong), &nb1));
+        CL_CHECK(clSetKernelArg(kernel, 24, sizeof(cl_ulong), &nb2));
+        CL_CHECK(clSetKernelArg(kernel, 25, sizeof(cl_ulong), &nb3));
+        CL_CHECK(clSetKernelArg(kernel, 26, sizeof(cl_int),   &dim));
+    } else {
+        CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &nb0));
+        CL_CHECK(clSetKernelArg(kernel, 20, sizeof(cl_ulong), &nb1));
+        CL_CHECK(clSetKernelArg(kernel, 21, sizeof(cl_ulong), &nb2));
+        CL_CHECK(clSetKernelArg(kernel, 22, sizeof(cl_ulong), &nb3));
+        CL_CHECK(clSetKernelArg(kernel, 23, sizeof(cl_int),   &dim));
+    }
 
-    const size_t LX = 64;
-    const size_t flat01 = (size_t)ne0 * (size_t)ne1;
-    const size_t gx = ((flat01 + LX - 1) / LX) * LX;
-    const size_t gy = (size_t)ne2 * (size_t)ne3;
-    size_t global_work_size[] = {gx, gy, 1};
-    size_t local_work_size[]  = {LX, 1, 1};
-
-    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+    if (use_flat) {
+        const size_t LX = 64;
+        const size_t flat01 = (size_t)ne0 * (size_t)ne1;
+        const size_t gx = ((flat01 + LX - 1) / LX) * LX;
+        const size_t gy = (size_t)ne2 * (size_t)ne3;
+        size_t global_work_size[] = {gx, gy, 1};
+        size_t local_work_size[]  = {LX, 1, 1};
+        backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+    } else {
+        // Original 3D launch: 1 workgroup per (i1, i2, i3); nth lanes iterate ne0.
+        int nth = MIN(64, ne0);
+        size_t global_work_size[] = {(size_t)ne1*nth, (size_t)ne2, (size_t)ne3};
+        size_t local_work_size[]  = {(size_t)nth, 1, 1};
+        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+    }
 }
 
 static void ggml_cl_timestep_embedding(ggml_backend_t backend, const ggml_tensor * src0, ggml_tensor * dst) {

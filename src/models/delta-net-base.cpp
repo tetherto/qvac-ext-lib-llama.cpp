@@ -62,11 +62,27 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     const int pad = (CS - n_tokens % CS) % CS;
     const int n_chunks = (n_tokens + pad) / CS;
 
-    q = ggml_pad(ctx0, q, 0, pad, 0, 0);
-    k = ggml_pad(ctx0, k, 0, pad, 0, 0);
-    v = ggml_pad(ctx0, v, 0, pad, 0, 0);
-    g = ggml_pad(ctx0, g, 0, pad, 0, 0);
-    b = ggml_pad(ctx0, b, 0, pad, 0, 0);
+    // After the permutes above q/k/v/g/b are non-contiguous views, but the
+    // ggml_reshape_4d calls below require contiguous inputs. ggml_pad always
+    // materialises a fresh contiguous tensor, so the original code relied on
+    // it doubling as a "force contiguous" step. When pad == 0 the pad kernel
+    // degenerates to a plain memcpy but on the OpenCL backend it dispatches
+    // through kernel_pad (~115 us/call) instead of kernel_cpy_f32_f32
+    // (~30 us/call) -- substituting ggml_cont saves ~85 us per call and
+    // ~15 ms / 1k prefill on Adreno 830 (5 calls/layer * 18 GDA layers * 2).
+    if (pad > 0) {
+        q = ggml_pad(ctx0, q, 0, pad, 0, 0);
+        k = ggml_pad(ctx0, k, 0, pad, 0, 0);
+        v = ggml_pad(ctx0, v, 0, pad, 0, 0);
+        g = ggml_pad(ctx0, g, 0, pad, 0, 0);
+        b = ggml_pad(ctx0, b, 0, pad, 0, 0);
+    } else {
+        q = ggml_cont(ctx0, q);
+        k = ggml_cont(ctx0, k);
+        v = ggml_cont(ctx0, v);
+        g = ggml_cont(ctx0, g);
+        b = ggml_cont(ctx0, b);
+    }
 
     ggml_tensor * v_b = ggml_mul(ctx0, v, b);
     ggml_tensor * k_b = ggml_mul(ctx0, k, b);
