@@ -3816,8 +3816,29 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32, matmul_f32_f32, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
         CREATE_MM(GGML_TYPE_F32, pipeline_matmul_f32_f16, matmul_f32_f16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
-        CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
-        CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
+        // ARM Mali / Qualcomm Adreno KHR_coopmat1: the F16 coopmat1 shaders produce zeros for tiles beyond M=32,
+        // corrupting F16-weight model outputs. Populate the .f32acc slots with non-coopmat fp32 shaders instead
+        if (device->vendor_id == VK_VENDOR_ID_ARM || device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+#define CREATE_MM_F16_NC(PIPELINE_NAME, NAMELC) \
+            if (device->mul_mat_l[GGML_TYPE_F16]) { \
+                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l,   #NAMELC "_l",         NAMELC ## _fp32_len,         NAMELC ## _fp32_data,         "main", 3, sizeof(vk_mat_mat_push_constants), l_wg_denoms, l_warptile, 1,       false, false, 0); \
+                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC "_aligned_l", NAMELC ## _aligned_fp32_len, NAMELC ## _aligned_fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_wg_denoms, l_warptile, l_align, false, false, 0); \
+            } \
+            if (device->mul_mat_m[GGML_TYPE_F16]) { \
+                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m,   #NAMELC "_m",         NAMELC ## _fp32_len,         NAMELC ## _fp32_data,         "main", 3, sizeof(vk_mat_mat_push_constants), m_wg_denoms, m_warptile, 1,       false, false, 0); \
+                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC "_aligned_m", NAMELC ## _aligned_fp32_len, NAMELC ## _aligned_fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_wg_denoms, m_warptile, m_align, false, false, 0); \
+            } \
+            if (device->mul_mat_s[GGML_TYPE_F16]) { \
+                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s,   #NAMELC "_s",         NAMELC ## _fp32_len,         NAMELC ## _fp32_data,         "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, s_warptile, 1,       false, false, 0); \
+                ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC "_aligned_s", NAMELC ## _aligned_fp32_len, NAMELC ## _aligned_fp32_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_wg_denoms, s_warptile, s_align, false, false, 0); \
+            }
+            CREATE_MM_F16_NC(pipeline_matmul_f16.f32acc,     matmul_f16);
+            CREATE_MM_F16_NC(pipeline_matmul_f16_f32.f32acc, matmul_f16_f32);
+#undef CREATE_MM_F16_NC
+        } else {
+            CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
+            CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_f16_f32, matmul_f16_f32, wg_denoms, warptile, vk_mat_mat_push_constants, 3, );
+        }
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
         if (device->coopmat_bf16_support) {
             CREATE_MM(GGML_TYPE_BF16, pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3, )
@@ -6374,9 +6395,19 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     }
     if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
+            // Mali / Adreno KHR_coopmat1: F16 accumulation overflows on wide reductions
+            // (e.g. bert encoder graphs at large batch). Force F32 accumulation.
+            if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+                return ctx->device->pipeline_matmul_f16_f32.f32acc;
+            }
             return ctx->device->pipeline_matmul_f16_f32.f16acc;
         }
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F16) {
+            // Mali / Adreno KHR_coopmat1: F16 accumulation overflows on wide reductions
+            // (e.g. bert encoder graphs at large batch). Force F32 accumulation.
+            if ((ctx->device->vendor_id == VK_VENDOR_ID_ARM || ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) && ctx->device->coopmat_support && !ctx->device->coopmat2) {
+                return ctx->device->pipeline_matmul_f16.f32acc;
+            }
             return ctx->device->pipeline_matmul_f16.f16acc;
         }
     } else {
