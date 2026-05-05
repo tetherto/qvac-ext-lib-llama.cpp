@@ -7636,6 +7636,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_set(GGML_TYPE_F32, GGML_TYPE_F32, {6, 5, 4, 3}, dim, true));
     }
 
+    // Larger 4D F32 SET shapes that exercise the chunked-write pattern used by
+    // hybrid-SSM attention (e.g. Qwen3.5 / Qwen3-Next gated DeltaNet, see
+    // build_delta_net_chunking in src/models/delta-net-base.cpp). These are
+    // regression tests for the OpenCL backend handling of GGML_OP_SET on
+    // tensors whose data lives in device memory.
+    for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+        test_cases.emplace_back(new test_set(GGML_TYPE_F32, GGML_TYPE_F32, {128, 64, 1, 16}, dim, false));
+        test_cases.emplace_back(new test_set(GGML_TYPE_F32, GGML_TYPE_F32, {128, 64, 1, 16}, dim, true));
+    }
+
     for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
         test_cases.emplace_back(new test_set(GGML_TYPE_I32, GGML_TYPE_I32, {6, 5, 4, 3}, dim, false));
         test_cases.emplace_back(new test_set(GGML_TYPE_I32, GGML_TYPE_I32, {6, 5, 4, 3}, dim, true));

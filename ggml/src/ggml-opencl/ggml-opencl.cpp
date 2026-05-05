@@ -3587,6 +3587,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 default:
                     return false;
             }
+        case GGML_OP_SET:
+            // Reuse the F32 cpy kernel for strided scatter writes.
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32;
         case GGML_OP_SCALE:
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
         case GGML_OP_ADD:
@@ -10532,6 +10537,97 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, src1);
 }
 
+static void ggml_cl_set(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->extra);
+    GGML_ASSERT(src1);
+    GGML_ASSERT(src1->extra);
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+
+    // GGML_OP_SET: dst is a view of src0. src1 is the data scattered into dst at byte-offset.
+    // op_params layout: [nb1, nb2, nb3, offset (bytes), inplace (0/1)]
+    // For inplace=1, dst->extra shares cl_mem with src0->extra (no pre-copy of src0 needed).
+    // For inplace=0, dst has its own cl_mem and we must first copy src0's whole buffer to dst.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    // Mirrors ggml_compute_forward_set_f32: the destination viewed at op_params[3]+strides
+    // and src0 must be contiguous (src1 may be non-contiguous along inner dims).
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    const cl_ulong p_nb1    = ((const int32_t *) dst->op_params)[0];
+    const cl_ulong p_nb2    = ((const int32_t *) dst->op_params)[1];
+    const cl_ulong p_nb3    = ((const int32_t *) dst->op_params)[2];
+    const cl_ulong p_offset = ((const int32_t *) dst->op_params)[3];
+    const bool     inplace  = (bool) ((const int32_t *) dst->op_params)[4];
+
+    const int ne10 = (int) src1->ne[0];
+    const int ne11 = (int) src1->ne[1];
+    const int ne12 = (int) src1->ne[2];
+    const int ne13 = (int) src1->ne[3];
+
+    const cl_ulong nb10 = src1->nb[0];
+    const cl_ulong nb11 = src1->nb[1];
+    const cl_ulong nb12 = src1->nb[2];
+    const cl_ulong nb13 = src1->nb[3];
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    ggml_tensor_extra_cl * extra_a   = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extra_b   = (ggml_tensor_extra_cl *) src1->extra;
+    ggml_tensor_extra_cl * extra_dst = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong offset_b = extra_b->offset + src1->view_offs;
+    const cl_ulong offsetd  = extra_dst->offset + dst->view_offs + p_offset;
+
+    if (!inplace) {
+        const cl_ulong copy_src = extra_a->offset + src0->view_offs;
+        const cl_ulong copy_dst = extra_dst->offset + dst->view_offs;
+        const size_t   copy_sz  = ggml_nbytes(src0);
+        CL_CHECK(clEnqueueCopyBuffer(backend_ctx->queue,
+            extra_a->data_device, extra_dst->data_device,
+            copy_src, copy_dst, copy_sz,
+            0, NULL, NULL));
+    }
+
+    // Reuse kernel_cpy_f32_f32 to scatter src1 -> dst with strides (sizeof(float), p_nb1, p_nb2, p_nb3) starting at offsetd.
+    // Pass src1's logical shape for both the src and dst dim parameters so the kernel's linear<->logical
+    // decomposition is the identity (i3=i03, i2=i02, ...) and dst writes land at the requested offset.
+    cl_kernel kernel = backend_ctx->kernel_cpy_f32_f32;
+
+    const cl_ulong nb0 = sizeof(float);
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra_b->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset_b));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra_dst->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(int),      &ne11));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne12));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne13));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb10));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb11));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb12));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb13));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne10));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne11));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne12));
+    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne13));
+    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &p_nb1));
+    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &p_nb2));
+    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(cl_ulong), &p_nb3));
+
+    const int nth = MIN(64, ne10);
+    size_t global_work_size[] = {(size_t)ne11 * nth, (size_t)ne12, (size_t)ne13};
+    size_t local_work_size[]  = {(size_t)nth, 1, 1};
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_dup(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_cl_cpy(backend, src0, dst, nullptr);
     UNUSED(src1);
@@ -11309,6 +11405,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_cpy;
+            break;
+        case GGML_OP_SET:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_set;
             break;
         case GGML_OP_DUP:
         case GGML_OP_CONT:
