@@ -3758,11 +3758,21 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_RMS_NORM:
             return op->ne[0] % 4 == 0 && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_L2_NORM:
-            return op->src[0]->type == GGML_TYPE_F32 && op->ne[0] % 4 == 0 && ggml_is_contiguous_rows(op->src[0]);
-        case GGML_OP_CUMSUM:
-            // Single-subgroup scan: gate on ne[0] fitting one subgroup. Adreno uses 64.
-            return op->src[0]->type == GGML_TYPE_F32 && op->ne[0] <= 64 &&
+            // ggml_cl_l2_norm only supplies sgs constants for ADRENO and INTEL; on any
+            // other GPU family fall back to CPU instead of asserting at dispatch time.
+            return (backend_ctx->gpu_family == ADRENO || backend_ctx->gpu_family == INTEL) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->ne[0] % 4 == 0 && ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_CUMSUM: {
+            // Single-subgroup scan kernel: gate on ne[0] fitting one subgroup.
+            // Subgroup size is fixed per GPU family and matches the
+            // REQD_SUBGROUP_SIZE_* attributes in cumsum.cl as well as the
+            // sgs fallback in ggml_cl_cumsum.
+            const size_t sgs = (backend_ctx->gpu_family == ADRENO) ? 64 :
+                               (backend_ctx->gpu_family == INTEL)  ? 32 : 0;
+            return sgs > 0 &&
+                   op->src[0]->type == GGML_TYPE_F32 && (size_t)op->ne[0] <= sgs &&
                    op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+        }
         case GGML_OP_DIAG:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[1] == 1 &&
                    op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
@@ -5819,7 +5829,11 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb2));
     CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb3));
 
-    size_t lws = 1024;
+    // Use up to 1024 threads per row to amortize the strided memory copy and
+    // hide latency. Clamp to the device's reported max workgroup size so we
+    // do not exceed the GPU's limit (Adreno: 1024, typical Mali/Intel: 256-512).
+    size_t lws = backend_ctx->max_workgroup_size > 0 ?
+                 MIN((size_t)1024, backend_ctx->max_workgroup_size) : 64;
     size_t global_work_size[] = {(size_t)ne10*lws, (size_t)ne11, (size_t)ne12};
     size_t local_work_size[] = {lws, 1, 1};
 
