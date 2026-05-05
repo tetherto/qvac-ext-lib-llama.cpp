@@ -3761,6 +3761,40 @@ struct test_rwkv_wkv7 : public test_case {
     }
 };
 
+// GGML_OP_DELTA_NET_AR (gated DeltaNet autoregressive recurrence)
+struct test_delta_net_ar : public test_case {
+    const ggml_type type;
+    const int64_t S;
+    const int64_t H;
+    const int64_t N;
+    const int64_t g_ne0;     // 1 (GDA) or S (KDA)
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, S, H, N, g_ne0);
+    }
+
+    test_delta_net_ar(ggml_type type = GGML_TYPE_F32,
+            int64_t S = 128, int64_t H = 16, int64_t N = 1, int64_t g_ne0 = 1)
+        : type(type), S(S), H(H), N(N), g_ne0(g_ne0) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * s_in = ggml_new_tensor_4d(ctx, type, S, S, H, N);
+        ggml_set_name(s_in, "s_in");
+
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, type, S, 1, H, N);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, type, S, 1, H, N);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, type, S, 1, H, N);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, type, g_ne0, 1, H, N);
+        ggml_tensor * b    = ggml_new_tensor_4d(ctx, type, 1, 1, H, N);
+        ggml_set_name(q, "q"); ggml_set_name(k, "k"); ggml_set_name(v, "v");
+        ggml_set_name(g, "g"); ggml_set_name(b, "beta");
+
+        ggml_tensor * out = ggml_delta_net_ar(ctx, s_in, q, k, v, g, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -7875,6 +7909,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 1));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_rwkv_wkv7(GGML_TYPE_F32, 32, 64, 128, 4));
+
+    // Gated DeltaNet autoregressive (Qwen3.5 / Qwen3-Next decode path).
+    // S = head_v_dim = 128, H = num_v_heads = 16, N = n_seqs = 1.
+    // g_ne0 = 1 (GDA) and g_ne0 = S (KDA) are both used by Qwen3.5.
+    test_cases.emplace_back(new test_delta_net_ar(GGML_TYPE_F32, 128, 16, 1, 1));
+    test_cases.emplace_back(new test_delta_net_ar(GGML_TYPE_F32, 128, 16, 1, 128));
+    // smaller shape for sanity coverage
+    test_cases.emplace_back(new test_delta_net_ar(GGML_TYPE_F32,  32,  4, 1, 1));
+    test_cases.emplace_back(new test_delta_net_ar(GGML_TYPE_F32,  32,  4, 1, 32));
 
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 1, 1));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 1));

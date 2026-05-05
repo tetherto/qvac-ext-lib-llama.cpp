@@ -1032,6 +1032,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV6",
     "GATED_LINEAR_ATTN",
     "RWKV_WKV7",
+    "DELTA_NET_AR",
     "SOLVE_TRI",
 
     "UNARY",
@@ -1052,7 +1053,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1145,6 +1146,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv6(k, v, r, tf, td, s)",
     "gated_linear_attn(k, v, q, gate, s)",
     "rwkv_wkv7(r, w, k, v, a, b, s)",
+    "delta_net_ar(s, q, k, v, g, beta)",
     "A X = B, A triangular, solve X",
 
     "unary(x)",
@@ -1165,7 +1167,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5804,6 +5806,59 @@ struct ggml_tensor * ggml_rwkv_wkv7(
     result->src[4] = a;
     result->src[5] = b;
     result->src[6] = state;
+
+    return result;
+}
+
+// ggml_delta_net_ar
+
+struct ggml_tensor * ggml_delta_net_ar(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta) {
+    GGML_ASSERT(s); GGML_ASSERT(q); GGML_ASSERT(k); GGML_ASSERT(v); GGML_ASSERT(g); GGML_ASSERT(beta);
+    GGML_ASSERT(s->type    == GGML_TYPE_F32);
+    GGML_ASSERT(q->type    == GGML_TYPE_F32);
+    GGML_ASSERT(k->type    == GGML_TYPE_F32);
+    GGML_ASSERT(v->type    == GGML_TYPE_F32);
+    GGML_ASSERT(g->type    == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous(s));
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+
+    const int64_t S = s->ne[0];
+    const int64_t H = s->ne[2];
+    const int64_t N = s->ne[3];
+
+    GGML_ASSERT(s->ne[1] == S);
+    GGML_ASSERT(q->ne[0] == S && q->ne[1] == 1 && q->ne[2] == H && q->ne[3] == N);
+    GGML_ASSERT(k->ne[0] == S && k->ne[1] == 1 && k->ne[2] == H && k->ne[3] == N);
+    GGML_ASSERT(v->ne[0] == S && v->ne[1] == 1 && v->ne[2] == H && v->ne[3] == N);
+    GGML_ASSERT(g->ne[1] == 1 && g->ne[2] == H && g->ne[3] == N);
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S);
+    GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == 1 && beta->ne[2] == H && beta->ne[3] == N);
+
+    // Packed 1D result: [o (S*H*N) | s_out (S*S*H*N)].
+    const int64_t n_o     = S * H * N;
+    const int64_t n_s_out = S * S * H * N;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_o + n_s_out);
+
+    result->op     = GGML_OP_DELTA_NET_AR;
+    result->src[0] = s;
+    result->src[1] = q;
+    result->src[2] = k;
+    result->src[3] = v;
+    result->src[4] = g;
+    result->src[5] = beta;
 
     return result;
 }

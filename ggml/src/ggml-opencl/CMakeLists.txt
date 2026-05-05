@@ -122,6 +122,7 @@ set(GGML_OPENCL_KERNELS
     l2_norm
     cumsum
     diag
+    dnet_ar
     rope
     scale
     set_rows

@@ -557,6 +557,7 @@ extern "C" {
         GGML_OP_RWKV_WKV6,
         GGML_OP_GATED_LINEAR_ATTN,
         GGML_OP_RWKV_WKV7,
+        GGML_OP_DELTA_NET_AR,
         GGML_OP_SOLVE_TRI,
 
         GGML_OP_UNARY,
@@ -2456,6 +2457,29 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             struct ggml_tensor  * state);
+
+    // Gated DeltaNet autoregressive (n_tokens == 1) recurrence.
+    //
+    //   s_g[j, i] = s_in[j, i] * exp(g_factor(i))
+    //   sk[j]     = sum_i s_g[j, i] * k[i]
+    //   d[j]      = beta * (v[j] - sk[j])
+    //   kq        = sum_b k[b] * q[b]                // no gate
+    //   o[j]      = sum_i s_g[j, i] * q[i] + d[j] * kq
+    //   s_out[j,i]= s_g[j, i] + d[j] * k[i]
+    //
+    // Inputs:  s [S, S, H, N], q [S, 1, H, N], k [S, 1, H, N], v [S, 1, H, N],
+    //          g [g_ne0, 1, H, N] with g_ne0 in {1, S}, beta [1, 1, H, N].
+    // Result:  packed 1D tensor of length (S + S*S)*H*N. The first S*H*N
+    //          elements are o (laid out as [S, 1, H, N]); the remaining
+    //          S*S*H*N are s_out (laid out as [S, S, H, N]).
+    GGML_API struct ggml_tensor * ggml_delta_net_ar(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta);
 
     /* Solves a specific equation of the form Ax=B, where A is a triangular matrix
     *  without zeroes on the diagonal (i.e. invertible).

@@ -510,6 +510,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_l2_norm;
     cl_kernel kernel_cumsum_f32_sg;
     cl_kernel kernel_diag_f32;
+    cl_kernel kernel_dnet_ar_f32_s128;
     cl_kernel kernel_group_norm, kernel_group_norm_mul_add;
     cl_kernel kernel_diag_mask_inf, kernel_diag_mask_inf_8;
     cl_kernel kernel_soft_max, kernel_soft_max_4;
@@ -2107,6 +2108,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         cl_program prog =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_diag_f32 = clCreateKernel(prog, "kernel_diag_f32", &err), err));
+        CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // dnet_ar (gated DeltaNet autoregressive recurrence; S=128 specialised)
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "dnet_ar.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("dnet_ar.cl");
+#endif
+        cl_program prog =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+        CL_CHECK((backend_ctx->kernel_dnet_ar_f32_s128 = clCreateKernel(prog, "kernel_dnet_ar_f32_s128", &err), err));
         CL_CHECK(clReleaseProgram(prog));
         GGML_LOG_CONT(".");
     }
@@ -3778,6 +3795,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_DIAG:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[1] == 1 &&
                    op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
+        case GGML_OP_DELTA_NET_AR: {
+            // Specialised kernel for Qwen3.5 (S = head_v_dim = 128).
+            const ggml_tensor * s_in = op->src[0];
+            if (!s_in || s_in->type != GGML_TYPE_F32) return false;
+            if (s_in->ne[0] != 128 || s_in->ne[1] != 128) return false;
+            for (int i = 1; i < 6; ++i) {
+                const ggml_tensor * src = op->src[i];
+                if (!src || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src)) return false;
+            }
+            return ggml_is_contiguous(s_in);
+        }
         case GGML_OP_REPEAT:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32; // Assuming F32 for now, can be expanded
         case GGML_OP_PAD:
@@ -11029,6 +11057,76 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, src1);
 }
 
+static void ggml_cl_delta_net_ar(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(dst);
+    GGML_ASSERT(dst->extra);
+    UNUSED(src0);
+    UNUSED(src1);
+
+    const ggml_tensor * s_in = dst->src[0];
+    const ggml_tensor * q    = dst->src[1];
+    const ggml_tensor * k    = dst->src[2];
+    const ggml_tensor * v    = dst->src[3];
+    const ggml_tensor * g    = dst->src[4];
+    const ggml_tensor * b    = dst->src[5];
+
+    GGML_ASSERT(s_in && q && k && v && g && b);
+    GGML_ASSERT(s_in->extra && q->extra && k->extra && v->extra && g->extra && b->extra);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    const int S     = (int) s_in->ne[0];
+    const int H     = (int) s_in->ne[2];
+    const int N     = (int) s_in->ne[3];
+    const int g_ne0 = (int) g->ne[0];
+    GGML_ASSERT(S == 128 && "ggml_cl_delta_net_ar: kernel specialised for S=128");
+    GGML_ASSERT(g_ne0 == 1 || g_ne0 == S);
+
+    ggml_tensor_extra_cl * extra_s = (ggml_tensor_extra_cl *) s_in->extra;
+    ggml_tensor_extra_cl * extra_q = (ggml_tensor_extra_cl *) q->extra;
+    ggml_tensor_extra_cl * extra_k = (ggml_tensor_extra_cl *) k->extra;
+    ggml_tensor_extra_cl * extra_v = (ggml_tensor_extra_cl *) v->extra;
+    ggml_tensor_extra_cl * extra_g = (ggml_tensor_extra_cl *) g->extra;
+    ggml_tensor_extra_cl * extra_b = (ggml_tensor_extra_cl *) b->extra;
+    ggml_tensor_extra_cl * extra_d = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong off_s   = extra_s->offset + s_in->view_offs;
+    const cl_ulong off_q   = extra_q->offset + q->view_offs;
+    const cl_ulong off_k   = extra_k->offset + k->view_offs;
+    const cl_ulong off_v   = extra_v->offset + v->view_offs;
+    const cl_ulong off_g   = extra_g->offset + g->view_offs;
+    const cl_ulong off_b   = extra_b->offset + b->view_offs;
+    const cl_ulong off_o   = extra_d->offset + dst->view_offs;
+    const cl_ulong off_so  = off_o + (cl_ulong)(S * H * N) * (cl_ulong)sizeof(float);
+
+    cl_kernel kernel = backend_ctx->kernel_dnet_ar_f32_s128;
+
+    int arg = 0;
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_s->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_s));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_q->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_q));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_k->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_k));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_v->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_v));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_g->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_g));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_b->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_b));
+    // o and s_out share the dst result buffer; just two offsets into it.
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_d->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_o));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem),   &extra_d->data_device));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_so));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &H));
+    CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(int),      &g_ne0));
+
+    size_t global_work_size[] = {(size_t)S, (size_t)H, (size_t)N};
+    size_t local_work_size[]  = {(size_t)S, 1, 1};
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_set(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -12083,6 +12181,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_diag;
+            break;
+        case GGML_OP_DELTA_NET_AR:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_delta_net_ar;
             break;
         case GGML_OP_GROUP_NORM:
             if (!any_on_device) {

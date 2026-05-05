@@ -320,11 +320,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     const float scale = 1.0f / sqrtf(S_k);
 
+    // Make q, k, v contiguous in the [S, n_tokens=1, H, N] layout that
+    // ggml_delta_net_ar expects.
     q = ggml_scale(ctx0, q, scale);
-
-    q = ggml_permute(ctx0, q, 0, 2, 1, 3); // [S_k, n_tokens, H_k, n_seqs]
-    k = ggml_permute(ctx0, k, 0, 2, 1, 3); // [S_k, n_tokens, H_k, n_seqs]
-    v = ggml_permute(ctx0, v, 0, 2, 1, 3); // [S_v, n_tokens, H_v, n_seqs]
+    q = ggml_cont(ctx0, ggml_permute(ctx0, q, 0, 2, 1, 3));
+    k = ggml_cont(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3));
+    v = ggml_cont(ctx0, ggml_permute(ctx0, v, 0, 2, 1, 3));
 
     cb(q, "q_in", il);
     cb(k, "k_in", il);
@@ -332,45 +333,38 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     cb(b, "b_in", il);
     cb(g, "g_in", il);
 
-    // GDA: [1,  1,  H_v, n_seqs]
-    // KDA: [1, S_k, H_v, n_seqs]
-    g = ggml_reshape_4d(ctx0, g, 1, g->ne[0], H_v, n_seqs);
-    b = ggml_reshape_4d(ctx0, b, 1,        1, H_v, n_seqs);
+    // ggml_delta_net_ar's API expects g of shape [g_ne0, 1, H, N] and beta of
+    // shape [1, 1, H, N]. (These are memory-equivalent to the [1, g_ne0, H, N]
+    // / [1, 1, H, N] reshapes used by the original unfused path; we just relabel
+    // the dims so the op signature is unambiguous.)
+    g = ggml_reshape_4d(ctx0, g, g->ne[0], 1, H_v, n_seqs);
+    b = ggml_reshape_4d(ctx0, b,        1, 1, H_v, n_seqs);
 
-    // [S_v, S_v, H_v, n_seqs]
-    g = ggml_exp(ctx0, g);
-    s = ggml_mul(ctx0, s, g);
+    // Single fused kernel: output [o | s_new] packed into one 1D tensor of
+    // length S*H*N + S*S*H*N. Replaces ~12 small ggml ops per layer per token.
+    ggml_tensor * fused = ggml_delta_net_ar(ctx0, s, q, k, v, g, b);
+    cb(fused, "dnet_ar", il);
 
-    ggml_tensor * s_t = ggml_cont(ctx0, ggml_transpose(ctx0, s));
+    const int64_t S = s->ne[0];
 
-    // [1, S_v, H_v, n_seqs]
-    ggml_tensor * sk;
-    sk = ggml_mul     (ctx0, s_t, k);
-    sk = ggml_sum_rows(ctx0, sk);
+    // Slice 1: o has shape [S, 1, H, N], stored at the start of fused.
+    ggml_tensor * o = ggml_view_4d(ctx0, fused, S, 1, H_v, n_seqs,
+            sizeof(float) * S,            // nb1
+            sizeof(float) * S,            // nb2 (ne[1]==1 so unused, but set to inner size)
+            sizeof(float) * S * H_v,      // nb3
+            0);                           // offset
 
-    // [S_v, 1, H_v, n_seqs]
-    ggml_tensor * d;
-    d = ggml_sub(ctx0, v, ggml_transpose(ctx0, sk));
-    d = ggml_mul(ctx0, d, b);
+    // Slice 2: s_new has shape [S, S, H, N], stored after the o block.
+    ggml_tensor * s_new = ggml_view_4d(ctx0, fused, S, S, H_v, n_seqs,
+            sizeof(float) * S,
+            sizeof(float) * S * S,
+            sizeof(float) * S * S * H_v,
+            sizeof(float) * S * H_v * n_seqs);
 
-    // [1, S_v, H_v, n_seqs]
-    ggml_tensor * d_t;
-    d_t = ggml_transpose(ctx0, d);
+    cb(s_new, "dnet_add_ar_state", il);
 
-    // [S_v, S_v, H_v, n_seqs]
-    ggml_tensor * kd;
-    k  = ggml_repeat(ctx0, k, s);
-    kd = ggml_mul   (ctx0, k, d_t);
-
-    s_t = ggml_add(ctx0, s_t, kd);
-
-    cb(s_t, "dnet_add_ar_state", il);
-
-    ggml_tensor * s_q = ggml_mul     (ctx0, s_t, q);
-    ggml_tensor * o   = ggml_sum_rows(ctx0, s_q);
-
-    o = ggml_permute  (ctx0, o, 2, 0, 1, 3); // [S_v, H_v, n_tokens, n_seqs]
-    s = ggml_transpose(ctx0, s_t);           // [S_v, S_v, H_v, n_seqs]
-
-    return {o, s};
+    // Match the original return contract: o permuted to [S_v, H_v, n_tokens, n_seqs],
+    // s_new in untransposed [S_v, S_v, H_v, n_seqs] orientation.
+    o = ggml_permute(ctx0, o, 0, 2, 1, 3); // [S, 1, H, N] -> [S, H, 1, N]
+    return {o, s_new};
 }

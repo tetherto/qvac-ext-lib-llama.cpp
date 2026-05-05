@@ -10345,6 +10345,122 @@ void ggml_compute_forward_rwkv_wkv6(
     }
 }
 
+// ggml_compute_forward_delta_net_ar
+
+void ggml_compute_forward_delta_net_ar(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * s_in = dst->src[0];
+    const struct ggml_tensor * q    = dst->src[1];
+    const struct ggml_tensor * k    = dst->src[2];
+    const struct ggml_tensor * v    = dst->src[3];
+    const struct ggml_tensor * g    = dst->src[4];
+    const struct ggml_tensor * beta = dst->src[5];
+
+    GGML_ASSERT(s_in->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int64_t S = s_in->ne[0];
+    const int64_t H = s_in->ne[2];
+    const int64_t N = s_in->ne[3];
+    const int64_t g_ne0 = g->ne[0];
+    GGML_ASSERT(g_ne0 == 1 || g_ne0 == S);
+
+    // Packed result layout: [o (S*H*N) | s_out (S*S*H*N)]
+    float * dst_data = (float *) dst->data;
+    float * o_buf    = dst_data;
+    float * s_out    = dst_data + S * H * N;
+
+    const float * s_in_d = (const float *) s_in->data;
+    const float * q_d    = (const float *) q->data;
+    const float * k_d    = (const float *) k->data;
+    const float * v_d    = (const float *) v->data;
+    const float * g_d    = (const float *) g->data;
+    const float * beta_d = (const float *) beta->data;
+
+    // Per (h, n) work: O(S^2). Each thread handles a contiguous slice of (h, n) blocks.
+    // The packed result is 1D so ggml_nrows() is unhelpful here; partition manually.
+    const int64_t total_hn = H * N;
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
+    const int64_t per_thread = (total_hn + nth - 1) / nth;
+    const int64_t hn_start = std::min(per_thread * ith, total_hn);
+    const int64_t hn_end   = std::min(hn_start + per_thread, total_hn);
+    for (int64_t hn = hn_start; hn < hn_end; ++hn) {
+        const int64_t h = hn % H;
+        const int64_t n = hn / H;
+        const int64_t s_block_off   = (n * H + h) * S * S;
+        const int64_t hn_off        = (n * H + h) * S;
+        const int64_t g_block_off   = (n * H + h) * g_ne0;
+
+        const float * s_block = s_in_d + s_block_off;
+        const float * k_h     = k_d    + hn_off;
+        const float * q_h     = q_d    + hn_off;
+        const float * v_h     = v_d    + hn_off;
+        const float beta_v    = beta_d[n * H + h];
+        const float * g_h     = g_d    + g_block_off;
+
+        float * o_h     = o_buf + hn_off;
+        float * s_out_h = s_out + s_block_off;
+
+        // Pre-compute exp(g) per i (or the single GDA scalar).
+        // Using a stack array; S is bounded (Qwen3.5: 128, generic: capped at e.g. 1024).
+        float gate[1024];
+        GGML_ASSERT(S <= 1024 && "ggml_delta_net_ar: S exceeds CPU stack buffer");
+        if (g_ne0 == 1) {
+            const float gv = expf(g_h[0]);
+            for (int64_t i = 0; i < S; ++i) gate[i] = gv;
+        } else {
+            for (int64_t i = 0; i < S; ++i) gate[i] = expf(g_h[i]);
+        }
+
+        // sk[j] = sum_i s[j, i] * gate(i) * k[i]
+        // sq[j] = sum_i s[j, i] * gate(i) * q[i]
+        // s[j, i] is at s_block[j + i * S].
+        float sk[1024];
+        float sq[1024];
+        for (int64_t j = 0; j < S; ++j) { sk[j] = 0.0f; sq[j] = 0.0f; }
+        for (int64_t i = 0; i < S; ++i) {
+            const float k_eff = gate[i] * k_h[i];
+            const float q_eff = gate[i] * q_h[i];
+            const float * row = s_block + (size_t)i * S;   // s[*, i]
+            for (int64_t j = 0; j < S; ++j) {
+                const float s_ji = row[j];                  // s[j, i]
+                sk[j] += s_ji * k_eff;
+                sq[j] += s_ji * q_eff;
+            }
+        }
+
+        // d[j] = beta * (v[j] - sk[j])
+        float d_arr[1024];
+        for (int64_t j = 0; j < S; ++j) {
+            d_arr[j] = beta_v * (v_h[j] - sk[j]);
+        }
+
+        // kq = sum_b k[b] * q[b] (no gate)
+        float kq = 0.0f;
+        for (int64_t b = 0; b < S; ++b) {
+            kq += k_h[b] * q_h[b];
+        }
+
+        // o[j] = sq[j] + d[j] * kq
+        for (int64_t j = 0; j < S; ++j) {
+            o_h[j] = sq[j] + d_arr[j] * kq;
+        }
+
+        // s_out[j, i] = s_g[j, i] + d[j] * k[i]
+        for (int64_t i = 0; i < S; ++i) {
+            const float k_i = k_h[i];
+            const float gate_i = gate[i];
+            float * out_row = s_out_h + (size_t)i * S;          // s_out[*, i]
+            const float * in_row = s_block + (size_t)i * S;     // s_in[*, i]
+            for (int64_t j = 0; j < S; ++j) {
+                out_row[j] = in_row[j] * gate_i + d_arr[j] * k_i;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_gla
 
 static void ggml_compute_forward_gla_f32(

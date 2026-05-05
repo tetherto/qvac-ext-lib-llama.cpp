@@ -2055,6 +2055,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_rwkv_wkv7(params, tensor);
             } break;
+        case GGML_OP_DELTA_NET_AR:
+            {
+                ggml_compute_forward_delta_net_ar(params, tensor);
+            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 ggml_compute_forward_solve_tri(params, tensor);
@@ -2392,6 +2396,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
+        case GGML_OP_DELTA_NET_AR:
             {
                 n_tasks = n_threads;
             } break;
