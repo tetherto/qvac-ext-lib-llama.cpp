@@ -7266,6 +7266,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+
+    // Qwen3.5 / Qwen3-Next gated-DeltaNet recurrent-state lookups go through
+    // ggml_get_rows on F32 buffers shaped [262144, n_seqs] (the SSM state
+    // for one layer: head_v_dim*head_v_dim*num_v_heads = 128*128*16) and
+    // [18432, n_seqs] (the conv state: (conv_kernel_size-1)*conv_channels =
+    // 3*(d_inner + 2*ssm_n_group*ssm_d_state)). These shapes exercise
+    // kernel_get_rows_f32 with very large inner dim, which is what motivates
+    // the larger-workgroup dispatch on Adreno.
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 262144, 4, 1, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 18432,  4, 1, 1, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {

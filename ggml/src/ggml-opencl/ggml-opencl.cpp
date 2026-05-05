@@ -5819,8 +5819,9 @@ static void ggml_cl_get_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb2));
     CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb3));
 
-    size_t global_work_size[] = {(size_t)ne10*64, (size_t)ne11, (size_t)ne12};
-    size_t local_work_size[] = {64, 1, 1};
+    size_t lws = 1024;
+    size_t global_work_size[] = {(size_t)ne10*lws, (size_t)ne11, (size_t)ne12};
+    size_t local_work_size[] = {lws, 1, 1};
 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
