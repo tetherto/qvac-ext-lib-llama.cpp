@@ -567,7 +567,11 @@ llama_model_loader::llama_model_loader(
         fname_empty = finput.fname.empty();
     }
 
-    if (!fname_empty) {
+    const bool is_buffer =
+        std::holds_alternative<load_input_variant::buffer_load_input>(load_input) ||
+        std::holds_alternative<load_input_variant::buffer_future_load_input>(load_input);
+
+    if (!fname_empty || is_buffer) {
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
         gguf_file_load main_gguf(&ctx, load_input);
