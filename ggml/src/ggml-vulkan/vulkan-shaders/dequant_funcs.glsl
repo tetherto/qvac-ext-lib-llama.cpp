@@ -498,7 +498,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #endif
 
 #if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
-#include "tq_utils.comp"
+#include "tq_utils.glsl"
 
 float tbq3_dequantize1(uint ib, uint iqs, uint a_offset) {
     const uint bit_pos = iqs * 3u;
@@ -522,7 +522,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #endif
 
 #if defined(DATA_A_PQ3_0) || defined(DATA_A_PQ3_0_64)
-#include "tq_utils.comp"
+#include "tq_utils.glsl"
 
 float pq3_dequantize1(uint ib, uint iqs, uint a_offset) {
     const uint bit_pos = iqs * 3u;
@@ -546,7 +546,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #endif
 
 #if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
-#include "tq_utils.comp"
+#include "tq_utils.glsl"
 
 // iqs is the element index (consistent with other QUANT_R=1 types). TBQ4 packs
 // 2 elements per byte, so byte = iqs/2 and nibble = iqs&1.
@@ -569,7 +569,7 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 #endif
 
 #if defined(DATA_A_PQ4_0) || defined(DATA_A_PQ4_0_64)
-#include "tq_utils.comp"
+#include "tq_utils.glsl"
 
 float pq4_dequantize1(uint ib, uint iqs, uint a_offset) {
     const uint vui = uint(data_a[a_offset + ib].qs[iqs >> 1u]);

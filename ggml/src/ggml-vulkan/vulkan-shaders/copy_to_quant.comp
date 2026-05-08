@@ -273,7 +273,7 @@ void quantize(uint dst_idx, uint src_idx)
 
 #if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_PQ4_0) || \
     defined(DATA_A_TBQ3_0_64) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ3_0_64) || defined(DATA_A_PQ4_0_64)
-#include "tq_utils.comp"
+#include "tq_utils.glsl"
 
 // Scratch for the cross-subgroup reduction stitch. Sized for the smallest
 // plausible subgroup (SG_SIZE=4 -> NSG=8). When SG_SIZE==32, NSG==1 and this
@@ -376,54 +376,59 @@ void quantize(uint dst_idx, uint src_idx)
         data_q[dst_idx].d = float16_t(norm);
     }
 
-    if (norm < 1e-15) {
+    // Uniform flag: all threads must agree on whether the norm is effectively zero.
+    // Using subgroupBroadcast ensures uniformity and avoids divergent barriers.
+    bool skip_quant = subgroupBroadcast(norm < 1e-15, 0u);
+
+    if (skip_quant) {
         for (uint j = lid; j < QS_BYTES; j += WG) data_q[dst_idx].qs[j] = uint8_t(0);
 #if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
         const uint QJL_BYTES = BK / 8u;
         for (uint j = lid; j < QJL_BYTES; j += WG) data_q[dst_idx].qjl[j] = uint8_t(0);
         if (lid == 0u) data_q[dst_idx].d_r = float16_t(0.0);
 #endif
-        return;
-    }
+    } else {
+        float inv_norm = 1.0 / norm;
 
-    float inv_norm = 1.0 / norm;
-
-    // Quantize each value; strided write into shared idx table.
-    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-        uint j = lid + s * WG;
-        tq3_sh_idx[j] = tbq3_quantize_val(tq3_sh_x[j] * inv_norm);
-    }
-    barrier();
-
-    // Pack 8 indices -> 3 bytes per group. NUM_GROUPS is 16 (BK=128) or 8 (BK=64),
-    // so one thread per group covers all groups.
-    if (lid < NUM_GROUPS) {
-        uint g = lid;
-        uint accum = 0u;
-        [[unroll]] for (uint i = 0u; i < 8u; i++) {
-            accum |= tq3_sh_idx[g * 8u + i] << (i * 3u);
+        // Quantize each value; strided write into shared idx table.
+        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+            uint j = lid + s * WG;
+            tq3_sh_idx[j] = tbq3_quantize_val(tq3_sh_x[j] * inv_norm);
         }
-        uint base = g * 3u;
-        data_q[dst_idx].qs[base + 0u] = uint8_t(accum & 0xFFu);
-        data_q[dst_idx].qs[base + 1u] = uint8_t((accum >> 8u) & 0xFFu);
-        data_q[dst_idx].qs[base + 2u] = uint8_t((accum >> 16u) & 0xFFu);
+        barrier();
+
+        // Pack 8 indices -> 3 bytes per group. NUM_GROUPS is 16 (BK=128) or 8 (BK=64),
+        // so one thread per group covers all groups.
+        if (lid < NUM_GROUPS) {
+            uint g = lid;
+            uint accum = 0u;
+            [[unroll]] for (uint i = 0u; i < 8u; i++) {
+                accum |= tq3_sh_idx[g * 8u + i] << (i * 3u);
+            }
+            uint base = g * 3u;
+            data_q[dst_idx].qs[base + 0u] = uint8_t(accum & 0xFFu);
+            data_q[dst_idx].qs[base + 1u] = uint8_t((accum >> 8u) & 0xFFu);
+            data_q[dst_idx].qs[base + 2u] = uint8_t((accum >> 16u) & 0xFFu);
+        }
     }
 
+    // Only run norm correction and QJL if quantization was performed.
+    if (!skip_quant) {
 #if defined(TQ_NORM_CORRECTION)
-    float local_xc = 0.0;
-    float local_cc = 0.0;
-    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-        uint j = lid + s * WG;
-        float cv = TBQ3_CB[tq3_sh_idx[j]];
-        local_xc += tq3_sh_x[j] * cv;
-        local_cc += cv * cv;
-    }
-    float dot_xc = tq_wg_add(local_xc);
-    float dot_cc = tq_wg_add(local_cc);
-    if (dot_cc > 1e-15) {
-        norm = dot_xc / dot_cc;
-    }
-    if (lid == 0u) data_q[dst_idx].d = float16_t(norm);
+        float local_xc = 0.0;
+        float local_cc = 0.0;
+        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+            uint j = lid + s * WG;
+            float cv = TBQ3_CB[tq3_sh_idx[j]];
+            local_xc += tq3_sh_x[j] * cv;
+            local_cc += cv * cv;
+        }
+        float dot_xc = tq_wg_add(local_xc);
+        float dot_cc = tq_wg_add(local_cc);
+        if (dot_cc > 1e-15) {
+            norm = dot_xc / dot_cc;
+        }
+        if (lid == 0u) data_q[dst_idx].d = float16_t(norm);
 #endif
 
 #if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
@@ -440,55 +445,57 @@ void quantize(uint dst_idx, uint src_idx)
     float r_norm = sqrt(tq_wg_add(local_rsq));
     if (lid == 0u) data_q[dst_idx].d_r = float16_t(r_norm);
 
-    if (r_norm < 1e-15) {
+    // Uniform flag: all threads must agree on whether to run the FHT/QJL path.
+    // Using a workgroup reduction ensures uniformity and avoids divergent barriers.
+    bool skip_fht = subgroupBroadcast(r_norm < 1e-15, 0u);
+
+    if (skip_fht) {
         for (uint j = lid; j < QJL_BYTES; j += WG) data_q[dst_idx].qjl[j] = uint8_t(0);
-        return;
-    }
-
-    barrier();
-
-    // Parallel in-place FHT: each pass has BK/2 independent butterflies distributed
-    // across the 32 threads.
-    for (uint h = 1u; h < BK; h <<= 1u) {
-        for (uint bi = lid; bi < BK / 2u; bi += WG) {
-            uint grp = bi / h;
-            uint pos = bi % h;
-            uint j = grp * (h << 1u) + pos;
-            float a = tq3_sh_proj[j];
-            float b = tq3_sh_proj[j + h];
-            tq3_sh_proj[j]     = a + b;
-            tq3_sh_proj[j + h] = a - b;
-        }
-        barrier();
-    }
-
-    // Pack QJL sign bits into qjl[]. When NSG==1 (SG_SIZE >= WG == 32), one
-    // subgroupBallot per 32-bit chunk fills all bits in one call; bit `lid` of
-    // ballot.x reflects this thread's predicate, matching the serial layout
-    // `qjl[j/8] |= 1 << (j%8)`. When NSG>1 (smaller subgroups) each ballot only
-    // has SG_SIZE valid low bits, so we fall back to atomicOr into shared and
-    // then one thread serializes each 32-bit word out as 4 bytes.
-    if (SG_SIZE >= TQ_WG) {
-        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-            uint j = lid + s * WG;
-            uvec4 ballot = subgroupBallot(tq3_sh_proj[j] > 0.0);
-            if (lid == 0u) {
-                uint bits = ballot.x;
-                uint byte_off = s * 4u;
-                data_q[dst_idx].qjl[byte_off + 0u] = uint8_t(bits & 0xFFu);
-                data_q[dst_idx].qjl[byte_off + 1u] = uint8_t((bits >> 8u) & 0xFFu);
-                data_q[dst_idx].qjl[byte_off + 2u] = uint8_t((bits >> 16u) & 0xFFu);
-                data_q[dst_idx].qjl[byte_off + 3u] = uint8_t((bits >> 24u) & 0xFFu);
-            }
-        }
     } else {
+        // Parallel in-place FHT: each pass has BK/2 independent butterflies distributed
+        // across the 32 threads.
+        for (uint h = 1u; h < BK; h <<= 1u) {
+            for (uint bi = lid; bi < BK / 2u; bi += WG) {
+                uint grp = bi / h;
+                uint pos = bi % h;
+                uint j = grp * (h << 1u) + pos;
+                float a = tq3_sh_proj[j];
+                float b = tq3_sh_proj[j + h];
+                tq3_sh_proj[j]     = a + b;
+                tq3_sh_proj[j + h] = a - b;
+            }
+            barrier();
+        }
+
+        // Pack QJL sign bits into qjl[]. We stage into tq_sh_qjl[] (one uint per
+        // 32 sign bits) and then have lanes 0..QJL_WORDS-1 each emit one 32-bit
+        // word as four uint8_t SSBO stores. This pattern spreads byte writes
+        // across QJL_WORDS lanes and matches the working stitch path; an earlier
+        // SG_SIZE >= TQ_WG variant that had lid==0 alone emit all 16 bytes of
+        // qjl across an [[unroll]] STRIDE loop hung the NVIDIA 595 driver on
+        // RTX 5090 (NV_coopmat2), so this single path is used unconditionally.
         const uint QJL_WORDS = (QJL_BYTES + 3u) / 4u;
         if (lid < QJL_WORDS) tq_sh_qjl[lid] = 0u;
         barrier();
-        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-            uint j = lid + s * WG;
-            if (tq3_sh_proj[j] > 0.0) {
-                atomicOr(tq_sh_qjl[j / 32u], 1u << (j % 32u));
+        if (SG_SIZE >= TQ_WG) {
+            // Single subgroup covers the workgroup: subgroupBallot.x is the
+            // 32-bit sign mask for one BK/SG chunk. subgroupElect() picks one
+            // lane to deposit each word into shared.
+            [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+                uint j = lid + s * WG;
+                uvec4 ballot = subgroupBallot(tq3_sh_proj[j] > 0.0);
+                if (subgroupElect()) {
+                    tq_sh_qjl[s] = ballot.x;
+                }
+            }
+        } else {
+            // Smaller subgroups: each ballot only spans SG_SIZE lanes, so fall
+            // back to atomicOr in shared memory.
+            [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+                uint j = lid + s * WG;
+                if (tq3_sh_proj[j] > 0.0) {
+                    atomicOr(tq_sh_qjl[j / 32u], 1u << (j % 32u));
+                }
             }
         }
         barrier();
@@ -502,6 +509,7 @@ void quantize(uint dst_idx, uint src_idx)
         }
     }
 #endif
+    }
 }
 #endif
 
@@ -579,46 +587,50 @@ void quantize(uint dst_idx, uint src_idx)
         data_q[dst_idx].d = float16_t(norm);
     }
 
-    if (norm < 1e-15) {
+    // Uniform flag: all threads must agree on whether the norm is effectively zero.
+    bool skip_quant = subgroupBroadcast(norm < 1e-15, 0u);
+
+    if (skip_quant) {
         for (uint j = lid; j < QS_BYTES; j += WG) data_q[dst_idx].qs[j] = uint8_t(0);
 #if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
         const uint QJL_BYTES = BK / 8u;
         for (uint j = lid; j < QJL_BYTES; j += WG) data_q[dst_idx].qjl[j] = uint8_t(0);
         if (lid == 0u) data_q[dst_idx].d_r = float16_t(0.0);
 #endif
-        return;
+    } else {
+        float inv_norm = 1.0 / norm;
+
+        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+            uint j = lid + s * WG;
+            tq4_sh_idx[j] = tbq4_quantize_val(tq4_sh_x[j] * inv_norm);
+        }
+        barrier();
+
+        // Pack nibble pairs: QS_BYTES = BK/2 (64 for BK=128, 32 for BK=64).
+        for (uint b = lid; b < QS_BYTES; b += WG) {
+            uint i0 = tq4_sh_idx[2u * b];
+            uint i1 = tq4_sh_idx[2u * b + 1u];
+            data_q[dst_idx].qs[b] = uint8_t(i0 | (i1 << 4u));
+        }
     }
 
-    float inv_norm = 1.0 / norm;
-
-    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-        uint j = lid + s * WG;
-        tq4_sh_idx[j] = tbq4_quantize_val(tq4_sh_x[j] * inv_norm);
-    }
-    barrier();
-
-    // Pack nibble pairs: QS_BYTES = BK/2 (64 for BK=128, 32 for BK=64).
-    for (uint b = lid; b < QS_BYTES; b += WG) {
-        uint i0 = tq4_sh_idx[2u * b];
-        uint i1 = tq4_sh_idx[2u * b + 1u];
-        data_q[dst_idx].qs[b] = uint8_t(i0 | (i1 << 4u));
-    }
-
+    // Only run norm correction and QJL if quantization was performed.
+    if (!skip_quant) {
 #if defined(TQ_NORM_CORRECTION)
-    float local_xc = 0.0;
-    float local_cc = 0.0;
-    [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-        uint j = lid + s * WG;
-        float cv = TBQ4_CB[tq4_sh_idx[j]];
-        local_xc += tq4_sh_x[j] * cv;
-        local_cc += cv * cv;
-    }
-    float dot_xc = tq_wg_add(local_xc);
-    float dot_cc = tq_wg_add(local_cc);
-    if (dot_cc > 1e-15) {
-        norm = dot_xc / dot_cc;
-    }
-    if (lid == 0u) data_q[dst_idx].d = float16_t(norm);
+        float local_xc = 0.0;
+        float local_cc = 0.0;
+        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+            uint j = lid + s * WG;
+            float cv = TBQ4_CB[tq4_sh_idx[j]];
+            local_xc += tq4_sh_x[j] * cv;
+            local_cc += cv * cv;
+        }
+        float dot_xc = tq_wg_add(local_xc);
+        float dot_cc = tq_wg_add(local_cc);
+        if (dot_cc > 1e-15) {
+            norm = dot_xc / dot_cc;
+        }
+        if (lid == 0u) data_q[dst_idx].d = float16_t(norm);
 #endif
 
 #if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
@@ -634,48 +646,44 @@ void quantize(uint dst_idx, uint src_idx)
     float r_norm = sqrt(tq_wg_add(local_rsq));
     if (lid == 0u) data_q[dst_idx].d_r = float16_t(r_norm);
 
-    if (r_norm < 1e-15) {
+    // Uniform flag: all threads must agree on whether to run the FHT/QJL path.
+    bool skip_fht = subgroupBroadcast(r_norm < 1e-15, 0u);
+
+    if (skip_fht) {
         for (uint j = lid; j < QJL_BYTES; j += WG) data_q[dst_idx].qjl[j] = uint8_t(0);
-        return;
-    }
-
-    barrier();
-
-    for (uint h = 1u; h < BK; h <<= 1u) {
-        for (uint bi = lid; bi < BK / 2u; bi += WG) {
-            uint grp = bi / h;
-            uint pos = bi % h;
-            uint j = grp * (h << 1u) + pos;
-            float a = tq4_sh_proj[j];
-            float b = tq4_sh_proj[j + h];
-            tq4_sh_proj[j]     = a + b;
-            tq4_sh_proj[j + h] = a - b;
-        }
-        barrier();
-    }
-
-    // See tq3 path above for the NSG==1 vs NSG>1 split.
-    if (SG_SIZE >= TQ_WG) {
-        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-            uint j = lid + s * WG;
-            uvec4 ballot = subgroupBallot(tq4_sh_proj[j] > 0.0);
-            if (lid == 0u) {
-                uint bits = ballot.x;
-                uint byte_off = s * 4u;
-                data_q[dst_idx].qjl[byte_off + 0u] = uint8_t(bits & 0xFFu);
-                data_q[dst_idx].qjl[byte_off + 1u] = uint8_t((bits >> 8u) & 0xFFu);
-                data_q[dst_idx].qjl[byte_off + 2u] = uint8_t((bits >> 16u) & 0xFFu);
-                data_q[dst_idx].qjl[byte_off + 3u] = uint8_t((bits >> 24u) & 0xFFu);
-            }
-        }
     } else {
+        for (uint h = 1u; h < BK; h <<= 1u) {
+            for (uint bi = lid; bi < BK / 2u; bi += WG) {
+                uint grp = bi / h;
+                uint pos = bi % h;
+                uint j = grp * (h << 1u) + pos;
+                float a = tq4_sh_proj[j];
+                float b = tq4_sh_proj[j + h];
+                tq4_sh_proj[j]     = a + b;
+                tq4_sh_proj[j + h] = a - b;
+            }
+            barrier();
+        }
+
+        // See tq3 path above for the NSG==1 vs NSG>1 split and the rationale
+        // for staging through tq_sh_qjl[] before emitting bytes.
         const uint QJL_WORDS = (QJL_BYTES + 3u) / 4u;
         if (lid < QJL_WORDS) tq_sh_qjl[lid] = 0u;
         barrier();
-        [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
-            uint j = lid + s * WG;
-            if (tq4_sh_proj[j] > 0.0) {
-                atomicOr(tq_sh_qjl[j / 32u], 1u << (j % 32u));
+        if (SG_SIZE >= TQ_WG) {
+            [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+                uint j = lid + s * WG;
+                uvec4 ballot = subgroupBallot(tq4_sh_proj[j] > 0.0);
+                if (subgroupElect()) {
+                    tq_sh_qjl[s] = ballot.x;
+                }
+            }
+        } else {
+            [[unroll]] for (uint s = 0u; s < STRIDE; s++) {
+                uint j = lid + s * WG;
+                if (tq4_sh_proj[j] > 0.0) {
+                    atomicOr(tq_sh_qjl[j / 32u], 1u << (j % 32u));
+                }
             }
         }
         barrier();
@@ -689,6 +697,7 @@ void quantize(uint dst_idx, uint src_idx)
         }
     }
 #endif
+    }
 }
 #endif
 

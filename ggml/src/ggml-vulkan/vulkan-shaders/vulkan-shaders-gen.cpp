@@ -723,25 +723,31 @@ void process_shaders() {
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
                 }
             }
-        }
 
-        // _64 variants (head_dim=64): same-type FA
+        // _64 variants (head_dim=64): same-type FA. Only emit on fp16=true outer
+        // iteration; the inner string_to_spv calls always pass fp16=true, so without
+        // this guard we would generate identical shader names twice.
+        if (fp16) {
         for (const auto& tname : {"tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
             std::string t(tname);
             std::string data_a_key = "DATA_A_" + to_uppercase(t);
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
             string_to_spv("flash_attn_f32_f16_" + t, "flash_attn_cm2.comp",
-                merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"DEQUANTFUNC", "dequantFunc"+to_uppercase(t) }, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(t) }}), true, false, true, f16acc);
+                merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"DEQUANTFUNC", "dequantFunc"+to_uppercase(t) }, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(t) }}), true, false, true, f16acc);
 #endif
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
             string_to_spv("flash_attn_f32_f16_" + t, "flash_attn_cm1.comp",
-                merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(t)}, {"COOPMAT", "1"}}), true, true, false, f16acc);
+                merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(t)}, {"COOPMAT", "1"}}), true, true, false, f16acc);
 #endif
             string_to_spv("flash_attn_f32_f16_" + t, "flash_attn.comp",
-                merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(t) }}), true, false, false, f16acc);
+                merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(t) }}), true, false, false, f16acc);
+        }
         }
 
-        // Mixed K/V type flash attention
+        // Mixed K/V type flash attention. Like the _64 same-type loop above, every
+        // string_to_spv call here passes fp16=true, so emit only on the fp16=true
+        // outer iteration to avoid duplicate symbol generation.
+        if (fp16) {
         const std::vector<std::string> fa_mixed_k_types = {"tbq3_0", "tbq4_0", "pq3_0", "pq4_0"};
         const std::vector<std::string> fa_mixed_v_types = {"pq3_0", "pq4_0", "q4_0", "q8_0", "f16"};
         const std::vector<std::string> fa_mixed_k_types_64 = {"tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"};
@@ -756,7 +762,7 @@ void process_shaders() {
                 // Scalar path
                 {
                     std::map<std::string, std::string> mixed_dict = {
-                        {"Q_TYPE", "float"}, {"D_TYPE", "float"},
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
                         {"DATA_K_" + k_upper, "1"},
                         {"DATA_V_" + v_upper, "1"},
                     };
@@ -768,7 +774,7 @@ void process_shaders() {
                 // Coopmat1 path
                 {
                     std::map<std::string, std::string> mixed_dict = {
-                        {"Q_TYPE", "float"}, {"D_TYPE", "float"},
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
                         {"DATA_K_" + k_upper, "1"},
                         {"DATA_V_" + v_upper, "1"},
                         {"COOPMAT", "1"},
@@ -782,7 +788,7 @@ void process_shaders() {
                 // Coopmat2 path
                 {
                     std::map<std::string, std::string> mixed_dict = {
-                        {"Q_TYPE", "float"}, {"D_TYPE", "float"},
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
                         {"DATA_K_" + k_upper, "1"},
                         {"DATA_V_" + v_upper, "1"},
                     };
@@ -809,7 +815,7 @@ void process_shaders() {
                 // Scalar path
                 {
                     std::map<std::string, std::string> mixed_dict = {
-                        {"Q_TYPE", "float"}, {"D_TYPE", "float"},
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
                         {"DATA_K_" + k_upper, "1"},
                         {"DATA_V_" + v_upper, "1"},
                     };
@@ -821,7 +827,7 @@ void process_shaders() {
                 // Coopmat1 path
                 {
                     std::map<std::string, std::string> mixed_dict = {
-                        {"Q_TYPE", "float"}, {"D_TYPE", "float"},
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
                         {"DATA_K_" + k_upper, "1"},
                         {"DATA_V_" + v_upper, "1"},
                         {"COOPMAT", "1"},
@@ -835,7 +841,7 @@ void process_shaders() {
                 // Coopmat2 path
                 {
                     std::map<std::string, std::string> mixed_dict = {
-                        {"Q_TYPE", "float"}, {"D_TYPE", "float"},
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
                         {"DATA_K_" + k_upper, "1"},
                         {"DATA_V_" + v_upper, "1"},
                     };
@@ -850,6 +856,8 @@ void process_shaders() {
                 }
 #endif
             }
+        }
+        } // end if (fp16) for mixed K/V flash attention
         }
     }
 
@@ -932,7 +940,7 @@ void process_shaders() {
         if (tname == "f16") {
             string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}}));
         } else {
-            // string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
+            string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
         }
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
     }

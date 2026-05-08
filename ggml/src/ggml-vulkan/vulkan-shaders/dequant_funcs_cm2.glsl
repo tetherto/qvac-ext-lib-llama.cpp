@@ -749,7 +749,7 @@ float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords
     defined(DATA_A_TBQ4_0_64) || defined(DATA_K_TBQ4_0_64) || defined(DATA_V_TBQ4_0_64) || \
     defined(DATA_A_PQ3_0_64) || defined(DATA_K_PQ3_0_64) || defined(DATA_V_PQ3_0_64) || \
     defined(DATA_A_PQ4_0_64) || defined(DATA_K_PQ4_0_64) || defined(DATA_V_PQ4_0_64)
-#include "tq_utils.comp"
+#include "tq_utils.glsl"
 
 // cm2 decode wrappers: read raw bytes from buffer-reference block, delegate to shared helpers.
 #define DEQUANT_CM2_3BIT(NAME, BLOCK_TYPE) \

@@ -369,6 +369,7 @@ void main() {
 
 #ifdef HAS_QJL_CORRECTION
         {
+            // sfsh is ACC_TYPEV4 (4 rows packed per vec4 lane), so r → (r/4, r%4).
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += gl_WorkGroupSize.x) {
                 uint32_t flat_idx = idx + tid;
                 if (flat_idx < Bc * Br) {
@@ -386,7 +387,7 @@ void main() {
                                                  Qf_qjl_proj[r][jj * 4u + 3u]);
                             proj_q_sum += proj_q_v4[jj].x + proj_q_v4[jj].y + proj_q_v4[jj].z + proj_q_v4[jj].w;
                         }
-                        sfsh[c * sfshstride + r] += ACC_TYPE(p.scale * qjl_correction_k(k_block, k_offset, proj_q_sum, proj_q_v4));
+                        sfsh[c * sfshstride + r / 4][r % 4] += ACC_TYPE(p.scale * qjl_correction_k(k_block, k_offset, proj_q_sum, proj_q_v4));
                     }
                 }
             }
@@ -454,34 +455,10 @@ void main() {
             }
         }
 
-#if V_BLOCK_SIZE > 1
-        // TurboQuant path: V is quantized → fused inline dequant + scalar P·V accumulation.
-        // Pf is computed per (c, r) and consumed immediately; Psh / coopmat P·V is skipped.
-        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-            if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
-                continue;
-            }
-
-            FLOAT_TYPE Pf[rows_per_thread];
-            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                const uint r_vec  = tile_row(r) / 4;
-                const uint r_comp = tile_row(r) % 4;
-                Pf[r] = FLOAT_TYPE(exp(float(sfsh[r_vec + (c * cols_per_iter + col_tid) * sfshstride][r_comp]) - Mf[r]));
-                Lf[r] += Pf[r];
-            }
-
-            [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * V_BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                uint ib = coord / V_BLOCK_SIZE;
-                uint iqs = (coord % V_BLOCK_SIZE);
-                vec4 Vf = dequantize4_v(ib, iqs, v_offset);
-                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                    Of[r][d] += ACC_TYPE(Pf[r]) * ACC_TYPEV4(Vf);
-                }
-            }
-        }
-#else
-        // Standard path (V is f16): store Pf in Psh; coopmat handles P·V later.
+        // Pf staging: same packing for both f16 V (consumed by coopmat P·V below)
+        // and TurboQuant V (consumed by the fused-dequant scalar P·V loop below).
+        // Each thread writes Pf for its owned (col, row_tid) group: 4 rows packed
+        // into one f16vec4 slot in Psh[col * psh_stride + tile_row(r) / 4].
         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
             const uint col = c * cols_per_iter + col_tid;
 
@@ -496,6 +473,41 @@ void main() {
                         Lf[r + vec_idx] += Pf[vec_idx];
                     }
                     Psh[col * psh_stride + row / 4] = Pf;
+                }
+            }
+        }
+#if V_BLOCK_SIZE > 1
+        barrier();
+
+        // TurboQuant V P·V: V is quantized, so coopmat P·V is skipped; instead each
+        // thread owns one HSV/4 output slot (d = d_local*threads_per_rowgroup + col_tid)
+        // and iterates ALL Bc cols, dequantizing V[c][d] inline and reading the
+        // already-staged P from Psh. Lf is computed during Pf staging above and
+        // matches the f16 path, so the existing subgroupAdd reduction at the end of
+        // main() works unchanged. Of needs no cross-thread reduction either, because
+        // each thread fully owns its (r, d_local) accumulator.
+        [[unroll]] for (uint32_t d_local = 0; d_local < d_per_thread; ++d_local) {
+            const uint d = d_local * threads_per_rowgroup + col_tid;
+            if (d >= HSV / 4) break;
+
+            [[unroll]] for (uint32_t c = 0; c < Bc; ++c) {
+                if (KV_bounds_check && j * Bc + c >= KV) {
+                    continue;
+                }
+
+                uint coord = (j * Bc + c) * v_stride * V_BLOCK_SIZE + 4 * d;
+                uint ib    = coord / V_BLOCK_SIZE;
+                uint iqs   = coord % V_BLOCK_SIZE;
+                f16vec4 Vf = f16vec4(dequantize4_v(ib, iqs, v_offset));
+
+                // Psh[col * psh_stride + tile_row(r) / 4] packs Pf for 4 consecutive
+                // rows owned by this thread's row_tid into one f16vec4 lane.
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
+                    const uint row = tile_row(r);
+                    f16vec4 Pf = Psh[c * psh_stride + row / 4];
+                    [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                        Of[r + vec_idx][d_local] += Pf[vec_idx] * Vf;
+                    }
                 }
             }
         }

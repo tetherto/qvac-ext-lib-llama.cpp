@@ -368,6 +368,38 @@ else
 fi
 echo ""
 
+# Guard against regressions in the shared FLASH_ATTN_EXT shaders. The TBQ
+# patches edit flash_attn_base.glsl / flash_attn.comp / flash_attn_cm1.comp,
+# which are also the upstream f16 KV path. The "tbq|pq" filter on the
+# test-backend-ops leg above does NOT match type_K=f16,type_V=f16 cases, and
+# the in-tree mixed-type FA loop skips same-type pairs, so a regression on
+# the shared f16 path is invisible to test-turboquant.sh.
+#
+# This leg picks a tiny f16/f16 cluster (~8 cases, ~1s) that exercises the
+# cooperative-matrix v1 path on devices that pick it (nb >= 2 routes through
+# FA_COOPMAT1 on KHR_cooperative_matrix devices; the scalar path is hit for
+# nb=1 via the n_rows==1 fallback in get_fa_tuning_params). Specifically:
+#
+#   * kv=113 + nb=32 -> small KV, padded batch, exercises KV_bounds_check
+#   * kv=512 + nb=3  -> exact-Bc-aligned KV, partial batch
+#   * kv=512 + nb=32 -> aligned KV and batch, hot path
+#   * prec=f32 / prec=def -> f32acc and f16acc variants
+#
+# These collectively trigger the bug where flash_attn_cm1.comp guards its
+# f16 P*V section by `#if V_BLOCK_SIZE == 1`, which evaluates as false when
+# V_BLOCK_SIZE is undefined (i.e. the f16 same-type variant emitted without
+# any DATA_V_* macro), dropping the entire P*V accumulation from the SPIR-V
+# and pushing PPL to ~1600 on the f16/f16 row of the perplexity sweep.
+echo "=== test-backend-ops (f16 FLASH_ATTN_EXT, shared FA shader sanity) ==="
+if [ -f "$B/bin/test-backend-ops" ]; then
+    "$B/bin/test-backend-ops" test -o FLASH_ATTN_EXT \
+        -p 'hsk=128,hsv=128,nh=4,nr23=\[1,1\],kv=(113|512),nb=(3|32),mask=1,sinks=0,max_bias=0\..*,logit_softcap=0\..*,prec=(f32|def),type_K=f16,type_V=f16,permute=\[0,1,2,3\]' \
+        || num_failed=$((num_failed + 1))
+else
+    echo "SKIP: $B/bin/test-backend-ops not found"
+fi
+echo ""
+
 if [ "${#coverage_rows[@]}" -gt 0 ]; then
     echo ""
     echo "=== Subgroup coverage summary ==="
