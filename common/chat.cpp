@@ -815,6 +815,7 @@ static std::string apply(
         {"messages", messages_override.has_value() ? *messages_override : inputs.messages},
         {"bos_token", tmpl.bos_token()},
         {"eos_token", tmpl.eos_token()},
+        {"enable_thinking", inputs.enable_thinking},
     };
     if (tools_override.has_value() || !inputs.tools.empty()) {
         inp["tools"] = tools_override.has_value() ? *tools_override : inputs.tools;
