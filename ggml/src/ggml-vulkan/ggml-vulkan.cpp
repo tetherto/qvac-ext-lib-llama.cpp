@@ -850,6 +850,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
+    vk_pipeline pipeline_dnet_ar_f32_s128;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1488,6 +1489,19 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+};
+struct vk_op_dnet_ar_push_constants {
+    uint32_t H;
+    uint32_t N;
+    uint32_t g_ne0;
+    uint32_t off_s_in;
+    uint32_t off_q;
+    uint32_t off_k;
+    uint32_t off_v;
+    uint32_t off_g;
+    uint32_t off_b;
+    uint32_t off_o;
+    uint32_t off_s_out;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -4761,6 +4775,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_dnet_ar_f32_s128, "dnet_ar_f32_s128",
+        dnet_ar_f32_len, dnet_ar_f32_data, "main", 7,
+        sizeof(vk_op_dnet_ar_push_constants), {128, 1, 1}, {128}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_sgd_f32, "opt_step_sgd_f32", opt_step_sgd_f32_len, opt_step_sgd_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -6447,7 +6465,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
     vk_matmul_pipeline2& mmp = ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
     // XXX TODO 'prec' is not actually allowed in mul_mat_id.
     bool prefer_fp16acc = ctx->device->fp16 /*&& prec == GGML_PREC_DEFAULT*/;
-    
+
     if (src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_TQ2_0) {
         prefer_fp16acc = false;
     }
@@ -11055,6 +11073,64 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
     });
 }
 
+static void ggml_vk_dnet_ar(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * s_in = dst->src[0];
+    const ggml_tensor * q    = dst->src[1];
+    const ggml_tensor * k    = dst->src[2];
+    const ggml_tensor * v    = dst->src[3];
+    const ggml_tensor * g    = dst->src[4];
+    const ggml_tensor * b    = dst->src[5];
+
+    GGML_ASSERT(s_in && q && k && v && g && b);
+
+    const uint32_t S = (uint32_t) s_in->ne[0];
+    const uint32_t H = (uint32_t) s_in->ne[2];
+    const uint32_t N = (uint32_t) s_in->ne[3];
+    const uint32_t g_ne0 = (uint32_t) g->ne[0];
+    GGML_ASSERT(S == 128 && "ggml_vk_dnet_ar: shader specialised for S=128");
+    GGML_ASSERT(g_ne0 == 1 || g_ne0 == S);
+
+    vk_pipeline pipeline = ctx->device->pipeline_dnet_ar_f32_s128;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer s_in_buf = ggml_vk_tensor_subbuffer(ctx, s_in);
+    vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer v_buf    = ggml_vk_tensor_subbuffer(ctx, v);
+    vk_subbuffer g_buf    = ggml_vk_tensor_subbuffer(ctx, g);
+    vk_subbuffer b_buf    = ggml_vk_tensor_subbuffer(ctx, b);
+    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    const uint32_t off_o     = 0;
+    const uint32_t off_s_out = S * H * N;
+
+    const vk_op_dnet_ar_push_constants pc = {
+        H, N, g_ne0,
+        (uint32_t)(s_in_buf.offset / sizeof(float)),
+        (uint32_t)(q_buf.offset    / sizeof(float)),
+        (uint32_t)(k_buf.offset    / sizeof(float)),
+        (uint32_t)(v_buf.offset    / sizeof(float)),
+        (uint32_t)(g_buf.offset    / sizeof(float)),
+        (uint32_t)(b_buf.offset    / sizeof(float)),
+        (uint32_t)(dst_buf.offset / sizeof(float)) + off_o,
+        (uint32_t)(dst_buf.offset / sizeof(float)) + off_s_out,
+    };
+
+    s_in_buf.offset = 0; s_in_buf.size = VK_WHOLE_SIZE;
+    q_buf.offset    = 0; q_buf.size    = VK_WHOLE_SIZE;
+    k_buf.offset    = 0; k_buf.size    = VK_WHOLE_SIZE;
+    v_buf.offset    = 0; v_buf.size    = VK_WHOLE_SIZE;
+    g_buf.offset    = 0; g_buf.size    = VK_WHOLE_SIZE;
+    b_buf.offset    = 0; b_buf.size    = VK_WHOLE_SIZE;
+    dst_buf.offset  = 0; dst_buf.size  = VK_WHOLE_SIZE;
+
+    std::array<uint32_t, 3> elements = { S, H, N };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { s_in_buf, q_buf, k_buf, v_buf, g_buf, b_buf, dst_buf },
+        pc, elements);
+}
+
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * g = dst->src[1];
@@ -13847,6 +13923,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_DELTA_NET_AR:
+        ggml_vk_dnet_ar(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_OPT_STEP_ADAMW:
         ggml_vk_opt_step_adamw(ctx, compute_ctx, node);
 
@@ -16281,6 +16362,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_DELTA_NET_AR:
+            {
+                const ggml_tensor * s_in = op->src[0];
+                if (!s_in || s_in->ne[0] != 128) return false;
+                if (op->type != GGML_TYPE_F32) return false;
+                for (int i = 0; i < 6; ++i) {
+                    if (!op->src[i] || op->src[i]->type != GGML_TYPE_F32) return false;
+                }
+                const int64_t g_ne0 = op->src[4]->ne[0];
+                if (g_ne0 != 1 && g_ne0 != s_in->ne[0]) return false;
+                return true;
+            }
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
