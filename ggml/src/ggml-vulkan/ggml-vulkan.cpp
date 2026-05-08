@@ -8070,6 +8070,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                               !ggml_vk_dim01_contiguous(src0);
     const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
+                              // Force F32 src1 through the strided cpy path which uses correct strides.
+                              ((ctx->device->vendor_id == VK_VENDOR_ID_ARM) && ctx->device->coopmat_support && !ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src1);
 
     // If src0 is BF16, try to use a BF16 x BF16 multiply
