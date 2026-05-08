@@ -839,6 +839,12 @@ int64_t llama_time_us(void) {
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static int llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         llama_model_loader & ml, FILE * file, llama_model & model, llama_model_params & params) {
+
+    (void) metadata;
+    (void) set_tensor_data;
+    (void) set_tensor_data_ud;
+    (void) file;
+
     // loading time will be recalculated after the first eval, so
     // we take page faults deferred by mmap() into consideration
     model.t_load_us = 0;
