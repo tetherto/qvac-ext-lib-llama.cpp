@@ -72,9 +72,7 @@ layout (push_constant) uniform parameter {
 layout (binding = 4) readonly buffer S {float data_s[];};
 
 layout (binding = 5) writeonly buffer O {D_TYPE data_o[];};
-#ifdef D_TYPEV4
 layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
-#endif
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
