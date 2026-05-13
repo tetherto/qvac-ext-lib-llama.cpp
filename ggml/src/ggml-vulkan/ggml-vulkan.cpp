@@ -16712,6 +16712,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 const ggml_type k_type = op->src[1]->type;
                 const ggml_type v_type = op->src[2]->type;
+                if ((ggml_is_tbq_or_pq(k_type) || ggml_is_tbq_or_pq(v_type)) && !device->fp16) {
+                    // TBQ/PQ FA shaders are fp16-only; reject so the scheduler falls back to CPU.
+                    return false;
+                }
                 {
                     auto any = [](ggml_type t, std::initializer_list<ggml_type> s) {
                         return std::any_of(s.begin(), s.end(), [t](ggml_type v) { return v == t; });

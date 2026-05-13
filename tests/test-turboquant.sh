@@ -400,6 +400,23 @@ else
 fi
 echo ""
 
+# Homogeneous PQ K/V FLASH_ATTN_EXT with fp16 disabled. supports_op currently
+# advertises PQ FA regardless of device->fp16, but the scalar FA pipelines for
+# tk == tv (PQ3/PQ3, PQ4/PQ4) are registered only inside the device->fp16
+# branch. On a real fp16-less GPU (or with GGML_VK_DISABLE_F16=1 forcing the
+# else-branch on any device), dispatch hits an uninitialized lazy pipeline and
+# asserts `Br == pipeline->wg_denoms[0]`. Either the gate must reject the op so
+# the scheduler falls back to CPU, or fp32 PQ FA pipelines must be added.
+echo "=== test-backend-ops (homogeneous PQ FLASH_ATTN_EXT, GGML_VK_DISABLE_F16=1) ==="
+if [ -f "$B/bin/test-backend-ops" ]; then
+    GGML_VK_DISABLE_F16=1 "$B/bin/test-backend-ops" test -o FLASH_ATTN_EXT \
+        -p 'type_K=(pq3_0|pq4_0|pq3_0_64|pq4_0_64),type_V=\1' \
+        || num_failed=$((num_failed + 1))
+else
+    echo "SKIP: $B/bin/test-backend-ops not found"
+fi
+echo ""
+
 if [ "${#coverage_rows[@]}" -gt 0 ]; then
     echo ""
     echo "=== Subgroup coverage summary ==="

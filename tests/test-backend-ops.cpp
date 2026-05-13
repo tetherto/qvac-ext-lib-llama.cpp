@@ -8702,6 +8702,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Homogeneous PQ K/V flash attention. Regression coverage for backends that
+    // gate PQ FA pipelines on fp16 support: with GGML_VK_DISABLE_F16=1 the
+    // Vulkan scalar FA pipelines for tk == tv (PQ3/PQ3, PQ4/PQ4) must either be
+    // registered, or supports_op must reject the op so the scheduler falls back
+    // to CPU. Without that gate, dispatch hits an uninitialized lazy pipeline
+    // and asserts (Br == pipeline->wg_denoms[0]).
+    {
+        const ggml_type pq_homo[]    = { GGML_TYPE_PQ3_0,    GGML_TYPE_PQ4_0 };
+        const ggml_type pq_homo_64[] = { GGML_TYPE_PQ3_0_64, GGML_TYPE_PQ4_0_64 };
+
+        for (ggml_type t : pq_homo) {
+            for (int kv : { 113, 512 }) {
+                for (int nb : { 1, 32 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                        128, 128, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t));
+                }
+            }
+        }
+        for (ggml_type t : pq_homo_64) {
+            for (int kv : { 113, 512 }) {
+                for (int nb : { 1, 32 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                        64, 64, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t));
+                }
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
