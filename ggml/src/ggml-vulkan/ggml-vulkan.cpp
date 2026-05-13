@@ -3279,7 +3279,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     const uint32_t mul_mat_subgroup_size_32 = std::max(mul_mat_subgroup_size, 32u);
 
     // TBQ / PQ cooperative copy_to_quant: the shader (copy_to_quant.comp) is
-    // parameterized by spec constant `SG_SIZE` (constant_id=0). At SG_SIZE >=
+    // parameterized by spec constant `SG_SIZE` (constant_id=1; id 0 is already
+    // used by generic_binary_head.glsl for `norepeat`). At SG_SIZE >=
     // workgroup size (32) it takes the single-subgroup fast path; at SG_SIZE
     // in {4, 8, 16} it takes a shared-memory stitch path. To keep the
     // SG_SIZE spec constant in sync with gl_SubgroupSize at runtime we also
