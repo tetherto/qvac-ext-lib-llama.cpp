@@ -1123,11 +1123,13 @@ struct llama_model * llama_model_init_from_user(
         void * set_tensor_data_ud,
         struct llama_model_params params) {
     GGML_ASSERT(metadata != nullptr);
-    std::string path_model;
     std::vector<std::string> splits = {};
     params.use_mmap = false;
     params.use_extra_bufts = false;
-    llama_model_loader ml = create_disk_fileloader(splits.front().c_str(), splits, params);
+    load_input_variant::fname_load_input loader_input{ "", splits };
+    llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, loader_input, /*file*/ nullptr,
+                          params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
+                          params.kv_overrides, params.tensor_buft_overrides);
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, ml, /*file*/ nullptr, params);
 }
 // deprecated
