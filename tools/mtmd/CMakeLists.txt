@@ -77,7 +77,7 @@ set_target_properties(mtmd
 
 set_target_properties(mtmd
     PROPERTIES
-    PRIVATE_HEADER debug/mtmd-debug.h)
+    PRIVATE_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/debug/mtmd-debug.h)
 
 if (NOT MSVC)
     # for stb_image.h and miniaudio.h
