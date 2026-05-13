@@ -4645,12 +4645,10 @@ int ggml_metal_op_soft_max_back(ggml_metal_op_t ctx, int idx) {
         while (nth < ne00_4 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
             nth *= 2;
         }
-        nth = std::min(nth, ne00_4);
     } else {
         while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
             nth *= 2;
         }
-        nth = std::min(nth, ne00);
     }
 
     nth = std::max(1, nth);
@@ -4713,7 +4711,6 @@ int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
     }
 
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-    nth = std::min(nth, ne00/4);
 
     const size_t smem = pipeline.smem;
 
