@@ -425,8 +425,6 @@ struct gguf_reader {
     }
 
 private:
-    FILE * file;
-
     mutable uint64_t nbytes_remain;
 };
 
