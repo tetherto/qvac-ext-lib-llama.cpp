@@ -908,16 +908,11 @@ static struct llama_model * llama_model_load_from_file_impl(
         if (metadata != nullptr) {
             n_sources_defined++;
         }
-        // TODO: path_model is not provided anymore
-        if (true) {
-        // if (!path_model.empty()) {
-            n_sources_defined++;
-        }
         if (file != nullptr) {
             n_sources_defined++;
         }
-        if (n_sources_defined != 1) {
-            LLAMA_LOG_ERROR("%s: exactly one out metadata, path_model, and file must be defined\n", __func__);
+        if (n_sources_defined > 1) {
+            LLAMA_LOG_ERROR("%s: at most one of metadata and file may be defined\n", __func__);
             return nullptr;
         }
     }
@@ -1285,7 +1280,11 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
         return nullptr;
     }
     std::vector<std::string> splits = {};
-    llama_model_loader ml = create_disk_fileloader(splits.front().c_str(), splits, params);
+    load_input_variant::fname_load_input loader_input{ "", splits };
+    llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
+                          loader_input, file,
+                          params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
+                          params.kv_overrides, params.tensor_buft_overrides);
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, file, params);
 }
 

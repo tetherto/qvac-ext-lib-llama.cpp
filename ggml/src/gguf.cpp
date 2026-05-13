@@ -297,7 +297,8 @@ struct gguf_bytes_file_reader : public gguf_bytes_reader {
 struct gguf_reader {
     gguf_bytes_reader& bytes_reader;
 
-    gguf_reader(gguf_bytes_reader& bytes_reader) : bytes_reader(bytes_reader) {}
+    gguf_reader(gguf_bytes_reader& bytes_reader)
+        : bytes_reader(bytes_reader), nbytes_remain(UINT64_MAX) {}
 
     // helper for remaining bytes in a file
     static uint64_t file_remain(FILE * file) {

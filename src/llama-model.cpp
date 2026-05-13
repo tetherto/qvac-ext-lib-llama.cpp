@@ -3117,7 +3117,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
             ggml_tensor * t_meta = ml.get_tensor_meta(tensor_name.c_str());
             std::optional<uint16_t> split_idx;
-            if (!t_meta && (flags & TENSOR_NOT_REQUIRED) &&
+            if (!ml.files.empty() && !t_meta && (flags & TENSOR_NOT_REQUIRED) &&
                 IncrementalSplitsTensorLoad::tensor_ignored(ml.incremental_splits_tensor_load, tensor_name.c_str())) {
                 return nullptr;
             }
