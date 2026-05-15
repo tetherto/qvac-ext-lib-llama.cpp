@@ -82,15 +82,20 @@ set(${TARGET}_HEADERS
     subproc.h
     trie.h
     unicode.h
+)
+
+set(${TARGET}_JINJA_HEADERS
+    jinja/caps.h
     jinja/lexer.h
     jinja/parser.h
     jinja/runtime.h
-    jinja/value.h
     jinja/string.h
-    jinja/caps.h
+    jinja/utils.h
+    jinja/value.h
 )
 
 list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
+list(TRANSFORM ${TARGET}_JINJA_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
 
 add_library(${TARGET} STATIC
     arg.cpp
@@ -127,6 +132,7 @@ add_library(${TARGET} STATIC
     jinja/string.cpp
     jinja/caps.cpp
     ${${TARGET}_HEADERS}
+    ${${TARGET}_JINJA_HEADERS}
     )
 
 set_target_properties(${TARGET} PROPERTIES
@@ -137,6 +143,9 @@ set_target_properties(${TARGET} PROPERTIES
 
 set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${${TARGET}_HEADERS}")
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
+
+install(FILES ${${TARGET}_JINJA_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llama/common/jinja)
 
 if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
