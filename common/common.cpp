@@ -1387,6 +1387,79 @@ common_init_result_ptr common_init_from_params(common_params & params) {
     return common_init_from_model_and_params(model, std::move(res), params);
 }
 
+// Compat overload for callers that have already loaded a model externally
+// and don't have a params.model.path the file-based constructor can open.
+common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params) {
+    if (model == nullptr) {
+        return common_init_result_ptr();
+    }
+
+    common_init_result_ptr res(new common_init_result(params));
+    auto & pimpl = res->pimpl;
+    pimpl->model.reset(model);
+
+    auto cparams = common_context_params_to_llama(params);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    for (auto & la : params.lora_adapters) {
+        llama_adapter_lora_ptr lora;
+        lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
+        if (lora == nullptr) {
+            LOG_ERR("%s: failed to load lora adapter '%s'\n", __func__, la.path.c_str());
+            return res;
+        }
+
+        char buf[1024];
+        la.ptr = lora.get();
+        llama_adapter_meta_val_str(la.ptr, "adapter.lora.task_name", buf, sizeof(buf));
+        la.task_name = buf;
+        llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
+        la.prompt_prefix = buf;
+        pimpl->lora.emplace_back(std::move(lora));
+    }
+
+    common_init_sampler_from_model(model, params.sampling);
+
+    if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+        LOG_WRN("%s: warning: vocab does not have an EOS token, ignoring --ignore-eos\n", __func__);
+        params.sampling.ignore_eos = false;
+    }
+
+    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
+        if (llama_vocab_is_eog(vocab, i)) {
+            LOG_INF("%s: added %s logit bias = %f\n", __func__, common_token_to_piece(vocab, i).c_str(), -INFINITY);
+            params.sampling.logit_bias_eog.push_back({i, -INFINITY});
+        }
+    }
+
+    if (params.sampling.ignore_eos) {
+        params.sampling.logit_bias.insert(
+                params.sampling.logit_bias.end(),
+                params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
+    }
+
+    pimpl->samplers.resize(cparams.n_seq_max);
+    pimpl->samplers_seq_config.resize(cparams.n_seq_max);
+    for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+        pimpl->samplers[i].reset(common_sampler_init(model, params.sampling));
+        pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
+    }
+
+    if (params.sampling.backend_sampling) {
+        cparams.samplers   = pimpl->samplers_seq_config.data();
+        cparams.n_samplers = pimpl->samplers_seq_config.size();
+    }
+
+    llama_context * lctx = llama_init_from_model(model, cparams);
+    if (lctx == NULL) {
+        LOG_ERR("%s: failed to create context with externally-loaded model\n", __func__);
+        return res;
+    }
+    pimpl->context.reset(lctx);
+
+    return common_init_from_model_and_params(model, std::move(res), params);
+}
+
 std::string get_model_endpoint() {
     const char * model_endpoint_env = getenv("MODEL_ENDPOINT");
     // We still respect the use of environment-variable "HF_ENDPOINT" for backward-compatibility.
@@ -2004,7 +2077,7 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
     // While chat templates render appropriately, we must parse the rendered string to find
     // the boundaries of the "assistant" role to calculate loss gracefully.
     // Currently, this only supports ChatML (Qwen, etc.) and Gemma formats.
-    // A more reliable, model-agnostic method would require common_chat_templates_apply to 
+    // A more reliable, model-agnostic method would require common_chat_templates_apply to
     // return token role spans directly, which is not yet supported in common/chat.cpp.
     const std::string START_TAG = "<|im_start|>";
     const std::string START_SYS = "<|im_start|>system\n";

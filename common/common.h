@@ -848,6 +848,8 @@ struct common_init_result {
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    friend std::unique_ptr<common_init_result> common_init_from_model_and_params(llama_model * model, common_params & params);
 };
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
@@ -855,6 +857,7 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 common_init_result_ptr common_init_from_params(common_params & params);
 common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_init_result_ptr res,
                                                          common_params & params);
+common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params);
 
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);

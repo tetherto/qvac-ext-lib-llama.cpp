@@ -689,9 +689,13 @@ llama_model::~llama_model() {
             fclose(f);
         }
     }
+
     for (auto * lora : loras) {
-        delete lora;
+        if (lora) {
+            lora->model = nullptr;
+        }
     }
+    loras.clear();
 }
 
 void llama_model::load_stats(llama_model_loader & ml) {
@@ -7988,15 +7992,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 bool llama_model::create_split_backend_buffers(
     const uint16_t idx, std::map<std::pair<ggml_backend_buffer_type_t, uint16_t>, ggml_context_ptr> & ctx_split_map,
     llama_model_loader & ml, const bool use_mmap_buffer, const bool use_mlock, const int32_t n_gpu_layers) {
-    // Extract contexts for the given split index from ctx_split_map into a new map
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    // Move per-split contexts for this idx into ml.ctx_map so that
+    // create_backend_buffers (which iterates ml.ctx_map) can allocate
+    // backend buffers for them and transfer ownership into pimpl->ctxs_bufs.
     for (auto it = ctx_split_map.begin(); it != ctx_split_map.end();) {
         const auto & [buft_split_idx, ctx_ptr] = *it;
         const auto & [buft, split_idx] = buft_split_idx;
         if (split_idx == idx) {
-            // Move the context from ctx_split_map to ctx_map
-            ctx_map[buft] = std::move(it->second);
-            // Remove from ctx_split_map since ownership has been transferred
+            ml.ctx_map[buft] = std::move(it->second);
             it = ctx_split_map.erase(it);
         } else {
             ++it;
@@ -8011,6 +8014,13 @@ bool llama_model::create_split_backend_buffers(
 
     // Note: create_backend_buffers moves the contexts into ctxs_bufs, taking ownership
     // The contexts in ctx_map are now empty after the move, which is expected
+    for (auto it = ml.ctx_map.begin(); it != ml.ctx_map.end();) {
+        if (!it->second) {
+            it = ml.ctx_map.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
     return creation_success;
 }
