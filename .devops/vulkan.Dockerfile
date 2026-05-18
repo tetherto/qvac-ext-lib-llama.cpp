@@ -6,9 +6,13 @@ FROM ubuntu:$UBUNTU_VERSION AS build
 RUN apt update && apt install -y git build-essential cmake wget xz-utils
 
 # Install cURL and Vulkan SDK dependencies.
-# shaderc provides glslc on Ubuntu and is more reliable across runner images.
 RUN apt install -y libcurl4-openssl-dev curl \
-    libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev shaderc
+    libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev
+
+# glslc package naming differs across Ubuntu releases/runners.
+RUN apt install -y glslc \
+    || apt install -y shaderc \
+    || apt install -y shaderc-tools
 
 RUN command -v glslc
 
