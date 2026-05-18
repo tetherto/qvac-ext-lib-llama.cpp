@@ -1,13 +1,20 @@
-ARG UBUNTU_VERSION=26.04
+ARG UBUNTU_VERSION=24.04
 
 FROM ubuntu:$UBUNTU_VERSION AS build
 
 # Install build tools
 RUN apt update && apt install -y git build-essential cmake wget xz-utils
 
-# Install SSL and Vulkan SDK dependencies
-RUN apt install -y libssl-dev curl \
-    libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev glslc
+# Install cURL and Vulkan SDK dependencies.
+RUN apt install -y libcurl4-openssl-dev curl \
+    libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev
+
+# glslc package naming differs across Ubuntu releases/runners.
+RUN apt install -y glslc \
+    || apt install -y shaderc \
+    || apt install -y shaderc-tools
+
+RUN command -v glslc
 
 # Build it
 WORKDIR /app
