@@ -33,6 +33,7 @@ jobs:
       COMMIT_SHA: ${{ github.sha }}
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         config:
           # Multi-stage build
