@@ -5,7 +5,6 @@ find_package(Threads REQUIRED)
 llama_add_compile_flags()
 
 # Build info header
-#
 
 if(EXISTS "${PROJECT_SOURCE_DIR}/.git")
     set(GIT_DIR "${PROJECT_SOURCE_DIR}/.git")
@@ -51,13 +50,27 @@ set(${TARGET}_HEADERS
   chat.h
   common.h
   console.h
+  debug.h
+  download.h
+  http.h
   json-partial.h
   json-schema-to-grammar.h
   log.h
   ngram-cache.h
+  ngram-map.h
+  ngram-mod.h
+  peg-parser.h
+  preset.h
   regex-partial.h
   sampling.h
   speculative.h
+  unicode.h
+  jinja/lexer.h
+  jinja/parser.h
+  jinja/runtime.h
+  jinja/value.h
+  jinja/string.h
+  jinja/caps.h
 )
 
 list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
@@ -68,10 +81,13 @@ add_library(${TARGET} STATIC
     chat-parser.h
     chat-parser-xml-toolcall.h
     chat-parser-xml-toolcall.cpp
+    chat-peg-parser.cpp
+    chat-peg-parser.h
     chat.cpp
     common.cpp
     console.cpp
     console.h
+    debug.cpp
     download.cpp
     download.h
     http.h
@@ -80,9 +96,20 @@ add_library(${TARGET} STATIC
     llguidance.cpp
     log.cpp
     ngram-cache.cpp
+    ngram-map.cpp
+    ngram-mod.cpp
+    peg-parser.cpp
+    preset.cpp
     regex-partial.cpp
     sampling.cpp
     speculative.cpp
+    unicode.cpp
+    jinja/lexer.cpp
+    jinja/parser.cpp
+    jinja/runtime.cpp
+    jinja/value.cpp
+    jinja/string.cpp
+    jinja/caps.cpp
     ${${TARGET}_HEADERS}
     )
 
@@ -92,43 +119,16 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
-# TODO: use list(APPEND LLAMA_COMMON_EXTRA_LIBS ...)
-set(LLAMA_COMMON_EXTRA_LIBS build_info)
-
-if (LLAMA_CURL)
-    # Use curl to download model url
-    find_package(CURL)
-    if (NOT CURL_FOUND)
-        message(FATAL_ERROR "Could NOT find CURL. Hint: to disable this feature, set -DLLAMA_CURL=OFF")
-    endif()
-    target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_CURL)
-    include_directories(${CURL_INCLUDE_DIRS})
-    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ${CURL_LIBRARIES})
-elseif (LLAMA_HTTPLIB)
-    # otherwise, use cpp-httplib
-    target_compile_definitions(${TARGET} PUBLIC LLAMA_USE_HTTPLIB)
-    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} cpp-httplib)
-endif()
+target_link_libraries(${TARGET} PRIVATE
+    build_info
+    cpp-httplib
+)
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)
     set(LLGUIDANCE_SRC ${CMAKE_BINARY_DIR}/llguidance/source)
     set(LLGUIDANCE_PATH ${LLGUIDANCE_SRC}/target/release)
-
-    # Set the correct library file extension based on platform
-    if (WIN32)
-        set(LLGUIDANCE_LIB_NAME "llguidance.lib")
-        # Add Windows-specific libraries
-        set(LLGUIDANCE_PLATFORM_LIBS
-            ws2_32    # Windows Sockets API
-            userenv   # For GetUserProfileDirectoryW
-            ntdll     # For NT functions
-            bcrypt    # For BCryptGenRandom
-        )
-    else()
-        set(LLGUIDANCE_LIB_NAME "libllguidance.a")
-        set(LLGUIDANCE_PLATFORM_LIBS "")
-    endif()
+    set(LLGUIDANCE_LIB_NAME "${CMAKE_STATIC_LIBRARY_PREFIX}llguidance${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
     ExternalProject_Add(llguidance_ext
         GIT_REPOSITORY https://github.com/guidance-ai/llguidance
@@ -151,13 +151,16 @@ if (LLAMA_LLGUIDANCE)
 
     target_include_directories(${TARGET} PRIVATE ${LLGUIDANCE_PATH})
     # Add platform libraries to the main target
-    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} llguidance ${LLGUIDANCE_PLATFORM_LIBS})
+    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} llguidance)
+    if (WIN32)
+        set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ws2_32 userenv ntdll bcrypt)
+    endif()
 endif ()
 
 target_include_directories(
   ${TARGET}
   PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/common$<SEMICOLON>${CMAKE_SOURCE_DIR}/vendor>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}$<SEMICOLON>${CMAKE_CURRENT_SOURCE_DIR}/../vendor>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)

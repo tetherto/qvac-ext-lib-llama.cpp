@@ -1,0 +1,97 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint S = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer S_in   { float s_in_buf[]; };
+layout(binding = 1) readonly buffer Q_buf  { float q_buf[]; };
+layout(binding = 2) readonly buffer K_buf  { float k_buf[]; };
+layout(binding = 3) readonly buffer V_buf  { float v_buf[]; };
+layout(binding = 4) readonly buffer G_buf  { float g_buf[]; };
+layout(binding = 5) readonly buffer B_buf  { float b_buf[]; };
+layout(binding = 6) buffer Dst             { float dst_buf[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint H;
+    uint N;
+    uint g_ne0;
+    uint off_s_in;
+    uint off_q;
+    uint off_k;
+    uint off_v;
+    uint off_g;
+    uint off_b;
+    uint off_o;
+    uint off_s_out;
+};
+
+shared float k_l[128];
+shared float q_l[128];
+shared float v_l[128];
+shared float d_l[128];
+shared float g_l[128];
+shared float beta_v;
+shared float kq_partials[128]; // tree-reduction scratch
+
+void main() {
+    const uint h = gl_WorkGroupID.y;
+    const uint n = gl_WorkGroupID.z;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint hn = n * H + h;
+
+    const uint base_s_in  = off_s_in  + hn * S * S;
+    const uint base_k     = off_k     + hn * S;
+    const uint base_q     = off_q     + hn * S;
+    const uint base_v     = off_v     + hn * S;
+    const uint base_b     = off_b     + hn;
+    const uint base_g     = off_g     + hn * g_ne0;
+    const uint base_o     = off_o     + hn * S;
+    const uint base_s_out = off_s_out + hn * S * S;
+
+    k_l[tid] = k_buf[base_k + tid];
+    q_l[tid] = q_buf[base_q + tid];
+    v_l[tid] = v_buf[base_v + tid];
+    if (g_ne0 == 1) {
+        if (tid == 0) g_l[0] = g_buf[base_g];
+    } else {
+        g_l[tid] = g_buf[base_g + tid];
+    }
+    if (tid == 0) beta_v = b_buf[base_b];
+
+    barrier();
+
+    float sk_j = 0.0;
+    float sq_j = 0.0;
+    [[unroll]] for (uint i = 0; i < S; ++i) {
+        const float g_v   = (g_ne0 == 1u) ? g_l[0] : g_l[i];
+        const float gate  = exp(g_v);
+        const float s_ji  = s_in_buf[base_s_in + tid + i * S];
+        sk_j += s_ji * gate * k_l[i];
+        sq_j += s_ji * gate * q_l[i];
+    }
+
+    const float dj = beta_v * (v_l[tid] - sk_j);
+    d_l[tid] = dj;
+
+    kq_partials[tid] = k_l[tid] * q_l[tid];
+    barrier();
+    for (uint stride = S / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            kq_partials[tid] += kq_partials[tid + stride];
+        }
+        barrier();
+    }
+    const float kq = kq_partials[0];
+
+    dst_buf[base_o + tid] = sq_j + dj * kq;
+
+    [[unroll]] for (uint i = 0; i < S; ++i) {
+        const float g_v  = (g_ne0 == 1u) ? g_l[0] : g_l[i];
+        const float gate = exp(g_v);
+        const float s_ji = s_in_buf[base_s_in + tid + i * S];
+        dst_buf[base_s_out + tid + i * S] = s_ji * gate + d_l[tid] * k_l[i];
+    }
+}

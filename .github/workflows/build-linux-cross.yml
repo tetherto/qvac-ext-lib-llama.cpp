@@ -9,7 +9,7 @@ jobs:
   #   runs-on: ubuntu-24.04
 
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #     - name: Setup Riscv
   #       run: |
   #         sudo dpkg --add-architecture riscv64
@@ -31,7 +31,7 @@ jobs:
 
   #     - name: Build
   #       run: |
-  #         cmake -B build -DLLAMA_CURL=OFF \
+  #         cmake -B build -DLLAMA_OPENSSL=OFF \
   #                        -DCMAKE_BUILD_TYPE=Release \
   #                        -DGGML_OPENMP=OFF \
   #                        -DLLAMA_BUILD_EXAMPLES=ON \
@@ -53,7 +53,7 @@ jobs:
   #   runs-on: ubuntu-24.04
 
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #     - name: Setup Riscv
   #       run: |
   #         sudo dpkg --add-architecture riscv64
@@ -77,7 +77,7 @@ jobs:
 
   #     - name: Build
   #       run: |
-  #         cmake -B build -DLLAMA_CURL=OFF \
+  #         cmake -B build -DLLAMA_OPENSSL=OFF \
   #                        -DCMAKE_BUILD_TYPE=Release \
   #                        -DGGML_VULKAN=ON \
   #                        -DGGML_OPENMP=OFF \
@@ -100,7 +100,7 @@ jobs:
   #   runs-on: ubuntu-24.04
 
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #     - name: Setup Arm64
   #       run: |
   #         sudo dpkg --add-architecture arm64
@@ -123,7 +123,7 @@ jobs:
 
   #     - name: Build
   #       run: |
-  #         cmake -B build -DLLAMA_CURL=OFF \
+  #         cmake -B build -DLLAMA_OPENSSL=OFF \
   #                        -DCMAKE_BUILD_TYPE=Release \
   #                        -DGGML_VULKAN=ON \
   #                        -DGGML_OPENMP=OFF \
@@ -147,7 +147,7 @@ jobs:
     container: debian@sha256:653dfb9f86c3782e8369d5f7d29bb8faba1f4bff9025db46e807fa4c22903671
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Setup LoongArch
         run: |
           rm -f /etc/apt/sources.list.d/*
@@ -179,7 +179,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -B build -DLLAMA_CURL=OFF \
+          cmake -B build -DLLAMA_OPENSSL=OFF \
                          -DCMAKE_BUILD_TYPE=Release \
                          -DGGML_OPENMP=OFF \
                          -DLLAMA_BUILD_EXAMPLES=ON \
@@ -202,7 +202,7 @@ jobs:
     container: debian@sha256:653dfb9f86c3782e8369d5f7d29bb8faba1f4bff9025db46e807fa4c22903671
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Setup LoongArch
         run: |
           rm -f /etc/apt/sources.list.d/*
@@ -236,7 +236,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -B build -DLLAMA_CURL=OFF \
+          cmake -B build -DLLAMA_OPENSSL=OFF \
                          -DCMAKE_BUILD_TYPE=Release \
                          -DGGML_VULKAN=ON \
                          -DGGML_OPENMP=OFF \
@@ -263,10 +263,10 @@ jobs:
       SPACEMIT_IME_TOOLCHAIN_VERSION: "1.1.2"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Use SpacemiT Toolchain Cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: cache-toolchain
         with:
           path: ./spacemit_toolchain
@@ -282,7 +282,7 @@ jobs:
       - name: Build
         run: |
           export RISCV_ROOT_PATH=${PWD}/spacemit_toolchain
-          cmake -B build -DLLAMA_CURL=OFF \
+          cmake -B build -DLLAMA_OPENSSL=OFF \
                          -DCMAKE_BUILD_TYPE=Release \
                          -DGGML_OPENMP=OFF \
                          -DLLAMA_BUILD_EXAMPLES=ON \
@@ -292,6 +292,7 @@ jobs:
                          -DGGML_RVV=ON \
                          -DGGML_RV_ZFH=ON \
                          -DGGML_RV_ZICBOP=ON \
+                         -DGGML_RV_ZIHINTPAUSE=ON \
                          -DRISCV64_SPACEMIT_IME_SPEC=RISCV64_SPACEMIT_IME1 \
                          -DCMAKE_TOOLCHAIN_FILE=${PWD}/cmake/riscv64-spacemit-linux-gnu-gcc.cmake
 

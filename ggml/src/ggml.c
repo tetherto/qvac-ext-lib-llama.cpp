@@ -53,13 +53,15 @@
 
 #define UNUSED GGML_UNUSED
 
+// Needed for ggml_fp32_to_bf16_row()
+#if defined(__AVX512BF16__)
 #if defined(_MSC_VER)
-#define m512bh(p) p
 #define m512i(p) p
 #else
-#define m512bh(p) (__m512bh)(p)
+#include <immintrin.h>
 #define m512i(p) (__m512i)(p)
-#endif
+#endif // defined(_MSC_VER)
+#endif // defined(__AVX512BF16__)
 
 #if defined(__linux__) || \
     defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || \
@@ -124,6 +126,13 @@ static void ggml_print_backtrace_symbols(void) {
     int nptrs = backtrace(trace, sizeof(trace)/sizeof(trace[0]));
     backtrace_symbols_fd(trace, nptrs, STDERR_FILENO);
 }
+#elif defined(__APPLE__)
+#include <execinfo.h>
+static void ggml_print_backtrace_symbols(void) {
+    void * trace[100];
+    int nptrs = backtrace(trace, sizeof(trace)/sizeof(trace[0]));
+    backtrace_symbols_fd(trace, nptrs, STDERR_FILENO);
+}
 #else
 static void ggml_print_backtrace_symbols(void) {
     // platform not supported
@@ -135,6 +144,20 @@ void ggml_print_backtrace(void) {
     if (GGML_NO_BACKTRACE) {
         return;
     }
+#if defined(__APPLE__)
+    // On macOS, fork+debugger attachment is problematic due to:
+    // 1. libdispatch "poisons" forked child processes
+    // 2. lldb has issues attaching to parent from forked child
+    // Use simple backtrace() instead to avoid Terminal.app crashes
+    const char * GGML_BACKTRACE_LLDB = getenv("GGML_BACKTRACE_LLDB");
+    if (!GGML_BACKTRACE_LLDB) {
+        fprintf(stderr, "WARNING: Using native backtrace. Set GGML_BACKTRACE_LLDB for more info.\n");
+        fprintf(stderr, "WARNING: GGML_BACKTRACE_LLDB may cause native MacOS Terminal.app to crash.\n");
+        fprintf(stderr, "See: https://github.com/ggml-org/llama.cpp/pull/17869\n");
+        ggml_print_backtrace_symbols();
+        return;
+    }
+#endif
 #if defined(__linux__)
     FILE * f = fopen("/proc/self/status", "r");
     size_t size = 0;
@@ -876,7 +899,8 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
-    GGML_ASSERT(type < GGML_TYPE_COUNT);
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
     return &type_traits[type];
 }
 
@@ -1008,6 +1032,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV6",
     "GATED_LINEAR_ATTN",
     "RWKV_WKV7",
+    "DELTA_NET_AR",
     "SOLVE_TRI",
 
     "UNARY",
@@ -1028,7 +1053,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1121,6 +1146,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv6(k, v, r, tf, td, s)",
     "gated_linear_attn(k, v, q, gate, s)",
     "rwkv_wkv7(r, w, k, v, a, b, s)",
+    "delta_net_ar(s, q, k, v, g, beta)",
     "A X = B, A triangular, solve X",
 
     "unary(x)",
@@ -1141,7 +1167,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1250,27 +1276,33 @@ size_t ggml_nbytes_pad(const struct ggml_tensor * tensor) {
 }
 
 int64_t ggml_blck_size(enum ggml_type type) {
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
     return type_traits[type].blck_size;
 }
 
 size_t ggml_type_size(enum ggml_type type) {
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
     return type_traits[type].type_size;
 }
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne) {
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
     assert(ne % ggml_blck_size(type) == 0);
     return ggml_type_size(type)*ne/ggml_blck_size(type);
 }
 
-double ggml_type_sizef(enum ggml_type type) {
-    return ((double)(type_traits[type].type_size))/type_traits[type].blck_size;
-}
-
 const char * ggml_type_name(enum ggml_type type) {
-    return type < GGML_TYPE_COUNT ? type_traits[type].type_name : "NONE";
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
+    return type_traits[type].type_name;
 }
 
 bool ggml_is_quantized(enum ggml_type type) {
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
     return type_traits[type].is_quantized;
 }
 
@@ -1481,6 +1513,10 @@ bool ggml_are_same_stride(const struct ggml_tensor * t0, const struct ggml_tenso
         (t0->nb[3] == t1->nb[3]);
 }
 
+bool ggml_is_view(const struct ggml_tensor * t) {
+    return ggml_impl_is_view(t);
+}
+
 // check if t1 can be represented as a repetition of t0
 bool ggml_can_repeat(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
     static_assert(GGML_MAX_DIMS == 4, "GGML_MAX_DIMS is not 4 - update this function");
@@ -1610,10 +1646,22 @@ static struct ggml_object * ggml_new_object(struct ggml_context * ctx, enum ggml
     const size_t cur_end  = cur_offs + cur_size;
 
     // align to GGML_MEM_ALIGN
+    GGML_ASSERT(size <= SIZE_MAX - (GGML_MEM_ALIGN - 1));
     size_t size_needed = GGML_PAD(size, GGML_MEM_ALIGN);
 
     char * const mem_buffer = ctx->mem_buffer;
     struct ggml_object * const obj_new = (struct ggml_object *)(mem_buffer + cur_end);
+
+    // integer overflow checks
+    if (cur_end > SIZE_MAX - size_needed) {
+        GGML_LOG_WARN("%s: overflow detected in cur_end (%zu) + size_needed (%zu)\n", __func__, cur_end, size_needed);
+        return NULL;
+    }
+    if (cur_end + size_needed > SIZE_MAX - GGML_OBJECT_SIZE) {
+        GGML_LOG_WARN("%s: overflow detected in cur_end (%zu) + size_needed (%zu) + GGML_OBJECT_SIZE (%zu)\n", __func__,
+                cur_end, size_needed, (size_t) GGML_OBJECT_SIZE);
+        return NULL;
+    }
 
     if (cur_end + size_needed + GGML_OBJECT_SIZE > ctx->mem_size) {
         GGML_LOG_WARN("%s: not enough space in the context's memory pool (needed %zu, available %zu)\n",
@@ -1682,6 +1730,8 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         // allocate tensor data in the context's memory pool
         obj_alloc_size = data_size;
     }
+
+    GGML_ASSERT(GGML_TENSOR_SIZE <= SIZE_MAX - obj_alloc_size);
 
     struct ggml_object * const obj_new = ggml_new_object(ctx, GGML_OBJECT_TYPE_TENSOR, GGML_TENSOR_SIZE + obj_alloc_size);
     GGML_ASSERT(obj_new);
@@ -3459,7 +3509,8 @@ struct ggml_tensor * ggml_cast(
 
     result->op     = GGML_OP_CPY;
     result->src[0] = a;
-    result->src[1] = result;
+    result->src[1] = result; // note: this self-reference might seem redundant, but it's actually needed by some
+                             //       backends for consistency with ggml_cpy_impl() above
 
     return result;
 }
@@ -4856,6 +4907,8 @@ struct ggml_tensor * ggml_pool_1d(
         a->ne[2],
         a->ne[3],
     };
+    GGML_ASSERT(ne[0] > 0);
+
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     int32_t params[] = { op, k0, s0, p0 };
@@ -4886,6 +4939,9 @@ struct ggml_tensor * ggml_pool_2d(
         a->ne[2],
         a->ne[3],
     };
+    GGML_ASSERT(ne[0] > 0);
+    GGML_ASSERT(ne[1] > 0);
+
     result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     int32_t params[] = { op, k0, k1, s0, s1, p0, p1 };
@@ -4988,6 +5044,18 @@ struct ggml_tensor * ggml_pad(
     return ggml_pad_ext(ctx, a, 0, p0, 0, p1, 0, p2, 0, p3);
 }
 
+// ggml_pad_circular
+
+struct ggml_tensor * ggml_pad_circular(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   p0,
+        int                   p1,
+        int                   p2,
+        int                   p3) {
+    return ggml_pad_ext_circular(ctx, a, 0, p0, 0, p1, 0, p2, 0, p3);
+}
+
 struct ggml_tensor * ggml_pad_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -5014,11 +5082,31 @@ struct ggml_tensor * ggml_pad_ext(
     ggml_set_op_params_i32(result, 5, rp2);
     ggml_set_op_params_i32(result, 6, lp3);
     ggml_set_op_params_i32(result, 7, rp3);
+    ggml_set_op_params_i32(result, 8, 0); // not circular by default
 
 
     result->op     = GGML_OP_PAD;
     result->src[0] = a;
 
+    return result;
+}
+
+// ggml_pad_ext_circular
+
+struct ggml_tensor * ggml_pad_ext_circular(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                  lp0,
+        int                  rp0,
+        int                  lp1,
+        int                  rp1,
+        int                  lp2,
+        int                  rp2,
+        int                  lp3,
+        int                  rp3
+        ) {
+    struct ggml_tensor * result = ggml_pad_ext(ctx, a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+    ggml_set_op_params_i32(result, 8, 1); // circular
     return result;
 }
 
@@ -5248,8 +5336,6 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     if (mask) {
         GGML_ASSERT(ggml_is_contiguous(mask));
-        GGML_ASSERT(mask->ne[1] >= GGML_PAD(q->ne[1], GGML_KQ_MASK_PAD) &&
-                "the Flash-Attention kernel requires the mask to be padded to GGML_KQ_MASK_PAD and at least n_queries big");
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
@@ -5724,6 +5810,59 @@ struct ggml_tensor * ggml_rwkv_wkv7(
     return result;
 }
 
+// ggml_delta_net_ar
+
+struct ggml_tensor * ggml_delta_net_ar(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta) {
+    GGML_ASSERT(s); GGML_ASSERT(q); GGML_ASSERT(k); GGML_ASSERT(v); GGML_ASSERT(g); GGML_ASSERT(beta);
+    GGML_ASSERT(s->type    == GGML_TYPE_F32);
+    GGML_ASSERT(q->type    == GGML_TYPE_F32);
+    GGML_ASSERT(k->type    == GGML_TYPE_F32);
+    GGML_ASSERT(v->type    == GGML_TYPE_F32);
+    GGML_ASSERT(g->type    == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous(s));
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+
+    const int64_t S = s->ne[0];
+    const int64_t H = s->ne[2];
+    const int64_t N = s->ne[3];
+
+    GGML_ASSERT(s->ne[1] == S);
+    GGML_ASSERT(q->ne[0] == S && q->ne[1] == 1 && q->ne[2] == H && q->ne[3] == N);
+    GGML_ASSERT(k->ne[0] == S && k->ne[1] == 1 && k->ne[2] == H && k->ne[3] == N);
+    GGML_ASSERT(v->ne[0] == S && v->ne[1] == 1 && v->ne[2] == H && v->ne[3] == N);
+    GGML_ASSERT(g->ne[1] == 1 && g->ne[2] == H && g->ne[3] == N);
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S);
+    GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == 1 && beta->ne[2] == H && beta->ne[3] == N);
+
+    // Packed 1D result: [o (S*H*N) | s_out (S*S*H*N)].
+    const int64_t n_o     = S * H * N;
+    const int64_t n_s_out = S * S * H * N;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_o + n_s_out);
+
+    result->op     = GGML_OP_DELTA_NET_AR;
+    result->src[0] = s;
+    result->src[1] = q;
+    result->src[2] = k;
+    result->src[3] = v;
+    result->src[4] = g;
+    result->src[5] = beta;
+
+    return result;
+}
+
 // ggml_unary
 
 static struct ggml_tensor * ggml_unary_impl(
@@ -5731,7 +5870,7 @@ static struct ggml_tensor * ggml_unary_impl(
         struct ggml_tensor  * a,
         enum ggml_unary_op    op,
         bool                  inplace) {
-    GGML_ASSERT(ggml_is_contiguous_1(a));
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
@@ -5974,7 +6113,7 @@ struct ggml_tensor * ggml_cross_entropy_loss(
     result->op     = GGML_OP_CROSS_ENTROPY_LOSS;
     result->src[0] = a;
     result->src[1] = b;
-
+    
     // Initialize op_params to 0 (no masking)
     *(int32_t *)(result->op_params) = 0;
 
@@ -6593,7 +6732,7 @@ static void ggml_compute_backward(
         case GGML_OP_DIAG_MASK_INF: {
             if (src0_needs_grads) {
                 /* ggml_diag_mask_inf_impl() shouldn't be here */
-                /* ref:  https://github.com/ggerganov/llama.cpp/pull/4203#discussion_r1412377992 */
+                /* ref:  https://github.com/ggml-org/llama.cpp/pull/4203#discussion_r1412377992 */
                 const int n_past = ((const int32_t *) tensor->op_params)[0];
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_diag_mask_zero_impl(ctx, grad, n_past, false));
             }
@@ -6774,19 +6913,34 @@ static void ggml_compute_backward(
     GGML_ASSERT(!src2_needs_grads || ggml_are_same_shape(src2, cgraph->grads[isrc2]));
 }
 
-static size_t ggml_visit_parents(struct ggml_cgraph * cgraph, struct ggml_tensor * node) {
-    // check if already visited
-    size_t node_hash_pos = ggml_hash_find(&cgraph->visited_hash_set, node);
+static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_tensor * node, bool compute) {
+    if (node->op != GGML_OP_NONE && compute) {
+        node->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    }
+
+    const size_t node_hash_pos = ggml_hash_find(&cgraph->visited_hash_set, node);
     GGML_ASSERT(node_hash_pos != GGML_HASHSET_FULL);
-    if (!ggml_bitset_get(cgraph->visited_hash_set.used, node_hash_pos)) {
-        // This is the first time we see this node in the current graph.
-        cgraph->visited_hash_set.keys[node_hash_pos] = node;
-        ggml_bitset_set(cgraph->visited_hash_set.used, node_hash_pos);
-        cgraph->use_counts[node_hash_pos] = 0;
-    } else {
+
+    if (ggml_bitset_get(cgraph->visited_hash_set.used, node_hash_pos)) {
         // already visited
+
+        if (compute) {
+            // update the compute flag regardless
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                struct ggml_tensor * src = node->src[i];
+                if (src && ((src->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
+                    ggml_visit_parents_graph(cgraph, src, true);
+                }
+            }
+        }
+
         return node_hash_pos;
     }
+
+    // This is the first time we see this node in the current graph.
+    cgraph->visited_hash_set.keys[node_hash_pos] = node;
+    ggml_bitset_set(cgraph->visited_hash_set.used, node_hash_pos);
+    cgraph->use_counts[node_hash_pos] = 0;
 
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         const int k =
@@ -6796,7 +6950,7 @@ static size_t ggml_visit_parents(struct ggml_cgraph * cgraph, struct ggml_tensor
 
         struct ggml_tensor * src = node->src[k];
         if (src) {
-            size_t src_hash_pos = ggml_visit_parents(cgraph, src);
+            const size_t src_hash_pos = ggml_visit_parents_graph(cgraph, src, compute);
 
             // Update the use count for this operand.
             cgraph->use_counts[src_hash_pos]++;
@@ -6827,17 +6981,17 @@ static size_t ggml_visit_parents(struct ggml_cgraph * cgraph, struct ggml_tensor
     return node_hash_pos;
 }
 
-static void ggml_build_forward_impl(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor, bool expand) {
+static void ggml_build_forward_impl(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor, bool expand, bool compute) {
     if (!expand) {
         // TODO: this branch isn't accessible anymore, maybe move this to ggml_build_forward_expand
         ggml_graph_clear(cgraph);
     }
 
-    const int n0 = cgraph->n_nodes;
+    const int n_old = cgraph->n_nodes;
 
-    ggml_visit_parents(cgraph, tensor);
+    ggml_visit_parents_graph(cgraph, tensor, compute);
 
-    const int n_new = cgraph->n_nodes - n0;
+    const int n_new = cgraph->n_nodes - n_old;
     GGML_PRINT_DEBUG("%s: visited %d new nodes\n", __func__, n_new);
 
     if (n_new > 0) {
@@ -6846,8 +7000,22 @@ static void ggml_build_forward_impl(struct ggml_cgraph * cgraph, struct ggml_ten
     }
 }
 
+struct ggml_tensor * ggml_build_forward_select(
+        struct ggml_cgraph  * cgraph,
+        struct ggml_tensor ** tensors,
+        int                   n_tensors,
+        int                   idx) {
+    GGML_ASSERT(idx >= 0 && idx < n_tensors);
+
+    for (int i = 0; i < n_tensors; i++) {
+        ggml_build_forward_impl(cgraph, tensors[i], true, i == idx ? true : false);
+    }
+
+    return tensors[idx];
+}
+
 void ggml_build_forward_expand(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
-    ggml_build_forward_impl(cgraph, tensor, true);
+    ggml_build_forward_impl(cgraph, tensor, true, true);
 }
 
 void ggml_build_backward_expand(
@@ -7282,6 +7450,10 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
             return false;
         }
 
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+
         if (ggml_node_list_find_tensor(cgraph, outputs, num_outputs, node) != -1) {
             continue;
         }
@@ -7363,7 +7535,7 @@ static void ggml_graph_dump_dot_leaf_edge(FILE * fp, struct ggml_tensor * node, 
             label);
 }
 
-void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename) {
+void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * cgraph, const char * filename) {
     char color[16];
 
     FILE * fp = ggml_fopen(filename, "w");
@@ -7384,7 +7556,7 @@ void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph
         if (node->flags & GGML_TENSOR_FLAG_PARAM) {
             snprintf(color, sizeof(color), "yellow");
         } else if (grad) {
-            if (ggml_graph_find(gf, node)) {
+            if (ggml_graph_find(cgraph, node)) {
                 snprintf(color, sizeof(color), "green");
             } else {
                 snprintf(color, sizeof(color), "lightblue");
@@ -7536,8 +7708,11 @@ void ggml_quantize_free(void) {
 
     iq2xs_free_impl(GGML_TYPE_IQ2_XXS);
     iq2xs_free_impl(GGML_TYPE_IQ2_XS);
+    iq2xs_free_impl(GGML_TYPE_IQ2_S);
     iq2xs_free_impl(GGML_TYPE_IQ1_S);
+    iq2xs_free_impl(GGML_TYPE_IQ1_M);
     iq3xs_free_impl(256);
+    iq3xs_free_impl(512);
 
     ggml_critical_section_end();
 }
@@ -7626,6 +7801,11 @@ size_t ggml_quantize_chunk(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+void ggml_log_get(ggml_log_callback * log_callback, void ** user_data) {
+    *log_callback = g_logger_state.log_callback;
+    *user_data    = g_logger_state.log_callback_user_data;
+}
 
 void ggml_log_set(ggml_log_callback log_callback, void * user_data) {
     g_logger_state.log_callback = log_callback ? log_callback : ggml_log_callback_default;

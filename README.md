@@ -28,7 +28,7 @@ For usage details and CLI reference, see the [Finetuning Guide](examples/trainin
 
 ### BitNet Inference and Fine-Tuning *(exclusive)*
 
-Native support for [BitNet](https://arxiv.org/abs/2402.17764) ternary quantized models via the TQ2_0 data type, enabling efficient inference and LoRA fine-tuning of models such as [bitnet_b1_58-xl](https://huggingface.co/qvac/fabric-llm-finetune-bitnet) on resource-constrained devices.
+Native support for [BitNet](https://arxiv.org/abs/2402.17764) ternary quantized models via the TQ2_0 data type, enabling efficient inference and LoRA fine-tuning of models such as [bitnet_b1_58-xl](https://huggingface.co/gianni-cor/bitnet_b1_58-xl-TQ2_0) on resource-constrained devices.
 
 The official [microsoft/BitNet](https://github.com/microsoft/BitNet) inference framework provides optimized CPU kernels and GPU support limited to CUDA. `qvac-fabric-llm.cpp` **extends** BitNet to all major GPU backends -- Vulkan, Metal, and CPU -- bringing cross-platform GPU-accelerated BitNet inference and on-device fine-tuning to hardware not covered by the upstream framework, including Apple Silicon, mobile GPUs (Adreno, Mali), and AMD/Intel discrete GPUs. Compatible with models such as [bitnet_b1_58-3B](https://huggingface.co/1bitLLM/bitnet_b1_58-3B).
 

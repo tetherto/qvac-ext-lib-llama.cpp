@@ -16,6 +16,17 @@
 #include <string>
 #include <vector>
 
+#define GGUF_MAX_STRING_LENGTH  (1024*1024*1024)
+#define GGUF_MAX_ARRAY_ELEMENTS (1024*1024*1024)
+
+#ifdef _WIN32
+#    define gguf_ftell _ftelli64
+#    define gguf_fseek _fseeki64
+#else
+#    define gguf_ftell ftello
+#    define gguf_fseek fseeko
+#endif
+
 template <typename T>
 struct type_to_gguf_type;
 
@@ -294,6 +305,19 @@ struct gguf_reader {
 
     template <typename T>
     bool read(std::vector<T> & dst, const size_t n) const {
+        if (n > GGUF_MAX_ARRAY_ELEMENTS) {
+            return false;
+        }
+        if constexpr (std::is_same<T, std::string>::value) {
+            // strings are prefixed with their length, so we need to account for that
+            if (n > SIZE_MAX / sizeof(uint64_t)) {
+                return false;
+            }
+        } else {
+            if (n > SIZE_MAX / sizeof(T)) {
+                return false;
+            }
+        }
         dst.resize(n);
         for (size_t i = 0; i < dst.size(); ++i) {
             if constexpr (std::is_same<T, bool>::value) {
@@ -638,8 +662,8 @@ struct gguf_context * gguf_init_from_reader_impl(const struct gguf_reader& gr, s
 
             // check that tensor type is within defined range
             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT) {
-                GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d (%s)\n",
-                    __func__, info.t.name, info.t.type, ggml_type_name(info.t.type));
+                GGML_LOG_ERROR("%s: tensor '%s' has invalid ggml type %d. should be in [0, %d)\n",
+                    __func__, info.t.name, info.t.type, GGML_TYPE_COUNT);
                 ok = false;
                 break;
             }
@@ -651,6 +675,14 @@ struct gguf_context * gguf_init_from_reader_impl(const struct gguf_reader& gr, s
                 GGML_LOG_ERROR("%s: tensor '%s' of type %d (%s) has %" PRId64 " elements per row, "
                     "not a multiple of block size (%" PRId64 ")\n",
                     __func__, info.t.name, (int) info.t.type, ggml_type_name(info.t.type), info.t.ne[0], blck_size);
+                ok = false;
+                break;
+            }
+
+            // check that the size of the tensor in bytes is representable
+            if (ok && uint64_t(ggml_nelements(&info.t)/ggml_blck_size(info.t.type)) > SIZE_MAX/ggml_type_size(info.t.type)) {
+                GGML_LOG_ERROR("%s: tensor '%s' with shape (%" PRIi64 ", %" PRIi64 ", %" PRIi64 ", %" PRIi64 ") has a size in bytes > %zu\n",
+                    __func__, info.t.name, info.t.ne[0], info.t.ne[1], info.t.ne[2], info.t.ne[3], SIZE_MAX);
                 ok = false;
                 break;
             }
@@ -718,10 +750,34 @@ struct gguf_context * gguf_init_from_reader_impl(const struct gguf_reader& gr, s
         //   the ggml_tensor structs to the appropriate locations in the binary blob
 
         // compute the exact size needed for the new ggml_context
-        const size_t mem_size =
-            params.no_alloc ?
-            (n_tensors    )*ggml_tensor_overhead() :
-            (n_tensors + 1)*ggml_tensor_overhead() + ctx->size;
+        size_t mem_size = 0;
+        if (params.no_alloc) {
+            if (n_tensors != 0 && SIZE_MAX / n_tensors < ggml_tensor_overhead()) {
+                GGML_LOG_ERROR("%s: memory size overflow while allocating ggml context\n", __func__);
+                gguf_free(ctx);
+                return nullptr;
+            }
+
+            const size_t overhead = n_tensors * ggml_tensor_overhead();
+
+            mem_size = overhead;
+        } else {
+            if ((n_tensors + 1) != 0 && SIZE_MAX / (n_tensors + 1) < ggml_tensor_overhead()) {
+                GGML_LOG_ERROR("%s: memory size overflow while allocating ggml context\n", __func__);
+                gguf_free(ctx);
+                return nullptr;
+            }
+
+            const size_t overhead = (n_tensors + 1) * ggml_tensor_overhead();
+
+            if (SIZE_MAX - overhead < ctx->size) {
+                GGML_LOG_ERROR("%s: memory size overflow while allocating ggml context\n", __func__);
+                gguf_free(ctx);
+                return nullptr;
+            }
+
+            mem_size = overhead + ctx->size;
+        }
 
         struct ggml_init_params pdata = {
             /*mem_size   =*/ mem_size,
@@ -810,7 +866,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
     FILE * file = ggml_fopen(fname, "rb");
 
     if (!file) {
-        GGML_LOG_ERROR("%s: failed to open GGUF file '%s'\n", __func__, fname);
+        GGML_LOG_ERROR("%s: failed to open GGUF file '%s' (%s)\n", __func__, fname, strerror(errno));
         return nullptr;
     }
 

@@ -62,7 +62,12 @@ export enum FileTypeText {
 	VUE = 'vue',
 	SVELTE = 'svelte',
 	LATEX = 'latex',
-	BIBTEX = 'bibtex'
+	BIBTEX = 'bibtex',
+	CUDA = 'cuda',
+	VULKAN = 'vulkan',
+	HASKELL = 'haskell',
+	CSHARP = 'csharp',
+	PROPERTIES = 'properties'
 }
 
 // File extension enums
@@ -121,12 +126,38 @@ export enum FileExtensionText {
 	VUE = '.vue',
 	SVELTE = '.svelte',
 	TEX = '.tex',
-	BIB = '.bib'
+	BIB = '.bib',
+	CU = '.cu',
+	CUH = '.cuh',
+	COMP = '.comp',
+	HPP = '.hpp',
+	HS = '.hs',
+	PROPERTIES = '.properties',
+	CS = '.cs'
+}
+
+// MIME type prefixes and includes for content detection
+export enum MimeTypePrefix {
+	IMAGE = 'image/',
+	TEXT = 'text'
+}
+
+export enum MimeTypeIncludes {
+	JSON = 'json',
+	JAVASCRIPT = 'javascript',
+	TYPESCRIPT = 'typescript'
+}
+
+// URI patterns for content detection
+export enum UriPattern {
+	DATABASE_KEYWORD = 'database',
+	DATABASE_SCHEME = 'db://'
 }
 
 // MIME type enums
 export enum MimeTypeApplication {
-	PDF = 'application/pdf'
+	PDF = 'application/pdf',
+	OCTET_STREAM = 'application/octet-stream'
 }
 
 export enum MimeTypeAudio {
@@ -140,6 +171,7 @@ export enum MimeTypeAudio {
 
 export enum MimeTypeImage {
 	JPEG = 'image/jpeg',
+	JPG = 'image/jpg',
 	PNG = 'image/png',
 	GIF = 'image/gif',
 	WEBP = 'image/webp',
@@ -165,7 +197,10 @@ export enum MimeTypeText {
 	CSV = 'text/csv',
 	PYTHON = 'text/x-python',
 	JAVA = 'text/x-java-source',
+	CPP_HDR = 'text/x-c++hdr',
 	CPP_SRC = 'text/x-c++src',
+	CSHARP = 'text/x-csharp',
+	HASKELL = 'text/x-haskell',
 	C_SRC = 'text/x-csrc',
 	C_HDR = 'text/x-chdr',
 	PHP = 'text/x-php',
@@ -182,6 +217,10 @@ export enum MimeTypeText {
 	DART = 'text/x-dart',
 	VUE = 'text/x-vue',
 	SVELTE = 'text/x-svelte',
-	LATEX = 'text/x-tex',
-	BIBTEX = 'text/x-bibtex'
+	TEX = 'text/x-tex',
+	TEX_APP = 'application/x-tex',
+	LATEX = 'application/x-latex',
+	BIBTEX = 'text/x-bibtex',
+	CUDA = 'text/x-cuda',
+	PROPERTIES = 'text/properties'
 }

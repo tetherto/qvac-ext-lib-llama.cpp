@@ -1,11 +1,14 @@
 #pragma once
 
 #include "ggml.h"
+#include "mtmd.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
 // !!! Internal header, to be used by mtmd only !!!
+
+#define MTMD_INTERNAL_HEADER
 
 struct clip_ctx;
 
@@ -36,6 +39,9 @@ struct clip_context_params {
     int image_max_tokens;
     bool warmup;
     const char * backend_device; // optional, if null will use env var or default GPU backend
+    bool has_bf16_weights;
+    ggml_backend_sched_eval_callback cb_eval;
+    void * cb_eval_user_data;
 };
 
 struct clip_init_result {
@@ -93,9 +99,6 @@ struct clip_image_f32 * clip_image_f32_get_img(const struct clip_image_f32_batch
  */
 void clip_build_img_from_pixels(const unsigned char * rgb_pixels, int nx, int ny, struct clip_image_u8 * img);
 
-/** preprocess img and store the result in res_imgs, pad_to_square may be overridden to false depending on model configuration */
-bool clip_image_preprocess(struct clip_ctx * ctx, const struct clip_image_u8 * img, struct clip_image_f32_batch * res_imgs );
-
 struct ggml_tensor * clip_get_newline_tensor(const struct clip_ctx * ctx);
 
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, struct clip_image_f32 * img, float * vec);
@@ -103,9 +106,9 @@ bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct 
 
 int clip_is_minicpmv(const struct clip_ctx * ctx);
 bool clip_is_glm(const struct clip_ctx * ctx);
-bool clip_is_qwen2vl(const struct clip_ctx * ctx);
 bool clip_is_llava(const struct clip_ctx * ctx);
-bool clip_is_gemma3(const struct clip_ctx * ctx);
+// note for contributor: this clip_is_(model) pattern is deprecated
+//                       do NOT add new functions like this
 
 bool clip_encode_float_image (struct clip_ctx * ctx, int n_threads, float * img, int h, int w, float * vec);
 

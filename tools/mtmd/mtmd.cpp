@@ -2,6 +2,8 @@
 #include "clip-impl.h"
 #include "mtmd.h"
 #include "mtmd-audio.h"
+#include "mtmd-image.h"
+#include "debug/mtmd-debug.h"
 
 #include "llama.h"
 
@@ -85,6 +87,8 @@ enum mtmd_slice_tmpl {
     MTMD_SLICE_TMPL_MINICPMV_2_6,
     MTMD_SLICE_TMPL_LLAMA4,
     MTMD_SLICE_TMPL_IDEFICS3,
+    MTMD_SLICE_TMPL_LFM2,
+    MTMD_SLICE_TMPL_STEP3VL,
 };
 
 const char * mtmd_default_marker() {
@@ -105,13 +109,15 @@ mtmd_context_params mtmd_context_params_default() {
         /* use_gpu           */ true,
         /* print_timings     */ true,
         /* n_threads         */ 4,
-        /* image_marker      */ MTMD_DEFAULT_IMAGE_MARKER,
+        /* image_marker      */ nullptr,
         /* media_marker      */ mtmd_default_marker(),
         /* flash_attn_type   */ LLAMA_FLASH_ATTN_TYPE_AUTO,
         /* warmup            */ true,
+        /* backend_device    */ nullptr,
         /* image_min_tokens  */ -1,
         /* image_max_tokens  */ -1,
-        /* backend_device    */ nullptr,
+        /* cb_eval           */ nullptr,
+        /* cb_eval_user_data */ nullptr,
     };
     return params;
 }
@@ -126,6 +132,7 @@ struct mtmd_context {
     int n_threads;
     std::string media_marker;
     const int n_embd_text;
+    llama_rope_type decoder_rope;
 
     // these are not token, but strings used to mark the beginning and end of image/audio embeddings
     std::string img_beg;
@@ -135,7 +142,7 @@ struct mtmd_context {
 
     // for llava-uhd style models, we need special tokens in-between slices
     // minicpmv calls them "slices", llama 4 calls them "tiles"
-    mtmd_slice_tmpl slice_tmpl    = MTMD_SLICE_TMPL_NONE;
+    mtmd_slice_tmpl slice_tmpl = MTMD_SLICE_TMPL_NONE;
     std::vector<llama_token> tok_ov_img_start;  // overview image
     std::vector<llama_token> tok_ov_img_end;    // overview image
     std::vector<llama_token> tok_slices_start;  // start of all slices
@@ -144,16 +151,14 @@ struct mtmd_context {
     std::vector<llama_token> tok_sli_img_end;   // single slice end
     std::vector<llama_token> tok_sli_img_mid;   // between 2 slices
     std::vector<llama_token> tok_row_end;       // end of row
-    bool        tok_row_end_trail = false;
-    bool        ov_img_first      = false;
-
-    bool use_mrope = false; // for Qwen2VL, we need to use M-RoPE
+    bool tok_row_end_trail = false;
+    bool ov_img_first      = false;
 
     // string template for slice image delimiters with row/col (idefics3)
     std::string sli_img_start_tmpl;
 
-    // for whisper, we pre-calculate the mel filter bank
-    whisper_preprocessor::whisper_filters w_filters;
+    std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
+    std::unique_ptr<mtmd_image_preprocessor> image_preproc;
 
     // TODO @ngxson : add timings
 
@@ -164,9 +169,10 @@ struct mtmd_context {
         print_timings(ctx_params.print_timings),
         n_threads    (ctx_params.n_threads),
         media_marker (ctx_params.media_marker),
-        n_embd_text  (llama_model_n_embd_inp(text_model))
+        n_embd_text  (llama_model_n_embd_inp(text_model)),
+        decoder_rope (llama_model_rope_type(text_model))
     {
-        if (std::string(ctx_params.image_marker) != MTMD_DEFAULT_IMAGE_MARKER) {
+        if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
         }
 
@@ -176,11 +182,14 @@ struct mtmd_context {
 
         clip_context_params ctx_clip_params {
             /* use_gpu           */ ctx_params.use_gpu,
-            /* flash_attn_type   */ CLIP_FLASH_ATTN_TYPE_AUTO,
+            /* flash_attn_type   */ mtmd_get_clip_flash_attn_type(ctx_params.flash_attn_type),
             /* image_min_tokens  */ ctx_params.image_min_tokens,
             /* image_max_tokens  */ ctx_params.image_max_tokens,
             /* warmup            */ ctx_params.warmup,
             /* backend_device    */ ctx_params.backend_device,
+            /* has_bf16_weights  */ false, // set by clip_init after scanning the GGUF
+            /* cb_eval           */ ctx_params.cb_eval,
+            /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
@@ -220,123 +229,280 @@ struct mtmd_context {
 
     void init_vision() {
         GGML_ASSERT(ctx_v != nullptr);
-        use_mrope = clip_is_qwen2vl(ctx_v);
+        image_preproc.reset();
 
         projector_type proj = clip_get_projector_type(ctx_v);
-        int minicpmv_version = clip_is_minicpmv(ctx_v);
-        if (minicpmv_version == 2) {
-            // minicpmv 2.5 format:
-            // <image> (overview) </image><slice><image> (slice) </image><image> (slice) </image>\n ... </slice>
-            slice_tmpl        = MTMD_SLICE_TMPL_MINICPMV_2_5;
-            tok_ov_img_start  = {lookup_token("<image>")};
-            tok_ov_img_end    = {lookup_token("</image>")};
-            tok_slices_start  = {lookup_token("<slice>")};
-            tok_slices_end    = {lookup_token("</slice>")};
-            tok_sli_img_start = tok_ov_img_start;
-            tok_sli_img_end   = tok_ov_img_end;
-            tok_row_end       = {lookup_token("\n")};
-            tok_row_end_trail = false; // no trailing end-of-row token
-            ov_img_first      = true;
 
-        } else if (minicpmv_version == 3 || minicpmv_version == 4 || minicpmv_version == 5 || minicpmv_version == 6) {
-            // minicpmv 2.6 format:
-            // <image> (overview) </image><slice> (slice) </slice><slice> (slice) </slice>\n ...
-            slice_tmpl        = MTMD_SLICE_TMPL_MINICPMV_2_6;
-            tok_ov_img_start  = {lookup_token("<image>")};
-            tok_ov_img_end    = {lookup_token("</image>")};
-            tok_sli_img_start = {lookup_token("<slice>")};
-            tok_sli_img_end   = {lookup_token("</slice>")};
-            tok_row_end       = {lookup_token("\n")};
-            tok_row_end_trail = false; // no trailing end-of-row token
-            ov_img_first      = true;
+        switch (proj) {
+            case PROJECTOR_TYPE_MLP:
+            case PROJECTOR_TYPE_MLP_NORM:
+            case PROJECTOR_TYPE_LDP:
+            case PROJECTOR_TYPE_LDPV2:
+            case PROJECTOR_TYPE_COGVLM:
+            case PROJECTOR_TYPE_JANUS_PRO:
+            case PROJECTOR_TYPE_GLM_EDGE:
+                {
+                    bool has_pinpoints = !clip_get_hparams(ctx_v)->image_res_candidates.empty();
+                    if (has_pinpoints) {
+                        image_preproc = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
+                    } else {
+                        image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                    }
+                } break;
+            case PROJECTOR_TYPE_MINICPMV:
+                {
+                    int minicpmv_version = clip_is_minicpmv(ctx_v);
+                    if (minicpmv_version == 2) {
+                        // minicpmv 2.5 format:
+                        // <image> (overview) </image><slice><image> (slice) </image><image> (slice) </image>\n ... </slice>
+                        slice_tmpl        = MTMD_SLICE_TMPL_MINICPMV_2_5;
+                        tok_ov_img_start  = {lookup_token("<image>")};
+                        tok_ov_img_end    = {lookup_token("</image>")};
+                        tok_slices_start  = {lookup_token("<slice>")};
+                        tok_slices_end    = {lookup_token("</slice>")};
+                        tok_sli_img_start = tok_ov_img_start;
+                        tok_sli_img_end   = tok_ov_img_end;
+                        tok_row_end       = {lookup_token("\n")};
+                        tok_row_end_trail = false; // no trailing end-of-row token
+                        ov_img_first      = true;
+                    } else if (minicpmv_version == 3 || minicpmv_version == 4 || minicpmv_version == 5 || minicpmv_version == 6 || minicpmv_version == 100045) {
+                        // minicpmv 2.6 format:
+                        // <image> (overview) </image><slice> (slice) </slice><slice> (slice) </slice>\n ...
+                        slice_tmpl        = MTMD_SLICE_TMPL_MINICPMV_2_6;
+                        tok_ov_img_start  = {lookup_token("<image>")};
+                        tok_ov_img_end    = {lookup_token("</image>")};
+                        tok_sli_img_start = {lookup_token("<slice>")};
+                        tok_sli_img_end   = {lookup_token("</slice>")};
+                        tok_row_end       = {lookup_token("\n")};
+                        tok_row_end_trail = false; // no trailing end-of-row token
+                        ov_img_first      = true;
 
-        } else if (minicpmv_version != 0) {
-            GGML_ASSERT(false && "unsupported minicpmv version");
-        } else if (proj == PROJECTOR_TYPE_LLAMA4) {
-            // llama 4 format:
-            // <|image_start|>
-            //     (slice) <|tile_x_separator|> (slice) <|tile_x_separator|> ... <|tile_y_separator|>
-            //     (slice) <|tile_x_separator|> (slice) <|tile_x_separator|> ... <|tile_y_separator|>
-            //     ... <|tile_y_separator|>   <-- trailing end-of-row token
-            // <|image|> (overview)           <-- overview image is last
-            // <|image_end|>
-            slice_tmpl        = MTMD_SLICE_TMPL_LLAMA4;
-            tok_ov_img_start  = {lookup_token("<|image|>")};
-            tok_sli_img_mid   = {lookup_token("<|tile_x_separator|>")};
-            tok_row_end       = {lookup_token("<|tile_y_separator|>")};
-            tok_row_end_trail = true; // add trailing end-of-row token
-            ov_img_first      = false; // overview image is last
+                    } else if (minicpmv_version != 0) {
+                        throw std::runtime_error(string_format("unsupported minicpmv version: %d\n", minicpmv_version));
+                    }
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_QWEN2VL:
+            case PROJECTOR_TYPE_QWEN25VL:
+            case PROJECTOR_TYPE_QWEN3VL:
+                {
+                    // <|vision_start|> ... (image embeddings) ... <|vision_end|>
+                    img_beg = "<|vision_start|>";
+                    img_end = "<|vision_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_YOUTUVL:
+                {
+                    // <|vision_start|> ... (image embeddings) ... <|vision_end|>
+                    img_beg = "<|vision_start|>";
+                    img_end = "<|vision_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_youtuvl>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_GEMMA3:
+            case PROJECTOR_TYPE_GEMMA3NV:
+                {
+                    // <start_of_image> ... (image embeddings) ... <end_of_image>
+                    img_beg = "<start_of_image>";
+                    img_end = "<end_of_image>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_IDEFICS3:
+                {
+                    // https://github.com/huggingface/transformers/blob/a42ba80fa520c784c8f11a973ca9034e5f859b79/src/transformers/models/idefics3/processing_idefics3.py#L192-L215
+                    slice_tmpl         = MTMD_SLICE_TMPL_IDEFICS3;
+                    tok_ov_img_start   = {lookup_token("\n\n"), lookup_token("<fake_token_around_image>"), lookup_token("<global-img>")};
+                    tok_ov_img_end     = {lookup_token("<fake_token_around_image>")};
+                    tok_row_end        = {lookup_token("\n")};
+                    sli_img_start_tmpl = "<fake_token_around_image><row_%d_col_%d>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_idefics3>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_PIXTRAL:
+                {
+                    // https://github.com/huggingface/transformers/blob/1cd110c6cb6a6237614130c470e9a902dbc1a4bd/docs/source/en/model_doc/pixtral.md
+                    img_end = "[IMG_END]";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_PHI4:
+                {
+                    // Phi-4 uses media marker insertion only. Keep image boundary text empty.
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_LLAMA4:
+                {
+                    // (more details in mtmd_context constructor)
+                    img_beg = "<|image_start|>";
+                    img_end = "<|image_end|>";
+                    LOG_WRN("%s: llama 4 vision is known to have degraded quality:\n"
+                            "    https://github.com/ggml-org/llama.cpp/pull/13282\n", __func__);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_STEP3VL:
+                {
+                    // Step3 format:
+                    //   <patch_start> (patch) <patch_end> [<patch_newline>]
+                    //   ... (all patch rows)
+                    //   <im_start> (overview) <im_end>
+                    slice_tmpl        = MTMD_SLICE_TMPL_STEP3VL;
+                    tok_ov_img_start  = {lookup_token("<im_start>")};
+                    tok_ov_img_end    = {lookup_token("<im_end>")};
+                    tok_sli_img_start = {lookup_token("<patch_start>")};
+                    tok_sli_img_end   = {lookup_token("<patch_end>")};
+                    tok_row_end       = {lookup_token("<patch_newline>")};
+                    tok_row_end_trail = false;
+                    ov_img_first      = false; // patches first, overview last
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_step3vl>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_INTERNVL:
+                {
+                    // <img> ... (image embeddings) ... </img>
+                    img_beg = "<img>";
+                    img_end = "</img>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_internvl>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_KIMIVL:
+                {
+                    // <|media_start|> ... (image embeddings) ... <|media_end|>
+                    img_beg = "<|media_start|>";
+                    img_end = "<|media_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_KIMIK25:
+                {
+                    // <|media_begin|> ... (image embeddings) ... <|media_end|>
+                    img_beg = "<|media_begin|>";
+                    img_end = "<|media_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_LIGHTONOCR:
+                {
+                    // <|im_start|> ... (image embeddings) ... <|im_end|>
+                    img_beg = "<|im_start|>";
+                    img_end = "<|im_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_longest_edge>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_DOTS_OCR:
+                {
+                    // <|img|> ... (image embeddings) ... <|endofimg|>
+                    img_beg = "<|img|>";
+                    img_end = "<|endofimg|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_NEMOTRON_V2_VL:
+                {
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_LFM2:
+                {
+                    // multi-tile:
+                    //   <|image_start|>
+                    //     <|img_row_1_col_1|> (tile) <|img_row_1_col_2|> (tile) ...
+                    //     <|img_thumbnail|> (thumbnail)
+                    //   <|image_end|>
+                    // single-tile:
+                    //   <|image_start|> (image) <|image_end|>
+                    img_beg            = "<|image_start|>";
+                    img_end            = "<|image_end|>";
+                    slice_tmpl         = MTMD_SLICE_TMPL_LFM2;
+                    sli_img_start_tmpl = "<|img_row_%d_col_%d|>";
+                    tok_ov_img_start   = {lookup_token("<|img_thumbnail|>")};
+                    ov_img_first       = false;
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_lfm2>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_GLM4V:
+                {
+                    // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
+                    img_beg = "<|begin_of_image|>";
+                    img_end = "<|end_of_image|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_PADDLEOCR:
+                {
+                    // <|IMAGE_START|> ... (image embeddings) ... <|IMAGE_END|>
+                    img_beg = "<|IMAGE_START|>";
+                    img_end = "<|IMAGE_END|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_GEMMA4V:
+                {
+                    // <|image> ... (image embeddings) ... <image|>
+                    img_beg = "<|image>";
+                    img_end = "<image|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_DEEPSEEKOCR:
+                {
+                    img_end = "\n"; // prevent empty batch on llama-server
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_HUNYUANOCR:
+                {
+                    // note: these use fullwidth ｜ (U+FF5C) and ▁ (U+2581) to match the tokenizer vocabulary
+                    img_beg = "<｜hy_place▁holder▁no▁100｜>";
+                    img_end = "<｜hy_place▁holder▁no▁101｜>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            default:
+                throw std::runtime_error(string_format("%s: unexpected vision projector type %d\n", __func__, proj));
         }
 
-        // set boi/eoi
-        if (proj == PROJECTOR_TYPE_GEMMA3) {
-            // <start_of_image> ... (image embeddings) ... <end_of_image>
-            img_beg = "<start_of_image>";
-            img_end = "<end_of_image>";
-
-        } else if (proj == PROJECTOR_TYPE_IDEFICS3) {
-            // https://github.com/huggingface/transformers/blob/a42ba80fa520c784c8f11a973ca9034e5f859b79/src/transformers/models/idefics3/processing_idefics3.py#L192-L215
-            slice_tmpl         = MTMD_SLICE_TMPL_IDEFICS3;
-            tok_ov_img_start   = {lookup_token("\n\n"), lookup_token("<fake_token_around_image>"), lookup_token("<global-img>")};
-            tok_ov_img_end     = {lookup_token("<fake_token_around_image>")};
-            tok_row_end        = {lookup_token("\n")};
-            sli_img_start_tmpl = "<fake_token_around_image><row_%d_col_%d>";
-
-        } else if (proj == PROJECTOR_TYPE_PIXTRAL) {
-            // https://github.com/huggingface/transformers/blob/1cd110c6cb6a6237614130c470e9a902dbc1a4bd/docs/source/en/model_doc/pixtral.md
-            img_end = "[IMG_END]";
-
-        } else if (proj == PROJECTOR_TYPE_QWEN2VL || proj == PROJECTOR_TYPE_QWEN25VL || proj == PROJECTOR_TYPE_QWEN3VL) {
-            // <|vision_start|> ... (image embeddings) ... <|vision_end|>
-            img_beg = "<|vision_start|>";
-            img_end = "<|vision_end|>";
-
-        } else if (proj == PROJECTOR_TYPE_LLAMA4) {
-            // (more details in mtmd_context constructor)
-            img_beg = "<|image_start|>";
-            img_end = "<|image_end|>";
-            LOG_WRN("%s: llama 4 vision is known to have degraded quality:\n"
-                    "    https://github.com/ggml-org/llama.cpp/pull/13282\n", __func__);
-
-        } else if (proj == PROJECTOR_TYPE_INTERNVL) {
-            // <img> ... (image embeddings) ... </img>
-            img_beg = "<img>";
-            img_end = "</img>";
-
-        } else if (proj == PROJECTOR_TYPE_LIGHTONOCR) {
-            // <|im_start|> ... (image embeddings) ... <|im_end|>
-            img_beg = "<|im_start|>";
-            img_end = "<|im_end|>";
-
-        } else if (proj == PROJECTOR_TYPE_LFM2) {
-            img_beg = "<|image_start|>";
-            img_end = "<|image_end|>";
-
-        }
+        GGML_ASSERT(image_preproc != nullptr);
     }
 
     void init_audio() {
         GGML_ASSERT(ctx_a != nullptr);
-        projector_type proj = clip_get_projector_type(ctx_a);
+        audio_preproc.reset();
 
-        if (clip_has_whisper_encoder(ctx_a)) {
-            // TODO @ngxson : check if model n_mel is 128 or 80
-            w_filters = whisper_precalc_filters::get_128_bins();
-        }
+        projector_type proj = clip_get_projector_type(ctx_a);
 
         LOG_WRN("%s: audio input is in experimental stage and may have reduced quality:\n"
                 "    https://github.com/ggml-org/llama.cpp/discussions/13759\n", __func__);
 
-        if (proj == PROJECTOR_TYPE_QWEN2A) {
-            // <|audio_bos|> ... (embeddings) ... <|audio_eos|>
-            aud_beg = "<|audio_bos|>";
-            aud_end = "<|audio_eos|>";
-
-        } else if (proj == PROJECTOR_TYPE_ULTRAVOX) {
-            // [BEGIN_AUDIO] ... (embeddings) ...
-            aud_beg = "[BEGIN_AUDIO]";
-
+        // set preprocessor
+        switch (proj) {
+            case PROJECTOR_TYPE_QWEN2A:
+            case PROJECTOR_TYPE_QWEN3A:
+            case PROJECTOR_TYPE_QWEN25O:
+                {
+                    // <|audio_bos|> ... (embeddings) ... <|audio_eos|>
+                    aud_beg = "<|audio_bos|>";
+                    aud_end = "<|audio_eos|>";
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
+                } break;
+            case PROJECTOR_TYPE_VOXTRAL:
+                {
+                    // [BEGIN_AUDIO] ... (embeddings) ...
+                    aud_beg = "[BEGIN_AUDIO]";
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
+                } break;
+            case PROJECTOR_TYPE_MUSIC_FLAMINGO:
+                {
+                    // <sound> ... (embeddings) ...
+                    aud_beg = "<sound>";
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
+                } break;
+            case PROJECTOR_TYPE_ULTRAVOX:
+            case PROJECTOR_TYPE_GLMA:
+            case PROJECTOR_TYPE_MERALION:
+                {
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
+                } break;
+            case PROJECTOR_TYPE_LFM2A:
+                {
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_conformer>(ctx_a);
+                } break;
+            case PROJECTOR_TYPE_GEMMA4A:
+                {
+                    aud_beg = "<|audio>";
+                    aud_end = "<audio|>";
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_gemma4a>(ctx_a);
+                } break;
+            default:
+                throw std::runtime_error(string_format("%s: unexpected audio projector type %d\n", __func__, proj));
         }
+
+        // initialize audio preprocessor
+        GGML_ASSERT(audio_preproc != nullptr);
+        audio_preproc->initialize();
     }
 
     // get clip ctx based on chunk type
@@ -404,10 +570,6 @@ void mtmd_free(mtmd_context * ctx) {
     delete ctx;
 }
 
-void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_data) {
-    clip_log_set_callback(llama_cb, llama_user_data);
-}
-
 struct mtmd_tokenizer {
     mtmd_context * ctx;
     std::vector<const mtmd_bitmap *> bitmaps;
@@ -427,9 +589,6 @@ struct mtmd_tokenizer {
         parse_special = text->parse_special;
         input_text    = text->text;
         vocab         = llama_model_get_vocab(ctx->text_model);
-
-        // for compatibility, we convert image marker to media marker
-        string_replace_all(input_text, MTMD_DEFAULT_IMAGE_MARKER, ctx->media_marker);
     }
 
     int32_t tokenize(mtmd_input_chunks * output) {
@@ -529,6 +688,11 @@ struct mtmd_tokenizer {
                 add_text(ctx->img_beg, true); // add image begin token
             }
 
+            // sanity check
+            GGML_ASSERT(bitmap->nx > 0 && bitmap->ny > 0);
+            GGML_ASSERT(bitmap->data.size() == (size_t)bitmap->nx * bitmap->ny * 3);
+            GGML_ASSERT(ctx->image_preproc != nullptr);
+
             // convert mtmd_bitmap to clip_image_u8
             clip_image_u8_ptr img_u8(clip_image_u8_init());
             img_u8->nx = bitmap->nx;
@@ -538,18 +702,21 @@ struct mtmd_tokenizer {
 
             // preprocess image
             clip_image_f32_batch batch_f32;
-            bool ok = clip_image_preprocess(ctx->ctx_v, img_u8.get(), &batch_f32);
+            bool ok = ctx->image_preproc->preprocess(*img_u8, batch_f32);
             if (!ok) {
                 LOG_ERR("Unable to preprocess image\n");
                 return 2;
             }
 
             // handle llava-uhd style preprocessing
+            const bool has_tiling_grid = batch_f32.grid_x > 0 && batch_f32.grid_y > 0;
             if (
                 ctx->slice_tmpl == MTMD_SLICE_TMPL_MINICPMV_2_5
                 || ctx->slice_tmpl == MTMD_SLICE_TMPL_MINICPMV_2_6
                 || ctx->slice_tmpl == MTMD_SLICE_TMPL_LLAMA4
                 || ctx->slice_tmpl == MTMD_SLICE_TMPL_IDEFICS3
+                || ctx->slice_tmpl == MTMD_SLICE_TMPL_STEP3VL
+                || (ctx->slice_tmpl == MTMD_SLICE_TMPL_LFM2 && has_tiling_grid)
             ) {
                 const int n_col = batch_f32.grid_x;
                 const int n_row = batch_f32.grid_y;
@@ -611,7 +778,7 @@ struct mtmd_tokenizer {
                 }
 
                 mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
-                if (ctx->use_mrope) {
+                if (mtmd_decode_use_mrope(ctx)) {
                     // for Qwen2VL, we need this information for M-RoPE decoding positions
                     image_tokens->nx = clip_n_output_tokens_x(ctx->ctx_v, batch_f32.entries[0].get());
                     image_tokens->ny = clip_n_output_tokens_y(ctx->ctx_v, batch_f32.entries[0].get());
@@ -658,12 +825,16 @@ struct mtmd_tokenizer {
                 add_text(ctx->aud_beg, true); // add audio begin token
             }
 
+            // sanity check
+            GGML_ASSERT(ctx->audio_preproc != nullptr);
+            GGML_ASSERT(bitmap->data.size() > sizeof(float));
+            GGML_ASSERT(bitmap->data.size() % sizeof(float) == 0);
+
             // preprocess audio
-            GGML_ASSERT(ctx->w_filters.n_mel); // make sure we have filter preloaded
-            std::vector<whisper_preprocessor::whisper_mel> mel_spec_chunks;
+            std::vector<mtmd_audio_mel> mel_spec_chunks;
             const float * samples = (const float *)bitmap->data.data();
             size_t n_samples = bitmap->data.size() / sizeof(float);
-            bool ok = whisper_preprocessor::preprocess_audio(samples, n_samples, ctx->w_filters, mel_spec_chunks);
+            bool ok = ctx->audio_preproc->preprocess(samples, n_samples, mel_spec_chunks);
             if (!ok) {
                 LOG_ERR("Unable to preprocess audio\n");
                 return 2;
@@ -814,13 +985,15 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
         LOG_ERR("%s: this API does not support non-vision input, please use mtmd_encode_chunk instead\n", __func__);
         return 1;
     }
+    auto proj_type = clip_get_projector_type(ctx_clip);
     int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
     ctx->image_embd_v.resize(image_tokens->n_tokens() * n_mmproj_embd);
     bool ok = false;
 
     if (clip_is_llava(ctx_clip)
         || clip_is_minicpmv(ctx_clip)
-        || clip_is_glm(ctx_clip)) {
+        || clip_is_glm(ctx_clip)
+        || proj_type == PROJECTOR_TYPE_INTERNVL) {
         // TODO @ngxson : llava does not support batched encoding ; this should be fixed inside clip_image_batch_encode()
         const auto & entries = image_tokens->batch_f32.entries;
         for (size_t i = 0; i < entries.size(); i++) {
@@ -846,15 +1019,23 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->image_embd_v.data();
 }
 
-bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
-    if (ctx->ctx_v && clip_get_projector_type(ctx->ctx_v) == PROJECTOR_TYPE_GEMMA3) {
-        return true;
+bool mtmd_decode_use_non_causal(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
+    auto proj_type = ctx->proj_type_v();
+    if (chunk && chunk->type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+        proj_type = ctx->proj_type_a();
     }
-    return false;
+    switch (proj_type) {
+        case PROJECTOR_TYPE_GEMMA3:
+        case PROJECTOR_TYPE_GEMMA4V:
+            return true;
+        default:
+            return false;
+    }
 }
 
 bool mtmd_decode_use_mrope(mtmd_context * ctx) {
-    return ctx->use_mrope;
+    return ctx->decoder_rope == LLAMA_ROPE_TYPE_MROPE
+        || ctx->decoder_rope == LLAMA_ROPE_TYPE_IMROPE;
 }
 
 bool mtmd_support_vision(mtmd_context * ctx) {
@@ -865,12 +1046,11 @@ bool mtmd_support_audio(mtmd_context * ctx) {
     return ctx->ctx_a != nullptr;
 }
 
-int mtmd_get_audio_bitrate(mtmd_context * ctx) {
+int mtmd_get_audio_sample_rate(mtmd_context * ctx) {
     if (!ctx->ctx_a) {
         return -1;
     }
-    // for now, we assume that all audio models have the same bitrate
-    return 16000; // 16kHz
+    return clip_get_hparams(ctx->ctx_a)->audio_sample_rate;
 }
 
 //
@@ -1059,6 +1239,17 @@ size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
     return image_tokens->ny;
 }
 
+mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i) {
+    mtmd_decoder_pos pos;
+    // M-RoPE logic
+    // TODO: support other types of position encoding if needed
+    pos.t = pos_0;
+    pos.x = pos_0 + (i % image_tokens->nx);
+    pos.y = pos_0 + (i / image_tokens->nx);
+    pos.z = 0; // unused for now
+    return pos;
+}
+
 const char * mtmd_image_tokens_get_id(const mtmd_image_tokens * image_tokens) {
     return image_tokens->id.c_str();
 }
@@ -1110,4 +1301,106 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
 void mtmd_log_set(ggml_log_callback log_callback, void * user_data) {
     g_logger_state.log_callback = log_callback ? log_callback : clip_log_callback_default;
     g_logger_state.log_callback_user_data = user_data;
+}
+
+//
+// Debugging API (NOT intended for public use)
+//
+
+static void mtmd_debug_encode_impl(mtmd_context * ctx, clip_ctx * ctx_clip, clip_image_f32 & image) {
+    clip_set_debug_output_embeddings(ctx_clip, true);
+    int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
+    int n_tokens = clip_n_output_tokens(ctx_clip, &image);
+    std::vector<float> embd_output(n_tokens * n_mmproj_embd, 0.0f);
+    bool ok = clip_image_encode(
+        ctx_clip,
+        ctx->n_threads,
+        &image,
+        embd_output.data());
+    if (!ok) {
+        LOG_ERR("%s: failed to encode image\n", __func__);
+    }
+}
+
+void mtmd_debug_encode_image(mtmd_context * ctx, const std::vector<std::vector<float>> & image) {
+    if (!ctx->ctx_v) {
+        LOG_ERR("%s: model does not support vision input\n", __func__);
+        return;
+    }
+    clip_image_f32 inp_image;
+    inp_image.nx = image.size();
+    inp_image.ny = inp_image.nx;
+    inp_image.buf.reserve(inp_image.nx * inp_image.ny);
+    for (const auto & row : image) {
+        inp_image.buf.insert(inp_image.buf.end(), row.begin(), row.end());
+    }
+    LOG_INF("%s: created input image with nx=%d, ny=%d\n", __func__, inp_image.nx, inp_image.ny);
+    mtmd_debug_encode_impl(ctx, ctx->ctx_v, inp_image);
+}
+
+void mtmd_debug_encode_audio(mtmd_context * ctx, const std::vector<float> & input) {
+    if (!ctx->ctx_a) {
+        LOG_ERR("%s: model does not support audio input\n", __func__);
+        return;
+    }
+    int n_mel = clip_get_hparams(ctx->ctx_a)->n_mel_bins;
+    clip_image_f32 inp_audio;
+    inp_audio.nx = input.size();
+    inp_audio.ny = n_mel;
+    inp_audio.buf.resize(input.size() * n_mel);
+    for (size_t i = 0; i < input.size(); i++) {
+        for (int j = 0; j < n_mel; j++) {
+            inp_audio.buf[j * inp_audio.nx + i] = input[i];
+        }
+    }
+    LOG_INF("%s: created input audio with nx=%d, ny=%d\n", __func__, inp_audio.nx, inp_audio.ny);
+    mtmd_debug_encode_impl(ctx, ctx->ctx_a, inp_audio);
+}
+
+void mtmd_debug_preprocess_image(mtmd_context * ctx, const std::vector<uint8_t> & rgb_values, int nx, int ny) {
+    if (!ctx->ctx_v) {
+        LOG_ERR("%s: model does not support vision input\n", __func__);
+        return;
+    }
+    clip_image_u8 img_u8;
+    img_u8.nx = nx;
+    img_u8.ny = ny;
+    img_u8.buf = rgb_values;
+    clip_image_f32_batch batch_f32;
+    GGML_ASSERT(ctx->image_preproc != nullptr);
+    bool ok = ctx->image_preproc->preprocess(img_u8, batch_f32);
+    if (!ok) {
+        LOG_ERR("%s: failed to preprocess image\n", __func__);
+        return;
+    }
+    LOG_INF("%s: preprocessed image to batch_f32 with %d entries\n", __func__, (int)batch_f32.entries.size());
+    for (size_t i = 0; i < batch_f32.entries.size(); i++) {
+        LOG_INF("%s: entry %zu has nx=%d, ny=%d\n", __func__, i, batch_f32.entries[i]->nx, batch_f32.entries[i]->ny);
+        // TODO: better way to dump entry content?
+    }
+}
+
+void mtmd_debug_preprocess_audio(mtmd_context * ctx, const std::vector<float> & samples) {
+    if (!ctx->ctx_a) {
+        LOG_ERR("%s: model does not support audio input\n", __func__);
+        return;
+    }
+    std::vector<mtmd_audio_mel> mel_spec_chunks;
+    bool ok = ctx->audio_preproc->preprocess(samples.data(), samples.size(), mel_spec_chunks);
+    if (!ok) {
+        LOG_ERR("%s: failed to preprocess audio\n", __func__);
+        return;
+    }
+    LOG_INF("%s: preprocessed audio to %zu mel spec chunks\n", __func__, mel_spec_chunks.size());
+    for (size_t i = 0; i < mel_spec_chunks.size(); i++) {
+        LOG_INF("%s: mel spec chunk %zu has n_len=%d, n_mel=%d\n", __func__, i, mel_spec_chunks[i].n_len, mel_spec_chunks[i].n_mel);
+
+        // dump mel entries: data is stored as [n_mel][n_len] (mel-major)
+        const auto & mel = mel_spec_chunks[i];
+        for (int m = 0; m < mel.n_mel; m++) {
+            for (int t = 0; t < mel.n_len; t++) {
+                LOG_INF("mel[%zu][m=%d][t=%d] = %f\n", i, m, t, mel.data[m * mel.n_len + t]);
+            }
+        }
+    }
 }

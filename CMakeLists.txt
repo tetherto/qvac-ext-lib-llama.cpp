@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14) # for add_link_options and implicit target directories.
+cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
 project("llama.cpp" C CXX)
 include(CheckIncludeFileCXX)
 
@@ -73,6 +73,12 @@ if (MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/bigobj>")
 endif()
 
+if (LLAMA_STANDALONE)
+    # enable parallel builds for msbuild
+    list(APPEND CMAKE_VS_GLOBALS UseMultiToolTask=true)
+    list(APPEND CMAKE_VS_GLOBALS EnforceProcessCountAcrossBuilds=true)
+endif()
+
 if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(LLAMA_TOOLS_INSTALL_DEFAULT OFF)
 else()
@@ -104,14 +110,13 @@ option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
+option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
 
 # specific extras
 option(LLAMA_MTMD "llama: multimodal support" ${LLAMA_BUILD_TOOLS})
 
 # 3rd party libs
-option(LLAMA_CURL       "llama: use libcurl to download model from an URL" ON)
-option(LLAMA_HTTPLIB    "llama: if libcurl is disabled, use httplib to download model from an URL" ON)
-option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" OFF)
+option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
 # profiling
@@ -143,10 +148,15 @@ if (NOT DEFINED GGML_CUDA_GRAPHS)
 endif()
 
 # transition helpers
-function (llama_option_depr TYPE OLD NEW)
+function (llama_option_depr TYPE OLD)
     if (${OLD})
-        message(${TYPE} "${OLD} is deprecated and will be removed in the future.\nUse ${NEW} instead\n")
-        set(${NEW} ON PARENT_SCOPE)
+        set(NEW "${ARGV2}")
+        if(NEW)
+            message(${TYPE} "${OLD} is deprecated, use ${NEW} instead")
+            set(${NEW} ON PARENT_SCOPE)
+        else()
+            message(${TYPE} "${OLD} is deprecated and will be ignored")
+        endif()
     endif()
 endfunction()
 
@@ -159,29 +169,10 @@ llama_option_depr(WARNING     LLAMA_RPC                 GGML_RPC)
 llama_option_depr(WARNING     LLAMA_SYCL                GGML_SYCL)
 llama_option_depr(WARNING     LLAMA_SYCL_F16            GGML_SYCL_F16)
 llama_option_depr(WARNING     LLAMA_CANN                GGML_CANN)
+llama_option_depr(WARNING     LLAMA_CURL)
 
-if (NOT MSVC)
-    if (LLAMA_SANITIZE_THREAD)
-        message(STATUS "Using -fsanitize=thread")
-
-        add_compile_options(-fsanitize=thread)
-        link_libraries     (-fsanitize=thread)
-    endif()
-
-    if (LLAMA_SANITIZE_ADDRESS)
-        message(STATUS "Using -fsanitize=address")
-
-        add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-        link_libraries     (-fsanitize=address)
-    endif()
-
-    if (LLAMA_SANITIZE_UNDEFINED)
-        message(STATUS "Using -fsanitize=undefined")
-
-        add_compile_options(-fsanitize=undefined)
-        link_libraries     (-fsanitize=undefined)
-    endif()
-endif()
+include("cmake/license.cmake")
+license_add_file("llama.cpp" "LICENSE")
 
 #
 # 3rd-party
@@ -200,11 +191,6 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
-if (MINGW)
-    # Target Windows 8 for PrefetchVirtualMemory
-    add_compile_definitions(_WIN32_WINNT=${GGML_WIN_VER})
-endif()
-
 #
 # build the library
 #
@@ -218,16 +204,9 @@ add_subdirectory(src)
 # utils, programs, examples and tests
 #
 
-if (NOT LLAMA_BUILD_COMMON)
-    message(STATUS "LLAMA_BUILD_COMMON is OFF, disabling LLAMA_CURL")
-    set(LLAMA_CURL OFF)
-endif()
-
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
-    if (LLAMA_HTTPLIB)
-        add_subdirectory(vendor/cpp-httplib)
-    endif()
+    add_subdirectory(vendor/cpp-httplib)
 endif()
 
 if(LLAMA_BUILD_EXAMPLES OR LLAMA_BUILD_TESTS)
@@ -250,6 +229,19 @@ elseif (LLAMA_MTMD)
     add_subdirectory(tools/mtmd)
 endif()
 
+endif() # NOT BUILD_LLAMA
+
+# Automatically add all files from the 'licenses' directory
+file(GLOB EXTRA_LICENSES "${CMAKE_SOURCE_DIR}/licenses/LICENSE-*")
+
+foreach(FILE_PATH ${EXTRA_LICENSES})
+    get_filename_component(FILE_NAME "${FILE_PATH}" NAME)
+    string(REGEX REPLACE "^LICENSE-" "" NAME "${FILE_NAME}")
+    license_add_file("${NAME}" "${FILE_PATH}")
+endforeach()
+
+if (LLAMA_BUILD_COMMON)
+    license_generate(common)
 endif()
 
 #
@@ -280,11 +272,9 @@ install(
 
 if (LLAMA_BUILD_COMMON)
 
-  if (NOT LLAMA_CURL AND LLAMA_HTTPLIB)
-    install(
+  install(
       TARGETS cpp-httplib
       EXPORT llama-targets)
-  endif()
 
   install(
     TARGETS common build_info
@@ -350,4 +340,4 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
-endif()
+endif() # BUILD_LLAMA

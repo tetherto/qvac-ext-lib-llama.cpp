@@ -672,7 +672,7 @@ layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufTQ2
 };
 
 #define TQ2_CM2 1
-#include "tq_utils.comp"
+#include "tq_utils.glsl"
 #undef TQ2_CM2
 
 float16_t dequantFuncTQ2_0(const in decodeBufTQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])

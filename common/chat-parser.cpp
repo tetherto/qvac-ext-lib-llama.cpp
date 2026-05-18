@@ -1,6 +1,8 @@
 #include "chat-parser.h"
+#include "chat-peg-parser.h"
 #include "common.h"
 #include "log.h"
+#include "peg-parser.h"
 #include "regex-partial.h"
 
 #include <algorithm>
@@ -127,7 +129,7 @@ static void parse_json_tool_calls(
     }
 }
 
-common_chat_msg_parser::common_chat_msg_parser(const std::string & input, bool is_partial, const common_chat_syntax & syntax)
+common_chat_msg_parser::common_chat_msg_parser(const std::string & input, bool is_partial, const common_chat_parser_params & syntax)
     : input_(input), is_partial_(is_partial), syntax_(syntax)
 {
     result_.role = "assistant";
@@ -796,6 +798,113 @@ static void common_chat_parse_llama_3_1(common_chat_msg_parser & builder, bool w
 
 }
 
+// Convert Gemma 4's tool-call argument syntax into JSON.
+// Gemma 4 uses <|"|>...<|"|> for strings instead of "..." and bare keys (no quotes).
+// This is a best-effort converter: it handles strings, numbers, booleans, null, nested
+// dicts/arrays, and a few common edge cases. For strict correctness on all inputs the
+// full upstream PEG parser would be needed.
+static std::string gemma4_args_to_json(const std::string & input) {
+    std::string out;
+    out.reserve(input.size() + 8);
+    size_t i = 0;
+    bool in_string  = false;
+
+    // Track where we are: 'k' expecting a dict key, 'v' expecting a value
+    auto at_key_start = [&]() {
+        // peek back to find nearest non-space structural char
+        for (int64_t j = (int64_t)out.size() - 1; j >= 0; --j) {
+            char c = out[j];
+            if (c == ' ' || c == '\n' || c == '\t' || c == '\r') continue;
+            return c == '{' || c == ',';
+        }
+        return false;
+    };
+
+    while (i < input.size()) {
+        // Detect gemma4 string quote <|"|>
+        if (!in_string && i + 5 <= input.size() && input.compare(i, 5, "<|\"|>") == 0) {
+            in_string = true;
+            out += '"';
+            i += 5;
+            continue;
+        }
+        if (in_string && i + 5 <= input.size() && input.compare(i, 5, "<|\"|>") == 0) {
+            in_string = false;
+            out += '"';
+            i += 5;
+            continue;
+        }
+
+        if (in_string) {
+            char c = input[i++];
+            if (c == '"') { out += "\\\""; }
+            else if (c == '\\') { out += "\\\\"; }
+            else if (c == '\n') { out += "\\n"; }
+            else if (c == '\r') { out += "\\r"; }
+            else if (c == '\t') { out += "\\t"; }
+            else { out += c; }
+            continue;
+        }
+
+        // Outside strings: quote bare dict keys before ':'
+        char c = input[i];
+        if ((std::isalpha((unsigned char)c) || c == '_') && at_key_start()) {
+            // Consume identifier
+            size_t j = i;
+            while (j < input.size() && (std::isalnum((unsigned char)input[j]) || input[j] == '_')) j++;
+            out += '"';
+            out.append(input, i, j - i);
+            out += '"';
+            i = j;
+            continue;
+        }
+
+        out += c;
+        i++;
+    }
+
+    return out;
+}
+
+// Parse Gemma 4's format: reasoning channel + tool calls.
+//   reasoning: <|channel>thought\n...\n<channel|>
+//   tool call: <|tool_call>call:name{args}<tool_call|>
+static void common_chat_parse_gemma4(common_chat_msg_parser & builder) {
+    // 1) Reasoning channel (thinking) — model-emitted
+    builder.try_parse_reasoning("<|channel>thought\n", "\n<channel|>");
+
+    if (!builder.syntax().parse_tool_calls) {
+        builder.add_content(builder.consume_rest());
+        return;
+    }
+
+    // 2) Tool calls. Use regex to find <|tool_call>call:NAME{ARGS}<tool_call|>
+    static const std::regex tool_call_re(R"(<\|tool_call>call:([^{]+)\{([\s\S]*?)\}<tool_call\|>)");
+
+    std::string rest = builder.consume_rest();
+    auto begin = std::sregex_iterator(rest.begin(), rest.end(), tool_call_re);
+    auto end   = std::sregex_iterator();
+
+    size_t last_end = 0;
+    for (auto it = begin; it != end; ++it) {
+        const auto & m = *it;
+        // Emit any plain content preceding the tool call
+        if ((size_t)m.position() > last_end) {
+            builder.add_content(rest.substr(last_end, m.position() - last_end));
+        }
+        std::string name = m[1].str();
+        std::string args_raw = m[2].str();
+        // Strip trailing whitespace from name
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\t' || name.back() == '\n')) name.pop_back();
+        std::string args_json = "{" + gemma4_args_to_json(args_raw) + "}";
+        builder.add_tool_call(name, /*id=*/"", args_json);
+        last_end = m.position() + m.length();
+    }
+    if (last_end < rest.size()) {
+        builder.add_content(rest.substr(last_end));
+    }
+}
+
 static void common_chat_parse_deepseek_r1(common_chat_msg_parser & builder) {
     builder.try_parse_reasoning("<think>", "</think>");
     if (!builder.syntax().parse_tool_calls) {
@@ -891,23 +1000,6 @@ static void common_chat_parse_minimax_m2(common_chat_msg_parser & builder) {
     builder.consume_reasoning_with_xml_tool_calls(form, "<think>", "</think>");
 }
 
-static void common_chat_parse_qwen3_coder_xml(common_chat_msg_parser & builder) {
-    static const xml_tool_call_format form = ([]() {
-        xml_tool_call_format form {};
-        form.scope_start = "<tool_call>";
-        form.tool_start  = "<function=";
-        form.tool_sep    = ">";
-        form.key_start   = "<parameter=";
-        form.key_val_sep = ">";
-        form.val_end     = "</parameter>";
-        form.tool_end    = "</function>";
-        form.scope_end   = "</tool_call>";
-        form.trim_raw_argval = true;
-        return form;
-    })();
-    builder.consume_reasoning_with_xml_tool_calls(form);
-}
-
 static void common_chat_parse_kimi_k2(common_chat_msg_parser & builder) {
     static const xml_tool_call_format form = ([]() {
         xml_tool_call_format form {};
@@ -915,12 +1007,13 @@ static void common_chat_parse_kimi_k2(common_chat_msg_parser & builder) {
         form.tool_start  = "<|tool_call_begin|>";
         form.tool_sep    = "<|tool_call_argument_begin|>{";
         form.key_start   = "\"";
-        form.key_val_sep = "\": ";
-        form.val_end     = ", ";
+        form.key_val_sep = "\":";
+        form.val_end     = ",";
         form.tool_end    = "}<|tool_call_end|>";
         form.scope_end   = "<|tool_calls_section_end|>";
         form.raw_argval  = false;
         form.last_val_end = "";
+        form.allow_toolcall_in_think = true;
         return form;
     })();
     builder.consume_reasoning_with_xml_tool_calls(form, "<think>", "</think>");
@@ -1392,6 +1485,126 @@ static void common_chat_parse_seed_oss(common_chat_msg_parser & builder) {
     builder.consume_reasoning_with_xml_tool_calls(form, "<seed:think>", "</seed:think>");
 }
 
+static void common_chat_parse_solar_open(common_chat_msg_parser & builder) {
+    builder.try_parse_reasoning("<|think|>", "<|end|><|begin|>assistant<|content|>");
+
+    // TODO: Tool calling
+
+    builder.add_content(builder.consume_rest());
+}
+
+static void common_chat_parse_exaone_moe_content(common_chat_msg_parser & builder) {
+    // 1) <tool_call>{ "name": "...", "arguments": {...} }</tool_call>
+    // 2) <tool_call>{ "id": "...", "type": "function", "function": { "name": "...", "arguments": {...} } }</tool_call>
+    static const common_regex tool_call_open(R"(<tool_call[^>]*>)");
+
+    if (!builder.syntax().parse_tool_calls) {
+        LOG_DBG("%s: not parse_tool_calls\n", __func__);
+        builder.add_content(builder.consume_rest());
+        return;
+    }
+
+    LOG_DBG("%s: parse_tool_calls\n", __func__);
+
+    // Find all <tool_call></tool_call> blocks
+    while (auto first = builder.try_find_regex(tool_call_open, std::string::npos, /* add_prelude_to_content= */ true)) {
+        builder.move_to(first->groups[0].end);
+        builder.consume_spaces();
+
+        builder.try_consume_literal("```json");
+        builder.try_consume_literal("```");
+        builder.consume_spaces();
+
+        // Consume JSON object
+        auto data = builder.consume_json();
+
+        builder.consume_spaces();
+        builder.try_consume_literal("```");
+        builder.consume_spaces();
+
+        if (!builder.try_consume_literal("</tool_call>")) {
+            throw common_chat_msg_partial_exception("incomplete tool call");
+        }
+        builder.consume_spaces();
+
+        // Extract name and arguments
+        std::string name;
+        std::string id;
+        nlohmann::ordered_json arguments;
+
+        const auto extract_args = [&](const nlohmann::ordered_json & obj) -> bool {
+            if (!obj.contains("name") || !obj.contains("arguments")) {
+                return false;
+            }
+            name = obj.at("name").get<std::string>();
+            arguments = obj.at("arguments");
+            if (obj.contains("id") && obj.at("id").is_string()) {
+                id = obj.at("id").get<std::string>();
+            }
+            return true;
+        };
+
+        if (!extract_args(data.json)) {
+            if (data.json.contains("function") && data.json.at("function").is_object()) {
+                auto fn = data.json.at("function");
+                extract_args(fn);
+                if (id.empty() && data.json.contains("id") && data.json.at("id").is_string()) {
+                    id = data.json.at("id").get<std::string>();
+                }
+            }
+        }
+
+        // If name is empty, treat the JSON object as content
+        if (name.empty()) {
+            LOG_DBG("%s: tool call missing name, treating as content\n", __func__);
+            builder.add_content(data.json.dump());
+            continue;
+        }
+
+        std::string args_str = arguments.dump();
+        if (!builder.add_tool_call(name, id, args_str)) {
+            throw common_chat_msg_partial_exception("incomplete tool call");
+        }
+    }
+
+    builder.add_content(builder.consume_rest());
+}
+
+static void common_chat_parse_exaone_moe(common_chat_msg_parser & builder) {
+    LOG_DBG("%s: parsing exaone_moe\n", __func__);
+    // EXAONE MoE outputs reasoning content between "<think>" and "</think>" tags, followed by regular content
+    // First try to parse using the standard reasoning parsing method
+    LOG_DBG("%s: thinking_forced_open: %s\n", __func__, std::to_string(builder.syntax().thinking_forced_open).c_str());
+
+    auto start_pos = builder.pos();
+    auto found_end_think = builder.try_find_literal("</think>");
+    builder.move_to(start_pos);
+
+    if (builder.syntax().thinking_forced_open && !builder.is_partial() && !found_end_think) {
+        LOG_DBG("%s: no end_think, not partial, adding content\n", __func__);
+        common_chat_parse_exaone_moe_content(builder);
+    } else if (builder.try_parse_reasoning("<think>", "</think>")) {
+        // If reasoning was parsed successfully, the remaining content is regular content
+        LOG_DBG("%s: parsed reasoning, adding content\n", __func__);
+        common_chat_parse_exaone_moe_content(builder);
+    } else {
+        if (builder.syntax().reasoning_format == COMMON_REASONING_FORMAT_NONE) {
+          LOG_DBG("%s: reasoning_format none, adding content\n", __func__);
+          common_chat_parse_exaone_moe_content(builder);
+          return;
+        }
+        // If no reasoning tags found, check if we should treat everything as reasoning
+        if (builder.syntax().thinking_forced_open) {
+            // If thinking is forced open but no tags found, treat everything as reasoning
+            LOG_DBG("%s: thinking_forced_open, adding reasoning content\n", __func__);
+            builder.add_reasoning_content(builder.consume_rest());
+        } else {
+            LOG_DBG("%s: no thinking_forced_open, adding content\n", __func__);
+            common_chat_parse_exaone_moe_content(builder);
+        }
+    }
+}
+
 static void common_chat_parse_content_only(common_chat_msg_parser & builder) {
     builder.try_parse_reasoning("<think>", "</think>");
     builder.add_content(builder.consume_rest());
@@ -1421,6 +1634,9 @@ static void common_chat_parse(common_chat_msg_parser & builder) {
             break;
         case COMMON_CHAT_FORMAT_DEEPSEEK_R1:
             common_chat_parse_deepseek_r1(builder);
+            break;
+        case COMMON_CHAT_FORMAT_GEMMA4:
+            common_chat_parse_gemma4(builder);
             break;
         case COMMON_CHAT_FORMAT_DEEPSEEK_V3_1:
             common_chat_parse_deepseek_v3_1(builder);
@@ -1467,14 +1683,17 @@ static void common_chat_parse(common_chat_msg_parser & builder) {
         case COMMON_CHAT_FORMAT_KIMI_K2:
             common_chat_parse_kimi_k2(builder);
             break;
-        case COMMON_CHAT_FORMAT_QWEN3_CODER_XML:
-            common_chat_parse_qwen3_coder_xml(builder);
-            break;
         case COMMON_CHAT_FORMAT_APRIEL_1_5:
             common_chat_parse_apriel_1_5(builder);
             break;
         case COMMON_CHAT_FORMAT_XIAOMI_MIMO:
             common_chat_parse_xiaomi_mimo(builder);
+            break;
+        case COMMON_CHAT_FORMAT_SOLAR_OPEN:
+            common_chat_parse_solar_open(builder);
+            break;
+        case COMMON_CHAT_FORMAT_EXAONE_MOE:
+            common_chat_parse_exaone_moe(builder);
             break;
         default:
             throw std::runtime_error(std::string("Unsupported format: ") + common_chat_format_name(builder.syntax().format));
@@ -1482,7 +1701,12 @@ static void common_chat_parse(common_chat_msg_parser & builder) {
     builder.finish();
 }
 
-common_chat_msg common_chat_parse(const std::string & input, bool is_partial, const common_chat_syntax & syntax) {
+common_chat_msg common_chat_parse(const std::string & input, bool is_partial, const common_chat_parser_params & syntax) {
+    if (syntax.format == COMMON_CHAT_FORMAT_PEG_SIMPLE ||
+        syntax.format == COMMON_CHAT_FORMAT_PEG_NATIVE ||
+        syntax.format == COMMON_CHAT_FORMAT_PEG_CONSTRUCTED) {
+        return common_chat_peg_parse(syntax.parser, input, is_partial, syntax);
+    }
     common_chat_msg_parser builder(input, is_partial, syntax);
     try {
         common_chat_parse(builder);
@@ -1496,7 +1720,40 @@ common_chat_msg common_chat_parse(const std::string & input, bool is_partial, co
     }
     auto msg = builder.result();
     if (!is_partial) {
-        LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat<json>({msg}).at(0).dump().c_str());
+        LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({msg}).at(0).dump().c_str());
+    }
+    return msg;
+}
+
+common_chat_msg common_chat_peg_parse(const common_peg_arena & parser, const std::string & input, bool is_partial, const common_chat_parser_params & syntax) {
+    if (parser.empty()) {
+        throw std::runtime_error("Failed to parse due to missing parser definition.");
+    }
+
+    LOG_DBG("Parsing input with format %s: %s\n", common_chat_format_name(syntax.format), input.c_str());
+
+    common_peg_parse_context ctx(input, is_partial);
+    auto result = parser.parse(ctx);
+    if (result.fail()) {
+        throw std::runtime_error(std::string("Failed to parse input at pos ") + std::to_string(result.end));
+    }
+
+    common_chat_msg msg;
+    msg.role = "assistant";
+
+    if (syntax.format == COMMON_CHAT_FORMAT_PEG_NATIVE) {
+        auto mapper = common_chat_peg_native_mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+    } else if (syntax.format == COMMON_CHAT_FORMAT_PEG_CONSTRUCTED) {
+        auto mapper = common_chat_peg_constructed_mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+    } else {
+        // Generic mapper
+        auto mapper = common_chat_peg_mapper(msg);
+        mapper.from_ast(ctx.ast, result);
+    }
+    if (!is_partial) {
+        LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({msg}).at(0).dump().c_str());
     }
     return msg;
 }

@@ -77,6 +77,13 @@ export function getFileTypeCategory(mimeType: string): FileTypeCategory | null {
 		case MimeTypeText.SVELTE:
 		case MimeTypeText.LATEX:
 		case MimeTypeText.BIBTEX:
+		case MimeTypeText.CUDA:
+		case MimeTypeText.CPP_HDR:
+		case MimeTypeText.CSHARP:
+		case MimeTypeText.HASKELL:
+		case MimeTypeText.PROPERTIES:
+		case MimeTypeText.TEX:
+		case MimeTypeText.TEX_APP:
 			return FileTypeCategory.TEXT;
 
 		default:
@@ -144,6 +151,12 @@ export function getFileTypeCategoryByExtension(filename: string): FileTypeCatego
 		case FileExtensionText.SVELTE:
 		case FileExtensionText.TEX:
 		case FileExtensionText.BIB:
+		case FileExtensionText.COMP:
+		case FileExtensionText.CU:
+		case FileExtensionText.CUH:
+		case FileExtensionText.HPP:
+		case FileExtensionText.HS:
+		case FileExtensionText.PROPERTIES:
 			return FileTypeCategory.TEXT;
 
 		default:
@@ -182,9 +195,28 @@ export function getFileTypeByExtension(filename: string): string | null {
 }
 
 export function isFileTypeSupported(filename: string, mimeType?: string): boolean {
-	if (mimeType && getFileTypeCategory(mimeType)) {
+	// Images are detected and handled separately for vision models
+	if (mimeType) {
+		const category = getFileTypeCategory(mimeType);
+		if (
+			category === FileTypeCategory.IMAGE ||
+			category === FileTypeCategory.AUDIO ||
+			category === FileTypeCategory.PDF
+		) {
+			return true;
+		}
+	}
+
+	// Check extension for known types (especially images without MIME)
+	const extCategory = getFileTypeCategoryByExtension(filename);
+	if (
+		extCategory === FileTypeCategory.IMAGE ||
+		extCategory === FileTypeCategory.AUDIO ||
+		extCategory === FileTypeCategory.PDF
+	) {
 		return true;
 	}
 
-	return getFileTypeByExtension(filename) !== null;
+	// Fallback: treat everything else as text (inclusive by default)
+	return true;
 }
