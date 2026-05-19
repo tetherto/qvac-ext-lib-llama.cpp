@@ -674,7 +674,12 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                         ggml_metal_library_free(lib);
                     }
                 }
-                if (!dev->props.has_simdgroup_mm) {
+                // Only probe simdgroup_mm on Apple GPUs, simdgroup_half8x8 / simdgroup_load(half)
+                // is an Apple-family hardware feature; trying to compile this pipeline on
+                // Intel/AMD Mac GPUs always fails and the existing pipeline compiler logs the
+                // failure via GGML_LOG_ERROR("incompatible pipeline ..."), which test harnesses
+                // pattern-match as fatal.
+                if (!dev->props.has_simdgroup_mm && [dev->mtl_device supportsFamily:MTLGPUFamilyApple1]) {
                     const char * src_simd_mm =
                         "#include <metal_stdlib>\n"
                         "using namespace metal;\n"
