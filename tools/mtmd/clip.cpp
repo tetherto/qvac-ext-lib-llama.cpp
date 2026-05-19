@@ -1373,7 +1373,16 @@ struct clip_model_loader {
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         // @ngxson : the model performs quite poor with small images, we need to bump minimum image tokens to 40 to avoid that
                         hparams.set_limit_image_tokens(252, 280);
-                        hparams.set_warmup_n_tokens(256); // avoid OOM on warmup
+                        // intentionally NOT calling set_warmup_n_tokens here: the previous
+                        // set_warmup_n_tokens(256) would override warmup_image_size with a
+                        // size smaller than the real-image max (280 tokens), so the gallocr
+                        // reserved a buffer that didn't fit the actual graph and tripped the
+                        // bounds assert in ggml_backend_tensor_alloc on iOS Heavy9-Gemma4.
+                        // Letting set_limit_image_tokens(252, 280) seed warmup_image_size
+                        // for the 280-token upper bound matches what the real run will need.
+                        // The memory cost is small here (max=280 tokens) compared to other
+                        // projectors with thousands of tokens where the OOM-on-warmup guard
+                        // matters.
                     } break;
 
                 case PROJECTOR_TYPE_GEMMA3NV:
