@@ -57,8 +57,26 @@ ACC_TYPE Max(const in uint32_t row, const in uint32_t col, const in ACC_TYPE ele
 
 #if BLOCK_SIZE > 1
 #define DECODEFUNC , DEQUANTFUNC
+#endif
+
+// Decode function setup for K and V.
+// Mixed-type mode: DEQUANTFUNC_K / DEQUANTFUNC_V passed as defines.
+// Same-type mode: DEQUANTFUNC passed as a single define, applied to both.
+// Unquantized (f16): no decode function needed.
+#if defined(DEQUANTFUNC_K)
+#define DECODEFUNC_K , DEQUANTFUNC_K
+#elif defined(DEQUANTFUNC)
+#define DECODEFUNC_K , DEQUANTFUNC
 #else
-#define DECODEFUNC
+#define DECODEFUNC_K
+#endif
+
+#if defined(DEQUANTFUNC_V)
+#define DECODEFUNC_V , DEQUANTFUNC_V
+#elif defined(DEQUANTFUNC)
+#define DECODEFUNC_V , DEQUANTFUNC
+#else
+#define DECODEFUNC_V
 #endif
 
 // Store the output when doing grouped query attention.
@@ -94,6 +112,20 @@ ACC_TYPE perElemOpNonGqaSplitKStoreCol0(const in uint32_t r, const in uint32_t c
     return elem;
 }
 
+#ifdef HAS_QJL_CORRECTION
+shared float qjl_proj_sh[Br][HSK];
+shared float qjl_corr_sh[Br][Bc];
+#endif
+
+ACC_TYPE perElemAddQjlCorrection(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem)
+{
+#ifdef HAS_QJL_CORRECTION
+    return elem + ACC_TYPE(qjl_corr_sh[r][c]);
+#else
+    return elem;
+#endif
+}
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -111,6 +143,12 @@ void main() {
     tensorLayoutK = setTensorLayoutBlockSizeNV(tensorLayoutK, 1, BLOCK_SIZE);
     tensorLayoutV = setTensorLayoutBlockSizeNV(tensorLayoutV, 1, BLOCK_SIZE);
 #endif
+#if defined(K_BLOCK_SIZE) && K_BLOCK_SIZE > 1
+    tensorLayoutK = setTensorLayoutBlockSizeNV(tensorLayoutK, 1, K_BLOCK_SIZE);
+#endif
+#if defined(V_BLOCK_SIZE) && V_BLOCK_SIZE > 1
+    tensorLayoutV = setTensorLayoutBlockSizeNV(tensorLayoutV, 1, V_BLOCK_SIZE);
+#endif
 
     tensorLayoutQ = setTensorLayoutDimensionNV(tensorLayoutQ, N, HSK);
     tensorLayoutK = setTensorLayoutDimensionNV(tensorLayoutK, KV, HSK);
@@ -120,8 +158,10 @@ void main() {
     if (Clamp != gl_CooperativeMatrixClampModeConstantNV)
     {
         q_stride &= ~7;
-#if BLOCK_SIZE == 1
+#if BLOCK_SIZE == 1 || !defined(K_BLOCK_SIZE) || K_BLOCK_SIZE <= 1
         k_stride &= ~7;
+#endif
+#if !defined(V_BLOCK_SIZE) || V_BLOCK_SIZE <= 1
         v_stride &= ~7;
 #endif
         m_stride &= ~7;
@@ -138,6 +178,50 @@ void main() {
 
     Qf16 = coopmat<float16_t, gl_ScopeWorkgroup, Br, HSK_pad, gl_MatrixUseA>(Q);
     Qf16 *= float16_t(p.scale);
+
+#ifdef HAS_QJL_CORRECTION
+    // Pre-compute QJL projection of Q: proj_q = FHT(D_qjl * q)
+    {
+        const uint32_t tid = gl_LocalInvocationIndex;
+        const uint32_t wg_size = gl_WorkGroupSize.x;
+
+        // Load raw Q (un-scaled) into shared memory, apply QJL sign diagonal
+        for (uint32_t idx = tid; idx < Br * HSK; idx += wg_size) {
+            uint32_t r = idx / HSK;
+            uint32_t d = idx % HSK;
+            float q_val = 0.0;
+            if (i * Br + r < N) {
+                uint32_t q_byte_offset = q_offset + (i * Br + r) * q_stride * 4 + d * 4;
+                q_val = uintBitsToFloat(
+                    uint(data_q[q_byte_offset]) |
+                    (uint(data_q[q_byte_offset + 1]) << 8u) |
+                    (uint(data_q[q_byte_offset + 2]) << 16u) |
+                    (uint(data_q[q_byte_offset + 3]) << 24u));
+            }
+            qjl_proj_sh[r][d] = q_val * qjl_get_sign(d);
+        }
+        barrier();
+
+        // FHT in-place per row. Parallelize butterfly pairs across all threads.
+        for (uint h = 1u; h < HSK; h <<= 1u) {
+            for (uint32_t fi = tid; fi < Br * (HSK / 2u); fi += wg_size) {
+                uint32_t r   = fi / (HSK / 2u);
+                uint32_t idx = fi % (HSK / 2u);
+                if (i * Br + r < N) {
+                    uint grp = idx / h;
+                    uint pos = idx % h;
+                    uint j = grp * (h << 1u) + pos;
+                    float a = qjl_proj_sh[r][j];
+                    float b = qjl_proj_sh[r][j + h];
+                    qjl_proj_sh[r][j]     = a + b;
+                    qjl_proj_sh[r][j + h] = a - b;
+                }
+            }
+            barrier();
+        }
+        barrier();
+    }
+#endif
 
     coopmat<float16_t, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator> O = coopmat<float16_t, gl_ScopeWorkgroup, Br, HSV_pad, gl_MatrixUseAccumulator>(0);
 
@@ -230,8 +314,72 @@ void main() {
         coopmat<float16_t, gl_ScopeWorkgroup, HSK_pad, Bc, gl_MatrixUseB> K_T;
 
         uint32_t k_offset = ik2*p.nb12 + ik3*p.nb13;
-        coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose DECODEFUNC);
+        coopMatLoadTensorNV(K_T, data_k, k_offset, sliceTensorLayoutNV(tensorLayoutK, j * Bc, Bc, 0, HSK_pad), tensorViewTranspose DECODEFUNC_K);
         S = coopMatMulAdd(Qf16, K_T, S);
+
+#ifdef HAS_QJL_CORRECTION
+        // QJL Stage 2 correction: for each score S[r,c], add
+        //   scale * d_r[c] * sqrt(π/2) / HSK * dot(proj_Q[r], sign_K[c])
+        // Compute correction matrix in shared memory, then add to S.
+        {
+            const uint32_t tid = gl_LocalInvocationIndex;
+            const uint32_t wg_size = gl_WorkGroupSize.x;
+            const float qjl_scale = p.scale * sqrt(1.5707963) / float(HSK);
+
+            for (uint32_t idx = tid; idx < Br * Bc; idx += wg_size) {
+                uint32_t r = idx / Bc;
+                uint32_t c = idx % Bc;
+                uint32_t kv_col = j * Bc + c;
+                float corr = 0.0;
+                if (i * Br + r < N && kv_col < KV) {
+                    uint32_t block_byte_off = k_offset + kv_col * k_stride * uint32_t(K_BLOCK_BYTE_SIZE);
+#if defined(DATA_K_TBQ3_0)
+                    const uint32_t qjl_off = block_byte_off + 50u;
+                    const uint32_t dr_off  = block_byte_off + 66u;
+#elif defined(DATA_K_TBQ3_0_64)
+                    const uint32_t qjl_off = block_byte_off + 26u;
+                    const uint32_t dr_off  = block_byte_off + 34u;
+#elif defined(DATA_K_TBQ4_0)
+                    const uint32_t qjl_off = block_byte_off + 66u;
+                    const uint32_t dr_off  = block_byte_off + 82u;
+#elif defined(DATA_K_TBQ4_0_64)
+                    const uint32_t qjl_off = block_byte_off + 34u;
+                    const uint32_t dr_off  = block_byte_off + 42u;
+#endif
+                    uint16_t dr_bits = uint16_t(data_k[dr_off]) | (uint16_t(data_k[dr_off + 1u]) << 8u);
+                    float d_r = float(uint16BitsToHalf(dr_bits));
+                    if (d_r > 1e-15) {
+                        float pos_sum = 0.0;
+                        float total_sum = 0.0;
+                        [[unroll]] for (uint w = 0u; w < HSK / 32u; w++) {
+                            uint boff = qjl_off + w * 4u;
+                            uint bits = uint(data_k[boff])
+                                      | (uint(data_k[boff + 1u]) << 8u)
+                                      | (uint(data_k[boff + 2u]) << 16u)
+                                      | (uint(data_k[boff + 3u]) << 24u);
+                            uint dd0 = w * 32u;
+                            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                                vec4 pq = vec4(qjl_proj_sh[r][dd0 + q * 4u],
+                                               qjl_proj_sh[r][dd0 + q * 4u + 1u],
+                                               qjl_proj_sh[r][dd0 + q * 4u + 2u],
+                                               qjl_proj_sh[r][dd0 + q * 4u + 3u]);
+                                vec4 mask = vec4(float(bits & 1u), float((bits >> 1u) & 1u),
+                                                 float((bits >> 2u) & 1u), float((bits >> 3u) & 1u));
+                                pos_sum += dot(mask, pq);
+                                total_sum += pq.x + pq.y + pq.z + pq.w;
+                                bits >>= 4u;
+                            }
+                        }
+                        corr = qjl_scale * d_r * (2.0 * pos_sum - total_sum);
+                    }
+                }
+                qjl_corr_sh[r][c] = corr;
+            }
+            barrier();
+            coopMatPerElementNV(S, S, perElemAddQjlCorrection);
+            barrier();
+        }
+#endif
 
         if (LOGIT_SOFTCAP) {
             [[unroll]]
@@ -291,7 +439,7 @@ void main() {
 
         coopmat<float16_t, gl_ScopeWorkgroup, Bc, HSV_pad, gl_MatrixUseB> V;
         uint32_t v_offset = iv2*p.nb22 + iv3*p.nb23;
-        coopMatLoadTensorNV(V,  data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc, Bc, 0, HSV_pad) DECODEFUNC);
+        coopMatLoadTensorNV(V,  data_v, v_offset, sliceTensorLayoutNV(tensorLayoutV, j * Bc, Bc, 0, HSV_pad) DECODEFUNC_V);
 
         L = eM*L + rowsum;
 

@@ -76,6 +76,10 @@ shared vec4 occupancy_limiter[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM 
 #include "flash_attn_mmq_funcs.glsl"
 #endif
 
+#ifdef HAS_QJL_CORRECTION
+shared float Qf_qjl_proj[Br][QUANT_K];
+#endif
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -144,6 +148,46 @@ void main() {
     }
     barrier();
 
+#ifdef HAS_QJL_CORRECTION
+    // Pre-compute QJL projection of Q: proj_q = FHT(D_qjl * q).
+    //
+    // Read Q straight from the input SSBO (data_qv4). The alternative is to
+    // read the already-loaded Qf shared array and divide by p.scale to undo
+    // the p.scale that was multiplied into Qf for the main Q·K dot. For the
+    // scalar FA path Qf is f32 and p.scale is usually a power of two
+    // (1/sqrt(head_dim)), so the round-trip is mathematically exact; for
+    // the coopmat1 path Qf is f16, which makes the round-trip lossy for
+    // large-magnitude activations. Reading the raw f32 Q directly avoids
+    // both issues and matches what the non-FA mul_mm_tbq_qjl_correction pass
+    // does with src1.
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        if (i * Br + r < N) {
+            for (uint32_t idx = tid; idx < QUANT_K; idx += gl_WorkGroupSize.x) {
+                vec4 qv = vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + idx / 4]);
+                float q_val = qv[idx % 4];
+                Qf_qjl_proj[r][idx] = q_val * qjl_get_sign(idx);
+            }
+        }
+        barrier();
+
+        if (i * Br + r < N) {
+            for (uint h = 1u; h < QUANT_K; h <<= 1u) {
+                for (uint idx = tid; idx < QUANT_K / 2u; idx += gl_WorkGroupSize.x) {
+                    uint grp = idx / h;
+                    uint pos = idx % h;
+                    uint j = grp * (h << 1u) + pos;
+                    float a = Qf_qjl_proj[r][j];
+                    float b = Qf_qjl_proj[r][j + h];
+                    Qf_qjl_proj[r][j]     = a + b;
+                    Qf_qjl_proj[r][j + h] = a - b;
+                }
+                barrier();
+            }
+        }
+        barrier();
+    }
+#endif
+
     FLOAT_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
@@ -177,11 +221,19 @@ void main() {
     // mo_offset will point to the tile starting at row i*Br and col 0
     uint32_t mo_offset = mo_stride * i;
 
-#if BLOCK_SIZE > 1
+#if K_BLOCK_SIZE > 1
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / K_BLOCK_BYTE_SIZE;
+#elif BLOCK_SIZE > 1
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
 #else
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
+#endif
+
+#if V_BLOCK_SIZE > 1
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / V_BLOCK_BYTE_SIZE;
+#elif BLOCK_SIZE > 1
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
+#else
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
 #endif
     uint32_t m_offset = gqa_iq1*KV;
@@ -257,7 +309,12 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSK / 4 || c < Bc) {
                     FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
-#if BLOCK_SIZE > 1
+#if K_BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c) * k_stride * K_BLOCK_SIZE + 4 * d;
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
+                        K_Tf = FLOAT_TYPEV4(dequantize4_k(ib, iqs, k_offset));
+#elif BLOCK_SIZE > 1
                         uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE + 4 * d;
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
@@ -311,7 +368,12 @@ void main() {
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
-#if BLOCK_SIZE > 1
+#if K_BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
+                        K_Tf = FLOAT_TYPEV4(dequantize4_k(ib, iqs, k_offset));
+#elif BLOCK_SIZE > 1
                         uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
@@ -326,17 +388,59 @@ void main() {
                 }
             }
         } else {
+#ifdef HAS_CENTROID_K
+            // Centroid trick (gather formulation): extract indices from K,
+            // then for each centroid accumulate matching Q components.
+            // Avoids codebook LUT lookup in the inner loop entirely.
             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
                 if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
                     continue;
                 }
+                uint coord0 = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE;
+                uint ib0 = coord0 / K_BLOCK_SIZE;
 
+                uvec4 indices[HSK_per_thread / 4];
+                [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
+                    indices[d] = k_get_indices4(ib0, 4u * (d * D_split + d_tid), k_offset);
+                }
+
+                float k_scale = k_get_scale(ib0, k_offset);
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    float score = 0.0;
+                    [[unroll]] for (uint32_t ci = 0; ci < K_NUM_CENTROIDS; ++ci) {
+                        float bin = 0.0;
+                        [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
+                            FLOAT_TYPEV4 qv = Qf[tile_row(r) * qf_stride + d * D_split + d_tid];
+                            bin += (indices[d].x == ci ? float(qv.x) : 0.0)
+                                 + (indices[d].y == ci ? float(qv.y) : 0.0)
+                                 + (indices[d].z == ci ? float(qv.z) : 0.0)
+                                 + (indices[d].w == ci ? float(qv.w) : 0.0);
+                        }
+#if K_NUM_CENTROIDS == 8
+                        score += TBQ3_CB[ci] * bin;
+#else
+                        score += TBQ4_CB[ci] * bin;
+#endif
+                    }
+                    Sf[r][c] += ACC_TYPE(k_scale * score);
+                }
+            }
+#else
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                    continue;
+                }
                 [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
                     FLOAT_TYPEV4 K_Tf;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
-#if BLOCK_SIZE > 1
+#if K_BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
+                        K_Tf = FLOAT_TYPEV4(dequantize4_k(ib, iqs, k_offset));
+#elif BLOCK_SIZE > 1
                         uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
@@ -350,6 +454,7 @@ void main() {
                     }
                 }
             }
+#endif // HAS_CENTROID_K
         }
 #else // MMQ
         const uint hsk4 = HSK_per_thread / 4;
@@ -465,6 +570,27 @@ void main() {
             }
         }
 
+#ifdef HAS_QJL_CORRECTION
+        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+            if (i * Br + r >= N) continue;
+            vec4 proj_q_v4[QUANT_K / 4];
+            float proj_q_sum = 0.0;
+            [[unroll]] for (uint jj = 0u; jj < QUANT_K / 4u; jj++) {
+                proj_q_v4[jj] = vec4(Qf_qjl_proj[r][jj * 4u],
+                                     Qf_qjl_proj[r][jj * 4u + 1u],
+                                     Qf_qjl_proj[r][jj * 4u + 2u],
+                                     Qf_qjl_proj[r][jj * 4u + 3u]);
+                proj_q_sum += proj_q_v4[jj].x + proj_q_v4[jj].y + proj_q_v4[jj].z + proj_q_v4[jj].w;
+            }
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                uint32_t kv_col = j * Bc + c * cols_per_iter + col_tid;
+                if (KV_bounds_check && kv_col >= KV) continue;
+                uint32_t k_block = kv_col * k_stride;
+                Sf[r][c] += ACC_TYPE(p.scale * qjl_correction_k(k_block, k_offset, proj_q_sum, proj_q_v4));
+            }
+        }
+#endif
+
         if (LOGIT_SOFTCAP) {
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
@@ -516,7 +642,12 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
-#if BLOCK_SIZE > 1
+#if V_BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c) * v_stride * V_BLOCK_SIZE + 4 * d;
+                        uint ib = coord / V_BLOCK_SIZE;
+                        uint iqs = (coord % V_BLOCK_SIZE);
+                        V_Tf = FLOAT_TYPEV4(dequantize4_v(ib, iqs, v_offset));
+#elif BLOCK_SIZE > 1
                         uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
                         uint ib = coord / BLOCK_SIZE;
                         uint iqs = (coord % BLOCK_SIZE);
@@ -548,7 +679,12 @@ void main() {
                 if (SHMEM_STAGING != 0) {
                     Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                 } else {
-#if BLOCK_SIZE > 1
+#if V_BLOCK_SIZE > 1
+                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * V_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                    uint ib = coord / V_BLOCK_SIZE;
+                    uint iqs = (coord % V_BLOCK_SIZE);
+                    Vf = FLOAT_TYPEV4(dequantize4_v(ib, iqs, v_offset));
+#elif BLOCK_SIZE > 1
                     uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                     uint ib = coord / BLOCK_SIZE;
                     uint iqs = (coord % BLOCK_SIZE);

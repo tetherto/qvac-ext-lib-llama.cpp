@@ -206,6 +206,37 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
+        // TurboQuant: auto-select block=64 variant when head_dim=64.
+        // User specifies tbq3_0/tbq4_0 on the CLI; we swap to the _64 internal type if needed.
+        auto resolve_tq_type = [&](ggml_type & type, const char * kv_label, uint32_t head_dim, uint32_t n_embd_gqa) {
+            if (!ggml_is_tbq_or_pq(type)) {
+                return;
+            }
+            if (head_dim == 64) {
+                if (type == GGML_TYPE_TBQ3_0) type = GGML_TYPE_TBQ3_0_64;
+                if (type == GGML_TYPE_TBQ4_0) type = GGML_TYPE_TBQ4_0_64;
+                if (type == GGML_TYPE_PQ3_0) type = GGML_TYPE_PQ3_0_64;
+                if (type == GGML_TYPE_PQ4_0) type = GGML_TYPE_PQ4_0_64;
+            } else if (head_dim != 128) {
+                throw std::runtime_error(
+                    std::string("KV cache type ") + ggml_type_name(type) +
+                    " requires head_dim=64 or 128, but this model uses head_dim=" +
+                    std::to_string(head_dim) +
+                    " for " + kv_label + ". Use a different --cache-type-" + kv_label + " (e.g. q8_0, q4_0).");
+            }
+            uint32_t blk = ggml_is_tbq_or_pq_64(type) ? 64 : 128;
+            if (n_embd_gqa % blk != 0) {
+                throw std::runtime_error(
+                    std::string("KV cache type ") + ggml_type_name(type) +
+                    " requires n_embd_" + kv_label + "_gqa to be a multiple of " +
+                    std::to_string(blk) + ", but got " +
+                    std::to_string(n_embd_gqa) + " at layer " + std::to_string(il));
+            }
+        };
+
+        resolve_tq_type(type_k, "k", hparams.n_embd_head_k(il), n_embd_k_gqa);
+        resolve_tq_type(type_v, "v", hparams.n_embd_head_v(il), n_embd_v_gqa);
+
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
@@ -1288,13 +1319,13 @@ ggml_tensor * llama_kv_cache::get_k_lora(ggml_context * ctx, ggml_tensor * k_cur
     if (sinfo.s0 == 0) {
         return k_cur;
     }
-    
+
     slot_info past_sinfo = sinfo;
     past_sinfo.s0 = 0;
     past_sinfo.s1 = sinfo.s0 - 1;
 
     ggml_tensor * k_past = get_k(ctx, il, n_kv, past_sinfo);
-    
+
     return ggml_concat(ctx, k_past, k_cur, 2);
 }
 
@@ -1302,12 +1333,12 @@ ggml_tensor * llama_kv_cache::get_v_lora(ggml_context * ctx, ggml_tensor * v_cur
     if (sinfo.s0 == 0) {
         return v_cur;
     }
-    
+
     slot_info past_sinfo = sinfo;
     past_sinfo.s0 = 0;
     past_sinfo.s1 = sinfo.s0 - 1;
     ggml_tensor * v_past = get_v(ctx, il, n_kv, past_sinfo);
-    
+
     return ggml_concat(ctx, v_past, v_cur, 2);
 }
 

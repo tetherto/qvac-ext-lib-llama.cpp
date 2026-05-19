@@ -572,12 +572,12 @@ jobs:
         shell: bash
         run: |
           sudo apt update
-          sudo apt install intel-oneapi-compiler-dpcpp-cpp libssl-dev
+          sudo apt install intel-oneapi-compiler-dpcpp-cpp-2025.3 libssl-dev
 
       - name: install oneAPI MKL library
         shell: bash
         run: |
-          sudo apt install intel-oneapi-mkl-devel
+          sudo apt install intel-oneapi-mkl-devel-2025.3
 
       - name: Clone
         id: checkout
@@ -627,7 +627,7 @@ jobs:
       - name: install oneAPI MKL library
         shell: bash
         run: |
-          sudo apt install intel-oneapi-mkl-devel
+          sudo apt install intel-oneapi-mkl-devel-2025.3
 
       - name: Clone
         id: checkout

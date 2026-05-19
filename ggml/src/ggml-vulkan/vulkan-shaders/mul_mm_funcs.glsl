@@ -1,4 +1,8 @@
-#if defined(DATA_A_TQ2_0)
+#if defined(DATA_A_TQ2_0) || \
+    defined(DATA_A_TBQ3_0) || defined(DATA_A_PQ3_0) || \
+    defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ4_0) || \
+    defined(DATA_A_TBQ3_0_64) || defined(DATA_A_PQ3_0_64) || \
+    defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ4_0_64)
 #include "tq_utils.glsl"
 #endif
 
@@ -269,6 +273,48 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const vec2 v = d * vec2(v0, v1);
 
             buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
+#elif defined(DATA_A_TBQ3_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_TBQ3_0_64) || defined(DATA_A_PQ3_0_64)
+            // LOAD_VEC_A is 2 for TBQ/PQ 3-bit variants (see vulkan-shaders-gen.cpp).
+            // One idx step covers a pair of consecutive elements e0 = 2*iqs, e1 = e0 + 1.
+            const uint idx     = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+
+            const uint ib  = idx / (QUANT_K / 2u);
+            const uint iqs = idx % (QUANT_K / 2u);
+
+            const float d = float(data_a[ib].d);
+
+            const uint bit_pos0 = (2u * iqs) * 3u;
+            const uint bit_pos1 = bit_pos0 + 3u;
+
+            uint raw0 = uint(data_a[ib].qs[bit_pos0 / 8u]);
+            if ((bit_pos0 % 8u) + 3u > 8u) {
+                raw0 |= uint(data_a[ib].qs[bit_pos0 / 8u + 1u]) << 8u;
+            }
+            uint raw1 = uint(data_a[ib].qs[bit_pos1 / 8u]);
+            if ((bit_pos1 % 8u) + 3u > 8u) {
+                raw1 |= uint(data_a[ib].qs[bit_pos1 / 8u + 1u]) << 8u;
+            }
+
+            const float v0 = tbq3_dequant_raw(raw0, bit_pos0 % 8u) * d;
+            const float v1 = tbq3_dequant_raw(raw1, bit_pos1 % 8u) * d;
+
+            buf_a[buf_idx] = FLOAT_TYPEV2(v0, v1);
+#elif defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ4_0) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ4_0_64)
+            // LOAD_VEC_A is 2 for TBQ/PQ 4-bit variants; one nibble-pair byte per pair.
+            const uint idx     = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+
+            const uint ib  = idx / (QUANT_K / 2u);
+            const uint iqs = idx % (QUANT_K / 2u);
+
+            const float d  = float(data_a[ib].d);
+            const uint vui = uint(data_a[ib].qs[iqs]);
+
+            const float v0 = tbq4_dequant_raw(vui, 0u) * d;
+            const float v1 = tbq4_dequant_raw(vui, 1u) * d;
+
+            buf_a[buf_idx] = FLOAT_TYPEV2(v0, v1);
 #elif defined(DATA_A_Q2_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;

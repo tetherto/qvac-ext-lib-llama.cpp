@@ -533,6 +533,98 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ3_0_64)
+#include "tq_utils.glsl"
+
+float tbq3_dequantize1(uint ib, uint iqs, uint a_offset) {
+    const uint bit_pos = iqs * 3u;
+    uint raw = uint(data_a[a_offset + ib].qs[bit_pos / 8u]);
+    if ((bit_pos % 8u) + 3u > 8u)
+        raw |= uint(data_a[a_offset + ib].qs[bit_pos / 8u + 1u]) << 8u;
+    return tbq3_dequant_raw(raw, bit_pos % 8u);
+}
+
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(tbq3_dequantize1(ib, iqs, a_offset), tbq3_dequantize1(ib, iqs + 1u, a_offset));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(
+        tbq3_dequantize1(ib, iqs + 0u, a_offset),
+        tbq3_dequantize1(ib, iqs + 1u, a_offset),
+        tbq3_dequantize1(ib, iqs + 2u, a_offset),
+        tbq3_dequantize1(ib, iqs + 3u, a_offset)
+    );
+}
+#endif
+
+#if defined(DATA_A_PQ3_0) || defined(DATA_A_PQ3_0_64)
+#include "tq_utils.glsl"
+
+float pq3_dequantize1(uint ib, uint iqs, uint a_offset) {
+    const uint bit_pos = iqs * 3u;
+    uint raw = uint(data_a[a_offset + ib].qs[bit_pos / 8u]);
+    if ((bit_pos % 8u) + 3u > 8u)
+        raw |= uint(data_a[a_offset + ib].qs[bit_pos / 8u + 1u]) << 8u;
+    return tbq3_dequant_raw(raw, bit_pos % 8u);
+}
+
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return vec2(pq3_dequantize1(ib, iqs, a_offset), pq3_dequantize1(ib, iqs + 1u, a_offset));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(
+        pq3_dequantize1(ib, iqs + 0u, a_offset),
+        pq3_dequantize1(ib, iqs + 1u, a_offset),
+        pq3_dequantize1(ib, iqs + 2u, a_offset),
+        pq3_dequantize1(ib, iqs + 3u, a_offset)
+    );
+}
+#endif
+
+#if defined(DATA_A_TBQ4_0) || defined(DATA_A_TBQ4_0_64)
+#include "tq_utils.glsl"
+
+// iqs is the element index (consistent with other QUANT_R=1 types). TBQ4 packs
+// 2 elements per byte, so byte = iqs/2 and nibble = iqs&1.
+float tbq4_dequantize1(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs >> 1u]);
+    return tbq4_dequant_raw(vui, iqs & 1u);
+}
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2(tbq4_dequant_raw(vui, 0u), tbq4_dequant_raw(vui, 1u));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(
+        tbq4_dequantize1(ib, iqs + 0u, a_offset),
+        tbq4_dequantize1(ib, iqs + 1u, a_offset),
+        tbq4_dequantize1(ib, iqs + 2u, a_offset),
+        tbq4_dequantize1(ib, iqs + 3u, a_offset)
+    );
+}
+#endif
+
+#if defined(DATA_A_PQ4_0) || defined(DATA_A_PQ4_0_64)
+#include "tq_utils.glsl"
+
+float pq4_dequantize1(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs >> 1u]);
+    return tbq4_dequant_raw(vui, iqs & 1u);
+}
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2(tbq4_dequant_raw(vui, 0u), tbq4_dequant_raw(vui, 1u));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return vec4(
+        pq4_dequantize1(ib, iqs + 0u, a_offset),
+        pq4_dequantize1(ib, iqs + 1u, a_offset),
+        pq4_dequantize1(ib, iqs + 2u, a_offset),
+        pq4_dequantize1(ib, iqs + 3u, a_offset)
+    );
+}
+#endif
+
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(0, 0);
@@ -548,7 +640,7 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_TQ2_0) || defined(DATA_A_TQ1_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_TQ2_0) || defined(DATA_A_TQ1_0) || defined(DATA_A_TBQ3_0) || defined(DATA_A_TBQ4_0) || defined(DATA_A_PQ3_0) || defined(DATA_A_PQ4_0) || defined(DATA_A_TBQ3_0_64) || defined(DATA_A_TBQ4_0_64) || defined(DATA_A_PQ3_0_64) || defined(DATA_A_PQ4_0_64) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }

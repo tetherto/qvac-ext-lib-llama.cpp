@@ -54,6 +54,10 @@ const std::vector<std::string> type_names = {
     "q8_0",
     "tq2_0",
     "tq1_0",
+    "tbq3_0",
+    "tbq4_0",
+    "pq3_0",
+    "pq4_0",
     "q2_k",
     "q3_k",
     "q4_k",
@@ -572,6 +576,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (tname == "bf16") {
             continue;
         }
+        if (coopmat2 && (tname == "tbq3_0" || tname == "tbq4_0" || tname == "pq3_0" || tname == "pq4_0")) {
+            continue;
+        }
 
         std::string data_a_key = "DATA_A_" + to_uppercase(tname);
         // For unaligned, load one at a time for f32/f16, or two at a time for quants
@@ -603,6 +610,39 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             string_to_spv(device_prefix + shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
         }
 #endif
+    }
+
+    // _64 variants (head_dim=64) of the standalone MUL_MAT path for TBQ/PQ.
+    //
+    // These are emitted outside the main `type_names` loop so we don't
+    // cascade through FA / MUL_MAT_ID / get_rows / ... which either already
+    // have dedicated _64 handling (FA) or don't apply to TBQ/PQ at all.
+    //
+    // Matches the `_128`-block TBQ/PQ matmul variants above: unaligned and
+    // aligned f32/f16 B, no cm2 (TBQ/PQ have no cm2 dequant_mul_mat_mat
+    // shader — the generic cm1/scalar pipeline is used on cm2 devices via
+    // the fallback in ggml_vk_get_mul_mat_mat_pipeline), no MUL_MAT_ID
+    // (gated off in supports_op for TBQ/PQ), no q8_1 integer-dot path.
+    if (matmul_id_type == MatMulIdType::NONE && !coopmat2) {
+        for (const auto& tname : {"tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
+            std::string t(tname);
+            std::string data_a_key = "DATA_A_" + to_uppercase(t);
+            std::string load_vec_quant = "2"; // matches tbq3_0 / pq3_0 / tbq4_0 / pq4_0 above
+            std::string load_vec_a_unaligned = load_vec_quant;
+            std::string load_vec_a = load_vec_quant;
+
+            const std::map<std::string, std::string> float_type_dict = {
+                {"FLOAT_TYPE",   FLOAT_TYPE(1, t)},
+                {"FLOAT_TYPEV2", FLOAT_TYPE(2, t)},
+                {"FLOAT_TYPEV4", FLOAT_TYPE(4, t)},
+                {"FLOAT_TYPEV8", FLOAT_TYPE(8, t)},
+            };
+
+            string_to_spv(device_prefix + shader_name + "_" + t + "_f32",         "mul_mm.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, false, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + t + "_f32_aligned", "mul_mm.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, false, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + t + "_f16",         "mul_mm.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float16_t"},        {"D_TYPE", "float"}}), fp16, coopmat, false, f16acc);
+            string_to_spv(device_prefix + shader_name + "_" + t + "_f16_aligned", "mul_mm.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, false, f16acc);
+        }
     }
 }
 
@@ -668,7 +708,8 @@ void process_shaders() {
                 if (tname == "f16") {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
-                } else if (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "iq4_nl" || tname == "q8_0" || tname == "f32") {
+                } else if (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "iq4_nl" || tname == "q8_0" || tname == "f32" ||
+                           tname == "tbq3_0" || tname == "tbq4_0" || tname == "pq3_0" || tname == "pq4_0") {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname)}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
@@ -679,18 +720,159 @@ void process_shaders() {
                 if (tname == "f16") {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
-                } else if (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "iq4_nl" || tname == "q8_0" || tname == "f32") {
+                } else if (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "iq4_nl" || tname == "q8_0" || tname == "f32" ||
+                           tname == "tbq3_0" || tname == "tbq4_0" || tname == "pq3_0" || tname == "pq4_0") {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-                    if (tname != "f32") {
+                    // TBQ/PQ use the HAS_CENTROID_K dequant path, not the MMQ
+                    // integer-dot path; mul_mmq_shmem_types.glsl has no
+                    // block_a_cache definition for them.
+                    if (tname != "f32" &&
+                        tname != "tbq3_0" && tname != "tbq4_0" &&
+                        tname != "pq3_0"  && tname != "pq4_0") {
                         string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                             merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }, {"MMQ", "1"}}), fp16, false, false, f16acc, "_int8");
                     }
 #endif
                 }
             }
+
+        // _64 variants (head_dim=64): same-type FA. Only emit on fp16=true outer
+        // iteration; the inner string_to_spv calls always pass fp16=true, so without
+        // this guard we would generate identical shader names twice.
+        if (fp16) {
+        for (const auto& tname : {"tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
+            std::string t(tname);
+            std::string data_a_key = "DATA_A_" + to_uppercase(t);
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+            string_to_spv("flash_attn_f32_f16_" + t, "flash_attn_cm2.comp",
+                merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"DEQUANTFUNC", "dequantFunc"+to_uppercase(t) }, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(t) }}), true, false, true, f16acc);
+#endif
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+            string_to_spv("flash_attn_f32_f16_" + t, "flash_attn_cm1.comp",
+                merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(t)}, {"COOPMAT", "1"}}), true, true, false, f16acc);
+#endif
+            string_to_spv("flash_attn_f32_f16_" + t, "flash_attn.comp",
+                merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(t) }}), true, false, false, f16acc);
+        }
+        }
+
+        // Mixed K/V type flash attention. Like the _64 same-type loop above, every
+        // string_to_spv call here passes fp16=true, so emit only on the fp16=true
+        // outer iteration to avoid duplicate symbol generation.
+        if (fp16) {
+        const std::vector<std::string> fa_mixed_k_types = {"tbq3_0", "tbq4_0", "pq3_0", "pq4_0"};
+        const std::vector<std::string> fa_mixed_v_types = {"pq3_0", "pq4_0", "q4_0", "q8_0", "f16"};
+        const std::vector<std::string> fa_mixed_k_types_64 = {"tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"};
+        const std::vector<std::string> fa_mixed_v_types_64 = {"pq3_0_64", "pq4_0_64", "q4_0", "q8_0", "f16"};
+
+        for (const auto& k_tname : fa_mixed_k_types) {
+            for (const auto& v_tname : fa_mixed_v_types) {
+
+                auto k_upper = to_uppercase(k_tname);
+                auto v_upper = to_uppercase(v_tname);
+
+                // Scalar path
+                {
+                    std::map<std::string, std::string> mixed_dict = {
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
+                        {"DATA_K_" + k_upper, "1"},
+                        {"DATA_V_" + v_upper, "1"},
+                    };
+                    string_to_spv("flash_attn_f32_f16_" + k_tname + "_" + v_tname, "flash_attn.comp",
+                        merge_maps(fa_base_dict, mixed_dict), true, false, false, f16acc);
+                }
+
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                // Coopmat1 path
+                {
+                    std::map<std::string, std::string> mixed_dict = {
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
+                        {"DATA_K_" + k_upper, "1"},
+                        {"DATA_V_" + v_upper, "1"},
+                        {"COOPMAT", "1"},
+                    };
+                    string_to_spv("flash_attn_f32_f16_" + k_tname + "_" + v_tname, "flash_attn_cm1.comp",
+                        merge_maps(fa_base_dict, mixed_dict), true, true, false, f16acc);
+                }
+#endif
+
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+                // Coopmat2 path
+                {
+                    std::map<std::string, std::string> mixed_dict = {
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
+                        {"DATA_K_" + k_upper, "1"},
+                        {"DATA_V_" + v_upper, "1"},
+                    };
+                    if (k_tname != "f16") {
+                        mixed_dict["DEQUANTFUNC_K"] = "dequantFunc" + k_upper;
+                    }
+                    if (v_tname != "f16") {
+                        mixed_dict["DEQUANTFUNC_V"] = "dequantFunc" + v_upper;
+                    }
+                    string_to_spv("flash_attn_f32_f16_" + k_tname + "_" + v_tname, "flash_attn_cm2.comp",
+                        merge_maps(fa_base_dict, mixed_dict), true, false, true, f16acc);
+                }
+#endif
+            }
+        }
+
+        // Mixed K/V type flash attention for _64 variants (head_dim=64)
+        for (const auto& k_tname : fa_mixed_k_types_64) {
+            for (const auto& v_tname : fa_mixed_v_types_64) {
+
+                auto k_upper = to_uppercase(k_tname);
+                auto v_upper = to_uppercase(v_tname);
+
+                // Scalar path
+                {
+                    std::map<std::string, std::string> mixed_dict = {
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
+                        {"DATA_K_" + k_upper, "1"},
+                        {"DATA_V_" + v_upper, "1"},
+                    };
+                    string_to_spv("flash_attn_f32_f16_" + k_tname + "_" + v_tname, "flash_attn.comp",
+                        merge_maps(fa_base_dict, mixed_dict), true, false, false, f16acc);
+                }
+
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                // Coopmat1 path
+                {
+                    std::map<std::string, std::string> mixed_dict = {
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
+                        {"DATA_K_" + k_upper, "1"},
+                        {"DATA_V_" + v_upper, "1"},
+                        {"COOPMAT", "1"},
+                    };
+                    string_to_spv("flash_attn_f32_f16_" + k_tname + "_" + v_tname, "flash_attn_cm1.comp",
+                        merge_maps(fa_base_dict, mixed_dict), true, true, false, f16acc);
+                }
+#endif
+
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+                // Coopmat2 path
+                {
+                    std::map<std::string, std::string> mixed_dict = {
+                        {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
+                        {"DATA_K_" + k_upper, "1"},
+                        {"DATA_V_" + v_upper, "1"},
+                    };
+                    if (k_tname != "f16") {
+                        mixed_dict["DEQUANTFUNC_K"] = "dequantFunc" + k_upper;
+                    }
+                    if (v_tname != "f16") {
+                        mixed_dict["DEQUANTFUNC_V"] = "dequantFunc" + v_upper;
+                    }
+                    string_to_spv("flash_attn_f32_f16_" + k_tname + "_" + v_tname, "flash_attn_cm2.comp",
+                        merge_maps(fa_base_dict, mixed_dict), true, false, true, f16acc);
+                }
+#endif
+            }
+        }
+        } // end if (fp16) for mixed K/V flash attention
         }
     }
 
@@ -706,6 +888,18 @@ void process_shaders() {
             shader = "mul_mat_vec_tq1_0.comp";
         }
 
+        const bool is_tq_fht = (tname == "tbq3_0" || tname == "tbq4_0" || tname == "pq3_0" || tname == "pq4_0");
+
+        if (is_tq_fht) {
+            if (tname == "pq3_0") {
+                shader = "mul_mat_vec_tbq3_0.comp";
+            } else if (tname == "pq4_0") {
+                shader = "mul_mat_vec_tbq4_0.comp";
+            } else {
+                shader = "mul_mat_vec_" + tname + ".comp";
+            }
+        }
+
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
 
@@ -715,7 +909,7 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
-        if (tname != "tq2_0" && tname != "tq1_0") {
+        if (tname != "tq2_0" && tname != "tq1_0" && !is_tq_fht) {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
@@ -744,10 +938,19 @@ void process_shaders() {
 
         // Dequant shaders
         if (tname != "f16" && tname != "bf16") {
-            string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
+            std::string dequant_source = "dequant_" + tname + ".comp";
+            if (tname == "pq3_0") {
+                dequant_source = "dequant_tbq3_0.comp";
+            } else if (tname == "pq4_0") {
+                dequant_source = "dequant_tbq4_0.comp";
+            }
+            string_to_spv("dequant_" + tname, dequant_source, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
         }
 
-        shader = (tname == "f32" || tname == "f16" || tname == "bf16") ? "get_rows.comp" : "get_rows_quant.comp";
+        // get_rows uses element-wise dequant which doesn't work for TQ3/TQ4 (need FHT)
+        if (!is_tq_fht) {
+            shader = (tname == "f32" || tname == "f16" || tname == "bf16") ? "get_rows.comp" : "get_rows_quant.comp";
+
 
         if (tname == "f16") {
             string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}}));
@@ -755,6 +958,20 @@ void process_shaders() {
             string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
         }
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+    }
+    }
+
+    // Dequant shaders for _64 variants
+    for (const auto& tname : {"tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
+        std::string t(tname);
+        std::string data_a_key = "DATA_A_" + to_uppercase(t);
+        std::string dequant_source;
+        if (t == "pq3_0_64" || t == "tbq3_0_64") {
+            dequant_source = "dequant_tbq3_0.comp";
+        } else {
+            dequant_source = "dequant_tbq4_0.comp";
+        }
+        string_to_spv("dequant_" + t, dequant_source, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
     }
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
@@ -791,14 +1008,53 @@ void process_shaders() {
     string_to_spv("cpy_transpose_16", "copy_transpose.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("cpy_transpose_32", "copy_transpose.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
 
-    for (std::string t : {"q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
+    for (std::string t : {"q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
+                           "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
         string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        // f16 output variant: lets MUL_MAT dispatch dequantize non-contiguous
+        // quantized src0 to f16 directly on the GPU, instead of falling back
+        // to CPU (which used to happen because the f32 intermediate was the
+        // only available cpy path for quantized inputs).
+        string_to_spv("cpy_" + t + "_f16", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
     }
 
-    for (std::string t : {"f32", "f16", "bf16", "q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
-        string_to_spv("set_rows_" + t + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
-        string_to_spv("set_rows_" + t + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    // Norm-correction variants for TBQ/PQ copy_to_quant
+    for (std::string t : {"tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
+                           "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
+        string_to_spv("cpy_f32_" + t + "_nc", "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("cpy_f32_" + t + "_nc_rte", "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+    }
+
+    for (std::string t : {"f32", "f16", "bf16", "q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
+                           "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
+        string_to_spv("set_rows_" + t + "_i32",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("set_rows_" + t + "_i32_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+        string_to_spv("set_rows_" + t + "_i64",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("set_rows_" + t + "_i64_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+    }
+
+    // Norm-correction variants for TBQ/PQ set_rows
+    for (std::string t : {"tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
+                           "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
+        string_to_spv("set_rows_" + t + "_i32_nc",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("set_rows_" + t + "_i32_nc_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+        string_to_spv("set_rows_" + t + "_i64_nc",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("set_rows_" + t + "_i64_nc_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+    }
+
+    // TBQ standalone MUL_MAT QJL (Stage 2) correction pass.
+    // Applied after mul_mm.comp for TBQ3_0/TBQ4_0 when n > mul_mat_vec_max_cols,
+    // to match the epilogue that `mul_mat_vec_tbq*_0.comp` applies on the vec path.
+    // Shader is parameterised over QUANT_K (128 for TBQ*_0, 64 for TBQ*_0_64) via
+    // DATA_A_TBQ*_0*, so the same source file yields the right workgroup / shared-
+    // memory sizing and qjl[] loop bounds for both head-dim variants.
+    for (std::string t : {"tbq3_0", "tbq4_0", "tbq3_0_64", "tbq4_0_64"}) {
+        const std::string dak = "DATA_A_" + to_uppercase(t);
+        string_to_spv("mul_mm_qjl_" + t + "_f32", "mul_mm_tbq_qjl_correction.comp",
+                      {{dak, "1"}, {"B_TYPE", "float"},     {"D_TYPE", "float"}});
+        string_to_spv("mul_mm_qjl_" + t + "_f16", "mul_mm_tbq_qjl_correction.comp",
+                      {{dak, "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}});
     }
 
     auto get_type_str = [](bool f16) {
@@ -1288,7 +1544,8 @@ void write_output_files() {
             src << "const uint64_t arr_dmmv_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
         }
 
-        if (btype == "f16" || tname == "tq2_0" || tname == "tq1_0") {
+        if (btype == "f16" || tname == "tq2_0" || tname == "tq1_0" ||
+            tname == "tbq3_0" || tname == "tbq4_0" || tname == "pq3_0" || tname == "pq4_0") {
             continue;
         }
         hdr << "extern const void * arr_dmmv_id_"   << tname << "_" << btype << "_f32_data[3];\n";
