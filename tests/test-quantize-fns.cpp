@@ -39,6 +39,7 @@ static const char* RESULT_STR[] = {"ok", "FAILED"};
 
 static float max_quantization_error_for(ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q1_0:    return MAX_QUANTIZATION_TOTAL_ERROR_BINARY;
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:   return MAX_QUANTIZATION_TOTAL_ERROR_TERNARY;
         case GGML_TYPE_TBQ3_0:
@@ -54,6 +55,7 @@ static float max_quantization_error_for(ggml_type type) {
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_IQ3_S:   return MAX_QUANTIZATION_TOTAL_ERROR_3BITS;
         case GGML_TYPE_IQ3_XXS: return MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS;
+        case GGML_TYPE_NVFP4:   return MAX_QUANTIZATION_TOTAL_ERROR_FP4;
         default:                return MAX_QUANTIZATION_TOTAL_ERROR;
     }
 }
@@ -66,6 +68,7 @@ static float max_dot_product_error_for(ggml_type type) {
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:   return MAX_DOT_PRODUCT_ERROR_LOWBIT;
+        case GGML_TYPE_Q1_0:    return MAX_DOT_PRODUCT_ERROR_BINARY;
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:   return MAX_DOT_PRODUCT_ERROR_TERNARY;
         case GGML_TYPE_TBQ3_0:
@@ -76,6 +79,7 @@ static float max_dot_product_error_for(ggml_type type) {
         case GGML_TYPE_PQ3_0_64:
         case GGML_TYPE_PQ4_0:
         case GGML_TYPE_PQ4_0_64: return MAX_DOT_PRODUCT_ERROR_TURBOQUANT;
+        case GGML_TYPE_NVFP4:   return MAX_DOT_PRODUCT_ERROR_FP4;
         default:                return MAX_DOT_PRODUCT_ERROR;
     }
 }
