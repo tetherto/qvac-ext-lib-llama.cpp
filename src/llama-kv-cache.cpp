@@ -188,12 +188,47 @@ llama_kv_cache::llama_kv_cache(
         const char * dev_name = "CPU";
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_dev_t         dev  = nullptr;
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
+            dev  = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+        }
+
+        // TBQ/PQ KV-cache types require the chosen device's backend to also
+        // support the SET_ROWS op on the requested type. On some Vulkan
+        // drivers (observed on Mali) the SET_ROWS pipeline for TBQ types
+        // silently fails to register, so supports_op returns false at
+        // dispatch time and the sched aborts mid-graph_reserve with
+        // "pre-allocated tensor (cache_k_l0 (view)) in a buffer (Vulkan0)
+        // that cannot run the operation (SET_ROWS)". Detect the mismatch
+        // here and route this layer's K/V cache to the CPU backend instead
+        // (where SET_ROWS for TBQ has a reference implementation).
+        auto supports_set_rows = [&](ggml_type type) -> bool {
+            if (!dev) return true;
+            if (!ggml_is_tbq_or_pq(type)) return true;
+            ggml_init_params probe_p = { /*mem_size=*/ 4096, /*mem_buffer=*/ nullptr, /*no_alloc=*/ true };
+            ggml_context * probe_ctx = ggml_init(probe_p);
+            if (!probe_ctx) return true; // fail open; caller hits the same abort as before
+            ggml_tensor * dst = ggml_new_tensor_3d(probe_ctx, type,            ggml_blck_size(type), 1, 1);
+            ggml_tensor * src = ggml_new_tensor_3d(probe_ctx, GGML_TYPE_F32,   ggml_blck_size(type), 1, 1);
+            ggml_tensor * idx = ggml_new_tensor_2d(probe_ctx, GGML_TYPE_I64,                       1, 1);
+            ggml_tensor * op  = ggml_set_rows(probe_ctx, dst, src, idx);
+            const bool ok = ggml_backend_dev_supports_op(dev, op);
+            ggml_free(probe_ctx);
+            return ok;
+        };
+        if (offload && (!supports_set_rows(type_k) || (!is_mla && !supports_set_rows(type_v)))) {
+            LLAMA_LOG_WARN("%s: layer %3d: device %s cannot run SET_ROWS on "
+                           "K=%s / V=%s; falling back to CPU buft for this "
+                           "layer's KV cache\n",
+                           __func__, il, dev_name,
+                           ggml_type_name(type_k), ggml_type_name(type_v));
+            buft     = ggml_backend_cpu_buffer_type();
+            dev      = nullptr;
+            dev_name = "CPU";
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

@@ -17209,6 +17209,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                        break;
                     case GGML_TYPE_TBQ3_0:
                     case GGML_TYPE_PQ3_0:
                     case GGML_TYPE_TBQ4_0:
@@ -17216,11 +17217,30 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_TBQ3_0_64:
                     case GGML_TYPE_PQ3_0_64:
                     case GGML_TYPE_TBQ4_0_64:
-                    case GGML_TYPE_PQ4_0_64:
-                        return true;
+                    case GGML_TYPE_PQ4_0_64: {
+                        // TBQ/PQ SET_ROWS pipelines need a cooperative shader
+                        // that depends on subgroup features the device may not
+                        // provide (the GLSL pipeline-create can silently fail
+                        // on Mali). Confirm the actual pipeline pointer is non
+                        // null for the index dtype the caller will use; if it
+                        // isn't, return false so the scheduler routes the op
+                        // to CPU instead of committing to Vulkan and aborting
+                        // in graph_reserve with "pre-allocated tensor in a
+                        // buffer that cannot run the operation (SET_ROWS)".
+                        auto device = ggml_vk_get_device(ctx->device);
+                        const bool has_i32 =
+                            device->pipeline_set_rows_i32[op->type] != nullptr;
+                        const bool has_i64 =
+                            device->pipeline_set_rows_i64[op->type] != nullptr;
+                        if (op->src[1] && op->src[1]->type == GGML_TYPE_I64) {
+                            return has_i64;
+                        }
+                        return has_i32;
+                    }
                     default:
                         return false;
                 }
+                return true;
             }
         case GGML_OP_CONT:
         case GGML_OP_CPY:
