@@ -346,20 +346,23 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
-    const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
-    if (attn_rot_disable) {
-        LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+    // Attention rotation (Hadamard on K/V before quantization) improves PPL for
+    // low-bit KV caches but costs 17-38% tg throughput on quantized configs.
+    // Default OFF; opt-in via LLAMA_ATTN_ROT_ENABLE=1 when quant quality matters.
+    const char * LLAMA_ATTN_ROT_ENABLE = getenv("LLAMA_ATTN_ROT_ENABLE");
+    const bool attn_rot_enable = LLAMA_ATTN_ROT_ENABLE ? atoi(LLAMA_ATTN_ROT_ENABLE) : false;
+    if (attn_rot_enable) {
+        LLAMA_LOG_INFO("%s: attention rotation enabled (LLAMA_ATTN_ROT_ENABLE)\n", __func__);
     }
 
     attn_rot_k =
-        !attn_rot_disable &&
+        attn_rot_enable &&
         n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
         hparams.n_embd_head_k() % 64 == 0;
 
     attn_rot_v =
-        !attn_rot_disable &&
+        attn_rot_enable &&
         n_embd_head_v_all > 0 &&
         ggml_is_quantized(type_v) &&
         hparams.n_embd_head_v() % 64 == 0;
