@@ -8864,6 +8864,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+
+        // Multi-block 128-wide TBQ/PQ heads. These exercise the base TBQ/PQ
+        // layouts with two consecutive blocks per head (head_dim=256).
+        const ggml_type multi_block_same[] = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0 };
+        const ggml_type multi_block_tbq_k[] = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0 };
+        const ggml_type multi_block_v[] = { GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+
+        for (ggml_type t : multi_block_same) {
+            for (int kv : { 113, 512 }) {
+                for (int nb : { 1, 32 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                        256, 256, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, t, t));
+                }
+            }
+        }
+        for (ggml_type tk : multi_block_tbq_k) {
+            for (ggml_type tv : multi_block_v) {
+                for (int kv : { 113, 512 }) {
+                    for (int nb : { 1, 32 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                            256, 256, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
+                    }
+                }
+            }
+        }
     }
 
     // Homogeneous PQ K/V flash attention. Regression coverage for backends that
@@ -9180,6 +9205,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                             test_cases.emplace_back(new test_flash_attn_ext(
                                 hs, hs, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
                         }
+                    }
+                }
+            }
+        }
+
+        const ggml_type multi_block_tbq_k[] = { GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0 };
+        const ggml_type multi_block_v[] = { GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 };
+
+        for (ggml_type tk : multi_block_tbq_k) {
+            for (ggml_type tv : multi_block_v) {
+                for (int kv : { 113, 512 }) {
+                    for (int nb : { 1, 32 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                            256, 256, 4, {1, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, tk, tv));
                     }
                 }
             }
