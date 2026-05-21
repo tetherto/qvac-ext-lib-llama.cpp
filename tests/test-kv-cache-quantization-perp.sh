@@ -7,7 +7,7 @@
 #   tests/test-kv-cache-quantization-perp.sh [options] [build_dir]
 #
 # Options:
-#   -c <tiny|tiny2|small|mid|large>  Size config preset (repeatable, default: small)
+#   -c <tiny|tiny2|small|mid|large|large-8k>  Size config preset (repeatable, default: small)
 #   -m <preset>                      Model preset (see -h for list, default: mistral-q4ks)
 #   --all                            Run all model presets sequentially
 #   --mixed-only                     Skip same-type tests, only run mixed K/V
@@ -31,6 +31,7 @@
 #   small  — 2 chunks, n_ctx 64,128           (quick, 2 context sizes)
 #   mid    — 4 chunks, n_ctx 448,512          (balanced, near standard 512)
 #   large  — 8 chunks, n_ctx 448,512,1024,2048  (thorough, 4 context sizes)
+#   large-8k — 8 chunks, n_ctx 8192             (single 8k context run)
 #   huge   — 16 chunks, n_ctx 448,512,1024,2048,4096  (full sweep, 5 context sizes)
 #
 # Each n_ctx value in the sweep gets its own randomized slice of the dataset,
@@ -69,22 +70,18 @@ set -euo pipefail
 # --- Model presets ---
 
 declare -A MODEL_PRESETS_NAME MODEL_PRESETS_URL
-MODEL_PRESETS_NAME[mistral-q4ks]="Mistral-7B-Instruct-v0.3-Q4_K_S.gguf"
-MODEL_PRESETS_URL[mistral-q4ks]="https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_S.gguf"
-MODEL_PRESETS_NAME[mistral-q4km]="Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"
-MODEL_PRESETS_URL[mistral-q4km]="https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"
-MODEL_PRESETS_NAME[mistral-f16]="Mistral-7B-Instruct-v0.3.fp16.gguf"
-MODEL_PRESETS_URL[mistral-f16]="https://huggingface.co/MaziyarPanahi/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3.fp16.gguf"
-MODEL_PRESETS_NAME[llama-q4km]="Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-MODEL_PRESETS_URL[llama-q4km]="https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
-MODEL_PRESETS_NAME[llama-f16]="Llama-3.1-8B-Instruct-f16.gguf"
-MODEL_PRESETS_URL[llama-f16]="https://huggingface.co/second-state/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Llama-3.1-8B-Instruct-f16.gguf"
-MODEL_PRESETS_NAME[qwen-q4km]="Qwen2.5-14B-Instruct-Q4_K_M.gguf"
-MODEL_PRESETS_URL[qwen-q4km]="https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf"
-MODEL_PRESETS_NAME[qwen05-q8]="Qwen2.5-0.5B-Instruct-Q8_0.gguf"
-MODEL_PRESETS_URL[qwen05-q8]="https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q8_0.gguf"
+MODEL_PRESETS_NAME[mistral-q8]="Mistral-7B-Instruct-v0.3-Q8_0.gguf"
+MODEL_PRESETS_URL[mistral-q8]="https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q8_0.gguf"
+MODEL_PRESETS_NAME[llama-q8]="Llama-3.1-8B-Instruct-Q8_0.gguf"
+MODEL_PRESETS_URL[llama-q8]="https://huggingface.co/second-state/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Llama-3.1-8B-Instruct-Q8_0.gguf"
+MODEL_PRESETS_NAME[qwen25-05b-q8]="Qwen2.5-0.5B-Instruct-Q8_0.gguf"
+MODEL_PRESETS_URL[qwen25-05b-q8]="https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q8_0.gguf"
+MODEL_PRESETS_NAME[qwen35-4b-q8]="Qwen3.5-4B-Q8_0.gguf"
+MODEL_PRESETS_URL[qwen35-4b-q8]="https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q8_0.gguf"
+MODEL_PRESETS_NAME[qwen36-35b-a3b-ud-q4km]="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+MODEL_PRESETS_URL[qwen36-35b-a3b-ud-q4km]="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 
-ALL_MODEL_PRESETS=("mistral-q4km" "mistral-f16" "llama-q4km" "llama-f16" "qwen-q4km" "qwen05-q8")
+ALL_MODEL_PRESETS=("mistral-q8" "llama-q8" "qwen25-05b-q8" "qwen35-4b-q8" "qwen36-35b-a3b-ud-q4km")
 
 # --- Parse arguments ---
 
@@ -375,8 +372,9 @@ config_n_chunks() {
         small) echo 2 ;;
         mid)   echo 4 ;;
         large) echo 8 ;;
+        large-8k) echo 8 ;;
         huge)  echo 16 ;;
-        *) echo "Error: unknown config '$1' (expected tiny, tiny2, small, mid, large, huge)" >&2; exit 1 ;;
+        *) echo "Error: unknown config '$1' (expected tiny, tiny2, small, mid, large, large-8k, huge)" >&2; exit 1 ;;
     esac
 }
 
@@ -387,6 +385,7 @@ config_n_ctx_list() {
         small) echo "64 128" ;;
         mid)   echo "448 512" ;;
         large) echo "448 512 1024 2048" ;;
+        large-8k) echo "8192" ;;
         huge)  echo "448 512 1024 2048 4096" ;;
         *) echo "Error: unknown config '$1'" >&2; exit 1 ;;
     esac
