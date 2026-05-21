@@ -180,12 +180,13 @@ void main() {
     Qf16 *= float16_t(p.scale);
 
 #ifdef HAS_QJL_CORRECTION
-    // Pre-compute QJL projection of Q: proj_q = FHT(D_qjl * q)
+    // Pre-compute QJL projection of Q per TBQ K block:
+    // proj_q = FHT(D_qjl * q[block:block+QUANT_K]).
     {
         const uint32_t tid = gl_LocalInvocationIndex;
         const uint32_t wg_size = gl_WorkGroupSize.x;
 
-        // Load raw Q (un-scaled) into shared memory, apply QJL sign diagonal
+        // Load raw Q (un-scaled) into shared memory, apply the per-block QJL sign diagonal.
         for (uint32_t idx = tid; idx < Br * HSK; idx += wg_size) {
             uint32_t r = idx / HSK;
             uint32_t d = idx % HSK;
@@ -198,24 +199,28 @@ void main() {
                     (uint(data_q[q_byte_offset + 2]) << 16u) |
                     (uint(data_q[q_byte_offset + 3]) << 24u));
             }
-            qjl_proj_sh[r][d] = q_val * qjl_get_sign(d);
+            qjl_proj_sh[r][d] = q_val * qjl_get_sign(d % QUANT_K);
         }
         barrier();
 
-        // FHT in-place per row. Parallelize butterfly pairs across all threads.
-        for (uint h = 1u; h < HSK; h <<= 1u) {
-            for (uint32_t fi = tid; fi < Br * (HSK / 2u); fi += wg_size) {
-                uint32_t r   = fi / (HSK / 2u);
-                uint32_t idx = fi % (HSK / 2u);
-                if (i * Br + r < N) {
-                    uint grp = idx / h;
-                    uint pos = idx % h;
-                    uint j = grp * (h << 1u) + pos;
-                    float a = qjl_proj_sh[r][j];
-                    float b = qjl_proj_sh[r][j + h];
-                    qjl_proj_sh[r][j]     = a + b;
-                    qjl_proj_sh[r][j + h] = a - b;
+        // FHT in-place per row and per TBQ block. Parallelize butterfly pairs across all threads.
+        [[unroll]] for (uint32_t qjl_block = 0; qjl_block < HSK / QUANT_K; ++qjl_block) {
+            const uint32_t block_start = qjl_block * QUANT_K;
+            for (uint h = 1u; h < QUANT_K; h <<= 1u) {
+                for (uint32_t fi = tid; fi < Br * (QUANT_K / 2u); fi += wg_size) {
+                    uint32_t r   = fi / (QUANT_K / 2u);
+                    uint32_t idx = fi % (QUANT_K / 2u);
+                    if (i * Br + r < N) {
+                        uint grp = idx / h;
+                        uint pos = idx % h;
+                        uint j = block_start + grp * (h << 1u) + pos;
+                        float a = qjl_proj_sh[r][j];
+                        float b = qjl_proj_sh[r][j + h];
+                        qjl_proj_sh[r][j]     = a + b;
+                        qjl_proj_sh[r][j + h] = a - b;
+                    }
                 }
+                barrier();
             }
             barrier();
         }
@@ -318,13 +323,13 @@ void main() {
         S = coopMatMulAdd(Qf16, K_T, S);
 
 #ifdef HAS_QJL_CORRECTION
-        // QJL Stage 2 correction: for each score S[r,c], add
-        //   scale * d_r[c] * sqrt(π/2) / HSK * dot(proj_Q[r], sign_K[c])
+        // QJL Stage 2 correction: for each score S[r,c], sum the correction
+        // from every 128-wide TBQ block in the head.
         // Compute correction matrix in shared memory, then add to S.
         {
             const uint32_t tid = gl_LocalInvocationIndex;
             const uint32_t wg_size = gl_WorkGroupSize.x;
-            const float qjl_scale = p.scale * sqrt(1.5707963) / float(HSK);
+            const float qjl_scale = p.scale * sqrt(1.5707963) / float(QUANT_K);
 
             for (uint32_t idx = tid; idx < Br * Bc; idx += wg_size) {
                 uint32_t r = idx / Bc;
@@ -332,45 +337,48 @@ void main() {
                 uint32_t kv_col = j * Bc + c;
                 float corr = 0.0;
                 if (i * Br + r < N && kv_col < KV) {
-                    uint32_t block_byte_off = k_offset + kv_col * k_stride * uint32_t(K_BLOCK_BYTE_SIZE);
+                    [[unroll]] for (uint32_t qjl_block = 0; qjl_block < HSK / QUANT_K; ++qjl_block) {
+                        uint32_t block_byte_off = k_offset + (kv_col * k_stride + qjl_block) * uint32_t(K_BLOCK_BYTE_SIZE);
 #if defined(DATA_K_TBQ3_0)
-                    const uint32_t qjl_off = block_byte_off + 50u;
-                    const uint32_t dr_off  = block_byte_off + 66u;
+                        const uint32_t qjl_off = block_byte_off + 50u;
+                        const uint32_t dr_off  = block_byte_off + 66u;
 #elif defined(DATA_K_TBQ3_0_64)
-                    const uint32_t qjl_off = block_byte_off + 26u;
-                    const uint32_t dr_off  = block_byte_off + 34u;
+                        const uint32_t qjl_off = block_byte_off + 26u;
+                        const uint32_t dr_off  = block_byte_off + 34u;
 #elif defined(DATA_K_TBQ4_0)
-                    const uint32_t qjl_off = block_byte_off + 66u;
-                    const uint32_t dr_off  = block_byte_off + 82u;
+                        const uint32_t qjl_off = block_byte_off + 66u;
+                        const uint32_t dr_off  = block_byte_off + 82u;
 #elif defined(DATA_K_TBQ4_0_64)
-                    const uint32_t qjl_off = block_byte_off + 34u;
-                    const uint32_t dr_off  = block_byte_off + 42u;
+                        const uint32_t qjl_off = block_byte_off + 34u;
+                        const uint32_t dr_off  = block_byte_off + 42u;
 #endif
-                    uint16_t dr_bits = uint16_t(data_k[dr_off]) | (uint16_t(data_k[dr_off + 1u]) << 8u);
-                    float d_r = float(uint16BitsToHalf(dr_bits));
-                    if (d_r > 1e-15) {
-                        float pos_sum = 0.0;
-                        float total_sum = 0.0;
-                        [[unroll]] for (uint w = 0u; w < HSK / 32u; w++) {
-                            uint boff = qjl_off + w * 4u;
-                            uint bits = uint(data_k[boff])
-                                      | (uint(data_k[boff + 1u]) << 8u)
-                                      | (uint(data_k[boff + 2u]) << 16u)
-                                      | (uint(data_k[boff + 3u]) << 24u);
-                            uint dd0 = w * 32u;
-                            [[unroll]] for (uint q = 0u; q < 8u; q++) {
-                                vec4 pq = vec4(qjl_proj_sh[r][dd0 + q * 4u],
-                                               qjl_proj_sh[r][dd0 + q * 4u + 1u],
-                                               qjl_proj_sh[r][dd0 + q * 4u + 2u],
-                                               qjl_proj_sh[r][dd0 + q * 4u + 3u]);
-                                vec4 mask = vec4(float(bits & 1u), float((bits >> 1u) & 1u),
-                                                 float((bits >> 2u) & 1u), float((bits >> 3u) & 1u));
-                                pos_sum += dot(mask, pq);
-                                total_sum += pq.x + pq.y + pq.z + pq.w;
-                                bits >>= 4u;
+                        uint16_t dr_bits = uint16_t(data_k[dr_off]) | (uint16_t(data_k[dr_off + 1u]) << 8u);
+                        float d_r = float(uint16BitsToHalf(dr_bits));
+                        if (d_r > 1e-15) {
+                            float pos_sum = 0.0;
+                            float total_sum = 0.0;
+                            [[unroll]] for (uint w = 0u; w < QUANT_K / 32u; w++) {
+                                uint boff = qjl_off + w * 4u;
+                                uint bits = uint(data_k[boff])
+                                          | (uint(data_k[boff + 1u]) << 8u)
+                                          | (uint(data_k[boff + 2u]) << 16u)
+                                          | (uint(data_k[boff + 3u]) << 24u);
+                                uint dd0 = w * 32u;
+                                [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                                    uint qd = qjl_block * QUANT_K + dd0 + q * 4u;
+                                    vec4 pq = vec4(qjl_proj_sh[r][qd],
+                                                   qjl_proj_sh[r][qd + 1u],
+                                                   qjl_proj_sh[r][qd + 2u],
+                                                   qjl_proj_sh[r][qd + 3u]);
+                                    vec4 mask = vec4(float(bits & 1u), float((bits >> 1u) & 1u),
+                                                     float((bits >> 2u) & 1u), float((bits >> 3u) & 1u));
+                                    pos_sum += dot(mask, pq);
+                                    total_sum += pq.x + pq.y + pq.z + pq.w;
+                                    bits >>= 4u;
+                                }
                             }
+                            corr += qjl_scale * d_r * (2.0 * pos_sum - total_sum);
                         }
-                        corr = qjl_scale * d_r * (2.0 * pos_sum - total_sum);
                     }
                 }
                 qjl_corr_sh[r][c] = corr;

@@ -59,6 +59,37 @@ shared ACC_TYPE slope[Br];
 
 #ifdef HAS_QJL_CORRECTION
 shared float Qf_qjl_proj[Br][QUANT_K];
+
+void qjl_project_q_block(uint32_t q_offset, uint32_t qjl_block_start, uint32_t tid) {
+    // See detailed comment in flash_attn.comp: read Q directly from the input
+    // SSBO and project one TBQ K block at a time.
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        if (i * Br + r < N) {
+            for (uint32_t idx = tid; idx < QUANT_K; idx += gl_WorkGroupSize.x) {
+                vec4 qv = vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + (qjl_block_start + idx) / 4]);
+                float q_val = qv[idx % 4];
+                Qf_qjl_proj[r][idx] = q_val * qjl_get_sign(idx);
+            }
+        }
+        barrier();
+
+        if (i * Br + r < N) {
+            for (uint h = 1u; h < QUANT_K; h <<= 1u) {
+                for (uint idx = tid; idx < QUANT_K / 2u; idx += gl_WorkGroupSize.x) {
+                    uint grp = idx / h;
+                    uint pos = idx % h;
+                    uint j = grp * (h << 1u) + pos;
+                    float a = Qf_qjl_proj[r][j];
+                    float b = Qf_qjl_proj[r][j + h];
+                    Qf_qjl_proj[r][j]     = a + b;
+                    Qf_qjl_proj[r][j + h] = a - b;
+                }
+                barrier();
+            }
+        }
+        barrier();
+    }
+}
 #endif
 
 void main() {
@@ -98,39 +129,6 @@ void main() {
         }
     }
     barrier();
-
-#ifdef HAS_QJL_CORRECTION
-    // See detailed comment in flash_attn.comp: we read Q directly from the
-    // input SSBO to avoid the Qf -> f16 -> /p.scale round-trip on the cm1
-    // path, which is lossy for the large activation magnitudes seen e.g. in
-    // Qwen2.5-0.5B's first layers.
-    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
-        if (i * Br + r < N) {
-            for (uint32_t idx = tid; idx < QUANT_K; idx += gl_WorkGroupSize.x) {
-                vec4 qv = vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + idx / 4]);
-                float q_val = qv[idx % 4];
-                Qf_qjl_proj[r][idx] = q_val * qjl_get_sign(idx);
-            }
-        }
-        barrier();
-
-        if (i * Br + r < N) {
-            for (uint h = 1u; h < QUANT_K; h <<= 1u) {
-                for (uint idx = tid; idx < QUANT_K / 2u; idx += gl_WorkGroupSize.x) {
-                    uint grp = idx / h;
-                    uint pos = idx % h;
-                    uint j = grp * (h << 1u) + pos;
-                    float a = Qf_qjl_proj[r][j];
-                    float b = Qf_qjl_proj[r][j + h];
-                    Qf_qjl_proj[r][j]     = a + b;
-                    Qf_qjl_proj[r][j + h] = a - b;
-                }
-                barrier();
-            }
-        }
-        barrier();
-    }
-#endif
 
     f16vec4 Of[rows_per_thread][d_per_thread];
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
@@ -368,30 +366,33 @@ void main() {
         barrier();
 
 #ifdef HAS_QJL_CORRECTION
-        {
-            // sfsh is ACC_TYPEV4 (4 rows packed per vec4 lane), so r → (r/4, r%4).
-            [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += gl_WorkGroupSize.x) {
-                uint32_t flat_idx = idx + tid;
-                if (flat_idx < Bc * Br) {
-                    uint32_t c = flat_idx / Br;
-                    uint32_t r = flat_idx % Br;
-                    uint32_t kv_col = j * Bc + c;
-                    if (i * Br + r < N && (!KV_bounds_check || kv_col < KV)) {
-                        uint32_t k_block = kv_col * k_stride;
-                        vec4 proj_q_v4[QUANT_K / 4];
-                        float proj_q_sum = 0.0;
-                        [[unroll]] for (uint jj = 0u; jj < QUANT_K / 4u; jj++) {
-                            proj_q_v4[jj] = vec4(Qf_qjl_proj[r][jj * 4u],
-                                                 Qf_qjl_proj[r][jj * 4u + 1u],
-                                                 Qf_qjl_proj[r][jj * 4u + 2u],
-                                                 Qf_qjl_proj[r][jj * 4u + 3u]);
-                            proj_q_sum += proj_q_v4[jj].x + proj_q_v4[jj].y + proj_q_v4[jj].z + proj_q_v4[jj].w;
+        [[unroll]] for (uint32_t qjl_block = 0; qjl_block < HSK / QUANT_K; ++qjl_block) {
+            qjl_project_q_block(q_offset, qjl_block * QUANT_K, tid);
+            {
+                // sfsh is ACC_TYPEV4 (4 rows packed per vec4 lane), so r -> (r/4, r%4).
+                [[unroll]] for (uint32_t idx = 0; idx < Bc * Br; idx += gl_WorkGroupSize.x) {
+                    uint32_t flat_idx = idx + tid;
+                    if (flat_idx < Bc * Br) {
+                        uint32_t c = flat_idx / Br;
+                        uint32_t r = flat_idx % Br;
+                        uint32_t kv_col = j * Bc + c;
+                        if (i * Br + r < N && (!KV_bounds_check || kv_col < KV)) {
+                            uint32_t k_block = kv_col * k_stride + qjl_block;
+                            vec4 proj_q_v4[QUANT_K / 4];
+                            float proj_q_sum = 0.0;
+                            [[unroll]] for (uint jj = 0u; jj < QUANT_K / 4u; jj++) {
+                                proj_q_v4[jj] = vec4(Qf_qjl_proj[r][jj * 4u],
+                                                     Qf_qjl_proj[r][jj * 4u + 1u],
+                                                     Qf_qjl_proj[r][jj * 4u + 2u],
+                                                     Qf_qjl_proj[r][jj * 4u + 3u]);
+                                proj_q_sum += proj_q_v4[jj].x + proj_q_v4[jj].y + proj_q_v4[jj].z + proj_q_v4[jj].w;
+                            }
+                            sfsh[c * sfshstride + r / 4][r % 4] += ACC_TYPE(p.scale * qjl_correction_k(k_block, k_offset, proj_q_sum, proj_q_v4));
                         }
-                        sfsh[c * sfshstride + r / 4][r % 4] += ACC_TYPE(p.scale * qjl_correction_k(k_block, k_offset, proj_q_sum, proj_q_v4));
                     }
                 }
+                barrier();
             }
-            barrier();
         }
 #endif
 

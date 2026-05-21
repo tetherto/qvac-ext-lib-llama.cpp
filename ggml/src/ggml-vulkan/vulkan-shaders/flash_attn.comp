@@ -78,6 +78,47 @@ shared vec4 occupancy_limiter[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM 
 
 #ifdef HAS_QJL_CORRECTION
 shared float Qf_qjl_proj[Br][QUANT_K];
+
+void qjl_project_q_block(uint32_t q_offset, uint32_t qjl_block_start, uint32_t tid) {
+    // Pre-compute QJL projection of one K block of Q:
+    // proj_q = FHT(D_qjl * q[qjl_block_start:qjl_block_start+QUANT_K]).
+    //
+    // Read Q straight from the input SSBO (data_qv4). The alternative is to
+    // read the already-loaded Qf shared array and divide by p.scale to undo
+    // the p.scale that was multiplied into Qf for the main Q·K dot. For the
+    // scalar FA path Qf is f32 and p.scale is usually a power of two
+    // (1/sqrt(head_dim)), so the round-trip is mathematically exact; for
+    // the coopmat1 path Qf is f16, which makes the round-trip lossy for
+    // large-magnitude activations. Reading the raw f32 Q directly avoids
+    // both issues and matches what the non-FA mul_mm_tbq_qjl_correction pass
+    // does with src1.
+    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+        if (i * Br + r < N) {
+            for (uint32_t idx = tid; idx < QUANT_K; idx += gl_WorkGroupSize.x) {
+                vec4 qv = vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + (qjl_block_start + idx) / 4]);
+                float q_val = qv[idx % 4];
+                Qf_qjl_proj[r][idx] = q_val * qjl_get_sign(idx);
+            }
+        }
+        barrier();
+
+        if (i * Br + r < N) {
+            for (uint h = 1u; h < QUANT_K; h <<= 1u) {
+                for (uint idx = tid; idx < QUANT_K / 2u; idx += gl_WorkGroupSize.x) {
+                    uint grp = idx / h;
+                    uint pos = idx % h;
+                    uint j = grp * (h << 1u) + pos;
+                    float a = Qf_qjl_proj[r][j];
+                    float b = Qf_qjl_proj[r][j + h];
+                    Qf_qjl_proj[r][j]     = a + b;
+                    Qf_qjl_proj[r][j + h] = a - b;
+                }
+                barrier();
+            }
+        }
+        barrier();
+    }
+}
 #endif
 
 void main() {
@@ -147,46 +188,6 @@ void main() {
 #endif
     }
     barrier();
-
-#ifdef HAS_QJL_CORRECTION
-    // Pre-compute QJL projection of Q: proj_q = FHT(D_qjl * q).
-    //
-    // Read Q straight from the input SSBO (data_qv4). The alternative is to
-    // read the already-loaded Qf shared array and divide by p.scale to undo
-    // the p.scale that was multiplied into Qf for the main Q·K dot. For the
-    // scalar FA path Qf is f32 and p.scale is usually a power of two
-    // (1/sqrt(head_dim)), so the round-trip is mathematically exact; for
-    // the coopmat1 path Qf is f16, which makes the round-trip lossy for
-    // large-magnitude activations. Reading the raw f32 Q directly avoids
-    // both issues and matches what the non-FA mul_mm_tbq_qjl_correction pass
-    // does with src1.
-    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
-        if (i * Br + r < N) {
-            for (uint32_t idx = tid; idx < QUANT_K; idx += gl_WorkGroupSize.x) {
-                vec4 qv = vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + idx / 4]);
-                float q_val = qv[idx % 4];
-                Qf_qjl_proj[r][idx] = q_val * qjl_get_sign(idx);
-            }
-        }
-        barrier();
-
-        if (i * Br + r < N) {
-            for (uint h = 1u; h < QUANT_K; h <<= 1u) {
-                for (uint idx = tid; idx < QUANT_K / 2u; idx += gl_WorkGroupSize.x) {
-                    uint grp = idx / h;
-                    uint pos = idx % h;
-                    uint j = grp * (h << 1u) + pos;
-                    float a = Qf_qjl_proj[r][j];
-                    float b = Qf_qjl_proj[r][j + h];
-                    Qf_qjl_proj[r][j]     = a + b;
-                    Qf_qjl_proj[r][j + h] = a - b;
-                }
-                barrier();
-            }
-        }
-        barrier();
-    }
-#endif
 
     FLOAT_TYPEV4 Of[rows_per_thread][HSV_per_thread / 4];
     [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
@@ -571,23 +572,27 @@ void main() {
         }
 
 #ifdef HAS_QJL_CORRECTION
-        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
-            if (i * Br + r >= N) continue;
-            vec4 proj_q_v4[QUANT_K / 4];
-            float proj_q_sum = 0.0;
-            [[unroll]] for (uint jj = 0u; jj < QUANT_K / 4u; jj++) {
-                proj_q_v4[jj] = vec4(Qf_qjl_proj[r][jj * 4u],
-                                     Qf_qjl_proj[r][jj * 4u + 1u],
-                                     Qf_qjl_proj[r][jj * 4u + 2u],
-                                     Qf_qjl_proj[r][jj * 4u + 3u]);
-                proj_q_sum += proj_q_v4[jj].x + proj_q_v4[jj].y + proj_q_v4[jj].z + proj_q_v4[jj].w;
+        [[unroll]] for (uint32_t qjl_block = 0; qjl_block < HSK / QUANT_K; ++qjl_block) {
+            qjl_project_q_block(q_offset, qjl_block * QUANT_K, tid);
+            [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+                if (i * Br + r >= N) continue;
+                vec4 proj_q_v4[QUANT_K / 4];
+                float proj_q_sum = 0.0;
+                [[unroll]] for (uint jj = 0u; jj < QUANT_K / 4u; jj++) {
+                    proj_q_v4[jj] = vec4(Qf_qjl_proj[r][jj * 4u],
+                                         Qf_qjl_proj[r][jj * 4u + 1u],
+                                         Qf_qjl_proj[r][jj * 4u + 2u],
+                                         Qf_qjl_proj[r][jj * 4u + 3u]);
+                    proj_q_sum += proj_q_v4[jj].x + proj_q_v4[jj].y + proj_q_v4[jj].z + proj_q_v4[jj].w;
+                }
+                [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                    uint32_t kv_col = j * Bc + c * cols_per_iter + col_tid;
+                    if (KV_bounds_check && kv_col >= KV) continue;
+                    uint32_t k_block = kv_col * k_stride + qjl_block;
+                    Sf[r][c] += ACC_TYPE(p.scale * qjl_correction_k(k_block, k_offset, proj_q_sum, proj_q_v4));
+                }
             }
-            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-                uint32_t kv_col = j * Bc + c * cols_per_iter + col_tid;
-                if (KV_bounds_check && kv_col >= KV) continue;
-                uint32_t k_block = kv_col * k_stride;
-                Sf[r][c] += ACC_TYPE(p.scale * qjl_correction_k(k_block, k_offset, proj_q_sum, proj_q_v4));
-            }
+            barrier();
         }
 #endif
 

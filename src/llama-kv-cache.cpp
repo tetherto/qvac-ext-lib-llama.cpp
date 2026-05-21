@@ -242,6 +242,8 @@ llama_kv_cache::llama_kv_cache(
         const bool has_v = !is_mla;
 
         // TurboQuant: auto-select block=64 variant when head_dim=64.
+        // For wider heads, the base 128-block types pack multiple consecutive
+        // 128-element blocks per head (e.g. head_dim=256 => two blocks/head).
         // User specifies tbq3_0/tbq4_0 on the CLI; we swap to the _64 internal type if needed.
         auto resolve_tq_type = [&](ggml_type & type, const char * kv_label, uint32_t head_dim, uint32_t n_embd_gqa) {
             if (!ggml_is_tbq_or_pq(type)) {
@@ -252,10 +254,10 @@ llama_kv_cache::llama_kv_cache(
                 if (type == GGML_TYPE_TBQ4_0) type = GGML_TYPE_TBQ4_0_64;
                 if (type == GGML_TYPE_PQ3_0) type = GGML_TYPE_PQ3_0_64;
                 if (type == GGML_TYPE_PQ4_0) type = GGML_TYPE_PQ4_0_64;
-            } else if (head_dim != 128) {
+            } else if (head_dim % 128 != 0) {
                 throw std::runtime_error(
                     std::string("KV cache type ") + ggml_type_name(type) +
-                    " requires head_dim=64 or 128, but this model uses head_dim=" +
+                    " requires head_dim=64 or a multiple of 128, but this model uses head_dim=" +
                     std::to_string(head_dim) +
                     " for " + kv_label + ". Use a different --cache-type-" + kv_label + " (e.g. q8_0, q4_0).");
             }

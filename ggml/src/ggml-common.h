@@ -287,9 +287,10 @@ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 
 // Both share identical codebooks, sign arrays, Hadamard transforms, and Stage 1 quantization logic.
 // TQ3 simply appends a QJL sidecar (sign bits of projected residual + residual norm) to each block.
 //
-// Two block sizes: 128 (head_dim=128) and 64 (head_dim=64).
+// Two block sizes: 128 (head_dim is a multiple of 128) and 64 (head_dim=64).
 // The user specifies "tbq3_0" (with QJL) or "pq3_0" (without) on the CLI;
-// the KV cache init selects the _64 variant automatically when head_dim=64.
+// the KV cache init selects the _64 variant automatically when head_dim=64
+// and packs wider heads as consecutive 128-element blocks.
 //
 
 #define QK_TQ 128
