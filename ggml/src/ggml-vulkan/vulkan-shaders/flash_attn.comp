@@ -574,15 +574,16 @@ void main() {
 #ifdef HAS_QJL_CORRECTION
         [[unroll]] for (uint32_t qjl_block = 0; qjl_block < HSK / QUANT_K; ++qjl_block) {
             qjl_project_q_block(q_offset, qjl_block * QUANT_K, tid);
-            [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
-                if (i * Br + r >= N) continue;
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                const uint32_t q_row = tile_row(r);
+                if (i * Br + q_row >= N) continue;
                 vec4 proj_q_v4[QUANT_K / 4];
                 float proj_q_sum = 0.0;
                 [[unroll]] for (uint jj = 0u; jj < QUANT_K / 4u; jj++) {
-                    proj_q_v4[jj] = vec4(Qf_qjl_proj[r][jj * 4u],
-                                         Qf_qjl_proj[r][jj * 4u + 1u],
-                                         Qf_qjl_proj[r][jj * 4u + 2u],
-                                         Qf_qjl_proj[r][jj * 4u + 3u]);
+                    proj_q_v4[jj] = vec4(Qf_qjl_proj[q_row][jj * 4u],
+                                         Qf_qjl_proj[q_row][jj * 4u + 1u],
+                                         Qf_qjl_proj[q_row][jj * 4u + 2u],
+                                         Qf_qjl_proj[q_row][jj * 4u + 3u]);
                     proj_q_sum += proj_q_v4[jj].x + proj_q_v4[jj].y + proj_q_v4[jj].z + proj_q_v4[jj].w;
                 }
                 [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
