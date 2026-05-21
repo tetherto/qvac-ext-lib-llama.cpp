@@ -16,12 +16,6 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
-#include "ggml-cpp.h"
-
-#ifdef __APPLE__
-#include <TargetConditionals.h>
-#endif
-
 #include "models/models.h"
 
 #include "ggml.h"
@@ -1299,12 +1293,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    #if TARGET_OS_IPHONE
-    const int max_gpu_layers = n_layer_all;
-    #else
-    const int max_gpu_layers = n_layer_all + 1;
-    #endif
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, max_gpu_layers);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
