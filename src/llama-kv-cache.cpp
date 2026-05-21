@@ -348,23 +348,46 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
-    // Attention rotation (Hadamard on K/V before quantization) improves PPL for
-    // low-bit KV caches but costs 17-38% tg throughput on quantized configs.
-    // Default OFF; opt-in via LLAMA_ATTN_ROT_ENABLE=1 when quant quality matters.
+    // Attention rotation (Hadamard on K/V before quantization) reduces per-block
+    // quant error. For low-bit TBQ/PQ caches it's load-bearing — without it,
+    // PQ3/PQ4/TBQ3 inference outputs can degrade into garbage. For higher-bit
+    // q4_0/q8_0 the quality benefit is small and not worth the 17-38% tg
+    // overhead. Default is per-type; LLAMA_ATTN_ROT_ENABLE=0/1 overrides both.
+    auto type_benefits_from_rot = [](ggml_type t) {
+        switch (t) {
+            case GGML_TYPE_TBQ3_0:
+            case GGML_TYPE_TBQ4_0:
+            case GGML_TYPE_TBQ3_0_64:
+            case GGML_TYPE_TBQ4_0_64:
+            case GGML_TYPE_PQ3_0:
+            case GGML_TYPE_PQ4_0:
+            case GGML_TYPE_PQ3_0_64:
+            case GGML_TYPE_PQ4_0_64:
+                return true;
+            default:
+                return false;
+        }
+    };
+
     const char * LLAMA_ATTN_ROT_ENABLE = getenv("LLAMA_ATTN_ROT_ENABLE");
-    const bool attn_rot_enable = LLAMA_ATTN_ROT_ENABLE ? atoi(LLAMA_ATTN_ROT_ENABLE) : false;
-    if (attn_rot_enable) {
-        LLAMA_LOG_INFO("%s: attention rotation enabled (LLAMA_ATTN_ROT_ENABLE)\n", __func__);
+    const bool attn_rot_enable_k = LLAMA_ATTN_ROT_ENABLE
+        ? (atoi(LLAMA_ATTN_ROT_ENABLE) != 0)
+        : type_benefits_from_rot(type_k);
+    const bool attn_rot_enable_v = LLAMA_ATTN_ROT_ENABLE
+        ? (atoi(LLAMA_ATTN_ROT_ENABLE) != 0)
+        : type_benefits_from_rot(type_v);
+    if (LLAMA_ATTN_ROT_ENABLE) {
+        LLAMA_LOG_INFO("%s: attention rotation override (LLAMA_ATTN_ROT_ENABLE=%s)\n", __func__, LLAMA_ATTN_ROT_ENABLE);
     }
 
     attn_rot_k =
-        attn_rot_enable &&
+        attn_rot_enable_k &&
         n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
         hparams.n_embd_head_k() % 64 == 0;
 
     attn_rot_v =
-        attn_rot_enable &&
+        attn_rot_enable_v &&
         n_embd_head_v_all > 0 &&
         ggml_is_quantized(type_v) &&
         hparams.n_embd_head_v() % 64 == 0;
