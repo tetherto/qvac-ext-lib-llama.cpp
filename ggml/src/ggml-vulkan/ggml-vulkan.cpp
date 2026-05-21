@@ -17097,6 +17097,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // are now coopmat2-only. If non-coopmat2 paths need these, revisit.
                 const ggml_type k_type = op->src[1]->type;
                 const ggml_type v_type = op->src[2]->type;
+                auto valid_tq_head_dim = [](ggml_type type, uint32_t head_dim) {
+                    if (!ggml_is_tbq_or_pq(type)) {
+                        return true;
+                    }
+                    return ggml_is_tbq_or_pq_64(type) ? head_dim == 64 : head_dim % 128 == 0;
+                };
+                if (!valid_tq_head_dim(k_type, HSK) || !valid_tq_head_dim(v_type, HSV)) {
+                    return false;
+                }
                 if ((ggml_is_tbq_or_pq(k_type) || ggml_is_tbq_or_pq(v_type)) && !device->fp16) {
                     // TBQ/PQ FA shaders are fp16-only; reject so the scheduler falls back to CPU.
                     return false;
