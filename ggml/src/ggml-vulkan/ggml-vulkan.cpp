@@ -3145,8 +3145,6 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type kv_type, bool f32acc) {
     GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
-    GGML_UNUSED(kv_type);
-    GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
     result.path = FA_COOPMAT1;
@@ -3168,6 +3166,16 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
+
+    const uint32_t qjl_quant_k = ggml_vk_flash_attn_qjl_quant_k(kv_type);
+    if (qjl_quant_k > 0 && hsk > qjl_quant_k) {
+        vk_fa_tuning_params fast = result;
+        fast.qjl_full_proj = true;
+
+        if (ggml_vk_flash_attn_coopmat_shmem_support(device, fast, hsk, hsv, f32acc, qjl_quant_k, true)) {
+            result = fast;
+        }
+    }
 
     return result;
 }
@@ -3234,7 +3242,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
                         (!f32acc && device->coopmat_support_16x16x16_f16acc);
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, kv_type, f32acc);
-        bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, ggml_vk_flash_attn_qjl_quant_k(kv_type));
+        bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, ggml_vk_flash_attn_qjl_quant_k(kv_type), params.qjl_full_proj);
         auto is_coopmat1_fa_type = [](ggml_type t) {
             static auto types = { GGML_TYPE_F16,    GGML_TYPE_F32,    GGML_TYPE_Q4_0,  GGML_TYPE_Q8_0,
                                   GGML_TYPE_TBQ3_0, GGML_TYPE_TBQ4_0, GGML_TYPE_PQ3_0, GGML_TYPE_PQ4_0,
