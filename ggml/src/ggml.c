@@ -6838,6 +6838,14 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
                     }
                 } break;
+                case GGML_UNARY_OP_TANH: {
+                    if (src0_needs_grads) {
+                        // d/dx tanh(x) = 1 - tanh(x)^2 ; tensor == tanh(x)
+                        // grad*(1 - y^2) = grad - grad*y^2  (uses only existing ops, all backends)
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                            ggml_sub(ctx, grad, ggml_mul(ctx, grad, ggml_sqr(ctx, tensor))));
+                    }
+                } break;
                 case GGML_UNARY_OP_EXP: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));

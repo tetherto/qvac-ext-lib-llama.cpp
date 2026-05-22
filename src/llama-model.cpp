@@ -4626,13 +4626,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
                         // note: use_alternative_attention (v_proj is optional, if it's not present, use k_proj)
+                        // shared-KV layers (i >= n_layer_kv_from_start) reuse an earlier
+                        // layer's K/V and therefore have no own attn_k / attn_v / attn_k_norm
+                        // tensors in the GGUF (Gemma-4-E4B / gemma3n MatFormer style). Mark them
+                        // NOT_REQUIRED so such models load instead of failing on a missing tensor.
+                        const bool kv_own = (hparams.n_layer_kv_from_start < 0) || (i < (int) hparams.n_layer_kv_from_start);
+                        const int  kv_req = kv_own ? 0 : TENSOR_NOT_REQUIRED;
                         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head * n_head}, 0);
-                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k}, kv_req);
                         layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v}, TENSOR_NOT_REQUIRED);
                         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, 0);
 
                         layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
-                        layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head}, 0);
+                        layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head}, kv_req);
                         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
 
                         layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1u}, TENSOR_NOT_REQUIRED);
