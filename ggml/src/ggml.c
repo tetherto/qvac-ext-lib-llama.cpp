@@ -6556,7 +6556,9 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 float eps;
                 memcpy(&eps, tensor->op_params, sizeof(float));
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
+                // gemma4 feeds non-contiguous grad/src0 here; rms_norm_back (CPU) asserts
+                // contiguous nb[0]==sizeof(float). Force contiguity (all-backend ggml_cont).
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, ggml_cont(ctx, grad), ggml_cont(ctx, src0), eps));
             }
         } break;
         case GGML_OP_MUL_MAT: {
