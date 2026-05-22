@@ -528,41 +528,45 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
     };
 
-    const std::map<std::string, std::string> float_type_dict_f16 = {
-        {"FLOAT_TYPE",   FLOAT_TYPE(1, "f16")},
-        {"FLOAT_TYPEV2", FLOAT_TYPE(2, "f16")},
-        {"FLOAT_TYPEV4", FLOAT_TYPE(4, "f16")},
-        {"FLOAT_TYPEV8", FLOAT_TYPE(8, "f16")},
-    };
+    const bool coopmat_f32_only = coopmat && !fp16;
 
-    // Shaders with f16 B_TYPE
-    string_to_spv(device_prefix + shader_name + "_f32_f16",         source_name, merge_maps(merge_maps(base_dict, float_type_dict_f16), {{"DATA_A_F32", "1"},                                                     {"B_TYPE", "float16_t"},        {"D_TYPE", "float"}, }), fp16, coopmat, coopmat2, f16acc);
-    string_to_spv(device_prefix + shader_name + "_f32_f16_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict_f16), {{"DATA_A_F32", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
-
-    string_to_spv(device_prefix + shader_name + "_f16",             source_name, merge_maps(merge_maps(base_dict, float_type_dict_f16), {{"DATA_A_F16", "1"},                                                     {"B_TYPE", "float16_t"},        {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
-    string_to_spv(device_prefix + shader_name + "_f16_aligned",     source_name, merge_maps(merge_maps(base_dict, float_type_dict_f16), {{"DATA_A_F16", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
-
-    // bf16
-    {
-        // For aligned matmul loads
-        std::string load_vec_a = coopmat2 ? "1" : "4";
-
-        // scalar path promotes to float
-        std::string to_float_type = (coopmat || coopmat2) ? "uintBitsToBFloat16EXT" : "bf16_to_fp32";
-
-        const std::map<std::string, std::string> float_type_dict_bf16 = {
-            {"FLOAT_TYPE",   FLOAT_TYPE(1, "bf16")},
-            {"FLOAT_TYPEV2", FLOAT_TYPE(2, "bf16")},
-            {"FLOAT_TYPEV4", FLOAT_TYPE(4, "bf16")},
+    if (!coopmat_f32_only) {
+        const std::map<std::string, std::string> float_type_dict_f16 = {
+            {"FLOAT_TYPE",   FLOAT_TYPE(1, "f16")},
+            {"FLOAT_TYPEV2", FLOAT_TYPE(2, "f16")},
+            {"FLOAT_TYPEV4", FLOAT_TYPE(4, "f16")},
+            {"FLOAT_TYPEV8", FLOAT_TYPE(8, "f16")},
         };
 
-        // If bfloat16 is not supported, then only compile the scalar (promote to fp32) shader
-#if !defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
-        if (!(coopmat || coopmat2))
-#endif
+        // Shaders with f16 B_TYPE
+        string_to_spv(device_prefix + shader_name + "_f32_f16",         source_name, merge_maps(merge_maps(base_dict, float_type_dict_f16), {{"DATA_A_F32", "1"},                                                     {"B_TYPE", "float16_t"},        {"D_TYPE", "float"}, }), fp16, coopmat, coopmat2, f16acc);
+        string_to_spv(device_prefix + shader_name + "_f32_f16_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict_f16), {{"DATA_A_F32", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+
+        string_to_spv(device_prefix + shader_name + "_f16",             source_name, merge_maps(merge_maps(base_dict, float_type_dict_f16), {{"DATA_A_F16", "1"},                                                     {"B_TYPE", "float16_t"},        {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+        string_to_spv(device_prefix + shader_name + "_f16_aligned",     source_name, merge_maps(merge_maps(base_dict, float_type_dict_f16), {{"DATA_A_F16", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+
+        // bf16
         {
-            string_to_spv(device_prefix + shader_name + "_bf16",         source_name, merge_maps(merge_maps(base_dict, float_type_dict_bf16), {{"TO_FLOAT_TYPE", to_float_type}, {"DATA_A_BF16", "1"},                             {"B_TYPE", coopmat2 ? "bfloat16_t" : "uint16_t"}, {"D_TYPE", "float"}, {"B_IS_FLOAT", "1"}, {"DATA_B_BF16", "1"}}),                   fp16, coopmat, coopmat2, f16acc);
-            string_to_spv(device_prefix + shader_name + "_bf16_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict_bf16), {{"TO_FLOAT_TYPE", to_float_type}, {"DATA_A_BF16", "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", "4"}, {"B_TYPE", coopmat2 ? "bfloat16_t" : "u16vec4"},  {"D_TYPE", "float"}, {"B_IS_FLOAT", "1"}, {"DATA_B_BF16", "1"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            // For aligned matmul loads
+            std::string load_vec_a = coopmat2 ? "1" : "4";
+
+            // scalar path promotes to float
+            std::string to_float_type = (coopmat || coopmat2) ? "uintBitsToBFloat16EXT" : "bf16_to_fp32";
+
+            const std::map<std::string, std::string> float_type_dict_bf16 = {
+                {"FLOAT_TYPE",   FLOAT_TYPE(1, "bf16")},
+                {"FLOAT_TYPEV2", FLOAT_TYPE(2, "bf16")},
+                {"FLOAT_TYPEV4", FLOAT_TYPE(4, "bf16")},
+            };
+
+            // If bfloat16 is not supported, then only compile the scalar (promote to fp32) shader
+#if !defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
+            if (!(coopmat || coopmat2))
+#endif
+            {
+                string_to_spv(device_prefix + shader_name + "_bf16",         source_name, merge_maps(merge_maps(base_dict, float_type_dict_bf16), {{"TO_FLOAT_TYPE", to_float_type}, {"DATA_A_BF16", "1"},                             {"B_TYPE", coopmat2 ? "bfloat16_t" : "uint16_t"}, {"D_TYPE", "float"}, {"B_IS_FLOAT", "1"}, {"DATA_B_BF16", "1"}}),                   fp16, coopmat, coopmat2, f16acc);
+                string_to_spv(device_prefix + shader_name + "_bf16_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict_bf16), {{"TO_FLOAT_TYPE", to_float_type}, {"DATA_A_BF16", "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", "4"}, {"B_TYPE", coopmat2 ? "bfloat16_t" : "u16vec4"},  {"D_TYPE", "float"}, {"B_IS_FLOAT", "1"}, {"DATA_B_BF16", "1"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            }
         }
     }
 
@@ -573,7 +577,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         else if ((tname == "q5_0") || (tname == "q8_0") || (tname == "q2_k") || (tname == "q4_k") || (tname == "q5_k") || (tname == "iq3_xxs") || (tname == "iq3_s") || (tname == "iq4_xs") || (tname == "iq4_nl") || (tname == "mxfp4") || (tname == "nvfp4"))
             load_vec_quant = "4";
 
-        if (tname == "bf16") {
+        if (tname == "bf16" ||
+            (coopmat_f32_only && tname != "f32")) {
             continue;
         }
         if (coopmat2 && (tname == "tbq3_0" || tname == "tbq4_0" || tname == "pq3_0" || tname == "pq4_0")) {
@@ -659,7 +664,8 @@ void process_shaders() {
 
         if (matmul_id_type != MatMulIdType::DEFAULT) {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-            // Coopmat, fp32acc and fp16acc
+            // Coopmat, fp32, fp32acc and fp16acc
+            matmul_shaders(false, matmul_id_type, true, false, false);
             matmul_shaders(true, matmul_id_type, true, false, false);
             matmul_shaders(true, matmul_id_type, true, false, true);
 #endif
