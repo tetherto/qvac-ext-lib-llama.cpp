@@ -6838,6 +6838,24 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
                     }
                 } break;
+                case GGML_UNARY_OP_GELU: {
+                    if (src0_needs_grads) {
+                        // d/dx gelu_tanh(x), matches ggml_gelu_backward_f32 (ggml-cpu/vec.h).
+                        // gelu(x)=0.5x(1+tanh(g)), g=c*x*(1+a*x^2), c=sqrt(2/pi), a=0.044715
+                        // dx=dy*0.5*(1+t + x*c*(1+3a*x^2)*(1-t^2)), t=tanh(g). All-backend graph ops.
+                        const float c = 0.79788456080286535587989211986876f;
+                        const float a = 0.044715f;
+                        struct ggml_tensor * x      = src0;
+                        struct ggml_tensor * x2     = ggml_sqr(ctx, x);
+                        struct ggml_tensor * g      = ggml_mul(ctx, ggml_scale(ctx, x, c), ggml_scale_bias(ctx, x2, a, 1.0f));
+                        struct ggml_tensor * t      = ggml_tanh(ctx, g);
+                        struct ggml_tensor * sech2  = ggml_scale_bias(ctx, ggml_sqr(ctx, t), -1.0f, 1.0f);
+                        struct ggml_tensor * dt     = ggml_scale(ctx, ggml_mul(ctx, ggml_scale_bias(ctx, x2, 3.0f*a, 1.0f), sech2), c);
+                        struct ggml_tensor * isum   = ggml_add(ctx, ggml_scale_bias(ctx, t, 1.0f, 1.0f), ggml_mul(ctx, x, dt));
+                        struct ggml_tensor * dx     = ggml_scale(ctx, ggml_mul(ctx, grad, isum), 0.5f);
+                        ggml_add_or_set(ctx, cgraph, isrc0, dx);
+                    }
+                } break;
                 case GGML_UNARY_OP_TANH: {
                     if (src0_needs_grads) {
                         // d/dx tanh(x) = 1 - tanh(x)^2 ; tensor == tanh(x)
