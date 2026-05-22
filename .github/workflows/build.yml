@@ -622,7 +622,7 @@ jobs:
         shell: bash
         run: |
           sudo apt update
-          sudo apt install intel-oneapi-compiler-dpcpp-cpp libssl-dev ninja-build
+          sudo apt install intel-oneapi-compiler-dpcpp-cpp-2025.3 libssl-dev ninja-build
 
       - name: install oneAPI MKL library
         shell: bash
