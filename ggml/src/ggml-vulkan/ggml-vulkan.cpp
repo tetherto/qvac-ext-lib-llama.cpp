@@ -3048,12 +3048,14 @@ struct vk_fa_tuning_params {
     uint32_t row_split;
     bool shmem_staging;
     bool disable_subgroups;
+    bool qjl_full_proj;
     uint32_t limit_occupancy_shmem;
 
     void print() const {
         std::cerr << "path=" << path << " workgroup_size=" << workgroup_size << " subgroup_size=" << subgroup_size <<
                      " block_rows=" << block_rows << " block_cols=" << block_cols << " d_split=" << d_split <<
                      " row_split=" << row_split << " shmem_staging=" << shmem_staging << " disable_subgroups=" << disable_subgroups <<
+                     " qjl_full_proj=" << qjl_full_proj <<
                      " limit_occupancy_shmem=" << limit_occupancy_shmem << std::endl;
     }
 };
@@ -3063,7 +3065,7 @@ static uint32_t ggml_vk_flash_attn_qjl_quant_k(ggml_type kv_type) {
 }
 
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type kv_type);
-static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, uint32_t qjl_quant_k = 0);
+static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, uint32_t qjl_quant_k = 0, bool qjl_full_proj = false);
 
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type kv_type, bool f32acc) {
 
@@ -3172,7 +3174,6 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
 
 static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type kv_type, bool f32acc) {
     GGML_UNUSED(n_kv);
-    GGML_UNUSED(f32acc);
 
     vk_fa_tuning_params result{};
     result.path = FA_COOPMAT2;
@@ -3194,6 +3195,28 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
 
     result.subgroup_size = device->subgroup_size;
     result.workgroup_size = (small_rows && (D % 32) == 0) ? 256 : 128;
+
+    const uint32_t qjl_quant_k = ggml_vk_flash_attn_qjl_quant_k(kv_type);
+    if (!small_rows && qjl_quant_k > 0 && hsk > qjl_quant_k) {
+        auto try_full_proj = [&](uint32_t block_rows, uint32_t block_cols) {
+            vk_fa_tuning_params fast = result;
+            fast.block_rows = block_rows;
+            fast.block_cols = block_cols;
+            fast.qjl_full_proj = true;
+
+            if (ggml_vk_flash_attn_coopmat_shmem_support(device, fast, hsk, hsv, f32acc, qjl_quant_k, true)) {
+                result = fast;
+                return true;
+            }
+            return false;
+        };
+
+        // Prefer fewer KV tiles when possible, but keep a smaller fallback for
+        // devices with 48 KiB workgroup shared-memory limits.
+        if (!try_full_proj(32, 32) && !try_full_proj(16, 64)) {
+            try_full_proj(16, 32);
+        }
+    }
 
     return result;
 }
@@ -3242,6 +3265,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     }
 }
 
+static constexpr uint32_t GGML_VK_FA_FLAG_QJL_FULL_PROJ = 16;
+
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
@@ -3250,7 +3275,8 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
     uint32_t flags = (use_mask_opt      ? 1 : 0) |
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
-                     (old_amd_windows   ? 8 : 0);
+                     (old_amd_windows   ? 8 : 0) |
+                     (params.qjl_full_proj ? GGML_VK_FA_FLAG_QJL_FULL_PROJ : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -10250,7 +10276,7 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
     return supported;
 }
 
-static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, uint32_t qjl_quant_k) {
+static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, uint32_t qjl_quant_k, bool qjl_full_proj) {
     // Needs to be kept up to date on shader changes
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
@@ -10285,12 +10311,14 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 
     const uint32_t slope = Br * acctype;
 
-    const uint32_t qjl_proj = qjl_quant_k ? Br * qjl_quant_k * sizeof(float) : 0;
+    const uint32_t qjl_proj_k = qjl_full_proj ? hsk : qjl_quant_k;
+    const uint32_t qjl_proj = qjl_quant_k ? Br * qjl_proj_k * sizeof(float) : 0;
+    const uint32_t qjl_corr = (qjl_quant_k && params.path == FA_COOPMAT2) ? Br * Bc * sizeof(float) : 0;
 
-    const uint32_t total_size = tmpsh + Qf + Psh + sfsh + ksh + pvsh + slope + qjl_proj;
+    const uint32_t total_size = tmpsh + Qf + Psh + sfsh + ksh + pvsh + slope + qjl_proj + qjl_corr;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
-    VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", qjl_quant_k=" << qjl_quant_k << ", total_size=" << total_size << ", supported=" << supported);
+    VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", qjl_quant_k=" << qjl_quant_k << ", qjl_full_proj=" << qjl_full_proj << ", total_size=" << total_size << ", supported=" << supported);
 
     return supported;
 }
