@@ -6845,9 +6845,12 @@ static void ggml_compute_backward(
                         // d/dx gelu_tanh(x), matches ggml_gelu_backward_f32 (ggml-cpu/vec.h).
                         // gelu(x)=0.5x(1+tanh(g)), g=c*x*(1+a*x^2), c=sqrt(2/pi), a=0.044715
                         // dx=dy*0.5*(1+t + x*c*(1+3a*x^2)*(1-t^2)), t=tanh(g). All-backend graph ops.
+                        // CLAMP x to [-30,30]: gelu'(x) saturates (->1 for x>>0, ->0 for x<<0), so this
+                        // is numerically faithful AND avoids Inf*0=NaN when (1+3a*x^2)->Inf while
+                        // (1-t^2)->0 for huge activations (Gemma has large pre-GELU values).
                         const float c = 0.79788456080286535587989211986876f;
                         const float a = 0.044715f;
-                        struct ggml_tensor * x      = src0;
+                        struct ggml_tensor * x      = ggml_clamp(ctx, src0, -30.0f, 30.0f);
                         struct ggml_tensor * x2     = ggml_sqr(ctx, x);
                         struct ggml_tensor * g      = ggml_mul(ctx, ggml_scale(ctx, x, c), ggml_scale_bias(ctx, x2, a, 1.0f));
                         struct ggml_tensor * t      = ggml_tanh(ctx, g);
