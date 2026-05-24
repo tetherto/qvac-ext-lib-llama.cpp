@@ -1,0 +1,6 @@
+set(TARGET lumi-serve)
+add_executable(${TARGET} lumi-serve.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common llama cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/vendor ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
