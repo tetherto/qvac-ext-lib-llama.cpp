@@ -9,8 +9,11 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const bool src0_is_quantized = (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16);
-    const bool src1_is_quantized = (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16);
+    // F16 must also be converted to F32: out_prod treats the non-converted operand as
+    // raw f32 (wrong pointer stride) -> cuBLAS lda = nb01/sizeof(float) = ne00/2 < m
+    // -> CUBLAS_INVALID_VALUE. Convert anything that isn't already F32.
+    const bool src0_is_quantized = (src0->type != GGML_TYPE_F32);
+    const bool src1_is_quantized = (src1->type != GGML_TYPE_F32);
 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
