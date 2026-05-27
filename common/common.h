@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -322,7 +323,6 @@ struct common_params_model {
     }
 };
 
-// draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
@@ -397,9 +397,9 @@ struct common_params_speculative {
 struct common_params_vocoder {
     struct common_params_model model;
 
-    std::string speaker_file; // speaker file path
+    std::string speaker_file = ""; // speaker file path                                      // NOLINT
 
-    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy
+    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy            // NOLINT
 };
 
 struct common_params_diffusion {
