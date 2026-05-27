@@ -286,13 +286,13 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
         std::string expanded_prefix = path_prefix;
 
 #if !defined(_WIN32)
-        if (string_starts_with(path_prefix, '~')) {
+        if (string_starts_with(path_prefix, "~")) {
             const char * home = std::getenv("HOME");
             if (home && home[0]) {
                 expanded_prefix = home + path_prefix.substr(1);
             }
         }
-        if (string_starts_with(expanded_prefix, '/')) {
+        if (string_starts_with(expanded_prefix, "/")) {
 #else
         if (std::isalpha(expanded_prefix[0]) && expanded_prefix.find(':') == 1) {
 #endif
@@ -593,7 +593,7 @@ int llama_cli(int argc, char ** argv) {
                 if (endpath != std::string::npos) {
                     std::string rel_pattern = pattern.substr(0, endpath);
 #if !defined(_WIN32)
-                    if (string_starts_with(rel_pattern, '~')) {
+                    if (string_starts_with(rel_pattern, "~")) {
                         const char * home = std::getenv("HOME");
                         if (home && home[0]) {
                             rel_pattern = home + rel_pattern.substr(1);
