@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -320,7 +321,6 @@ struct common_params_model {
     }
 };
 
-// draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
