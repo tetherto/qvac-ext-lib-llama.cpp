@@ -20,7 +20,7 @@ TurboQuant adds low-bit KV-cache quantization formats for long-context inference
 - **PQ3_0 / PQ4_0**: PolarQuant 3-bit and 4-bit Stage 1-only formats.
 - **64-wide variants**: `tbq3_0_64`, `tbq4_0_64`, `pq3_0_64`, and `pq4_0_64` for models with smaller attention head dimensions.
 - **Backend support**: CPU quantization/dequantization and Vulkan inference kernels, including attention paths and mixed K/V cache configurations. CUDA and Metal do not include TurboQuant kernels in this release.
-- **Test coverage**: quantization correctness/performance tests, backend op coverage for mixed K/V cache types, and benchmark coverage on RTX 5090 and Strix Halo GPU targets.
+- **Test coverage**: quantization correctness ([test-quantize-fns](tests/test-quantize-fns.cpp)) and performance ([test-quantize-perf](tests/test-quantize-perf.cpp)) tests, Vulkan copy-to-quantize coverage ([test-copy-tbq-subgroups](tests/test-copy-tbq-subgroups.cpp)), backend op coverage for mixed K/V cache types ([test-backend-ops](tests/test-backend-ops.cpp)), and [benchmark coverage](docs/turboquant-benchmarks.md) on RTX 5090 and Strix Halo GPU targets.
 
 Qwen3.5-4B Q8_0 benchmark highlights:
 
