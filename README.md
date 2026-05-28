@@ -35,7 +35,7 @@ Qwen3.5-4B Q8_0 benchmark highlights:
 | 8k | `tbq4_0/pq4_0` | 4.75 | 0.42x | 0.94x | 0.32x | 0.97x |
 | 8k | `tbq3_0/pq3_0` | 3.75 | 0.43x | 0.94x | 0.32x | 0.97x |
 
-Quality checks on Qwen3.5-4B Q8_0 show `tbq4_0/pq4_0` at -0.03% perplexity delta versus `f16/f16`, with 94.8% RULER main score and 100.0% NIAH grid score. See the full [TurboQuant benchmark report](docs/turboquant-benchmarks.md) for all measured models, contexts, and quality results.
+Quality checks on Qwen3.5-4B Q8_0 show `tbq4_0/pq4_0` at -0.03% perplexity delta versus `f16/f16`, with 94.8% RULER main score and 37.04 LongBench average versus 37.52 for `f16/f16`. See the full [TurboQuant benchmark report](docs/turboquant-benchmarks.md) for all measured models, contexts, and quality results.
 
 ### LoRA Fine-Tuning *(exclusive)*
 
