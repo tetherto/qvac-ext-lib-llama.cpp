@@ -26,6 +26,7 @@ Qwen3.5-4B Q8_0 benchmark highlights:
 
 | Context | Cache config | BPW | RTX 5090 pp | RTX 5090 tg | Strix Halo pp | Strix Halo tg |
 | :-- | :-- | --: | --: | --: | --: | --: |
+| 2k | `f16/f16` | 16.00 | 14,538 t/s (baseline) | 236.02 t/s (baseline) | 1,750 t/s (baseline) | 42.30 t/s (baseline) |
 | 2k | `pq4_0/pq4_0` | 4.25 | 0.96x | 0.96x | 0.94x | 0.99x |
 | 2k | `pq3_0/pq3_0` | 3.25 | 0.96x | 0.96x | 0.95x | 0.99x |
 | 2k | `tbq4_0/pq4_0` | 4.75 | 0.71x | 0.94x | 0.60x | 0.97x |
