@@ -20,7 +20,7 @@ TurboQuant adds low-bit KV-cache quantization formats for long-context inference
 - **PQ3_0 / PQ4_0**: PolarQuant 3-bit and 4-bit Stage 1-only formats.
 - **64-wide variants**: `tbq3_0_64`, `tbq4_0_64`, `pq3_0_64`, and `pq4_0_64` for models with smaller attention head dimensions.
 - **Backend support**: CPU quantization/dequantization and Vulkan inference kernels, including attention paths and mixed K/V cache configurations. CUDA and Metal do not include TurboQuant kernels in this release.
-- **Test coverage**: performance coverage via [test-kv-cache-quantization-perf.sh](tests/test-kv-cache-quantization-perf.sh), perplexity coverage via [test-kv-cache-quantization-perp.sh](tests/test-kv-cache-quantization-perp.sh), and eval coverage via [test-kv-cache-ruler.py](tests/test-kv-cache-ruler.py) and [ruler-bench.sh](tests/ruler-bench.sh).
+- **Test coverage**: performance coverage via [test-kv-cache-quantization-perf.sh](tests/test-kv-cache-quantization-perf.sh), perplexity coverage via [test-kv-cache-quantization-perp.sh](tests/test-kv-cache-quantization-perp.sh), and eval coverage via [test-kv-cache-ruler.py](tests/test-kv-cache-ruler.py), [test-kv-cache-niah.py](tests/test-kv-cache-niah.py), [test-kv-cache-longbench.py](tests/test-kv-cache-longbench.py), [test-kv-cache-zeroscrolls.py](tests/test-kv-cache-zeroscrolls.py), and [test-kv-cache-leval.py](tests/test-kv-cache-leval.py).
 
 Qwen3.5-4B Q8_0 benchmark highlights:
 
