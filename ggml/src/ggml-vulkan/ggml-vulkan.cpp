@@ -18879,6 +18879,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_type src0_type = op->src[0]->type;
+                // qvac: Mali/Adreno KHR_coopmat1 + TQ1_0/TQ2_0 MUL_MAT hangs the
+                // GPU on Mali-G715 (ErrorDeviceLost on the first prompt-decode
+                // submit; matmul_tq2_0_f32 shader path). Pre-b9341 the Vulkan
+                // backend had no GPU TQ matmul at all, so these ops graph-split
+                // to CPU and bitnet inference worked end-to-end at ~17.9 t/s on
+                // Mali-G715. Restore that hybrid behavior here. MUL_MAT_ID for
+                // TQ2_0 is already CPU-only below.
+                if (op->op == GGML_OP_MUL_MAT &&
+                    (src0_type == GGML_TYPE_TQ1_0 || src0_type == GGML_TYPE_TQ2_0) &&
+                    (device->vendor_id == VK_VENDOR_ID_ARM || device->vendor_id == VK_VENDOR_ID_QUALCOMM) &&
+                    device->coopmat_support && !device->coopmat2) {
+                    return false;
+                }
                 if (op->op == GGML_OP_MUL_MAT_ID) {
                     if (!device->mul_mat_id_s[src0_type] && !device->mul_mat_id_m[src0_type] && !device->mul_mat_id_l[src0_type]) {
                         // If there's not enough shared memory for row_ids and the result tile, fallback to CPU
