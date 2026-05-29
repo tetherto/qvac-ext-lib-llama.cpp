@@ -1028,6 +1028,9 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_QWEN3TTS:
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
             return false;
         default:
             return true;
