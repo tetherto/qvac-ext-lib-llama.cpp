@@ -145,6 +145,10 @@ set(GGML_OPENCL_KERNELS
     mul_mm_q6_k_f32_l4_lm
     gemv_noshuffle_q4_0_f32
     gemv_noshuffle_q4_0_f32_spec
+    gemv_noshuffle_general
+    gemv_noshuffle
+    mul_mat_Ab_Bi_8x4
+    mul_mm_q8_0_f32_8x4
     gemm_noshuffle_q4_0_f32
     gemv_noshuffle_q4_1_f32
     gemm_noshuffle_q4_1_f32
