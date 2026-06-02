@@ -63,7 +63,10 @@ static bool can_reuse_kq_mask(
 
 // impl
 
-static ggml_tensor * ggml_mul_mat_aux(
+// TODO(tbq-rebase): HEAD called this helper `ggml_mul_mat_aux`; PR renamed it
+// to `ggml_rotate_hadamard`. Renaming to PR's name; callsites that referenced
+// `ggml_mul_mat_aux` from HEAD need to be updated (or this name reverted).
+static ggml_tensor * ggml_rotate_hadamard(
         ggml_context * ctx,
         ggml_tensor * cur,
         ggml_tensor * rot) {
@@ -2630,15 +2633,18 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
             int       il) const {
-    GGML_ASSERT(v_mla == nullptr);
+    // TurboQuant/PolarQuant KV-cache rotation is incompatible with MLA absorption
+    // (DeepSeek-V2/V3 pass wv_b as v_mla here). Only enforce when the rotation
+    // path is actually active; otherwise this overload must still support MLA.
+    GGML_ASSERT(!(inp->self_k_rot || inp->self_v_rot) || v_mla == nullptr);
 
     if (inp->self_k_rot) {
-        q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
-        k_cur = ggml_mul_mat_aux(ctx0, k_cur, inp->self_k_rot);
+        q_cur = ggml_rotate_hadamard(ctx0, q_cur, inp->self_k_rot);
+        k_cur = ggml_rotate_hadamard(ctx0, k_cur, inp->self_k_rot);
     }
 
     if (inp->self_v_rot) {
-        v_cur = ggml_mul_mat_aux(ctx0, v_cur, inp->self_v_rot);
+        v_cur = ggml_rotate_hadamard(ctx0, v_cur, inp->self_v_rot);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2684,7 +2690,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
-        cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+        cur = ggml_rotate_hadamard(ctx0, cur, inp->self_v_rot);
     }
 
     if (wo) {
@@ -2889,14 +2895,14 @@ ggml_tensor * llm_graph_context::build_attn(
     auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
 
     if (k_rot) {
-        q_cur = ggml_mul_mat_aux(ctx0, q_cur, k_rot);
+        q_cur = ggml_rotate_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
-            k_cur = ggml_mul_mat_aux(ctx0, k_cur, k_rot);
+            k_cur = ggml_rotate_hadamard(ctx0, k_cur, k_rot);
         }
     }
     if (v_rot) {
         if (v_cur) {
-            v_cur = ggml_mul_mat_aux(ctx0, v_cur, v_rot);
+            v_cur = ggml_rotate_hadamard(ctx0, v_cur, v_rot);
         }
     }
 
@@ -2955,7 +2961,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (v_rot) {
-        cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
+        cur = ggml_rotate_hadamard(ctx0, cur, v_rot);
     }
 
     if (wo) {
