@@ -1418,125 +1418,9 @@ common_init_result_ptr common_init_from_model_and_params(llama_model* model, com
 
     llama_context * lctx = res->context();
     if (lctx == NULL) {
-        LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
-        return res;
-    }
-
-    if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
-        LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
-        params.ctx_shift = false;
-    }
-
-    if (!params.control_vectors.empty()) {
-        if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
-        if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);
-
-        const auto cvec = common_control_vector_load(params.control_vectors);
-        if (cvec.n_embd == -1) {
-            return res;
-        }
-
-        int err = llama_set_adapter_cvec(
-                lctx,
-                cvec.data.data(),
-                cvec.data.size(),
-                cvec.n_embd,
-                params.control_vector_layer_start,
-                params.control_vector_layer_end);
-        if (err) {
-            return res;
-        }
-    }
-
-    if (llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_RANK) {
-        bool ok = true;
-
-        if (llama_vocab_bos(vocab) == LLAMA_TOKEN_NULL) {
-            LOG_WRN("%s: warning: vocab does not have a  BOS token, reranking will not work\n", __func__);
-            ok = false;
-        }
-
-        bool has_eos = llama_vocab_eos(vocab) != LLAMA_TOKEN_NULL;
-        bool has_sep = llama_vocab_sep(vocab) != LLAMA_TOKEN_NULL;
-        bool has_rerank_prompt = llama_model_chat_template(model, "rerank") != NULL;
-
-        if (!has_eos && !has_sep && !has_rerank_prompt) {
-            LOG_WRN("%s: warning: vocab does not have an EOS token, SEP token, or rerank prompt. Reranking will not work\n", __func__);
-            ok = false;
-        } else if (!has_eos) {
-            LOG_WRN("%s: warning: vocab does not have an EOS token, using SEP token as fallback\n", __func__);
-        }
-
-        if (!ok) {
-            return res;
-        }
-    }
-
-    if (!params.lora_init_without_apply) {
-        common_set_adapter_lora(lctx, params.lora_adapters);
-    }
-
-    if (params.warmup) {
-        LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
-
-        std::vector<llama_token> tmp;
-        llama_token bos = llama_vocab_bos(vocab);
-        llama_token eos = llama_vocab_eos(vocab);
-
-        // some models (e.g. T5) don't have a BOS token
-        if (bos != LLAMA_TOKEN_NULL) {
-            tmp.push_back(bos);
-        }
-        if (eos != LLAMA_TOKEN_NULL) {
-            tmp.push_back(eos);
-        }
-        if (tmp.empty()) {
-            tmp.push_back(0);
-        }
-
-        if (llama_model_has_encoder(model)) {
-            llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));
-            llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
-            if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
-                decoder_start_token_id = bos;
-            }
-            tmp.clear();
-            tmp.push_back(decoder_start_token_id);
-        }
-        if (llama_model_has_decoder(model)) {
-            llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
-        }
-        llama_memory_clear(llama_get_memory(lctx), true);
-        llama_synchronize(lctx);
-        llama_perf_context_reset(lctx);
-
-        // reset samplers to reset RNG state after warmup to the seeded state
-        res->reset_samplers();
-    }
-
-    return res;
-}
-
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
-
-    llama_model * model = res->model();
-    if (model == NULL) {
-        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
-        return res;
-    }
-
-    if (model_only) {
-        return res;
-    }
-
-    llama_context * lctx = res->context();
-    if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return res;
     }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");
@@ -1633,11 +1517,32 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     return res;
 }
 
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    return common_init_from_model_and_params(model, std::move(res), params);
+}
+
 // Compat overload for callers that have already loaded a model externally
 // and don't have a params.model.path the file-based constructor can open.
 common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params) {
     if (model == nullptr) {
-        return common_init_result_ptr();
+        // Mirror common_init_from_params: on load failure return a *valid* empty
+        // result (model()/context() == nullptr), never a null pointer. Callers
+        // adopt this result and inspect model()/context() to detect failure
+        // (e.g. and then throw); returning a null common_init_result_ptr here
+        // makes those callers dereference null and crash.
+        return common_init_result_ptr(new common_init_result());
     }
 
     // Adopt the externally-loaded model into an empty result. Do NOT use the
