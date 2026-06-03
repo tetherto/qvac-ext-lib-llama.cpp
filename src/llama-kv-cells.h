@@ -448,6 +448,7 @@ public:
     }
 
     // pos[i] = pos[i] + d
+    // for decoder M-RoPE/iM-RoPE, ext holds the active spatial axes and the 4th axis is unused
     // sets "has_shift" to true
     // note: call only if the cell is not empty
     bool pos_add(uint32_t i, llama_pos d, bool shift_ext = false) {
@@ -455,6 +456,7 @@ public:
         delta.t = d;
 
         if (shift_ext) {
+            // Move the shared M-RoPE origin while preserving relative image-grid offsets.
             delta.y = d;
             delta.x = d;
         }

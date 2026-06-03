@@ -1551,6 +1551,7 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
             const int64_t idx = (int64_t) s*cells.size() + i;
 
             if (is_mrope_shift) {
+                // M-RoPE/iM-RoPE decoder K-shift layout is [t, y, x, other] planes.
                 for (uint32_t dim = 0; dim < 4; ++dim) {
                     data[dim*n_kv + idx] = cells.is_empty(i) ? 0 : cells.get_shift(i, dim);
                 }

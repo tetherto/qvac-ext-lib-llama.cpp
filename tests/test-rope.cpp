@@ -257,7 +257,8 @@ int main(int /*argc*/, const char ** /*argv*/) {
         }
     }
 
-    // Explicit decoder K-shift shape for M-RoPE/iM-RoPE: shift t/y/x while keeping the 4th axis unused.
+    // Explicit decoder K-shift shape for M-RoPE/iM-RoPE image grids:
+    // shift t/y/x while keeping the 4th axis unused.
     for (int m = 0; m < 2; ++m) {
         const int ndims = 4;
 
@@ -267,6 +268,7 @@ int main(int /*argc*/, const char ** /*argv*/) {
         int sections[4] = {16, 24, 24, 0};
         const int mode = m == 0 ? GGML_ROPE_TYPE_MROPE : GGML_ROPE_TYPE_IMROPE;
         const int shift = -17;
+        const int grid_w = 4;
 
         x = get_random_tensor_f32(ctx0, ndims, ne, -1.0f, 1.0f);
 
@@ -275,9 +277,9 @@ int main(int /*argc*/, const char ** /*argv*/) {
         struct ggml_tensor * p1 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * 4);
 
         for (int i = 0; i < ne[2]; ++i) {
-            const int32_t old_t = 100 + i;
-            const int32_t old_y = 50 + i;
-            const int32_t old_x = 25 + i;
+            const int32_t old_t = 100;
+            const int32_t old_y = 50 + i/grid_w;
+            const int32_t old_x = 25 + i%grid_w;
 
             ((int32_t *) p0->data)[i + ne[2] * 0] = old_t;
             ((int32_t *) p0->data)[i + ne[2] * 1] = old_y;
