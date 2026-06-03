@@ -257,6 +257,82 @@ int main(int /*argc*/, const char ** /*argv*/) {
         }
     }
 
+    // Explicit decoder K-shift shape for M-RoPE/iM-RoPE: shift t/y/x while keeping the 4th axis unused.
+    for (int m = 0; m < 2; ++m) {
+        const int ndims = 4;
+
+        const int64_t n_rot = 128;
+        const int64_t ne[4] = { n_rot, 2, 11, 1 };
+
+        int sections[4] = {16, 24, 24, 0};
+        const int mode = m == 0 ? GGML_ROPE_TYPE_MROPE : GGML_ROPE_TYPE_IMROPE;
+        const int shift = -17;
+
+        x = get_random_tensor_f32(ctx0, ndims, ne, -1.0f, 1.0f);
+
+        struct ggml_tensor * p0 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * 4);
+        struct ggml_tensor * pd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * 4);
+        struct ggml_tensor * p1 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * 4);
+
+        for (int i = 0; i < ne[2]; ++i) {
+            const int32_t old_t = 100 + i;
+            const int32_t old_y = 50 + i;
+            const int32_t old_x = 25 + i;
+
+            ((int32_t *) p0->data)[i + ne[2] * 0] = old_t;
+            ((int32_t *) p0->data)[i + ne[2] * 1] = old_y;
+            ((int32_t *) p0->data)[i + ne[2] * 2] = old_x;
+            ((int32_t *) p0->data)[i + ne[2] * 3] = 0;
+
+            ((int32_t *) pd->data)[i + ne[2] * 0] = shift;
+            ((int32_t *) pd->data)[i + ne[2] * 1] = shift;
+            ((int32_t *) pd->data)[i + ne[2] * 2] = shift;
+            ((int32_t *) pd->data)[i + ne[2] * 3] = 0;
+
+            ((int32_t *) p1->data)[i + ne[2] * 0] = old_t + shift;
+            ((int32_t *) p1->data)[i + ne[2] * 1] = old_y + shift;
+            ((int32_t *) p1->data)[i + ne[2] * 2] = old_x + shift;
+            ((int32_t *) p1->data)[i + ne[2] * 3] = 0;
+        }
+
+        struct ggml_tensor * r0 = ggml_rope_multi(
+            ctx0, x, p0, nullptr,
+            n_rot, sections, mode, 32768, 1000000, 1, 0, 1, 32, 1);
+        struct ggml_tensor * rd = ggml_rope_multi(
+            ctx0, r0, pd, nullptr,
+            n_rot, sections, mode, 32768, 1000000, 1, 0, 1, 32, 1);
+        struct ggml_tensor * r1 = ggml_rope_multi(
+            ctx0, x, p1, nullptr,
+            n_rot, sections, mode, 32768, 1000000, 1, 0, 1, 32, 1);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+        ggml_build_forward_expand(gf, r0);
+        ggml_build_forward_expand(gf, rd);
+        ggml_build_forward_expand(gf, r1);
+
+        ggml_graph_compute_helper(work_buffer, gf, 4);
+
+        double sum = 0.0f;
+        double diff = 0.0f;
+
+        const float * rd_data = (float *) rd->data;
+        const float * r1_data = (float *) r1->data;
+
+        const int n_elements = ggml_nelements(rd);
+
+        for (int i = 0; i < n_elements; ++i) {
+            sum  += fabs(r1_data[i]);
+            diff += fabs(rd_data[i] - r1_data[i]);
+        }
+
+        printf("k-shift mode: %d\n", mode);
+        printf("k-shift diff: %f\n", diff);
+        printf("k-shift rel err: %f\n", diff / sum);
+
+        GGML_ASSERT(diff / sum < 0.0001f);
+    }
+
     ggml_free(ctx0);
 
     return 0;

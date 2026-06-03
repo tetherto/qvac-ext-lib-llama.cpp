@@ -17,6 +17,10 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static bool llama_kv_cache_uses_mrope_shift(const llama_hparams & hparams) {
+    return hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -555,24 +559,25 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     v_cells[s1].reset();
     for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {
         if (v_cells[s0].seq_has(i, seq_id_src)) {
-            llama_pos pos   = v_cells[s0].pos_get(i);
-            llama_pos shift = v_cells[s0].get_shift(i);
+            llama_pos pos = v_cells[s0].pos_get(i);
+            const llama_kv_cell_shift shift = v_cells[s0].get_shift_ext(i);
 
             llama_kv_cell_ext ext = v_cells[s0].ext_get(i);
 
-            if (shift != 0) {
-                pos -= shift;
+            if (!shift.is_zero()) {
+                pos   -= shift.t;
+                ext.y -= shift.y;
+                ext.x -= shift.x;
                 assert(pos >= 0);
             }
 
             v_cells[s1].pos_set(i, pos);
+            v_cells[s1].ext_set(i, ext);
             v_cells[s1].seq_add(i, seq_id_dst);
 
-            if (shift != 0) {
-                v_cells[s1].pos_add(i, shift);
+            if (!shift.is_zero()) {
+                v_cells[s1].pos_shift(i, shift);
             }
-
-            v_cells[s1].ext_set(i, ext);
         }
     }
 
@@ -607,7 +612,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    GGML_ASSERT(get_can_shift() && "seq_add() is not supported for this model");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -637,7 +642,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
 
         if (cells.seq_has(i, seq_id)) {
-            if (cells.pos_add(i, shift)) {
+            if (cells.pos_add(i, shift, llama_kv_cache_uses_mrope_shift(hparams))) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
@@ -652,7 +657,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
+    GGML_ASSERT(get_can_shift() && "seq_div() is not supported for this model");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -679,7 +684,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         }
 
         if (cells.seq_has(i, seq_id)) {
-            cells.pos_div(i, d);
+            cells.pos_div(i, d, llama_kv_cache_uses_mrope_shift(hparams));
         }
     }
 }
@@ -1185,9 +1190,19 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
+
+    if (hparams.n_pos_per_embd() == 1) {
+        return true;
+    }
+
+    if (hparams.n_pos_per_embd() == 4 && llama_kv_cache_uses_mrope_shift(hparams)) {
+        return true;
+    }
+
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
+
     return true;
 }
 
@@ -1526,11 +1541,22 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
     int32_t * data = (int32_t *) dst->data;
 
+    const bool is_mrope_shift = llama_kv_cache_uses_mrope_shift(hparams);
+    const int64_t n_kv = (int64_t) get_size()*n_stream;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
-            data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+            const int64_t idx = (int64_t) s*cells.size() + i;
+
+            if (is_mrope_shift) {
+                for (uint32_t dim = 0; dim < 4; ++dim) {
+                    data[dim*n_kv + idx] = cells.is_empty(i) ? 0 : cells.get_shift(i, dim);
+                }
+            } else {
+                data[idx] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+            }
         }
     }
 }
@@ -1856,13 +1882,16 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
     const auto & yarn_attn_factor = cparams.yarn_attn_factor;
 
     const auto & n_rot     = hparams.n_rot(il);
-    const auto & rope_type = hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE
-                                // @ngxson : this is a workaround
-                                // for M-RoPE, we want to rotate the whole vector when doing KV shift
-                                // a normal RoPE should work, we just need to use the correct ordering
-                                // ref: https://github.com/ggml-org/llama.cpp/pull/13870
-                                ? LLAMA_ROPE_TYPE_NEOX
-                                : hparams.rope_type;
+    const auto & rope_type = hparams.rope_type;
+    const bool is_mrope_shift = llama_kv_cache_uses_mrope_shift(hparams);
+
+    int rope_sections[GGML_MROPE_SECTIONS] = {
+        hparams.rope_sections[0],
+        hparams.rope_sections[1],
+        hparams.rope_sections[2],
+        hparams.rope_sections[3],
+    };
+
     ggml_tensor * tmp;
 
     if (ggml_is_quantized(cur->type)) {
@@ -1872,9 +1901,15 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         // rotate back
         tmp = ggml_mul_mat_aux(ctx, tmp, rot);
 
-        tmp = ggml_rope_ext(ctx, tmp,
-                shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        if (is_mrope_shift) {
+            tmp = ggml_rope_multi(ctx, tmp,
+                    shift, factors, n_rot, rope_sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        } else {
+            tmp = ggml_rope_ext(ctx, tmp,
+                    shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        }
 
         // rotate fwd
         tmp = ggml_mul_mat_aux(ctx, tmp, rot);
@@ -1882,9 +1917,15 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {
         // we rotate only the first n_rot dimensions
-        tmp = ggml_rope_ext_inplace(ctx, cur,
-                shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        if (is_mrope_shift) {
+            tmp = ggml_rope_multi_inplace(ctx, cur,
+                    shift, factors, n_rot, rope_sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        } else {
+            tmp = ggml_rope_ext_inplace(ctx, cur,
+                    shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        }
     }
 
     return tmp;
@@ -1897,7 +1938,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * k_shift; // I32 [kv_size*n_stream]
+    ggml_tensor * k_shift; // I32 [kv_size*n_stream] or [4*kv_size*n_stream] for M-RoPE
 
     // note: assumes k_rot^2 == I
     ggml_tensor * k_rot = nullptr;
@@ -1923,7 +1964,9 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    const int64_t n_kv_shift = (int64_t) get_size()*n_stream*(llama_kv_cache_uses_mrope_shift(hparams) ? 4 : 1);
+
+    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv_shift);
     ggml_set_input(inp->k_shift);
 
     inp->k_rot = build_input_k_rot(ctx);

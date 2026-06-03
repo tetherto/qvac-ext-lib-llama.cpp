@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <type_traits>
 #include <vector>
 
 struct llama_kv_cell_ext {
@@ -27,6 +28,23 @@ struct llama_kv_cell_ext {
     }
 };
 
+struct llama_kv_cell_shift {
+    llama_pos t     = 0;
+    llama_pos y     = 0;
+    llama_pos x     = 0;
+    llama_pos other = 0;
+
+    bool is_zero() const {
+        return t == 0 && y == 0 && x == 0 && other == 0;
+    }
+
+    void reset() {
+        static_assert(std::is_trivially_copyable_v<llama_kv_cell_shift>);
+
+        memset(this, 0, sizeof(*this));
+    }
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -35,7 +53,7 @@ public:
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
-            shift[i] =  0;
+            shift[i].reset();
             seq[i].reset();
         }
 
@@ -52,7 +70,7 @@ public:
         has_shift = false;
 
         for (uint32_t i = 0; i < shift.size(); ++i) {
-            shift[i] = 0;
+            shift[i].reset();
         }
     }
 
@@ -131,7 +149,7 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
 
         return res;
@@ -150,7 +168,7 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
 
         return res;
@@ -183,7 +201,7 @@ public:
                 seq_pos_add(i + j);
             }
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
     }
 
@@ -214,7 +232,7 @@ public:
                 seq_pos_add(idx);
             }
 
-            assert(shift[idx] == 0);
+            assert(shift[idx].is_zero());
         }
     }
 
@@ -228,7 +246,7 @@ public:
 
         pos[i] = -1;
         ext[i].reset();
-        shift[i] = 0;
+        shift[i].reset();
 
         used.erase(i);
     }
@@ -247,7 +265,7 @@ public:
         if (seq[i].none()) {
             pos[i] = -1;
             ext[i].reset();
-            shift[i] = 0;
+            shift[i].reset();
 
             used.erase(i);
 
@@ -277,7 +295,7 @@ public:
 
             pos[i] = -1;
             ext[i].reset();
-            shift[i] = 0;
+            shift[i].reset();
 
             used.erase(i);
 
@@ -379,6 +397,28 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        return shift[i].t;
+    }
+
+    llama_pos get_shift(uint32_t i, uint32_t dim) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        switch (dim) {
+            case 0: return shift[i].t;
+            case 1: return shift[i].y;
+            case 2: return shift[i].x;
+            case 3: return shift[i].other;
+            default: assert(false);
+        }
+
+        return 0;
+    }
+
+    const llama_kv_cell_shift & get_shift_ext(uint32_t i) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
         return shift[i];
     }
 
@@ -410,21 +450,40 @@ public:
     // pos[i] = pos[i] + d
     // sets "has_shift" to true
     // note: call only if the cell is not empty
-    bool pos_add(uint32_t i, llama_pos d) {
+    bool pos_add(uint32_t i, llama_pos d, bool shift_ext = false) {
+        llama_kv_cell_shift delta;
+        delta.t = d;
+
+        if (shift_ext) {
+            delta.y = d;
+            delta.x = d;
+        }
+
+        return pos_shift(i, delta);
+    }
+
+    bool pos_shift(uint32_t i, const llama_kv_cell_shift & d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
 
         seq_pos_rm(i);
 
-        pos[i]   += d;
-        shift[i] += d;
+        pos[i]     += d.t;
+        ext[i].y   += d.y;
+        ext[i].x   += d.x;
+
+        shift[i].t     += d.t;
+        shift[i].y     += d.y;
+        shift[i].x     += d.x;
+        shift[i].other += d.other;
 
         has_shift = true;
 
         if (pos[i] < 0) {
             seq[i].reset();
             pos[i] = -1;
-            shift[i] = 0;
+            ext[i].reset();
+            shift[i].reset();
 
             used.erase(i);
 
@@ -439,16 +498,25 @@ public:
     // pos[i] = pos[i] / d
     // sets "has_shift" to true
     // note: call only if the cell is not empty
-    void pos_div(uint32_t i, int d) {
+    void pos_div(uint32_t i, int d, bool shift_ext = false) {
         assert(i < pos.size());
         assert(pos[i] != -1);
 
         const llama_pos p_old = pos[i];
+        const llama_kv_cell_ext ext_old = ext[i];
 
         seq_pos_rm(i);
 
         pos[i]   /= d;
-        shift[i] += p_old - pos[i];
+        shift[i].t += p_old - pos[i];
+
+        if (shift_ext) {
+            ext[i].y /= d;
+            ext[i].x /= d;
+
+            shift[i].y += ext_old.y - ext[i].y;
+            shift[i].x += ext_old.x - ext[i].x;
+        }
 
         seq_pos_add(i);
 
@@ -481,7 +549,7 @@ private:
     //      cells.reset_shift();
     //   }
     //
-    std::vector<llama_pos> shift;
+    std::vector<llama_kv_cell_shift> shift;
 
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
