@@ -1551,7 +1551,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 // and don't have a params.model.path the file-based constructor can open.
 common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params) {
     if (model == nullptr) {
-        return common_init_result_ptr();
+        // Mirror common_init_from_params: on load failure return a *valid* empty
+        // result (model()/context() == nullptr), never a null pointer. Callers
+        // adopt this result and inspect model()/context() to detect failure
+        // (e.g. and then throw); returning a null common_init_result_ptr here
+        // makes those callers dereference null and crash.
+        return common_init_result_ptr(new common_init_result());
     }
 
     // Adopt the externally-loaded model into an empty result. Do NOT use the
