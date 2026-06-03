@@ -1601,6 +1601,22 @@ bool llama_model::create_split_backend_buffers(
         }
     }
 
+    // Register this split's tensors in tensors_by_name now, while their source
+    // file is still mapped. A later TENSOR_DUPLICATED reference (e.g. a model
+    // with tied embeddings, where output.weight aliases token_embd.weight) is
+    // resolved by looking the original up here (see create_tensor in
+    // load_tensors); without this, the duplicate would instead be (re)created
+    // against this split after release_split() freed its file, failing with
+    // "file not found for tensor ... at split-index N". Capture the pointers
+    // before create_backend_buffers moves the contexts into ctxs_bufs (the
+    // tensor pointers stay valid across that ownership transfer).
+    for (const auto & [buft, ctx_ptr] : ml.ctx_map) {
+        for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != nullptr;
+             cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+            tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+        }
+    }
+
     const std::size_t split_data_size = ml.incremental_splits_tensor_load->get_split_data_size(idx);
     LLAMA_LOG_CMAKE_DEBUG("%s: creating backend buffers for split %d with size %zu\n", __func__, idx, split_data_size);
     constexpr bool do_print_backend_buffers_info = false;
