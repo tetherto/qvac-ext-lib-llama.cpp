@@ -1899,8 +1899,12 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         // dequantize to f32 -> RoPE -> quantize back
         tmp = ggml_cast(ctx, cur, GGML_TYPE_F32);
 
-        // rotate back
-        tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+        // rotate back for TurboQuant/PolarQuant cache formats that use an
+        // auxiliary attention rotation matrix; standard quantized types such
+        // as q8_0 do not configure one.
+        if (rot) {
+            tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+        }
 
         if (is_mrope_shift) {
             tmp = ggml_rope_multi(ctx, tmp,
@@ -1912,8 +1916,10 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                     yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
         }
 
-        // rotate fwd
-        tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+        // rotate fwd, matching the optional inverse rotation above.
+        if (rot) {
+            tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+        }
 
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {
