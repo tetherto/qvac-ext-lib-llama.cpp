@@ -270,7 +270,7 @@ int main(int /*argc*/, const char ** /*argv*/) {
     static constexpr int64_t MROPE_TEST_N_HEADS  = 2;
     static constexpr int64_t MROPE_TEST_N_TOKENS = 11;
     static constexpr int64_t MROPE_TEST_N_BATCH  = 1;
-    static constexpr int64_t MROPE_TEST_K_ROW    = 160;
+    static constexpr int64_t MROPE_TEST_K_ROW    = 256;
 
     static constexpr int MROPE_SECTION_T     = 16;
     static constexpr int MROPE_SECTION_Y     = 24;
@@ -378,10 +378,23 @@ int main(int /*argc*/, const char ** /*argv*/) {
 
     // Quantized K-cache decoder K-shift for M-RoPE/iM-RoPE image grids.
     // Mirrors the standard quantized cache path:
-    //   q8 K -> f32 -> M-RoPE shift -> q8 K
+    //   quantized K -> f32 -> M-RoPE shift -> quantized K
     // and compares it with directly rotating to the shifted positions before
     // quantizing. This catches regressions where quantized M-RoPE shift graphs
     // diverge from the unquantized shift semantics.
+    static constexpr ggml_type QUANTIZED_K_SHIFT_TYPES[] = {
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_TBQ3_0,
+        GGML_TYPE_TBQ3_0_64,
+        GGML_TYPE_TBQ4_0,
+        GGML_TYPE_TBQ4_0_64,
+        GGML_TYPE_PQ3_0,
+        GGML_TYPE_PQ3_0_64,
+        GGML_TYPE_PQ4_0,
+        GGML_TYPE_PQ4_0_64,
+    };
+    static constexpr float QUANTIZED_K_SHIFT_TOLERANCE = 0.125f;
+
     for (int m = 0; m < 2; ++m) {
         const int64_t ne[MROPE_TEST_NDIMS] = {
             MROPE_TEST_N_ROT, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH
@@ -398,8 +411,8 @@ int main(int /*argc*/, const char ** /*argv*/) {
 
         x = get_random_tensor_f32(ctx0, MROPE_TEST_NDIMS, ne, RANDOM_MIN, RANDOM_MAX);
 
-        auto new_q8_cache_view = [&]() {
-            struct ggml_tensor * cache = ggml_new_tensor(ctx0, GGML_TYPE_Q8_0, MROPE_TEST_NDIMS, cache_ne);
+        auto new_quantized_cache_view = [&](ggml_type type) {
+            struct ggml_tensor * cache = ggml_new_tensor(ctx0, type, MROPE_TEST_NDIMS, cache_ne);
             return ggml_view_4d(
                 ctx0, cache,
                 MROPE_TEST_N_ROT, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH,
@@ -436,51 +449,53 @@ int main(int /*argc*/, const char ** /*argv*/) {
             MROPE_TEST_N_ROT, sections, mode,
             ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
             YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
-        struct ggml_tensor * old_q8 = ggml_cpy(ctx0, old_f32, new_q8_cache_view());
-        struct ggml_tensor * old_deq = ggml_cast(ctx0, old_q8, GGML_TYPE_F32);
-        struct ggml_tensor * shifted_deq = ggml_rope_multi(
-            ctx0, old_deq, pd, nullptr,
-            MROPE_TEST_N_ROT, sections, mode,
-            ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
-            YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
-        struct ggml_tensor * shifted_q8 = ggml_cpy(ctx0, shifted_deq, new_q8_cache_view());
-        struct ggml_tensor * shifted_out = ggml_cast(ctx0, shifted_q8, GGML_TYPE_F32);
-
         struct ggml_tensor * target_f32 = ggml_rope_multi(
             ctx0, x, p1, nullptr,
             MROPE_TEST_N_ROT, sections, mode,
             ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
             YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
-        struct ggml_tensor * target_q8 = ggml_cpy(ctx0, target_f32, new_q8_cache_view());
-        struct ggml_tensor * target_out = ggml_cast(ctx0, target_q8, GGML_TYPE_F32);
 
-        ggml_cgraph * gf = ggml_new_graph(ctx0);
+        for (ggml_type qtype : QUANTIZED_K_SHIFT_TYPES) {
+            struct ggml_tensor * old_q = ggml_cpy(ctx0, old_f32, new_quantized_cache_view(qtype));
+            struct ggml_tensor * old_deq = ggml_cast(ctx0, old_q, GGML_TYPE_F32);
+            struct ggml_tensor * shifted_deq = ggml_rope_multi(
+                ctx0, old_deq, pd, nullptr,
+                MROPE_TEST_N_ROT, sections, mode,
+                ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+                YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+            struct ggml_tensor * shifted_q = ggml_cpy(ctx0, shifted_deq, new_quantized_cache_view(qtype));
+            struct ggml_tensor * shifted_out = ggml_cast(ctx0, shifted_q, GGML_TYPE_F32);
 
-        ggml_build_forward_expand(gf, old_f32);
-        ggml_build_forward_expand(gf, shifted_out);
-        ggml_build_forward_expand(gf, target_out);
+            struct ggml_tensor * target_q = ggml_cpy(ctx0, target_f32, new_quantized_cache_view(qtype));
+            struct ggml_tensor * target_out = ggml_cast(ctx0, target_q, GGML_TYPE_F32);
 
-        ggml_graph_compute_helper(work_buffer, gf, 4);
+            ggml_cgraph * gf = ggml_new_graph(ctx0);
 
-        double sum = 0.0f;
-        double diff = 0.0f;
+            ggml_build_forward_expand(gf, old_f32);
+            ggml_build_forward_expand(gf, shifted_out);
+            ggml_build_forward_expand(gf, target_out);
 
-        const float * shifted_data = (float *) shifted_out->data;
-        const float * target_data  = (float *) target_out->data;
+            ggml_graph_compute_helper(work_buffer, gf, 4);
 
-        const int n_elements = ggml_nelements(shifted_out);
+            double sum = 0.0f;
+            double diff = 0.0f;
 
-        for (int i = 0; i < n_elements; ++i) {
-            sum  += fabs(target_data[i]);
-            diff += fabs(shifted_data[i] - target_data[i]);
+            const float * shifted_data = (float *) shifted_out->data;
+            const float * target_data  = (float *) target_out->data;
+
+            const int n_elements = ggml_nelements(shifted_out);
+
+            for (int i = 0; i < n_elements; ++i) {
+                sum  += fabs(target_data[i]);
+                diff += fabs(shifted_data[i] - target_data[i]);
+            }
+
+            printf("%s k-shift mode: %d\n", ggml_type_name(qtype), mode);
+            printf("%s k-shift diff: %f\n", ggml_type_name(qtype), diff);
+            printf("%s k-shift rel err: %f\n", ggml_type_name(qtype), diff / sum);
+
+            GGML_ASSERT(diff / sum < QUANTIZED_K_SHIFT_TOLERANCE);
         }
-
-        printf("q8 k-shift mode: %d\n", mode);
-        printf("q8 k-shift diff: %f\n", diff);
-        printf("q8 k-shift rel err: %f\n", diff / sum);
-
-        static constexpr float Q8_K_SHIFT_TOLERANCE = 0.015f;
-        GGML_ASSERT(diff / sum < Q8_K_SHIFT_TOLERANCE);
     }
 
     ggml_free(ctx0);

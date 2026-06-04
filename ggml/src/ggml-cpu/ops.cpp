@@ -290,21 +290,20 @@ static void ggml_compute_forward_dup_to_q(
     const int ir1 = MIN(ir0 + dr, nr);
 
     if (nb00 == sizeof(src_t) &&
-            nb0 == ggml_type_size(dst->type) &&
             ne00 % ggml_blck_size(dst->type) == 0 &&
             ggml_get_type_traits_cpu(dst->type)->from_float) {
         // casting non-quantized types --> intermediate f32 --> quantized
         ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dst->type)->from_float;
         float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
+        const size_t dst_row_size = ggml_row_size(dst->type, ne00);
 
         if (ggml_is_contiguous(dst)) {
             size_t id = 0;
-            size_t rs = nb0 * (ne00 / ggml_blck_size(dst->type));
             char * dst_ptr = (char *) dst->data;
 
             for (int i03 = 0; i03 < ne03; i03++) {
                 for (int i02 = 0; i02 < ne02; i02++) {
-                    id += rs * ir0;
+                    id += dst_row_size * ir0;
                     for (int i01 = ir0; i01 < ir1; i01++) {
                         const src_t * src0_ptr = (src_t *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
@@ -313,9 +312,9 @@ static void ggml_compute_forward_dup_to_q(
                         }
 
                         quantize_row_q(src0_f32, dst_ptr + id, ne00);
-                        id += rs;
+                        id += dst_row_size;
                     }
-                    id += rs * (ne01 - ir1);
+                    id += dst_row_size * (ne01 - ir1);
                 }
             }
         } else {
