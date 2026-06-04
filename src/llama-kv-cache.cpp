@@ -1990,6 +1990,17 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
         const auto n_embd_head_k = hparams.n_embd_head_k(il);
         const auto n_embd_nope   = hparams.n_lora_kv > 0 ? n_embd_head_k - n_rot : 0;
 
+        // Quantized CPU writeback requires complete quantization rows. Some
+        // M-RoPE models rotate fewer dimensions than the TBQ/PQ block size
+        // (e.g. n_rot=64 with 128-wide cache blocks), so include the whole
+        // block and let RoPE copy the unrotated tail unchanged.
+        int64_t n_k_shift = n_rot;
+        if (ggml_is_quantized(layer.k->type)) {
+            n_k_shift = std::min<int64_t>(
+                    n_embd_head_k - n_embd_nope,
+                    GGML_PAD(n_rot, ggml_blck_size(layer.k->type)));
+        }
+
         const float freq_base_l  = model.get_rope_freq_base (cparams, il);
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
@@ -1997,7 +2008,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_k_shift, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));

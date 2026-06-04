@@ -394,10 +394,12 @@ int main(int /*argc*/, const char ** /*argv*/) {
         GGML_TYPE_PQ4_0_64,
     };
     static constexpr float QUANTIZED_K_SHIFT_TOLERANCE = 0.125f;
+    static constexpr int64_t QUANTIZED_K_SHIFT_N_ROT = 64;
+    static constexpr int64_t QUANTIZED_K_SHIFT_WIDTH = 128;
 
     for (int m = 0; m < 2; ++m) {
         const int64_t ne[MROPE_TEST_NDIMS] = {
-            MROPE_TEST_N_ROT, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH
+            QUANTIZED_K_SHIFT_WIDTH, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH
         };
 
         int sections[MROPE_AXIS_COUNT] = {
@@ -415,7 +417,7 @@ int main(int /*argc*/, const char ** /*argv*/) {
             struct ggml_tensor * cache = ggml_new_tensor(ctx0, type, MROPE_TEST_NDIMS, cache_ne);
             return ggml_view_4d(
                 ctx0, cache,
-                MROPE_TEST_N_ROT, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH,
+                QUANTIZED_K_SHIFT_WIDTH, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH,
                 cache->nb[1], cache->nb[2], cache->nb[3], 0);
         };
 
@@ -446,12 +448,12 @@ int main(int /*argc*/, const char ** /*argv*/) {
 
         struct ggml_tensor * old_f32 = ggml_rope_multi(
             ctx0, x, p0, nullptr,
-            MROPE_TEST_N_ROT, sections, mode,
+            QUANTIZED_K_SHIFT_N_ROT, sections, mode,
             ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
             YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
         struct ggml_tensor * target_f32 = ggml_rope_multi(
             ctx0, x, p1, nullptr,
-            MROPE_TEST_N_ROT, sections, mode,
+            QUANTIZED_K_SHIFT_N_ROT, sections, mode,
             ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
             YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
 
@@ -460,7 +462,7 @@ int main(int /*argc*/, const char ** /*argv*/) {
             struct ggml_tensor * old_deq = ggml_cast(ctx0, old_q, GGML_TYPE_F32);
             struct ggml_tensor * shifted_deq = ggml_rope_multi(
                 ctx0, old_deq, pd, nullptr,
-                MROPE_TEST_N_ROT, sections, mode,
+                QUANTIZED_K_SHIFT_N_ROT, sections, mode,
                 ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
                 YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
             struct ggml_tensor * shifted_q = ggml_cpy(ctx0, shifted_deq, new_quantized_cache_view(qtype));
