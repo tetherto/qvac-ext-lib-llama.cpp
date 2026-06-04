@@ -269,6 +269,13 @@ int32_t mtmd_helper_decode_image_chunk(
             const auto n_tokens = mtmd_image_tokens_get_n_tokens(image_tokens);
             std::vector<mtmd_decoder_pos> rel_pos(n_tokens);
             mtmd_helper_image_get_decoder_pos(image_tokens, rel_pos.data());
+            const uint32_t rel_t0 = rel_pos[0].t;
+            for (const auto & pos : rel_pos) {
+                if (pos.t != rel_t0) {
+                    LOG_ERR("failed to decode image chunk: image tokens with varying temporal M-RoPE positions are not supported\n");
+                    return -1;
+                }
+            }
             batch_embd.set_position_mrope_2d(n_past, rel_pos, seq_id);
         } else if (chunk_type == MTMD_INPUT_CHUNK_TYPE_AUDIO) {
             batch_embd.set_position_mrope_1d(n_past, seq_id);
