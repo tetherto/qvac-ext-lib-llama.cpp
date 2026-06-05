@@ -113,6 +113,56 @@ static struct ggml_tensor * get_random_tensor_f32(
     return result;
 }
 
+static void fill_hadamard_f32(struct ggml_tensor * tensor) {
+    assert(tensor->type == GGML_TYPE_F32);
+
+    const int n = tensor->ne[0];
+    assert(n > 0 && (n & (n - 1)) == 0);
+    assert(tensor->ne[1] == n);
+
+    float * data = (float *) tensor->data;
+    data[0] = 1.0f / sqrtf(n);
+
+    for (int s = 1; s < n; s *= 2) {
+        for (int i = 0; i < s; i++) {
+            for (int j = 0; j < s; j++) {
+                const float val = data[i*n + j];
+                data[(i + s)*n + j]       =  val;
+                data[i*n + (j + s)]       =  val;
+                data[(i + s)*n + (j + s)] = -val;
+            }
+        }
+    }
+}
+
+static struct ggml_tensor * test_mul_mat_aux(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * rot) {
+    const auto n = rot->ne[0];
+
+    struct ggml_tensor * res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    res = ggml_mul_mat(ctx, rot, res);
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
+
+static double rel_err(const struct ggml_tensor * actual, const struct ggml_tensor * expected) {
+    double sum  = 0.0;
+    double diff = 0.0;
+
+    const float * actual_data   = (const float *) actual->data;
+    const float * expected_data = (const float *) expected->data;
+
+    for (int i = 0; i < ggml_nelements(actual); ++i) {
+        sum  += fabs(expected_data[i]);
+        diff += fabs(actual_data[i] - expected_data[i]);
+    }
+
+    return diff / sum;
+}
+
 static void ggml_graph_compute_helper(std::vector<uint8_t> & buf, ggml_cgraph * graph, int n_threads) {
     struct ggml_cplan plan = ggml_graph_plan(graph, n_threads, nullptr);
 
@@ -497,6 +547,93 @@ int main(int /*argc*/, const char ** /*argv*/) {
             printf("%s k-shift rel err: %f\n", ggml_type_name(qtype), diff / sum);
 
             GGML_ASSERT(diff / sum < QUANTIZED_K_SHIFT_TOLERANCE);
+        }
+
+        // TBQ/PQ K-cache shift with the attention-rotation path enabled:
+        // quantized rotated K -> f32 -> rotate back -> M-RoPE shift ->
+        // rotate forward -> quantized rotated K. This mirrors the branch that
+        // uses ggml_mul_mat_aux() in llama_kv_cache::build_rope_shift().
+        static constexpr ggml_type ATTENTION_ROT_K_SHIFT_TYPES[] = {
+            GGML_TYPE_TBQ4_0,
+            GGML_TYPE_PQ4_0,
+        };
+
+        struct ggml_tensor * rot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, QUANTIZED_K_SHIFT_WIDTH, QUANTIZED_K_SHIFT_WIDTH);
+        fill_hadamard_f32(rot);
+
+        for (ggml_type qtype : ATTENTION_ROT_K_SHIFT_TYPES) {
+            struct ggml_tensor * old_rot = test_mul_mat_aux(ctx0, old_f32, rot);
+            struct ggml_tensor * old_q = ggml_cpy(ctx0, old_rot, new_quantized_cache_view(qtype));
+            struct ggml_tensor * old_deq = ggml_cast(ctx0, old_q, GGML_TYPE_F32);
+            struct ggml_tensor * old_unrot = test_mul_mat_aux(ctx0, old_deq, rot);
+            struct ggml_tensor * shifted_unrot = ggml_rope_multi(
+                ctx0, old_unrot, pd, nullptr,
+                QUANTIZED_K_SHIFT_N_ROT, sections, mode,
+                ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+                YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+            struct ggml_tensor * shifted_rot = test_mul_mat_aux(ctx0, shifted_unrot, rot);
+            struct ggml_tensor * shifted_q = ggml_cpy(ctx0, shifted_rot, new_quantized_cache_view(qtype));
+            struct ggml_tensor * shifted_out = ggml_cast(ctx0, shifted_q, GGML_TYPE_F32);
+
+            struct ggml_tensor * target_rot = test_mul_mat_aux(ctx0, target_f32, rot);
+            struct ggml_tensor * target_q = ggml_cpy(ctx0, target_rot, new_quantized_cache_view(qtype));
+            struct ggml_tensor * target_out = ggml_cast(ctx0, target_q, GGML_TYPE_F32);
+
+            ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+            ggml_build_forward_expand(gf, shifted_out);
+            ggml_build_forward_expand(gf, target_out);
+
+            ggml_graph_compute_helper(work_buffer, gf, 4);
+
+            const double err = rel_err(shifted_out, target_out);
+
+            printf("%s attention-rot k-shift mode: %d\n", ggml_type_name(qtype), mode);
+            printf("%s attention-rot k-shift rel err: %f\n", ggml_type_name(qtype), err);
+
+            static constexpr float ATTENTION_ROT_K_SHIFT_TOLERANCE = 0.25f;
+            GGML_ASSERT(err < ATTENTION_ROT_K_SHIFT_TOLERANCE);
+        }
+
+        // Full-cache image-token writeback: seed a quantized cache view with
+        // image-grid keys, shift that same view in place, then read it back.
+        // This catches regressions where the writeback to a non-contiguous KV
+        // cache view succeeds as a standalone copy but fails in the full path.
+        {
+            static constexpr ggml_type FULL_CACHE_WRITEBACK_TYPE = GGML_TYPE_PQ4_0;
+
+            struct ggml_tensor * cache = ggml_new_tensor(ctx0, FULL_CACHE_WRITEBACK_TYPE, MROPE_TEST_NDIMS, cache_ne);
+            struct ggml_tensor * cache_view = ggml_view_4d(
+                ctx0, cache,
+                QUANTIZED_K_SHIFT_WIDTH, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH,
+                cache->nb[1], cache->nb[2], cache->nb[3], 0);
+
+            struct ggml_tensor * old_q = ggml_cpy(ctx0, old_f32, cache_view);
+            struct ggml_tensor * old_deq = ggml_cast(ctx0, old_q, GGML_TYPE_F32);
+            struct ggml_tensor * shifted_deq = ggml_rope_multi(
+                ctx0, old_deq, pd, nullptr,
+                QUANTIZED_K_SHIFT_N_ROT, sections, mode,
+                ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+                YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+            struct ggml_tensor * shifted_q = ggml_cpy(ctx0, shifted_deq, cache_view);
+            struct ggml_tensor * shifted_out = ggml_cast(ctx0, shifted_q, GGML_TYPE_F32);
+
+            struct ggml_tensor * target_q = ggml_cpy(ctx0, target_f32, new_quantized_cache_view(FULL_CACHE_WRITEBACK_TYPE));
+            struct ggml_tensor * target_out = ggml_cast(ctx0, target_q, GGML_TYPE_F32);
+
+            ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+            ggml_build_forward_expand(gf, shifted_out);
+            ggml_build_forward_expand(gf, target_out);
+
+            ggml_graph_compute_helper(work_buffer, gf, 4);
+
+            const double err = rel_err(shifted_out, target_out);
+
+            printf("%s full-cache image k-shift mode: %d\n", ggml_type_name(FULL_CACHE_WRITEBACK_TYPE), mode);
+            printf("%s full-cache image k-shift rel err: %f\n", ggml_type_name(FULL_CACHE_WRITEBACK_TYPE), err);
+
+            GGML_ASSERT(err < QUANTIZED_K_SHIFT_TOLERANCE);
         }
     }
 
