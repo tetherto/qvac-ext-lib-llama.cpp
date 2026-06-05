@@ -1187,23 +1187,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
-    if (model.arch == LLM_ARCH_STEP35) {
-        return false;
-    }
+    const int n_pos_per_embd = hparams.n_pos_per_embd();
 
-    if (hparams.n_pos_per_embd() == 1) {
-        return true;
-    }
-
-    if (hparams.n_pos_per_embd() == 4 && llama_kv_cache_uses_mrope_shift(hparams)) {
-        return true;
-    }
-
-    if (hparams.n_pos_per_embd() > 1) {
-        return false;
-    }
-
-    return true;
+    return model.arch != LLM_ARCH_STEP35 &&
+        (n_pos_per_embd <= 1 ||
+         (n_pos_per_embd == 4 && llama_kv_cache_uses_mrope_shift(hparams)));
 }
 
 uint32_t llama_kv_cache::get_size() const {
