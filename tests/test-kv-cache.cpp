@@ -1,9 +1,8 @@
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
-#include "ggml-cpu.h"
-
 #include <memory>
+#include <vector>
 
 static constexpr uint32_t TEST_LAYER     = 0;
 static constexpr uint32_t TEST_KV_SIZE   = 4;
@@ -120,24 +119,10 @@ static void test_mrope_k_shift_input_layout() {
     kv.apply_ubatch(make_slot_info(), ubatch);
     kv.seq_add(TEST_SEQ_ID, 0, 200, IMAGE_SHIFT);
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    GGML_ASSERT(backend != nullptr);
+    std::vector<int32_t> data(TEST_KV_SIZE * TEST_N_POS);
 
-    ggml_init_params params = {
-        /* .mem_size   = */ 1024 * 1024,
-        /* .mem_buffer = */ nullptr,
-        /* .no_alloc   = */ true,
-    };
-    ggml_context * ctx = ggml_init(params);
-    GGML_ASSERT(ctx != nullptr);
+    kv.set_input_k_shift_data(data.data());
 
-    ggml_tensor * k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, TEST_KV_SIZE * TEST_N_POS);
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    GGML_ASSERT(buf != nullptr);
-
-    kv.set_input_k_shift(k_shift);
-
-    const int32_t * data = (const int32_t *) k_shift->data;
     for (uint32_t i = 0; i < TEST_N_TOKENS; ++i) {
         GGML_ASSERT(data[i + TEST_KV_SIZE * T_AXIS]     == IMAGE_SHIFT);
         GGML_ASSERT(data[i + TEST_KV_SIZE * Y_AXIS]     == IMAGE_SHIFT);
@@ -147,10 +132,6 @@ static void test_mrope_k_shift_input_layout() {
     for (uint32_t dim = 0; dim < TEST_N_POS; ++dim) {
         GGML_ASSERT(data[TEST_N_TOKENS + TEST_KV_SIZE * dim] == 0);
     }
-
-    ggml_backend_buffer_free(buf);
-    ggml_free(ctx);
-    ggml_backend_free(backend);
 }
 
 static void test_quantized_k_shift_width_pads_to_block() {

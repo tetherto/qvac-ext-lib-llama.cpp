@@ -1560,8 +1560,10 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    int32_t * data = (int32_t *) dst->data;
+    set_input_k_shift_data((int32_t *) dst->data);
+}
 
+void llama_kv_cache::set_input_k_shift_data(int32_t * data) const {
     const bool is_mrope_shift = llama_kv_cache_uses_mrope_shift(hparams);
     const int64_t n_kv = (int64_t) get_size()*n_stream;
 
