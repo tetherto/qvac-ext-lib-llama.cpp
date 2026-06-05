@@ -565,9 +565,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             llama_kv_cell_ext ext = v_cells[s0].ext_get(i);
 
             if (!shift.is_zero()) {
-                pos   -= shift.t;
-                ext.y -= shift.y;
-                ext.x -= shift.x;
+                pos   -= shift.t();
+                ext.y -= shift.y();
+                ext.x -= shift.x();
                 assert(pos >= 0);
             }
 

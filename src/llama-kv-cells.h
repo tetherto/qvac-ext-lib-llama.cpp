@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <array>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -29,19 +30,29 @@ struct llama_kv_cell_ext {
 };
 
 struct llama_kv_cell_shift {
-    llama_pos t     = 0;
-    llama_pos y     = 0;
-    llama_pos x     = 0;
-    llama_pos other = 0;
+    std::array<llama_pos, 4> v = {}; // [t, y, x, other]
+
+    llama_pos & t()     { return v[0]; }
+    llama_pos & y()     { return v[1]; }
+    llama_pos & x()     { return v[2]; }
+    llama_pos & other() { return v[3]; }
+
+    llama_pos t()     const { return v[0]; }
+    llama_pos y()     const { return v[1]; }
+    llama_pos x()     const { return v[2]; }
+    llama_pos other() const { return v[3]; }
+
+    llama_pos axis(uint32_t dim) const {
+        assert(dim < v.size());
+        return v[dim];
+    }
 
     bool is_zero() const {
-        return t == 0 && y == 0 && x == 0 && other == 0;
+        return v == std::array<llama_pos, 4>{};
     }
 
     void reset() {
-        static_assert(std::is_trivially_copyable_v<llama_kv_cell_shift>);
-
-        memset(this, 0, sizeof(*this));
+        v = {};
     }
 };
 
@@ -397,22 +408,14 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
-        return shift[i].t;
+        return shift[i].t();
     }
 
     llama_pos get_shift(uint32_t i, uint32_t dim) const {
         assert(i < pos.size());
         assert(pos[i] != -1);
 
-        switch (dim) {
-            case 0: return shift[i].t;
-            case 1: return shift[i].y;
-            case 2: return shift[i].x;
-            case 3: return shift[i].other;
-            default: assert(false);
-        }
-
-        return 0;
+        return shift[i].axis(dim);
     }
 
     const llama_kv_cell_shift & get_shift_ext(uint32_t i) const {
@@ -453,12 +456,12 @@ public:
     // note: call only if the cell is not empty
     bool pos_add(uint32_t i, llama_pos d, bool shift_ext = false) {
         llama_kv_cell_shift delta;
-        delta.t = d;
+        delta.t() = d;
 
         if (shift_ext) {
             // Move the shared M-RoPE origin while preserving relative image-grid offsets.
-            delta.y = d;
-            delta.x = d;
+            delta.y() = d;
+            delta.x() = d;
         }
 
         return pos_shift(i, delta);
@@ -470,14 +473,14 @@ public:
 
         seq_pos_rm(i);
 
-        pos[i]     += d.t;
-        ext[i].y   += d.y;
-        ext[i].x   += d.x;
+        pos[i]     += d.t();
+        ext[i].y   += d.y();
+        ext[i].x   += d.x();
 
-        shift[i].t     += d.t;
-        shift[i].y     += d.y;
-        shift[i].x     += d.x;
-        shift[i].other += d.other;
+        shift[i].t()     += d.t();
+        shift[i].y()     += d.y();
+        shift[i].x()     += d.x();
+        shift[i].other() += d.other();
 
         has_shift = true;
 
@@ -510,14 +513,14 @@ public:
         seq_pos_rm(i);
 
         pos[i]   /= d;
-        shift[i].t += p_old - pos[i];
+        shift[i].t() += p_old - pos[i];
 
         if (shift_ext) {
             ext[i].y /= d;
             ext[i].x /= d;
 
-            shift[i].y += ext_old.y - ext[i].y;
-            shift[i].x += ext_old.x - ext[i].x;
+            shift[i].y() += ext_old.y - ext[i].y;
+            shift[i].x() += ext_old.x - ext[i].x;
         }
 
         seq_pos_add(i);
