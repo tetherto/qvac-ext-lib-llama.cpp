@@ -506,22 +506,14 @@ public:
     void pos_div(uint32_t i, int d, bool shift_ext = false) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+        assert(!shift_ext && "pos_div() is not supported for multi-axis M-RoPE shifts");
 
         const llama_pos p_old = pos[i];
-        const llama_kv_cell_ext ext_old = ext[i];
 
         seq_pos_rm(i);
 
         pos[i]   /= d;
         shift[i].t() += p_old - pos[i];
-
-        if (shift_ext) {
-            ext[i].y /= d;
-            ext[i].x /= d;
-
-            shift[i].y() += ext_old.y - ext[i].y;
-            shift[i].x() += ext_old.x - ext[i].x;
-        }
 
         seq_pos_add(i);
 

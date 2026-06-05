@@ -145,7 +145,7 @@ static void test_mrope_image_grid_negative_shift_clears_cells() {
     GGML_ASSERT(cells.seq_pos_max(SEQ_0) == EMPTY_POS);
 }
 
-static void test_mrope_div_tracks_axis_deltas() {
+static void test_scalar_div_tracks_position_delta() {
     static constexpr llama_pos DIV_EXT_X = 9;
     static constexpr llama_pos DIV_EXT_Y = 5;
     static constexpr llama_pos DIV_TOKEN_POS = 11;
@@ -162,14 +162,14 @@ static void test_mrope_div_tracks_axis_deltas() {
     cells.ext_set(CELL_0, ext);
     cells.seq_add(CELL_0, SEQ_0);
 
-    cells.pos_div(CELL_0, DIVISOR, true);
+    cells.pos_div(CELL_0, DIVISOR);
 
     GGML_ASSERT(cells.pos_get(CELL_0) == DIV_TOKEN_POS/DIVISOR);
-    GGML_ASSERT(cells.ext_get(CELL_0).x == DIV_EXT_X/DIVISOR);
-    GGML_ASSERT(cells.ext_get(CELL_0).y == DIV_EXT_Y/DIVISOR);
+    GGML_ASSERT(cells.ext_get(CELL_0).x == DIV_EXT_X);
+    GGML_ASSERT(cells.ext_get(CELL_0).y == DIV_EXT_Y);
     GGML_ASSERT(cells.get_shift(CELL_0, T_AXIS) == DIV_TOKEN_POS - DIV_TOKEN_POS/DIVISOR);
-    GGML_ASSERT(cells.get_shift(CELL_0, Y_AXIS) == DIV_EXT_Y - DIV_EXT_Y/DIVISOR);
-    GGML_ASSERT(cells.get_shift(CELL_0, X_AXIS) == DIV_EXT_X - DIV_EXT_X/DIVISOR);
+    GGML_ASSERT(cells.get_shift(CELL_0, Y_AXIS) == 0);
+    GGML_ASSERT(cells.get_shift(CELL_0, X_AXIS) == 0);
     GGML_ASSERT(cells.get_shift(CELL_0, OTHER_AXIS) == 0);
 }
 
@@ -201,7 +201,7 @@ int main() {
     test_mrope_shift_updates_active_axes();
     test_mrope_image_grid_shift_preserves_relative_positions();
     test_mrope_image_grid_negative_shift_clears_cells();
-    test_mrope_div_tracks_axis_deltas();
+    test_scalar_div_tracks_position_delta();
     test_mrope_negative_shift_clears_cell();
 
     return 0;

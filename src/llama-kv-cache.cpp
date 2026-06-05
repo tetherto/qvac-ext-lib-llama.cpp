@@ -665,6 +665,8 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
+    GGML_ASSERT(!llama_kv_cache_uses_mrope_shift(hparams) && "seq_div() is not supported for multi-axis M-RoPE shifts");
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -684,7 +686,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         }
 
         if (cells.seq_has(i, seq_id)) {
-            cells.pos_div(i, d, llama_kv_cache_uses_mrope_shift(hparams));
+            cells.pos_div(i, d);
         }
     }
 }
