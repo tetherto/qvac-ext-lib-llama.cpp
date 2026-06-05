@@ -506,7 +506,7 @@ public:
     void pos_div(uint32_t i, int d, bool shift_ext = false) {
         assert(i < pos.size());
         assert(pos[i] != -1);
-        assert(!shift_ext && "pos_div() is not supported for multi-axis M-RoPE shifts");
+        GGML_ASSERT(!shift_ext && "pos_div() is not supported for multi-axis M-RoPE shifts");
 
         const llama_pos p_old = pos[i];
 
