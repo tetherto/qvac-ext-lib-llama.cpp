@@ -321,6 +321,7 @@ static void ggml_compute_forward_dup_to_q(
             // Quantize into row-strided views, e.g. the RoPE slice of a quantized
             // KV-cache row. Higher dimensions may be strided, but each logical
             // row must still start on a quantized block boundary.
+            // dim0 must be dense because quantize_row_q writes ne00 contiguous elements.
             GGML_ASSERT(nb0 == ggml_type_size(dst->type));
             for (int i03 = 0; i03 < ne03; i03++) {
                 for (int i02 = 0; i02 < ne02; i02++) {
