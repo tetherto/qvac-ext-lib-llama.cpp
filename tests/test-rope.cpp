@@ -113,6 +113,56 @@ static struct ggml_tensor * get_random_tensor_f32(
     return result;
 }
 
+static void fill_hadamard_f32(struct ggml_tensor * tensor) {
+    assert(tensor->type == GGML_TYPE_F32);
+
+    const int n = tensor->ne[0];
+    assert(n > 0 && (n & (n - 1)) == 0);
+    assert(tensor->ne[1] == n);
+
+    float * data = (float *) tensor->data;
+    data[0] = 1.0f / sqrtf(n);
+
+    for (int s = 1; s < n; s *= 2) {
+        for (int i = 0; i < s; i++) {
+            for (int j = 0; j < s; j++) {
+                const float val = data[i*n + j];
+                data[(i + s)*n + j]       =  val;
+                data[i*n + (j + s)]       =  val;
+                data[(i + s)*n + (j + s)] = -val;
+            }
+        }
+    }
+}
+
+static struct ggml_tensor * test_mul_mat_aux(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * rot) {
+    const auto n = rot->ne[0];
+
+    struct ggml_tensor * res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
+    res = ggml_mul_mat(ctx, rot, res);
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
+
+static double rel_err(const struct ggml_tensor * actual, const struct ggml_tensor * expected) {
+    double sum  = 0.0;
+    double diff = 0.0;
+
+    const float * actual_data   = (const float *) actual->data;
+    const float * expected_data = (const float *) expected->data;
+
+    for (int i = 0; i < ggml_nelements(actual); ++i) {
+        sum  += fabs(expected_data[i]);
+        diff += fabs(actual_data[i] - expected_data[i]);
+    }
+
+    return diff / sum;
+}
+
 static void ggml_graph_compute_helper(std::vector<uint8_t> & buf, ggml_cgraph * graph, int n_threads) {
     struct ggml_cplan plan = ggml_graph_plan(graph, n_threads, nullptr);
 
@@ -254,6 +304,336 @@ int main(int /*argc*/, const char ** /*argv*/) {
 
             GGML_ASSERT(diff / sum0 < 0.0001f);
             GGML_ASSERT(diff / sum1 < 0.0001f);
+        }
+    }
+
+    // Explicit decoder K-shift shape for M-RoPE/iM-RoPE image grids:
+    // shift t/y/x while keeping the 4th axis unused.
+    static constexpr int MROPE_TEST_NDIMS = 4;
+    static constexpr int MROPE_AXIS_COUNT = 4;
+    static constexpr int MROPE_T_AXIS     = 0;
+    static constexpr int MROPE_Y_AXIS     = 1;
+    static constexpr int MROPE_X_AXIS     = 2;
+    static constexpr int MROPE_OTHER_AXIS = 3;
+
+    static constexpr int64_t MROPE_TEST_N_ROT    = 128;
+    static constexpr int64_t MROPE_TEST_N_HEADS  = 2;
+    static constexpr int64_t MROPE_TEST_N_TOKENS = 11;
+    static constexpr int64_t MROPE_TEST_N_BATCH  = 1;
+    static constexpr int64_t MROPE_TEST_K_ROW    = 256;
+
+    static constexpr int MROPE_SECTION_T     = 16;
+    static constexpr int MROPE_SECTION_Y     = 24;
+    static constexpr int MROPE_SECTION_X     = 24;
+    static constexpr int MROPE_SECTION_OTHER = 0;
+
+    static constexpr int32_t IMAGE_T_ORIGIN = 100;
+    static constexpr int32_t IMAGE_Y_ORIGIN = 50;
+    static constexpr int32_t IMAGE_X_ORIGIN = 25;
+    static constexpr int32_t IMAGE_SHIFT    = -17;
+    static constexpr int32_t IMAGE_GRID_W   = 4;
+
+    static constexpr int ROPE_CTX_ORIG    = 32768;
+    static constexpr int ROPE_FREQ_BASE   = 1000000;
+    static constexpr int ROPE_FREQ_SCALE  = 1;
+    static constexpr int YARN_EXT_FACTOR  = 0;
+    static constexpr int YARN_ATTN_FACTOR = 1;
+    static constexpr int YARN_BETA_FAST   = 32;
+    static constexpr int YARN_BETA_SLOW   = 1;
+
+    static constexpr float RANDOM_MIN = -1.0f;
+    static constexpr float RANDOM_MAX =  1.0f;
+
+    for (int m = 0; m < 2; ++m) {
+        const int64_t ne[MROPE_TEST_NDIMS] = {
+            MROPE_TEST_N_ROT, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH
+        };
+
+        int sections[MROPE_AXIS_COUNT] = {
+            MROPE_SECTION_T, MROPE_SECTION_Y, MROPE_SECTION_X, MROPE_SECTION_OTHER
+        };
+        const int mode = m == 0 ? GGML_ROPE_TYPE_MROPE : GGML_ROPE_TYPE_IMROPE;
+
+        x = get_random_tensor_f32(ctx0, MROPE_TEST_NDIMS, ne, RANDOM_MIN, RANDOM_MAX);
+
+        struct ggml_tensor * p0 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * MROPE_AXIS_COUNT);
+        struct ggml_tensor * pd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * MROPE_AXIS_COUNT);
+        struct ggml_tensor * p1 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * MROPE_AXIS_COUNT);
+
+        for (int i = 0; i < ne[2]; ++i) {
+            const int32_t old_t = IMAGE_T_ORIGIN;
+            const int32_t old_y = IMAGE_Y_ORIGIN + i/IMAGE_GRID_W;
+            const int32_t old_x = IMAGE_X_ORIGIN + i%IMAGE_GRID_W;
+
+            ((int32_t *) p0->data)[i + ne[2] * MROPE_T_AXIS]     = old_t;
+            ((int32_t *) p0->data)[i + ne[2] * MROPE_Y_AXIS]     = old_y;
+            ((int32_t *) p0->data)[i + ne[2] * MROPE_X_AXIS]     = old_x;
+            ((int32_t *) p0->data)[i + ne[2] * MROPE_OTHER_AXIS] = 0;
+
+            ((int32_t *) pd->data)[i + ne[2] * MROPE_T_AXIS]     = IMAGE_SHIFT;
+            ((int32_t *) pd->data)[i + ne[2] * MROPE_Y_AXIS]     = IMAGE_SHIFT;
+            ((int32_t *) pd->data)[i + ne[2] * MROPE_X_AXIS]     = IMAGE_SHIFT;
+            ((int32_t *) pd->data)[i + ne[2] * MROPE_OTHER_AXIS] = 0;
+
+            ((int32_t *) p1->data)[i + ne[2] * MROPE_T_AXIS]     = old_t + IMAGE_SHIFT;
+            ((int32_t *) p1->data)[i + ne[2] * MROPE_Y_AXIS]     = old_y + IMAGE_SHIFT;
+            ((int32_t *) p1->data)[i + ne[2] * MROPE_X_AXIS]     = old_x + IMAGE_SHIFT;
+            ((int32_t *) p1->data)[i + ne[2] * MROPE_OTHER_AXIS] = 0;
+        }
+
+        struct ggml_tensor * r0 = ggml_rope_multi(
+            ctx0, x, p0, nullptr,
+            MROPE_TEST_N_ROT, sections, mode,
+            ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+            YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+        struct ggml_tensor * rd = ggml_rope_multi(
+            ctx0, r0, pd, nullptr,
+            MROPE_TEST_N_ROT, sections, mode,
+            ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+            YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+        struct ggml_tensor * r1 = ggml_rope_multi(
+            ctx0, x, p1, nullptr,
+            MROPE_TEST_N_ROT, sections, mode,
+            ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+            YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+        ggml_build_forward_expand(gf, r0);
+        ggml_build_forward_expand(gf, rd);
+        ggml_build_forward_expand(gf, r1);
+
+        ggml_graph_compute_helper(work_buffer, gf, 4);
+
+        double sum = 0.0f;
+        double diff = 0.0f;
+
+        const float * rd_data = (float *) rd->data;
+        const float * r1_data = (float *) r1->data;
+
+        const int n_elements = ggml_nelements(rd);
+
+        for (int i = 0; i < n_elements; ++i) {
+            sum  += fabs(r1_data[i]);
+            diff += fabs(rd_data[i] - r1_data[i]);
+        }
+
+        printf("k-shift mode: %d\n", mode);
+        printf("k-shift diff: %f\n", diff);
+        printf("k-shift rel err: %f\n", diff / sum);
+
+        static constexpr float FLOAT_K_SHIFT_TOLERANCE = 0.0001f;
+        GGML_ASSERT(diff / sum < FLOAT_K_SHIFT_TOLERANCE);
+    }
+
+    // Quantized K-cache decoder K-shift for M-RoPE/iM-RoPE image grids.
+    // Mirrors the standard quantized cache path:
+    //   quantized K -> f32 -> M-RoPE shift -> quantized K
+    // and compares it with directly rotating to the shifted positions before
+    // quantizing. This catches regressions where quantized M-RoPE shift graphs
+    // diverge from the unquantized shift semantics.
+    static constexpr ggml_type QUANTIZED_K_SHIFT_TYPES[] = {
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_TBQ3_0,
+        GGML_TYPE_TBQ3_0_64,
+        GGML_TYPE_TBQ4_0,
+        GGML_TYPE_TBQ4_0_64,
+        GGML_TYPE_PQ3_0,
+        GGML_TYPE_PQ3_0_64,
+        GGML_TYPE_PQ4_0,
+        GGML_TYPE_PQ4_0_64,
+    };
+    static constexpr float QUANTIZED_K_SHIFT_TOLERANCE = 0.125f;
+    static constexpr int64_t QUANTIZED_K_SHIFT_N_ROT = 64;
+    static constexpr int64_t QUANTIZED_K_SHIFT_WIDTH = 128;
+
+    for (int m = 0; m < 2; ++m) {
+        const int64_t ne[MROPE_TEST_NDIMS] = {
+            QUANTIZED_K_SHIFT_WIDTH, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH
+        };
+
+        int sections[MROPE_AXIS_COUNT] = {
+            MROPE_SECTION_T, MROPE_SECTION_Y, MROPE_SECTION_X, MROPE_SECTION_OTHER
+        };
+        const int mode = m == 0 ? GGML_ROPE_TYPE_MROPE : GGML_ROPE_TYPE_IMROPE;
+
+        const int64_t cache_ne[MROPE_TEST_NDIMS] = {
+            MROPE_TEST_K_ROW, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH
+        };
+
+        x = get_random_tensor_f32(ctx0, MROPE_TEST_NDIMS, ne, RANDOM_MIN, RANDOM_MAX);
+
+        auto new_quantized_cache_view = [&](ggml_type type) {
+            struct ggml_tensor * cache = ggml_new_tensor(ctx0, type, MROPE_TEST_NDIMS, cache_ne);
+            return ggml_view_4d(
+                ctx0, cache,
+                QUANTIZED_K_SHIFT_WIDTH, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH,
+                cache->nb[1], cache->nb[2], cache->nb[3], 0);
+        };
+
+        struct ggml_tensor * p0 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * MROPE_AXIS_COUNT);
+        struct ggml_tensor * pd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * MROPE_AXIS_COUNT);
+        struct ggml_tensor * p1 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * MROPE_AXIS_COUNT);
+
+        for (int i = 0; i < ne[2]; ++i) {
+            const int32_t old_t = IMAGE_T_ORIGIN;
+            const int32_t old_y = IMAGE_Y_ORIGIN + i/IMAGE_GRID_W;
+            const int32_t old_x = IMAGE_X_ORIGIN + i%IMAGE_GRID_W;
+
+            ((int32_t *) p0->data)[i + ne[2] * MROPE_T_AXIS]     = old_t;
+            ((int32_t *) p0->data)[i + ne[2] * MROPE_Y_AXIS]     = old_y;
+            ((int32_t *) p0->data)[i + ne[2] * MROPE_X_AXIS]     = old_x;
+            ((int32_t *) p0->data)[i + ne[2] * MROPE_OTHER_AXIS] = 0;
+
+            ((int32_t *) pd->data)[i + ne[2] * MROPE_T_AXIS]     = IMAGE_SHIFT;
+            ((int32_t *) pd->data)[i + ne[2] * MROPE_Y_AXIS]     = IMAGE_SHIFT;
+            ((int32_t *) pd->data)[i + ne[2] * MROPE_X_AXIS]     = IMAGE_SHIFT;
+            ((int32_t *) pd->data)[i + ne[2] * MROPE_OTHER_AXIS] = 0;
+
+            ((int32_t *) p1->data)[i + ne[2] * MROPE_T_AXIS]     = old_t + IMAGE_SHIFT;
+            ((int32_t *) p1->data)[i + ne[2] * MROPE_Y_AXIS]     = old_y + IMAGE_SHIFT;
+            ((int32_t *) p1->data)[i + ne[2] * MROPE_X_AXIS]     = old_x + IMAGE_SHIFT;
+            ((int32_t *) p1->data)[i + ne[2] * MROPE_OTHER_AXIS] = 0;
+        }
+
+        struct ggml_tensor * old_f32 = ggml_rope_multi(
+            ctx0, x, p0, nullptr,
+            QUANTIZED_K_SHIFT_N_ROT, sections, mode,
+            ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+            YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+        struct ggml_tensor * target_f32 = ggml_rope_multi(
+            ctx0, x, p1, nullptr,
+            QUANTIZED_K_SHIFT_N_ROT, sections, mode,
+            ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+            YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+
+        for (ggml_type qtype : QUANTIZED_K_SHIFT_TYPES) {
+            struct ggml_tensor * old_q = ggml_cpy(ctx0, old_f32, new_quantized_cache_view(qtype));
+            struct ggml_tensor * old_deq = ggml_cast(ctx0, old_q, GGML_TYPE_F32);
+            struct ggml_tensor * shifted_deq = ggml_rope_multi(
+                ctx0, old_deq, pd, nullptr,
+                QUANTIZED_K_SHIFT_N_ROT, sections, mode,
+                ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+                YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+            struct ggml_tensor * shifted_q = ggml_cpy(ctx0, shifted_deq, new_quantized_cache_view(qtype));
+            struct ggml_tensor * shifted_out = ggml_cast(ctx0, shifted_q, GGML_TYPE_F32);
+
+            struct ggml_tensor * target_q = ggml_cpy(ctx0, target_f32, new_quantized_cache_view(qtype));
+            struct ggml_tensor * target_out = ggml_cast(ctx0, target_q, GGML_TYPE_F32);
+
+            ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+            ggml_build_forward_expand(gf, old_f32);
+            ggml_build_forward_expand(gf, shifted_out);
+            ggml_build_forward_expand(gf, target_out);
+
+            ggml_graph_compute_helper(work_buffer, gf, 4);
+
+            double sum = 0.0f;
+            double diff = 0.0f;
+
+            const float * shifted_data = (float *) shifted_out->data;
+            const float * target_data  = (float *) target_out->data;
+
+            const int n_elements = ggml_nelements(shifted_out);
+
+            for (int i = 0; i < n_elements; ++i) {
+                sum  += fabs(target_data[i]);
+                diff += fabs(shifted_data[i] - target_data[i]);
+            }
+
+            printf("%s k-shift mode: %d\n", ggml_type_name(qtype), mode);
+            printf("%s k-shift diff: %f\n", ggml_type_name(qtype), diff);
+            printf("%s k-shift rel err: %f\n", ggml_type_name(qtype), diff / sum);
+
+            GGML_ASSERT(diff / sum < QUANTIZED_K_SHIFT_TOLERANCE);
+        }
+
+        // TBQ/PQ K-cache shift with the attention-rotation path enabled:
+        // quantized rotated K -> f32 -> rotate back -> M-RoPE shift ->
+        // rotate forward -> quantized rotated K. This mirrors the branch that
+        // uses ggml_mul_mat_aux() in llama_kv_cache::build_rope_shift().
+        static constexpr ggml_type ATTENTION_ROT_K_SHIFT_TYPES[] = {
+            GGML_TYPE_TBQ4_0,
+            GGML_TYPE_PQ4_0,
+        };
+
+        struct ggml_tensor * rot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, QUANTIZED_K_SHIFT_WIDTH, QUANTIZED_K_SHIFT_WIDTH);
+        fill_hadamard_f32(rot);
+
+        for (ggml_type qtype : ATTENTION_ROT_K_SHIFT_TYPES) {
+            struct ggml_tensor * old_rot = test_mul_mat_aux(ctx0, old_f32, rot);
+            struct ggml_tensor * old_q = ggml_cpy(ctx0, old_rot, new_quantized_cache_view(qtype));
+            struct ggml_tensor * old_deq = ggml_cast(ctx0, old_q, GGML_TYPE_F32);
+            struct ggml_tensor * old_unrot = test_mul_mat_aux(ctx0, old_deq, rot);
+            struct ggml_tensor * shifted_unrot = ggml_rope_multi(
+                ctx0, old_unrot, pd, nullptr,
+                QUANTIZED_K_SHIFT_N_ROT, sections, mode,
+                ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+                YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+            struct ggml_tensor * shifted_rot = test_mul_mat_aux(ctx0, shifted_unrot, rot);
+            struct ggml_tensor * shifted_q = ggml_cpy(ctx0, shifted_rot, new_quantized_cache_view(qtype));
+            struct ggml_tensor * shifted_out = ggml_cast(ctx0, shifted_q, GGML_TYPE_F32);
+
+            struct ggml_tensor * target_rot = test_mul_mat_aux(ctx0, target_f32, rot);
+            struct ggml_tensor * target_q = ggml_cpy(ctx0, target_rot, new_quantized_cache_view(qtype));
+            struct ggml_tensor * target_out = ggml_cast(ctx0, target_q, GGML_TYPE_F32);
+
+            ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+            ggml_build_forward_expand(gf, shifted_out);
+            ggml_build_forward_expand(gf, target_out);
+
+            ggml_graph_compute_helper(work_buffer, gf, 4);
+
+            const double err = rel_err(shifted_out, target_out);
+
+            printf("%s attention-rot k-shift mode: %d\n", ggml_type_name(qtype), mode);
+            printf("%s attention-rot k-shift rel err: %f\n", ggml_type_name(qtype), err);
+
+            static constexpr float ATTENTION_ROT_K_SHIFT_TOLERANCE = 0.25f;
+            GGML_ASSERT(err < ATTENTION_ROT_K_SHIFT_TOLERANCE);
+        }
+
+        // Full-cache image-token writeback: seed a quantized cache view with
+        // image-grid keys, shift that same view in place, then read it back.
+        // This catches regressions where the writeback to a non-contiguous KV
+        // cache view succeeds as a standalone copy but fails in the full path.
+        {
+            static constexpr ggml_type FULL_CACHE_WRITEBACK_TYPE = GGML_TYPE_PQ4_0;
+
+            struct ggml_tensor * cache = ggml_new_tensor(ctx0, FULL_CACHE_WRITEBACK_TYPE, MROPE_TEST_NDIMS, cache_ne);
+            struct ggml_tensor * cache_view = ggml_view_4d(
+                ctx0, cache,
+                QUANTIZED_K_SHIFT_WIDTH, MROPE_TEST_N_HEADS, MROPE_TEST_N_TOKENS, MROPE_TEST_N_BATCH,
+                cache->nb[1], cache->nb[2], cache->nb[3], 0);
+
+            struct ggml_tensor * old_q = ggml_cpy(ctx0, old_f32, cache_view);
+            struct ggml_tensor * old_deq = ggml_cast(ctx0, old_q, GGML_TYPE_F32);
+            struct ggml_tensor * shifted_deq = ggml_rope_multi(
+                ctx0, old_deq, pd, nullptr,
+                QUANTIZED_K_SHIFT_N_ROT, sections, mode,
+                ROPE_CTX_ORIG, ROPE_FREQ_BASE, ROPE_FREQ_SCALE,
+                YARN_EXT_FACTOR, YARN_ATTN_FACTOR, YARN_BETA_FAST, YARN_BETA_SLOW);
+            struct ggml_tensor * shifted_q = ggml_cpy(ctx0, shifted_deq, cache_view);
+            struct ggml_tensor * shifted_out = ggml_cast(ctx0, shifted_q, GGML_TYPE_F32);
+
+            struct ggml_tensor * target_q = ggml_cpy(ctx0, target_f32, new_quantized_cache_view(FULL_CACHE_WRITEBACK_TYPE));
+            struct ggml_tensor * target_out = ggml_cast(ctx0, target_q, GGML_TYPE_F32);
+
+            ggml_cgraph * gf = ggml_new_graph(ctx0);
+
+            ggml_build_forward_expand(gf, shifted_out);
+            ggml_build_forward_expand(gf, target_out);
+
+            ggml_graph_compute_helper(work_buffer, gf, 4);
+
+            const double err = rel_err(shifted_out, target_out);
+
+            printf("%s full-cache image k-shift mode: %d\n", ggml_type_name(FULL_CACHE_WRITEBACK_TYPE), mode);
+            printf("%s full-cache image k-shift rel err: %f\n", ggml_type_name(FULL_CACHE_WRITEBACK_TYPE), err);
+
+            GGML_ASSERT(err < QUANTIZED_K_SHIFT_TOLERANCE);
         }
     }
 
