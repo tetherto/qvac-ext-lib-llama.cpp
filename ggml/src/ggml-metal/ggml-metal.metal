@@ -6092,19 +6092,11 @@ kernel void kernel_conv_2d_dw(
     }
 }
 
+// Only the f32-weight specialization: the CPU conv_2d_dw reference (and the
+// DocTR consumers) are f32-only, so an f16-weight kernel can't be validated
+// against the backend-ops reference. Keep TK templated for a future f16 path.
 template [[host_name("kernel_conv_2d_dw_f32_f32")]]
 kernel void kernel_conv_2d_dw<float>(
-        constant ggml_metal_kargs_conv_2d & args,
-        device const char * weights,
-        device const char * src,
-        device       char * dst,
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        uint3    tgpg[[threadgroups_per_grid]],
-        uint3   tpitg[[thread_position_in_threadgroup]],
-        uint3     ntg[[threads_per_threadgroup]]);
-
-template [[host_name("kernel_conv_2d_dw_f16_f32")]]
-kernel void kernel_conv_2d_dw<half>(
         constant ggml_metal_kargs_conv_2d & args,
         device const char * weights,
         device const char * src,
