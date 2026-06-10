@@ -3784,37 +3784,20 @@ int ggml_metal_op_conv_2d_dw(ggml_metal_op_t ctx, int idx) {
     const int32_t d0 = ((const int32_t *) op->op_params)[4];
     const int32_t d1 = ((const int32_t *) op->op_params)[5];
 
-    // Depthwise: src[0] (weights) is [KW, KH, 1, C] (IC==1, channels in ne03);
-    // src[1] (input) is [IW, IH, C, N]; dst is [OW, OH, C, N]. The kargs map is
-    // the same as CONV_2D (IC=ne02=1, OC=ne03=C); only the kernel differs.
+    // Depthwise reuses the conv_2d kargs (OC == channels, nb03 == per-channel
+    // weight stride); only the kernel differs. Spatial/kernel extents map from
+    // the input and weight tensors, hence the IW/IH/KW/KH hints below.
     ggml_metal_kargs_conv_2d args = {
-        /*.nb00 =*/ nb00,
-        /*.nb01 =*/ nb01,
-        /*.nb02 =*/ nb02,
-        /*.nb03 =*/ nb03,
-        /*.nb10 =*/ nb10,
-        /*.nb11 =*/ nb11,
-        /*.nb12 =*/ nb12,
-        /*.nb13 =*/ nb13,
-        /*.nb0  =*/ nb0,
-        /*.nb1  =*/ nb1,
-        /*.nb2  =*/ nb2,
-        /*.nb3  =*/ nb3,
-        /*.IW   =*/ ne10,
-        /*.IH   =*/ ne11,
-        /*.KW   =*/ ne00,
-        /*.KH   =*/ ne01,
-        /*.IC   =*/ ne02,
-        /*.OC   =*/ ne03,
-        /*.OW   =*/ ne0,
-        /*.OH   =*/ ne1,
-        /*.N    =*/ ne3,
-        /*.s0   =*/ s0,
-        /*.s1   =*/ s1,
-        /*.p0   =*/ p0,
-        /*.p1   =*/ p1,
-        /*.d0   =*/ d0,
-        /*.d1   =*/ d1,
+        nb00, nb01, nb02, nb03,
+        nb10, nb11, nb12, nb13,
+        nb0,  nb1,  nb2,  nb3,
+        ne10, ne11, // IW, IH
+        ne00, ne01, // KW, KH
+        ne02,       // IC
+        ne03,       // OC (== channels)
+        ne0,  ne1,  // OW, OH
+        ne3,        // N
+        s0, s1, p0, p1, d0, d1,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_conv_2d_dw(lib, op);
