@@ -55,6 +55,19 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.cpp
         )
 
+    # clang-22's -O3 optimizer blows up (>6h on a single TU; reproduced
+    # locally as one clang++ pegged at 100% CPU, ~0.8 GB RSS) compiling the AMX
+    # quantized-matmul kernel for the sapphirerapids variant under
+    # GGML_CPU_ALL_VARIANTS. AMX throughput comes from the tile intrinsics, not
+    # the high-level optimizer, so building this one TU at -O1 avoids the
+    # compile-time explosion at negligible runtime cost (-O1: ~5s vs -O3: >40m).
+    # The trailing -O1 overrides the build-type -O3. Skip MSVC: it maps -O1 to
+    # /O1, incompatible with the debug /RTC1 flag (D8016), and it doesn't hit
+    # the clang blow-up anyway.
+    if(NOT MSVC)
+      set_source_files_properties(ggml-cpu/amx/mmq.cpp PROPERTIES COMPILE_OPTIONS "-O1")
+    endif()
+
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
 
