@@ -8264,7 +8264,13 @@ static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
         VMA_ALLOCATION_CREATE_MAPPED_BIT;
     alloc_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-    vk_buffer buf = ggml_vk_create_buffer_aligned(device, buffer_info, alloc_info, TENSOR_ALIGNMENT);
+    // host buffer type advertises minMemoryMapAlignment; make the mapped ptr honour it
+    // so the tallocr base-align (ggml-alloc.c:71) consumes no unreserved slack
+    // This issue is upstream, at least until b9518. And it is triggered by VMA
+    // and possibility of buffer misalignment.
+    const size_t host_align = std::max<size_t>(TENSOR_ALIGNMENT, device->properties.limits.minMemoryMapAlignment);
+    vk_buffer buf = ggml_vk_create_buffer_aligned(device, buffer_info, alloc_info, host_align);
+
     if(!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
         fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n",
             size/1024.0/1024.0);
