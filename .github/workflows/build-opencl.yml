@@ -108,6 +108,10 @@ jobs:
       - name: Build (GGML_OPENCL, portable kernels)
         id: cmake_build
         run: |
+          # NOTE: no -DLLAMA_FATAL_WARNINGS=ON — upstream ggml-opencl.cpp has
+          # intentional (un-annotated) case fall-throughs that GCC's
+          # -Wimplicit-fallthrough would turn into errors. This job's purpose is
+          # to run test-backend-ops, not to gate upstream warning-cleanliness.
           # GGML_NATIVE defaults to ON for a native x86 build, which bakes
           # -march=native into the CPU backend. The ccache key is shared across
           # runs, so an object built on an AVX-512 runner gets reused on a runner
@@ -115,7 +119,6 @@ jobs:
           # printing a single test. Every other x64 job here already sets OFF.
           cmake -B build \
             -DGGML_NATIVE=OFF \
-            -DLLAMA_FATAL_WARNINGS=ON \
             -DGGML_OPENCL=ON \
             -DLLAMA_BUILD_TOOLS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
