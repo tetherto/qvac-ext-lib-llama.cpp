@@ -1,7 +1,11 @@
 #include "llama-kv-cache.h"
+#include "llama-io.h"
 #include "llama-model.h"
 
+#include <cstring>
 #include <memory>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 static constexpr uint32_t TEST_LAYER     = 0;
@@ -26,12 +30,58 @@ static constexpr uint32_t Y_AXIS     = 1;
 static constexpr uint32_t X_AXIS     = 2;
 static constexpr uint32_t OTHER_AXIS = 3;
 
-static std::unique_ptr<llama_model> make_test_model(enum llama_rope_type rope_type = LLAMA_ROPE_TYPE_IMROPE) {
+class vector_writer : public llama_io_write_i {
+public:
+    void write(const void * src, size_t size) override {
+        const auto * bytes = static_cast<const uint8_t *>(src);
+        data.insert(data.end(), bytes, bytes + size);
+    }
+
+    void write_tensor(const ggml_tensor * tensor, size_t offset, size_t size) override {
+        const size_t start = data.size();
+        data.resize(start + size);
+        ggml_backend_tensor_get(tensor, data.data() + start, offset, size);
+    }
+
+    size_t n_bytes() override {
+        return data.size();
+    }
+
+    std::vector<uint8_t> data;
+};
+
+class vector_reader : public llama_io_read_i {
+public:
+    explicit vector_reader(const std::vector<uint8_t> & bytes) : data(bytes) {}
+
+    const uint8_t * read(size_t size) override {
+        if (offset + size > data.size()) {
+            throw std::runtime_error("vector_reader: read past end");
+        }
+        const uint8_t * result = data.data() + offset;
+        offset += size;
+        return result;
+    }
+
+    void read_to(void * dst, size_t size) override {
+        memcpy(dst, read(size), size);
+    }
+
+    size_t n_bytes() override {
+        return offset;
+    }
+
+private:
+    const std::vector<uint8_t> & data;
+    size_t offset = 0;
+};
+
+static std::unique_ptr<llama_model> make_test_model(enum llama_rope_type rope_type = LLAMA_ROPE_TYPE_IMROPE, bool no_alloc = true) {
     llama_model_params params = llama_model_default_params();
     auto model = std::make_unique<llama_model>(params);
 
     llama_hparams & hparams = model->hparams;
-    hparams.no_alloc             = true;
+    hparams.no_alloc             = no_alloc;
     hparams.n_ctx_train          = 512;
     hparams.n_embd               = TEST_N_HEAD * TEST_HEAD_DIM;
     hparams.n_layer_all          = 1;
@@ -116,6 +166,18 @@ static llama_kv_cache::slot_info make_slot_info() {
     return sinfo;
 }
 
+static std::vector<uint8_t> write_sequence_state(const llama_kv_cache & kv) {
+    vector_writer writer;
+    kv.state_write(writer, TEST_SEQ_ID);
+    return std::move(writer.data);
+}
+
+static void read_sequence_state(llama_kv_cache & kv, const std::vector<uint8_t> & bytes) {
+    vector_reader reader(bytes);
+    kv.state_read(reader, TEST_SEQ_ID);
+    GGML_ASSERT(reader.n_bytes() == bytes.size());
+}
+
 static void test_mrope_k_shift_input_layout() {
     auto model = make_test_model();
     llama_kv_cache kv = make_test_cache(*model, GGML_TYPE_F16);
@@ -155,9 +217,25 @@ static void test_quantized_k_shift_width_pads_to_block() {
     GGML_ASSERT(pq_cache.get_k_shift_width(TEST_LAYER) == TEST_HEAD_DIM);
 }
 
+static void test_sequence_state_roundtrip_preserves_mrope_ext() {
+    auto model = make_test_model(LLAMA_ROPE_TYPE_IMROPE, false);
+
+    llama_kv_cache source = make_test_cache(*model, GGML_TYPE_F16);
+    source.apply_ubatch(make_slot_info(), make_image_grid_ubatch());
+
+    const std::vector<uint8_t> saved = write_sequence_state(source);
+
+    llama_kv_cache restored = make_test_cache(*model, GGML_TYPE_F16);
+    read_sequence_state(restored, saved);
+
+    const std::vector<uint8_t> resaved = write_sequence_state(restored);
+    GGML_ASSERT(resaved == saved);
+}
+
 int main() {
     test_mrope_k_shift_input_layout();
     test_quantized_k_shift_width_pads_to_block();
+    test_sequence_state_roundtrip_preserves_mrope_ext();
 
     return 0;
 }
