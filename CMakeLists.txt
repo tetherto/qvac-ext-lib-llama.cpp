@@ -208,6 +208,14 @@ add_subdirectory(src)
 # utils, programs, examples and tests
 #
 
+# LLAMA_INCLUDE_INSTALL_DIR is referenced by common/CMakeLists.txt (added just
+# below) in llama-common-base's $<INSTALL_INTERFACE:> include dir. It must be
+# defined here, before add_subdirectory(common); otherwise it expands empty and
+# the installed llama::llama-common target carries a bogus "/common" include
+# path that breaks downstream find_package(llama) consumers.
+include(GNUInstallDirs)
+set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header files")
+
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
     add_subdirectory(vendor/cpp-httplib)
