@@ -1739,6 +1739,8 @@ struct block_tq2_0
 #define A_TYPE block_tq2_0
 #endif
 
+#include "turbo-quant/types.glsl"
+
 #define QUANT_K_MXFP4 32
 #define QUANT_R_MXFP4 2
 
