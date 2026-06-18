@@ -7450,9 +7450,15 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, grad_b));
             }
         } break;
-        case GGML_OP_SSM_CONV:
-        case GGML_OP_GATED_DELTA_NET:
         case GGML_OP_L2_NORM: {
+            if (src0_needs_grads) {
+                float eps;
+                memcpy(&eps, tensor->op_params, sizeof(float));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_l2_norm_back(ctx, grad, src0, eps));
+            }
+        } break;
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_GATED_DELTA_NET: {
             // Stop-gradient: analytical backward not implemented for SSM/recurrent ops.
             // Inputs receive zero gradient. Residual bypass in hybrid archs
             // (Qwen3Next, Mamba-attn hybrids) preserves loss propagation to upstream
