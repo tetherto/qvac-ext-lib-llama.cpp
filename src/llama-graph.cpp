@@ -2062,9 +2062,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
         // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        // Under training, build the equivalent max(x, eps) = x + relu(eps - x) 
+        // using non-view ops so the gradient walk stays legal. The relu trick 
+        // produces a fresh tensor at each step.
+        const float weights_sum_eps = 6.103515625e-5f;
+        if (cparams.training) {
+            ggml_tensor * shifted = ggml_scale_bias(ctx0, weights_sum, -1.0f, weights_sum_eps);
+            ggml_tensor * relu_shifted = ggml_relu(ctx0, shifted);
+            weights_sum = ggml_add(ctx0, weights_sum, relu_shifted);
+        } else {
+            weights_sum = ggml_clamp(ctx0, weights_sum, weights_sum_eps, INFINITY);
+        }
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
+        // Under training, materialize the broadcast so div's src1 backward
+        // doesn't hit ggml's broadcast-reduction gap (div grad w.r.t. src1 has
+        // no repeat_back step). Inference keeps the implicit broadcast for
+        // perf, ggml_repeat is a no-op when shapes already match
+        if (cparams.training) {
+            weights_sum = ggml_repeat(ctx0, weights_sum, weights);
+        }
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
         cb(weights, "ffn_moe_weights_norm", il);
 
