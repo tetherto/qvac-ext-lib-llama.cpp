@@ -61,10 +61,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     # GGML_CPU_ALL_VARIANTS. AMX throughput comes from the tile intrinsics, not
     # the high-level optimizer, so building this one TU at -O1 avoids the
     # compile-time explosion at negligible runtime cost (-O1: ~5s vs -O3: >40m).
-    # The trailing -O1 overrides the build-type -O3. Skip MSVC: it maps -O1 to
-    # /O1, incompatible with the debug /RTC1 flag (D8016), and it doesn't hit
-    # the clang blow-up anyway.
-    if(NOT MSVC)
+    # The trailing -O1 overrides the build-type -O3. Scope it tightly: only the
+    # sapphirerapids variant of the DL all-variants build compiles the AMX TU and
+    # hits the blow-up, so every other build keeps -O3. Skip MSVC regardless: it
+    # maps -O1 to /O1, incompatible with the debug /RTC1 flag (D8016), and it
+    # doesn't hit the clang blow-up anyway.
+    if(NOT MSVC AND GGML_BACKEND_DL AND GGML_CPU_ALL_VARIANTS AND tag_name STREQUAL "sapphirerapids")
       set_source_files_properties(ggml-cpu/amx/mmq.cpp PROPERTIES COMPILE_OPTIONS "-O1")
     endif()
 
