@@ -1144,6 +1144,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_back_sx_f32;
+    vk_pipeline pipeline_ssm_conv_back_c_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1983,6 +1985,20 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb01, nb02;
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
+    uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+struct vk_op_ssm_conv_back_sx_push_constants {
+    uint32_t grad_nb0, grad_nb1, grad_nb2;
+    uint32_t c_nb1;
+    uint32_t dst_nb0, dst_nb1, dst_nb2;
+    uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+struct vk_op_ssm_conv_back_c_push_constants {
+    uint32_t grad_nb0, grad_nb1, grad_nb2;
+    uint32_t sx_nb0, sx_nb1, sx_nb2;
+    uint32_t dst_nb1;
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
@@ -6549,6 +6565,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_sx_f32, "ssm_conv_back_sx_f32", ssm_conv_back_sx_f32_len, ssm_conv_back_sx_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_sx_push_constants), {32, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_back_c_f32, "ssm_conv_back_c_f32", ssm_conv_back_c_f32_len, ssm_conv_back_c_f32_data, "main", 3, sizeof(vk_op_ssm_conv_back_c_push_constants), {32, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -13148,6 +13166,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             }
         }
         return nullptr;
+    case GGML_OP_SSM_CONV_BACK_SX:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_ssm_conv_back_sx_f32;
+        }
+        return nullptr;
+    case GGML_OP_SSM_CONV_BACK_C:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_ssm_conv_back_c_f32;
+        }
+        return nullptr;
     case GGML_OP_OPT_STEP_ADAMW:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_adamw_f32;
@@ -13831,6 +13859,16 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { nr, n_t, n_s };
         }
         break;
+    case GGML_OP_SSM_CONV_BACK_SX:
+        {
+            elements = { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], (uint32_t)dst->ne[2] };
+        }
+        break;
+    case GGML_OP_SSM_CONV_BACK_C:
+        {
+            elements = { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], 1 };
+        }
+        break;
     default:
         elements = { (uint32_t)ggml_nelements(src0), 1, 1 };
         break;
@@ -14510,6 +14548,34 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)src0->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
+    });
+}
+
+static void ggml_vk_ssm_conv_back_sx(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // src0 = grad_out {d_inner, n_t, n_s}, src1 = c {d_conv, d_inner}, dst = grad_sx {ncs, d_inner, n_s}
+    ggml_vk_op_f32<vk_op_ssm_conv_back_sx_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SSM_CONV_BACK_SX, {
+        (uint32_t)src0->nb[0], (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
+        (uint32_t)src1->nb[1],
+        (uint32_t)dst->nb[0], (uint32_t)dst->nb[1], (uint32_t)dst->nb[2],
+        (uint32_t)src1->ne[0],
+        (uint32_t)dst->ne[0],
+        (uint32_t)dst->ne[1],
+        (uint32_t)src0->ne[1],
+        (uint32_t)dst->ne[2],
+    });
+}
+
+static void ggml_vk_ssm_conv_back_c(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // src0 = grad_out {d_inner, n_t, n_s}, src1 = sx {ncs, d_inner, n_s}, dst = grad_c {d_conv, d_inner}
+    ggml_vk_op_f32<vk_op_ssm_conv_back_c_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SSM_CONV_BACK_C, {
+        (uint32_t)src0->nb[0], (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
+        (uint32_t)src1->nb[0], (uint32_t)src1->nb[1], (uint32_t)src1->nb[2],
+        (uint32_t)dst->nb[1],
+        (uint32_t)dst->ne[0],
+        (uint32_t)src1->ne[0],
+        (uint32_t)dst->ne[1],
+        (uint32_t)src0->ne[1],
+        (uint32_t)src0->ne[2],
     });
 }
 
@@ -17545,6 +17611,16 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_SSM_CONV_BACK_SX:
+        ggml_vk_ssm_conv_back_sx(ctx, compute_ctx, src0, src1, node);
+
+        break;
+
+    case GGML_OP_SSM_CONV_BACK_C:
+        ggml_vk_ssm_conv_back_c(ctx, compute_ctx, src0, src1, node);
+
+        break;
+
     case GGML_OP_OPT_STEP_ADAMW:
         ggml_vk_opt_step_adamw(ctx, compute_ctx, node);
 
@@ -20518,6 +20594,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SSM_CONV:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_SSM_CONV_BACK_SX:
+        case GGML_OP_SSM_CONV_BACK_C:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_COL2IM_1D:
@@ -21506,6 +21585,10 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6], K);
         } else if (tensor->op == GGML_OP_SSM_CONV) {
             tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_SSM_CONV_BACK_SX) {
+            tensor_clone = ggml_ssm_conv_back_sx(ggml_ctx, src_clone[0], src_clone[1], tensor);
+        } else if (tensor->op == GGML_OP_SSM_CONV_BACK_C) {
+            tensor_clone = ggml_ssm_conv_back_c(ggml_ctx, src_clone[0], src_clone[1], tensor);
         } else if (tensor->op == GGML_OP_ROLL) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];
