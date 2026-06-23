@@ -834,9 +834,9 @@ struct clip_image_f32_batch {
 
     clip_image_f32_batch clone() const {
         clip_image_f32_batch new_batch;
-        new_batch.is_audio = is_audio;
-        new_batch.grid_x   = grid_x;
-        new_batch.grid_y   = grid_y;
+        new_batch.is_audio     = is_audio;
+        new_batch.grid_x       = grid_x;
+        new_batch.grid_y       = grid_y;
         new_batch.entries.reserve(entries.size());
         for (const auto & entry : entries) {
             new_batch.entries.emplace_back(entry); // copy

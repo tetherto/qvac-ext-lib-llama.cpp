@@ -947,7 +947,6 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                                                             const clip_encode_params * params = nullptr) {
     GGML_ASSERT(!imgs.entries.empty());
     const clip_image_f32 & img = imgs.entries[0];
-    const int batch_size = (int)imgs.entries.size();
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
