@@ -901,7 +901,6 @@ ggml_tensor * clip_graph::build_patch_merge_permute(ggml_tensor * cur, int scale
 static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const clip_image_f32_batch & imgs) {
     GGML_ASSERT(!imgs.entries.empty());
     const clip_image_f32 & img = imgs.entries[0];
-    const int batch_size = (int)imgs.entries.size();
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
