@@ -1399,6 +1399,15 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
 }
 
 static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
+    if (backend_ctx->kernels_loaded_argsort) {
+        return;
+    }
+    // Serialize concurrent first-use kernel compilation (see load_cl_kernels).
+    static std::mutex s_argsort_mutex;
+    std::lock_guard<std::mutex> argsort_lock(s_argsort_mutex);
+    if (backend_ctx->kernels_loaded_argsort) {
+        return;
+    }
     // compiler options for general kernels
     auto opencl_c_std =
         std::string("CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." + std::to_string(backend_ctx->opencl_c_version.minor);
@@ -1436,6 +1445,13 @@ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
 }
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+    if (backend_ctx->kernels_loaded) {
+        return;
+    }
+
+    // Serialize first-time kernel compilation across threads.
+    static std::mutex s_load_kernels_mutex;
+    std::lock_guard<std::mutex> load_kernels_lock(s_load_kernels_mutex);
     if (backend_ctx->kernels_loaded) {
         return;
     }
@@ -6023,6 +6039,15 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     GGML_ASSERT(dev_ctx->platform);
     GGML_ASSERT(dev_ctx->device);
 
+    if (dev_ctx->backend_ctx) {
+        return dev_ctx->backend_ctx;
+    }
+
+    // Serialize device-context creation across threads. Concurrent model loads
+    // on one OpenCL device (multi-instance) otherwise race on this lazy init and
+    // build two contexts on the same device.
+    static std::mutex s_cl_init_mutex;
+    std::lock_guard<std::mutex> cl_init_lock(s_cl_init_mutex);
     if (dev_ctx->backend_ctx) {
         return dev_ctx->backend_ctx;
     }
