@@ -261,7 +261,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
         /* backend_device    */ nullptr,
-        /* image_tile_mode   */ 0, // 0=batched (default), 1=sequential, 2=disabled
+        /* image_tile_mode   */ 1, // 0=batched, 1=sequential (default), 2=disabled
     };
     return params;
 }
