@@ -183,7 +183,7 @@ struct clip_ctx {
     size_t fa_mem_capacity  = 0;   // device memory used to cap the cutoff (0 = unknown)
 
     bool debug_output_embeddings = false;
-    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_BATCHED;
+    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_SEQUENTIAL;
 
     // for measuring memory usage
     bool no_alloc = false;
@@ -5128,19 +5128,29 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 GGML_ASSERT(pw % merge_ratio == 0 && ph % merge_ratio == 0 &&
                             "tile dimensions must be divisible by n_merge");
                 const int n_pos_tile   = pw * ph; // raw patches per tile == n_patches (graph sequence length)
-                // single local-coordinate block [y,x,y,x]; the graph passes the same
-                // positions tensor to every tile's rope (see clip_graph_qwen3vl)
-                std::vector<int32_t> positions((size_t)n_pos_tile * 4);
-                int ptr = 0;
-                for (int y = 0; y < ph; y += merge_ratio) {
-                    for (int x = 0; x < pw; x += merge_ratio) {
-                        for (int dy = 0; dy < merge_ratio; dy++) {
-                            for (int dx = 0; dx < merge_ratio; dx++) {
-                                positions[ptr]                          = y + dy;
-                                positions[(size_t)n_pos_tile + ptr]     = x + dx;
-                                positions[(size_t)2 * n_pos_tile + ptr] = y + dy;
-                                positions[(size_t)3 * n_pos_tile + ptr] = x + dx;
-                                ptr++;
+                // positions layout: section-major over the FULL batched sequence. The mrope kernel
+                // reads section s of token i as positions[s * N + i], where N = n_pos_tile * n_batch_cur
+                // is the rope tensor's ne[2]. The four sections are [y, x, y, x]. Every tile gets the
+                // same local-coordinate block (per-tile absolute offsets cancel under relative
+                // attention), so each section just repeats the tile coordinates n_batch_cur times.
+                // For n_batch_cur == 1 this is identical to the old tile-major layout; for
+                // n_batch_cur > 1 (batched mode) it is the only layout the kernel reads correctly —
+                // a tile-major buffer would mis-index every section beyond the first tile.
+                const size_t N = (size_t)n_pos_tile * (size_t)n_batch_cur;
+                std::vector<int32_t> positions(N * 4);
+                for (int b = 0; b < n_batch_cur; b++) {
+                    const size_t tile_off = (size_t)b * (size_t)n_pos_tile;
+                    int ptr = 0;
+                    for (int y = 0; y < ph; y += merge_ratio) {
+                        for (int x = 0; x < pw; x += merge_ratio) {
+                            for (int dy = 0; dy < merge_ratio; dy++) {
+                                for (int dx = 0; dx < merge_ratio; dx++) {
+                                    positions[0 * N + tile_off + ptr] = y + dy;
+                                    positions[1 * N + tile_off + ptr] = x + dx;
+                                    positions[2 * N + tile_off + ptr] = y + dy;
+                                    positions[3 * N + tile_off + ptr] = x + dx;
+                                    ptr++;
+                                }
                             }
                         }
                     }

@@ -67,7 +67,7 @@ struct clip_context_params {
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
     const char * backend_device; // optional, if null will use env var or default GPU backend
-    int image_tile_mode;   // 0=batched (default), 1=sequential, 2=disabled
+    int image_tile_mode;   // 0=batched, 1=sequential (default), 2=disabled
     int image_max_tiles;   // override preproc_max_tiles; -1 = use GGUF/model default
 };
 
