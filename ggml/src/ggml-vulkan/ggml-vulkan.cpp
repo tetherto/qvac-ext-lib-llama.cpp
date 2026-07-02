@@ -4055,7 +4055,9 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     // as uint32) and become CEIL_DIV divisors / Vulkan workgroup sizes, so an
     // absurd value could wrap that math and slip past the shmem guard below.
     {
-        constexpr uint32_t FA_OVERRIDE_MAX = 1024u;  // well below any wrap threshold
+        // static storage duration so the no-capture parse lambda below can use it
+        // without a capture (MSVC C3493 otherwise); also a compile-time constant.
+        static constexpr uint32_t FA_OVERRIDE_MAX = 1024u;  // well below any wrap threshold
 
         struct fa_overrides {
             bool     has_br=false, has_bc=false, has_wg=false, has_sgs=false,
