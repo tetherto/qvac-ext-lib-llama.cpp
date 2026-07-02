@@ -182,7 +182,7 @@ struct clip_ctx {
     size_t fa_mem_capacity  = 0;   // device memory used to cap the cutoff (0 = unknown)
 
     bool debug_output_embeddings = false;
-    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_BATCHED;
+    clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_SEQUENTIAL;
 
     // for measuring memory usage
     bool no_alloc = false;
@@ -1172,8 +1172,6 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             GGML_ABORT("missing cgraph builder");
     }
 
-    builder->img_batch = &imgs;
-
     // TODO [QWEN_VIDEO]: improve this in the future
     builder->n_batch = imgs.entries.size();
 
@@ -1771,16 +1769,7 @@ struct clip_model_loader {
                         get_u32(KEY_SAM_N_HEAD, hparams.sam_n_head, true);
                         get_u32(KEY_SAM_N_EMBD, hparams.sam_n_embd, true);
                         get_u32(KEY_ATTN_WINDOW_SIZE, hparams.attn_window_size, true);
-                        hparams.preproc_min_tiles = 2;
-                        if (model.proj_type == PROJECTOR_TYPE_DEEPSEEKOCR) {
-                            hparams.preproc_max_tiles = 9;
-                            hparams.preproc_tile_size = 640;
-                            // the CLIP/ViT body runs its layernorms at 1e-5 (the SAM stage uses 1e-6)
-                            hparams.eps = 1e-5f;
-                        }
                         if (model.proj_type == PROJECTOR_TYPE_DEEPSEEKOCR2) {
-                            hparams.preproc_max_tiles = 6;
-                            hparams.preproc_tile_size = 768;
                             // qwen2 encoder is GQA, requires KEY_N_HEAD_KV
                             get_u32(string_format(KEY_N_HEAD_KV, "vision"), hparams.n_head_kv);
                         }
@@ -3583,9 +3572,6 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
             return (img->nx() / params.patch_size) / 2;
         case PROJECTOR_TYPE_STEP3VL:
             return img->nx() / (params.patch_size * params.n_merge);
-        case PROJECTOR_TYPE_DEEPSEEKOCR:
-        case PROJECTOR_TYPE_DEEPSEEKOCR2:
-            return (img->nx() / params.patch_size) / 4;
         default:
             break;
     }
@@ -3814,17 +3800,10 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
             // E.g., 64x64 -> 16x16 patches
             n_patches /= 16;
 
-            if (img->add_viewsep) {
-                // global view: one image-newline per token-row + trailing view separator
-                const int h = static_cast<int>(std::sqrt(static_cast<float>(n_patches)));
-                n_patches = h * (h + 1) + 1;
-            } else if (img->ny() >= img->nx() && img->ny() % img->nx() == 0) {
-                // tile row: one image-newline per token-row
-                const int grid_w = img->ny() / img->nx();
-                const int tile_patches = img->nx() / (patch_size * 4); // patches per tile side (SAM divides by 4)
-                const int h = tile_patches;
-                n_patches = (tile_patches * grid_w + 1) * h;
-            }
+            // build_global_local_features adds image newlines and view separator
+            // Formula: h*(w+1) + 1 where h = w = sqrt(n_patches)
+            int h = static_cast<int>(std::sqrt(static_cast<float>(n_patches)));
+            n_patches = h * (h + 1) + 1;
         } break;
         case PROJECTOR_TYPE_HUNYUANVL:
             {
@@ -3937,14 +3916,13 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         const int n_tokens_per_tile = clip_n_output_tokens(ctx, &imgs.entries[0]);
         const int out_embd          = clip_n_mmproj_embd(ctx);
         const size_t tile_size      = (size_t)n_tokens_per_tile * out_embd;
-        // reused across iterations: same-size tiles, so the buffers are allocated once
-        clip_image_f32_batch single;
-        single.entries.resize(1);
-        single.grid_x = 1;
-        single.grid_y = 1;
-        std::vector<float> single_out;
         for (int b = 0; b < n_batch_cur; b++) {
-            single.entries[0] = imgs.entries[b];
+            clip_image_f32_batch single;
+            single.entries.push_back(imgs.entries[b]);
+            single.grid_x = 1;
+            single.grid_y = 1;
+
+            std::vector<float> single_out;
             if (!out_batch_embd.empty()) {
                 single_out.resize(tile_size);
             }
@@ -4276,19 +4254,29 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
                 GGML_ASSERT(pw % merge_ratio == 0 && ph % merge_ratio == 0 &&
                             "tile dimensions must be divisible by n_merge");
                 const int n_pos_tile   = pw * ph; // raw patches per tile == n_patches (graph sequence length)
-                // single local-coordinate block [y,x,y,x]; the graph passes the same
-                // positions tensor to every tile's rope (see clip_graph_qwen3vl)
-                std::vector<int32_t> positions((size_t)n_pos_tile * 4);
-                int ptr = 0;
-                for (int y = 0; y < ph; y += merge_ratio) {
-                    for (int x = 0; x < pw; x += merge_ratio) {
-                        for (int dy = 0; dy < merge_ratio; dy++) {
-                            for (int dx = 0; dx < merge_ratio; dx++) {
-                                positions[ptr]                          = y + dy;
-                                positions[(size_t)n_pos_tile + ptr]     = x + dx;
-                                positions[(size_t)2 * n_pos_tile + ptr] = y + dy;
-                                positions[(size_t)3 * n_pos_tile + ptr] = x + dx;
-                                ptr++;
+                // positions layout: section-major over the FULL batched sequence. The mrope kernel
+                // reads section s of token i as positions[s * N + i], where N = n_pos_tile * n_batch_cur
+                // is the rope tensor's ne[2]. The four sections are [y, x, y, x]. Every tile gets the
+                // same local-coordinate block (per-tile absolute offsets cancel under relative
+                // attention), so each section just repeats the tile coordinates n_batch_cur times.
+                // For n_batch_cur == 1 this is identical to the old tile-major layout; for
+                // n_batch_cur > 1 (batched mode) it is the only layout the kernel reads correctly —
+                // a tile-major buffer would mis-index every section beyond the first tile.
+                const size_t N = (size_t)n_pos_tile * (size_t)n_batch_cur;
+                std::vector<int32_t> positions(N * 4);
+                for (int b = 0; b < n_batch_cur; b++) {
+                    const size_t tile_off = (size_t)b * (size_t)n_pos_tile;
+                    int ptr = 0;
+                    for (int y = 0; y < ph; y += merge_ratio) {
+                        for (int x = 0; x < pw; x += merge_ratio) {
+                            for (int dy = 0; dy < merge_ratio; dy++) {
+                                for (int dx = 0; dx < merge_ratio; dx++) {
+                                    positions[0 * N + tile_off + ptr] = y + dy;
+                                    positions[1 * N + tile_off + ptr] = x + dx;
+                                    positions[2 * N + tile_off + ptr] = y + dy;
+                                    positions[3 * N + tile_off + ptr] = x + dx;
+                                    ptr++;
+                                }
                             }
                         }
                     }
@@ -4590,10 +4578,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         case PROJECTOR_TYPE_DEEPSEEKOCR:
         case PROJECTOR_TYPE_DEEPSEEKOCR2:
             {
-                GGML_ASSERT(
-                    (pos_w == pos_h) // overview image
-                    || (pos_h >= pos_w && pos_h % pos_w == 0) // tile images
-                );
+                GGML_ASSERT(pos_w == pos_h);
 
                 const int window = hparams.attn_window_size;
                 const int pos = pos_w;
