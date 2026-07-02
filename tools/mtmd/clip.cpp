@@ -1755,8 +1755,26 @@ struct clip_model_loader {
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
-                        // optional multi-tile cap; absent in GGUF means it stays 0 and the qwen3vl preprocessor falls back to 4
+                        // SigLIP2-Large ViT (n_head=16, n_layer=24) is used for 2B/4B — max_tiles=4 confirmed.
+                        // Larger ViT variants (8B+) use SigLIP2-SO-400M with unknown max_tiles.
+                        // Read from GGUF if present; otherwise default to 4 and warn for unknown ViTs.
+                        hparams.preproc_max_tiles = 4;
+                        const bool has_max_tiles_key = gguf_find_key(ctx_gguf.get(), KEY_PREPROC_MAX_TILES) >= 0;
                         get_u32(KEY_PREPROC_MAX_TILES, hparams.preproc_max_tiles, false);
+                        if (has_max_tiles_key && (hparams.preproc_max_tiles < 1 || hparams.preproc_max_tiles > 256)) {
+                            LOG_WRN("%s: clip.vision.preproc_max_tiles=%d out of range [1,256] in GGUF — defaulting to 4\n",
+                                    __func__, hparams.preproc_max_tiles);
+                            hparams.preproc_max_tiles = 4;
+                        }
+                        if (!has_max_tiles_key && (hparams.n_head > 16 || hparams.n_layer > 24)) {
+                            const char * model_name =
+                                model.proj_type == PROJECTOR_TYPE_QWEN2VL  ? "Qwen2VL"  :
+                                model.proj_type == PROJECTOR_TYPE_QWEN25VL ? "Qwen2.5VL" : "Qwen3VL";
+                            LOG_WRN("%s: %s large ViT detected (n_head=%d, n_layer=%d) but "
+                                    "clip.vision.preproc_max_tiles not in GGUF — defaulting to 4. "
+                                    "If using an 8B+ model, set the correct value with --image-max-tiles.\n",
+                                    __func__, model_name, hparams.n_head, hparams.n_layer);
+                        }
                         // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
                         hparams.set_limit_image_tokens(8, 4096);
                         hparams.warmup_image_size = hparams.image_size; // warmup at actual tile size to match inference graph shape
@@ -4151,6 +4169,18 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
+            // apply CLI overrides after load_hparams so GGUF defaults don't clobber them
+            if (ctx_params.image_max_tiles != -1) {
+                ctx_vision->model.hparams.preproc_max_tiles = ctx_params.image_max_tiles;
+                LOG_INF("%s: preproc_max_tiles: %d (custom value)\n", __func__, ctx_vision->model.hparams.preproc_max_tiles);
+                // models with a min-tiles floor (e.g. InternVL) would produce an empty candidate
+                // set if the override drops max below min; clamp min so the invariant holds.
+                if (ctx_vision->model.hparams.preproc_min_tiles > ctx_vision->model.hparams.preproc_max_tiles) {
+                    LOG_WRN("%s: --image-max-tiles=%d is below the model's preproc_min_tiles=%d; clamping min\n",
+                            __func__, ctx_params.image_max_tiles, ctx_vision->model.hparams.preproc_min_tiles);
+                    ctx_vision->model.hparams.preproc_min_tiles = ctx_vision->model.hparams.preproc_max_tiles;
+                }
+            }
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
             if (ctx_params.warmup) {

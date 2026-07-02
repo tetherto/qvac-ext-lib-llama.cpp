@@ -119,6 +119,10 @@ struct mtmd_context_params {
 
     // tile encoding mode for multi-tile vision models (Qwen3VL): 0=batched (default), 1=sequential, 2=disabled
     int image_tile_mode;
+
+    // override preproc_max_tiles from GGUF; -1 = use model default (4 for Qwen3VL 2B/4B)
+    // needed for 8B+ models whose GGUFs may lack the clip.vision.preproc_max_tiles key
+    int image_max_tiles;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
