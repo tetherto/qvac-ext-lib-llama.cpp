@@ -117,7 +117,11 @@ struct mtmd_context_params {
     void * progress_callback_user_data;
     const char * backend_device; // optional GPU backend name (e.g. "CUDA", "Metal", "Vulkan"), if null will use env var or default
 
-    // tile encoding mode for multi-tile vision models (Qwen3VL): 0=batched, 1=sequential (default), 2=disabled
+    // tile encoding mode for multi-tile vision models (Qwen3VL): 0=batched, 1=sequential (default), 2=disabled.
+    // WARNING: the DEFAULT is sequential, but the ZERO value is 0=batched — so a zero-initialized
+    // params struct ({}, memset, calloc) selects BATCHED (the ne[3] one-pass path not yet verified on
+    // all backends), NOT the default. Always initialize via mtmd_context_params_default() (which sets
+    // sequential) or set image_tile_mode explicitly. Values are fixed API (consumers pass "0"/"1"/"2").
     int image_tile_mode;
 
     // override preproc_max_tiles from GGUF; -1 = use model default (4 for Qwen3VL 2B/4B)
