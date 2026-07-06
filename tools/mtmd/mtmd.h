@@ -124,7 +124,9 @@ struct mtmd_context_params {
     // sequential) or set image_tile_mode explicitly. Values are fixed API (consumers pass "0"/"1"/"2").
     int image_tile_mode;
 
-    // override preproc_max_tiles from GGUF; -1 = use model default (4 for Qwen3VL 2B/4B)
+    // override preproc_max_tiles from GGUF; -1 or 0 = use model default (4 for Qwen3VL 2B/4B).
+    // Only a positive value is treated as an explicit override, so a zero-initialized struct
+    // keeps the model default instead of forcing single-tile.
     // needed for 8B+ models whose GGUFs may lack the clip.vision.preproc_max_tiles key
     int image_max_tiles;
 };

@@ -4181,7 +4181,13 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
             // Only the Qwen3VL preprocessor reads preproc_max_tiles live; Qwen2/2.5VL use dyn_size
             // and InternVL uses a candidate list already frozen in load_hparams, so the override is
             // inert for them — apply (and validate) it only where it takes effect.
-            if (ctx_params.image_max_tiles != -1) {
+            //
+            // Treat only a POSITIVE value as an explicit override. -1 is the documented unset
+            // sentinel, and 0 is what a zero-initialized clip_context_params / mtmd_context_params
+            // passes (bindings / direct C API callers that never set the field). Both are treated
+            // as unset here so those callers keep the GGUF/model default instead of silently
+            // forcing single-tile and losing multi-tile preprocessing on large/high-res images.
+            if (ctx_params.image_max_tiles > 0) {
                 if (ctx_vision->model.proj_type != PROJECTOR_TYPE_QWEN3VL) {
                     LOG_WRN("%s: --image-max-tiles is only supported for Qwen3VL; ignoring for this model\n", __func__);
                 } else {
@@ -4189,10 +4195,10 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
                     // Re-validate at this library boundary: bindings populate clip_context_params
                     // directly and bypass the CLI's [1,256] check. An unbounded value reaches the
                     // grid-fitting reserve in mtmd-image.cpp and can OOM the process.
-                    if (max_tiles < 1 || max_tiles > CLIP_PREPROC_MAX_TILES_LIMIT) {
-                        LOG_WRN("%s: --image-max-tiles=%d out of range [1,%d]; clamping\n",
+                    if (max_tiles > CLIP_PREPROC_MAX_TILES_LIMIT) {
+                        LOG_WRN("%s: --image-max-tiles=%d exceeds [1,%d]; clamping\n",
                                 __func__, max_tiles, CLIP_PREPROC_MAX_TILES_LIMIT);
-                        max_tiles = std::min(std::max(max_tiles, 1), CLIP_PREPROC_MAX_TILES_LIMIT);
+                        max_tiles = CLIP_PREPROC_MAX_TILES_LIMIT;
                     }
                     ctx_vision->model.hparams.preproc_max_tiles = max_tiles;
                     LOG_INF("%s: preproc_max_tiles: %d (custom value)\n", __func__, max_tiles);
