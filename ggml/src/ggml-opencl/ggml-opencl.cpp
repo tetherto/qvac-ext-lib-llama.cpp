@@ -36,6 +36,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <inttypes.h>
 #include <string.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -7276,6 +7277,22 @@ static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor 
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
+    // QVAC-21914: bound the driver's per-submission work on giant graphs.
+    // Large vision graphs (e.g. a monolithic 16k-patch ViT encode: thousands
+    // of nodes, ~48 s of GPU work) enqueue everything between two host
+    // synchronization points. On Adreno the GSL command-buffer manager
+    // accumulates the whole stream and the GPU faults near the tail
+    // (log_gpu_snapshot), after which the next submission aborts the process
+    // from cl_a8x_cmdbuf_mgr_submit_ibs (os_exit) — observed on Galaxy S25
+    // Ultra / Adreno 830. Periodically flushing hands the driver bounded
+    // batches instead. clFlush only submits (no host stall), so the overhead
+    // is negligible; 0 disables.
+    static const int flush_interval = [] {
+        const char * env = std::getenv("GGML_OPENCL_FLUSH_INTERVAL");
+        return env && env[0] ? atoi(env) : 64;
+    }();
+    int nodes_since_flush = 0;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
@@ -7292,14 +7309,25 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
+        // Submit the accumulated batch to the driver every flush_interval
+        // enqueued nodes (see the QVAC-21914 note above).
+        auto maybe_flush = [&]() {
+            if (flush_interval > 0 && ++nodes_since_flush >= flush_interval) {
+                CL_CHECK(clFlush(backend_ctx->queue));
+                nodes_since_flush = 0;
+            }
+        };
+
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
+            maybe_flush();
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
+            maybe_flush();
             continue;
         }
         // Fuse the MoE combine: router-weight mul + cross-expert add chain ->
@@ -7316,6 +7344,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
+            maybe_flush();
             continue;
         }
 
@@ -7324,6 +7353,7 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+        maybe_flush();
     }
 
     return GGML_STATUS_SUCCESS;
@@ -15921,10 +15951,44 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         size_t global_work_size[] = { (size_t)((n_q + bm - 1) / bm) * wg_size, (size_t)(n_head * n_batch) };
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     } else {
+        // QVAC-21914: chunk very large dispatches along the q-rows so no
+        // single kernel runs unboundedly long. A monolithic ViT encode at
+        // image_max_tokens=4096 puts n_q = n_kv = 16384 through one dispatch
+        // whose every workgroup loops the full 16k KV — on Adreno 830
+        // (Galaxy S25 Ultra, OpenCL) the GPU faults near the end of such
+        // encodes and the driver then kills the process on the next
+        // submission (cl_a8x_cmdbuf_mgr_submit_ibs -> os_exit). Splitting is
+        // exact: the kernel resolves its q row as
+        // group_id(0)*BLOCK_M + tid relative to the Q/O/mask base offsets,
+        // is_causal is always 0 (masking is explicit) and alibi/sinks depend
+        // on the head index only, so shifting the row base via the byte
+        // offsets while shrinking n_q is mathematically identical. clFlush
+        // between chunks hands the driver bounded submissions; 0 disables.
+        static const int fa_max_nq = [] {
+            const char * env = std::getenv("GGML_OPENCL_FA_MAX_NQ");
+            return env && env[0] ? atoi(env) : 4096;
+        }();
         const size_t wg_size = (size_t) wg_size_fa;
-        size_t local_work_size[] = { wg_size, 1 };
-        size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
-        backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+        const int chunk_rows = (fa_max_nq > 0 && n_q > fa_max_nq) ? fa_max_nq : n_q;
+
+        for (int q_base = 0; q_base < n_q; q_base += chunk_rows) {
+            const int n_q_chunk = std::min(chunk_rows, n_q - q_base);
+            if (q_base > 0 || n_q_chunk != n_q) {
+                const cl_ulong offset_q_chunk    = offset_q + (cl_ulong)q_base * q_nb1;
+                const cl_ulong offset_o_chunk    = offset_o + (cl_ulong)q_base * o_nb1;
+                const cl_ulong offset_mask_chunk = mask ? offset_mask + (cl_ulong)q_base * mask_nb1 : offset_mask;
+                CL_CHECK(clSetKernelArg(kernel, 1,  sizeof(cl_ulong), &offset_q_chunk));
+                CL_CHECK(clSetKernelArg(kernel, 7,  sizeof(cl_ulong), &offset_o_chunk));
+                CL_CHECK(clSetKernelArg(kernel, 9,  sizeof(int),      &n_q_chunk));
+                CL_CHECK(clSetKernelArg(kernel, 32, sizeof(cl_ulong), &offset_mask_chunk));
+            }
+            size_t local_work_size[] = { wg_size, 1 };
+            size_t global_work_size[] = { (size_t)((n_q_chunk + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
+            backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+            if (q_base + chunk_rows < n_q) {
+                CL_CHECK(clFlush(backend_ctx->queue));
+            }
+        }
     }
 }
 
