@@ -7366,50 +7366,51 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
-        // Single touch point for the submission bound (see the QVAC-21914 note
-        // above): estimate this node's work before dispatching it and submit
-        // the accumulated batch once the budget is exceeded. Fused ops are
-        // accounted by their anchor node — precision is irrelevant here.
+        // Accumulate this node's estimated work before dispatch; the budget
+        // check + flush runs AFTER the node is enqueued (bottom of the loop),
+        // so the node that crosses the budget is part of the flushed batch
+        // rather than deferred into a fresh, potentially-unflushed final
+        // batch. Fused ops are accounted by their anchor node — precision is
+        // irrelevant here (see the QVAC-21914 note above).
         if (backend_ctx->flush_work_budget > 0) {
             work_since_flush += ggml_opencl_node_work_estimate(node);
-            if (work_since_flush >= backend_ctx->flush_work_budget) {
-                CL_CHECK(clFlush(backend_ctx->queue));
-                work_since_flush = 0;
-            }
         }
 
+        // Resolve MoE-combine fusion up front so it can slot into the if/else
+        // chain below (can_fuse_moe_combine reports via an out-param).
+        const ggml_tensor * moe_combine_out = nullptr;
+        if (backend_ctx->fuse_moe_combine && !backend_ctx->disable_fusion) {
+            ggml_opencl_can_fuse_moe_combine(cgraph, i, &moe_combine_out);
+        }
+
+        // if/else (not `continue`) so every dispatch path reaches the single
+        // budget-flush touch point below.
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
-            continue;
-        }
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        } else if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
-            continue;
-        }
-        // Fuse the MoE combine: router-weight mul + cross-expert add chain ->
-        // one weighted-sum-across-experts kernel.
-        if (backend_ctx->fuse_moe_combine && !backend_ctx->disable_fusion) {
-            const ggml_tensor * combine_out = nullptr;
-            if (ggml_opencl_can_fuse_moe_combine(cgraph, i, &combine_out)) {
-                ggml_cl_moe_combine_fused(backend, node, combine_out);
-                i += 2 * (int)node->ne[1] - 1;   // skip the k VIEWs + (k-1) ADDs
-                continue;
-            }
-        }
-
-        if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        } else if (backend_ctx->fuse_moe_combine && !backend_ctx->disable_fusion && moe_combine_out != nullptr) {
+            // Fuse the MoE combine: router-weight mul + cross-expert add chain ->
+            // one weighted-sum-across-experts kernel.
+            ggml_cl_moe_combine_fused(backend, node, moe_combine_out);
+            i += 2 * (int)node->ne[1] - 1;   // skip the k VIEWs + (k-1) ADDs
+        } else if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
-            continue;
+        } else {
+            bool ok = ggml_cl_compute_forward(backend, node);
+            if (!ok) {
+                GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+            }
+            GGML_ASSERT(ok);
         }
 
-        bool ok = ggml_cl_compute_forward(backend, node);
-        if (!ok) {
-            GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+        if (backend_ctx->flush_work_budget > 0 && work_since_flush >= backend_ctx->flush_work_budget) {
+            CL_CHECK(clFlush(backend_ctx->queue));
+            work_since_flush = 0;
         }
-        GGML_ASSERT(ok);
     }
 
     return GGML_STATUS_SUCCESS;
