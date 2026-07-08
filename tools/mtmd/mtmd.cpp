@@ -2078,6 +2078,9 @@ mtmd_input_chunks * mtmd_test_create_input_chunks() {
     mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
     image_tokens->nx = 4;
     image_tokens->ny = 4;
+    // The test fixture mtmd_test_create_input_chunks() never sets a position
+    // type, so it defaults to MTMD_POS_TYPE_NORMAL, where the last token gets
+    // pos.t = 15.
     image_tokens->pos = MTMD_POS_TYPE_MROPE;
     image_tokens->batch_f32.entries.resize(16);
     image_tokens->id = "image_1";
