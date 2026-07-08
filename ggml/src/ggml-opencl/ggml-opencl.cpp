@@ -6383,7 +6383,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
                           name, env, (long long) defval);
             return defval;
         }
-        return v > maxval ? maxval : (int64_t) v;
+        if (v > maxval) {
+            GGML_LOG_WARN("ggml_opencl: %s=%lld exceeds max, clamping to %lld\n",
+                          name, v, (long long) maxval);
+            return maxval;
+        }
+        return (int64_t) v;
     };
     backend_ctx->flush_work_budget = parse_env_i64("GGML_OPENCL_FLUSH_WORK_MB", 512, INT64_MAX >> 20) * (1ll << 20);
     backend_ctx->fa_max_nq         = (int) parse_env_i64("GGML_OPENCL_FA_MAX_NQ", 4096, INT32_MAX);
