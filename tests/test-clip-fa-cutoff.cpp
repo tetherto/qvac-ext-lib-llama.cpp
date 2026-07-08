@@ -67,7 +67,12 @@ int main() {
     expect_eq("no meminfo keeps smaller cutoff", clip_fa_effective_min_kv(1000, 0, 0, 16), 1000);
 
     // Degenerate n_head is guarded (treated as 1), not a crash/div-by-zero.
-    expect_eq("n_head=0 guarded", clip_fa_effective_min_kv(2048, 0, 0, 0), 2048);
+    // Must pass memory info so a sqrt(.../n_head) branch actually runs — with
+    // total_mem==free_mem==0 the NO_MEMINFO short-circuit returns before the
+    // guard is reached, leaving it untested. At 16 GB total, n_head=1:
+    // total clamp = sqrt((16e9/2)/24) ~= 18257 > 4096, so the default 4096
+    // survives (and the run completing at all proves no div-by-zero).
+    expect_eq("n_head=0 guarded (total mem path)", clip_fa_effective_min_kv(4096, 16 * GB, 0, 0), 4096);
 
     // Fewer heads => larger permissible n (scratch is linear in n_head):
     // same 1.5 GB free, n_head=4 -> sqrt(1.5e9/48) ~= 5590, so the 4096
