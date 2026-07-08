@@ -336,47 +336,10 @@ static bool clip_backend_is_mali(const clip_ctx * ctx) {
 // (7056) uses flash-attention (explicit would OOM there).
 static const int CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT = 4096;
 
-// Conservative cutoff cap when the device reports no memory information at
-// all: 2048 patches keeps the explicit scratch around ~0.8 GB at n_head=16
-// instead of trusting the raw 4096 default (~3.2 GB) blind.
-static const int CLIP_AUTO_FA_MIN_KV_NO_MEMINFO_CAP = 2048;
-
-// Pure arithmetic for the AUTO budget decision (exported for unit tests, see
-// tests/test-clip-fa-cutoff.cpp). Returns the effective explicit-attention
-// cutoff in n_patches given the configured cutoff and the device memory probe:
-//
-//  - total memory provides the STABLE fast-path clamp (session-independent —
-//    the explicit scratch, ~3*n^2*n_head*4 bytes, must fit in half of total):
-//    normal-size images keep the fast explicit path regardless of momentary
-//    memory pressure.
-//  - free memory (a volatile, load-dependent number) may only LOWER the
-//    cutoff further, and only by the hard-fit requirement: when reported,
-//    the explicit scratch must also fit in what is actually free right now.
-//    It can never extend the explicit path beyond the total-memory clamp.
-//  - neither reported: fail SAFE toward memory-frugal FA with a conservative
-//    constant cap instead of the raw default.
-int clip_fa_effective_min_kv(int auto_min_kv, size_t total_mem, size_t free_mem, int n_head) {
-    if (auto_min_kv <= 0) {
-        return auto_min_kv;
-    }
-    const double heads = (double) (n_head > 0 ? n_head : 1);
-    int eff_min_kv = auto_min_kv;
-    if (total_mem > 0) {
-        // Stable clamp: explicit scratch (3 * n^2 * n_head * 4) <= total/4
-        // =>  n <= sqrt((total/2) / (24*n_head))
-        const double n_max_total = std::sqrt(((double) total_mem / 2.0) / (24.0 * heads));
-        eff_min_kv = std::min(eff_min_kv, (int) n_max_total);
-    }
-    if (free_mem > 0) {
-        // Hard fit: 3 * n^2 * n_head * 4 <= free  =>  n <= sqrt(free / (12*n_head))
-        const double n_max_free = std::sqrt((double) free_mem / (12.0 * heads));
-        eff_min_kv = std::min(eff_min_kv, (int) n_max_free);
-    }
-    if (total_mem == 0 && free_mem == 0) {
-        eff_min_kv = std::min(eff_min_kv, CLIP_AUTO_FA_MIN_KV_NO_MEMINFO_CAP);
-    }
-    return eff_min_kv;
-}
+// clip_fa_effective_min_kv() — the pure AUTO-budget arithmetic — is defined
+// inline in clip.h (so unit tests can exercise it without linking an
+// unexported symbol across the Windows mtmd.dll boundary). See there for the
+// full behavior contract.
 
 // Resolve the effective flash-attention mode for a single image graph.
 //
