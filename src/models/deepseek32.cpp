@@ -308,7 +308,8 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 ggml_tensor * indexer_score = nullptr;
                 if (cparams.fused_lid) {
                     indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_attn_dsa->get_kq_mask_lid());
-                    cb(indexer_score, LLAMA_TENSOR_NAME_FLID, il);
+                    cb(indexer_score, "indexer_score", il);
+                    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, indexer_score, il});
                 } else {
                     // calculate indexer kq
                     indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);

@@ -235,7 +235,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
 
     if (cparams.fused_dsv4_hc_pre && il >= 0) {
         ggml_tensor * result = ggml_dsv4_hc_pre(ctx0, x, weights);
-        cb(result, LLAMA_TENSOR_NAME_FHC_PRE, il);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, result, il});
         return result;
     }
 
@@ -329,6 +329,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     if (cparams.fused_dsv4_hc_comb) {
         *comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
                 (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, *comb, il});
     } else {
         ggml_tensor * scale_comb = dsv4_view_1d(ctx0, hc_scale, 1, 2);
         ggml_tensor * base_comb  = dsv4_view_1d(ctx0, hc_base, hc*hc, 2*hc);
@@ -338,7 +339,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
         *comb = build_hc_sinkhorn(*comb, il);
     }
-    cb(*comb, cparams.fused_dsv4_hc_comb ? LLAMA_TENSOR_NAME_FHC_COMB : "hc_comb", il);
+    cb(*comb, "hc_comb", il);
 
     ggml_tensor * result = build_hc_pre(x, pre, il);
     return result;
@@ -355,7 +356,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
 
     if (cparams.fused_dsv4_hc_post) {
         ggml_tensor * result = ggml_dsv4_hc_post(ctx0, x, residual, post, comb);
-        cb(result, LLAMA_TENSOR_NAME_FHC_POST, il);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, result, il});
         return result;
     }
 
@@ -609,7 +610,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     ggml_tensor * indexer_score = nullptr;
     if (cparams.fused_lid) {
         indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, inp_lid.kq_mask);
-        cb(indexer_score, LLAMA_TENSOR_NAME_FLID, il);
+        cb(indexer_score, "lid_score_masked", il);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, indexer_score, il});
     } else {
         indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
         cb(indexer_q, "lid_q", il);
