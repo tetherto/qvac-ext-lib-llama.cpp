@@ -180,7 +180,8 @@ struct clip_ctx {
     // change between images. Populated lazily on the first AUTO resolve.
     bool   fa_budget_cached = false;
     int    fa_auto_min_kv   = 0;   // explicit-attention cutoff (n_patches); <=0 disables it
-    size_t fa_mem_capacity  = 0;   // device memory used to cap the cutoff (0 = unknown)
+    size_t fa_mem_total     = 0;   // device total memory, stable clamp input (0 = unknown)
+    size_t fa_mem_free      = 0;   // device free memory at first resolve, hard-fit check only (0 = unknown)
     // Set at warmup when the backend reports it lacks efficient (coopmat) FA
     // (ggml_backend_supports_efficient_fa == false, e.g. Mali via ggml-vulkan).
     // Turns on the AUTO cutoff default so the budget heuristic prefers the
@@ -335,6 +336,48 @@ static bool clip_backend_is_mali(const clip_ctx * ctx) {
 // (7056) uses flash-attention (explicit would OOM there).
 static const int CLIP_AUTO_FA_MIN_KV_MALI_DEFAULT = 4096;
 
+// Conservative cutoff cap when the device reports no memory information at
+// all: 2048 patches keeps the explicit scratch around ~0.8 GB at n_head=16
+// instead of trusting the raw 4096 default (~3.2 GB) blind.
+static const int CLIP_AUTO_FA_MIN_KV_NO_MEMINFO_CAP = 2048;
+
+// Pure arithmetic for the AUTO budget decision (exported for unit tests, see
+// tests/test-clip-fa-cutoff.cpp). Returns the effective explicit-attention
+// cutoff in n_patches given the configured cutoff and the device memory probe:
+//
+//  - total memory provides the STABLE fast-path clamp (session-independent —
+//    the explicit scratch, ~3*n^2*n_head*4 bytes, must fit in half of total):
+//    normal-size images keep the fast explicit path regardless of momentary
+//    memory pressure.
+//  - free memory (a volatile, load-dependent number) may only LOWER the
+//    cutoff further, and only by the hard-fit requirement: when reported,
+//    the explicit scratch must also fit in what is actually free right now.
+//    It can never extend the explicit path beyond the total-memory clamp.
+//  - neither reported: fail SAFE toward memory-frugal FA with a conservative
+//    constant cap instead of the raw default.
+int clip_fa_effective_min_kv(int auto_min_kv, size_t total_mem, size_t free_mem, int n_head) {
+    if (auto_min_kv <= 0) {
+        return auto_min_kv;
+    }
+    const double heads = (double) (n_head > 0 ? n_head : 1);
+    int eff_min_kv = auto_min_kv;
+    if (total_mem > 0) {
+        // Stable clamp: explicit scratch (3 * n^2 * n_head * 4) <= total/4
+        // =>  n <= sqrt((total/2) / (24*n_head))
+        const double n_max_total = std::sqrt(((double) total_mem / 2.0) / (24.0 * heads));
+        eff_min_kv = std::min(eff_min_kv, (int) n_max_total);
+    }
+    if (free_mem > 0) {
+        // Hard fit: 3 * n^2 * n_head * 4 <= free  =>  n <= sqrt(free / (12*n_head))
+        const double n_max_free = std::sqrt((double) free_mem / (12.0 * heads));
+        eff_min_kv = std::min(eff_min_kv, (int) n_max_free);
+    }
+    if (total_mem == 0 && free_mem == 0) {
+        eff_min_kv = std::min(eff_min_kv, CLIP_AUTO_FA_MIN_KV_NO_MEMINFO_CAP);
+    }
+    return eff_min_kv;
+}
+
 // Resolve the effective flash-attention mode for a single image graph.
 //
 // ENABLED/DISABLED are explicit user choices and are honored as-is. AUTO is
@@ -375,10 +418,8 @@ static clip_flash_attn_type clip_resolve_flash_attn_type(clip_ctx * ctx, int n_p
         if (dev) {
             ggml_backend_dev_memory(dev, &free_mem, &total_mem);
         }
-        // Prefer free memory when the backend reports it; many mobile drivers
-        // report 0, so fall back to total. If neither is known, rely on the
-        // threshold alone.
-        ctx->fa_mem_capacity = free_mem > 0 ? free_mem : total_mem;
+        ctx->fa_mem_total = total_mem;
+        ctx->fa_mem_free  = free_mem;
         ctx->fa_budget_cached = true;
     }
 
@@ -392,19 +433,14 @@ static clip_flash_attn_type clip_resolve_flash_attn_type(clip_ctx * ctx, int n_p
     // Explicit attention (mul_mat + softmax) is faster than the scalar FA kernel
     // on no-coopmat GPUs for short sequences, but it materializes an
     // O(n_patches^2 * n_head) score matrix. Memory-constrained devices can't
-    // hold that, so cap the "use explicit" cutoff by how much device memory is
-    // available: the effective cutoff is the smaller of the configured threshold
-    // and the largest n_patches whose explicit scratch (scores + softmax/kqv
-    // temporaries, ~3x) fits in ~half of device memory. This only ever lowers
-    // the cutoff, so low-memory devices fall back to memory-frugal FA sooner.
-    int eff_min_kv = auto_fa_min_kv;
-    const size_t capacity = ctx->fa_mem_capacity;
-    if (capacity > 0) {
-        const size_t n_head = (size_t) ctx->model.hparams.n_head;
-        // 3 * n^2 * n_head * 4 bytes <= capacity / 2  =>  n <= sqrt(capacity / (24*n_head))
-        const double n_max = std::sqrt((double) capacity / (24.0 * (double) std::max<size_t>(n_head, 1)));
-        eff_min_kv = std::min(eff_min_kv, (int) n_max);
-    }
+    // hold that, so cap the "use explicit" cutoff by the memory budget (see
+    // clip_fa_effective_min_kv above: total memory = stable clamp, free memory
+    // = hard-fit check only, no memory info = conservative constant). This only
+    // ever lowers the cutoff, so constrained devices fall back to memory-frugal
+    // FA sooner.
+    const int eff_min_kv = clip_fa_effective_min_kv(
+        auto_fa_min_kv, ctx->fa_mem_total, ctx->fa_mem_free,
+        (int) ctx->model.hparams.n_head);
 
     return (n_patches < eff_min_kv) ? CLIP_FLASH_ATTN_TYPE_DISABLED
                                     : CLIP_FLASH_ATTN_TYPE_ENABLED;
@@ -3916,9 +3952,12 @@ struct clip_model_loader {
         // scalar FA for huge ones — slow-but-alive beats fast-but-OOM.
         // Default when the backend can't confirm efficient FA = KEEP it. Only ggml-vulkan
         // implements the query (returning false for Mali/non-coopmat); backends that don't
-        // answer (Metal, CUDA, …) have efficient FA and must keep it — disabling there forces
-        // explicit attention whose QK^T overflows the clip compute buffer at high n_pos
-        // (GGML_ASSERT in ggml-backend, e.g. image_tile_mode=disabled + large image_max_tokens).
+        // answer (Metal, CUDA, and also ggml-opencl) have (or are assumed to have) efficient
+        // FA and must keep it — disabling there forces explicit attention whose QK^T
+        // overflows the clip compute buffer at high n_pos (GGML_ASSERT in ggml-backend,
+        // e.g. image_tile_mode=disabled + large image_max_tokens). ggml-opencl's own
+        // giant-encode driver fault at high n_pos is handled inside that backend
+        // (submission bounding: periodic clFlush + FA q-chunking), not via this gate.
         if (ctx_clip.flash_attn_type != CLIP_FLASH_ATTN_TYPE_DISABLED &&
             ctx_clip.backend && ctx_clip.backend != ctx_clip.backend_cpu) {
             bool efficient_fa = true;

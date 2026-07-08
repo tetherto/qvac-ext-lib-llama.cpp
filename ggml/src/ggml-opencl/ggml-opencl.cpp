@@ -37,6 +37,7 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <string.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -586,6 +587,13 @@ struct ggml_backend_opencl_context {
 
     // whether fuse moe combine
     cl_uint fuse_moe_combine;
+
+    // QVAC-21914 submission bounds (resolved once at init from env, logged there).
+    // flush_work_budget: bytes of estimated enqueued work per driver submission in
+    // graph_compute; 0 disables. fa_max_nq: max q rows per flash-attention dispatch;
+    // 0 disables chunking.
+    int64_t flush_work_budget;
+    int     fa_max_nq;
 
     bool adreno_has_large_buffer;
     bool adreno_use_large_buffer;
@@ -6359,6 +6367,31 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 
     backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
 
+    // QVAC-21914 submission bounds. Robust parse (strtol, clamp, warn on garbage
+    // instead of silently disabling the mitigation) and log the effective values,
+    // matching the file's other env knobs.
+    auto parse_env_i64 = [](const char * name, int64_t defval, int64_t maxval) -> int64_t {
+        const char * env = std::getenv(name);
+        if (!env || !env[0]) {
+            return defval;
+        }
+        errno = 0;
+        char * end = nullptr;
+        long long v = std::strtoll(env, &end, 10);
+        if (errno != 0 || end == env || *end != '\0' || v < 0) {
+            GGML_LOG_WARN("ggml_opencl: invalid %s='%s', using default %lld\n",
+                          name, env, (long long) defval);
+            return defval;
+        }
+        return v > maxval ? maxval : (int64_t) v;
+    };
+    backend_ctx->flush_work_budget = parse_env_i64("GGML_OPENCL_FLUSH_WORK_MB", 512, INT64_MAX >> 20) * (1ll << 20);
+    backend_ctx->fa_max_nq         = (int) parse_env_i64("GGML_OPENCL_FA_MAX_NQ", 4096, INT32_MAX);
+    GGML_LOG_INFO("ggml_opencl: flush work budget: %lld MB (0 = disabled)\n",
+                  (long long) (backend_ctx->flush_work_budget >> 20));
+    GGML_LOG_INFO("ggml_opencl: flash attention max q rows per dispatch: %d (0 = disabled)\n",
+                  backend_ctx->fa_max_nq);
+
     dev_ctx->backend_ctx = backend_ctx.release();
     return dev_ctx->backend_ctx;
 }
@@ -7274,6 +7307,26 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 static void ggml_opencl_op_group_norm_fused(ggml_backend_t backend, ggml_tensor * gn_tensor, ggml_tensor * mul_tensor, ggml_tensor * add_tensor);
 
+// QVAC-21914: cheap per-node proxy for enqueued GPU work, used to bound the
+// driver's per-submission batch in graph_compute. Precision is irrelevant —
+// only the ~3 orders of magnitude between a per-token decode step (~10-50 ms
+// of GPU work) and a monolithic 16k-patch ViT encode (~48 s) must separate,
+// and they do: reduction-heavy ops scale by how often their inputs are re-read.
+static int64_t ggml_opencl_node_work_estimate(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            // src0 (weights) is streamed once per output column.
+            return (int64_t) ggml_nbytes(node->src[0]) * std::max<int64_t>(node->ne[1], 1);
+        case GGML_OP_FLASH_ATTN_EXT:
+            // K and V are re-read for every q row.
+            return ((int64_t) ggml_nbytes(node->src[1]) + (int64_t) ggml_nbytes(node->src[2])) *
+                   std::max<int64_t>(node->src[0]->ne[1], 1);
+        default:
+            return (int64_t) ggml_nbytes(node);
+    }
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
@@ -7284,14 +7337,13 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     // accumulates the whole stream and the GPU faults near the tail
     // (log_gpu_snapshot), after which the next submission aborts the process
     // from cl_a8x_cmdbuf_mgr_submit_ibs (os_exit) — observed on Galaxy S25
-    // Ultra / Adreno 830. Periodically flushing hands the driver bounded
-    // batches instead. clFlush only submits (no host stall), so the overhead
-    // is negligible; 0 disables.
-    static const int flush_interval = [] {
-        const char * env = std::getenv("GGML_OPENCL_FLUSH_INTERVAL");
-        return env && env[0] ? atoi(env) : 64;
-    }();
-    int nodes_since_flush = 0;
+    // Ultra / Adreno 830. Flushing whenever the estimated enqueued work
+    // exceeds flush_work_budget hands the driver bounded batches instead.
+    // Gating on WORK (not a node count) keeps the per-token LLM decode hot
+    // path submission-free by construction: a decode step never accumulates
+    // anywhere near the budget, while the giant encode flushes dozens of
+    // times. clFlush only submits (no host stall).
+    int64_t work_since_flush = 0;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -7309,25 +7361,26 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             continue;
         }
 
-        // Submit the accumulated batch to the driver every flush_interval
-        // enqueued nodes (see the QVAC-21914 note above).
-        auto maybe_flush = [&]() {
-            if (flush_interval > 0 && ++nodes_since_flush >= flush_interval) {
+        // Single touch point for the submission bound (see the QVAC-21914 note
+        // above): estimate this node's work before dispatching it and submit
+        // the accumulated batch once the budget is exceeded. Fused ops are
+        // accounted by their anchor node — precision is irrelevant here.
+        if (backend_ctx->flush_work_budget > 0) {
+            work_since_flush += ggml_opencl_node_work_estimate(node);
+            if (work_since_flush >= backend_ctx->flush_work_budget) {
                 CL_CHECK(clFlush(backend_ctx->queue));
-                nodes_since_flush = 0;
+                work_since_flush = 0;
             }
-        };
+        }
 
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
-            maybe_flush();
             continue;
         }
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
             ggml_opencl_op_group_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
             i += 2;
-            maybe_flush();
             continue;
         }
         // Fuse the MoE combine: router-weight mul + cross-expert add chain ->
@@ -7344,7 +7397,6 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_opencl_op_rms_norm_fused(backend, node, cgraph->nodes[i+1]);
             i++;
-            maybe_flush();
             continue;
         }
 
@@ -7353,7 +7405,6 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
-        maybe_flush();
     }
 
     return GGML_STATUS_SUCCESS;
@@ -15915,6 +15966,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         CL_CHECK(clSetKernelArg(kernel, 40, sizeof(cl_mem),    &blk_buffer));
     }
 
+    if (n_q == 0) {
+        // Degenerate empty dispatch: nothing to compute. Guard explicitly so
+        // the chunk loop below cannot be entered with a zero row count.
+        return;
+    }
+
     if (n_q == 1) {
         if (use_local_tile) {
             const size_t lt_wg = 128;
@@ -15963,11 +16020,15 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
         // is_causal is always 0 (masking is explicit) and alibi/sinks depend
         // on the head index only, so shifting the row base via the byte
         // offsets while shrinking n_q is mathematically identical. clFlush
-        // between chunks hands the driver bounded submissions; 0 disables.
-        static const int fa_max_nq = [] {
-            const char * env = std::getenv("GGML_OPENCL_FA_MAX_NQ");
-            return env && env[0] ? atoi(env) : 4096;
-        }();
+        // between chunks hands the driver bounded submissions; 0 disables
+        // (GGML_OPENCL_FA_MAX_NQ, resolved at init).
+        //
+        // The kernel's causal-boundary formula needs the TOTAL n_q; chunks
+        // after the first would silently corrupt output if causal FA were
+        // ever enabled here. This backend always passes explicit masks
+        // (is_causal == 0) — keep it loud if that invariant ever changes.
+        GGML_ASSERT(is_causal == 0 && "FA q-chunking requires total n_q for the causal boundary");
+        const int fa_max_nq = backend_ctx->fa_max_nq;
         const size_t wg_size = (size_t) wg_size_fa;
         const int chunk_rows = (fa_max_nq > 0 && n_q > fa_max_nq) ? fa_max_nq : n_q;
 

@@ -154,6 +154,13 @@ int clip_model_n_temporal_merge(const struct clip_ctx * ctx); // TODO @ngxson : 
 // summed with the scheduler's compute reservations. Used by mtmd_get_memory_usage
 // (and ultimately by common/fit.cpp's heuristic). Restored from upstream b9341.
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
+
+// qvac QVAC-21914: pure arithmetic of the flash-attention AUTO budget decision —
+// the effective explicit-attention cutoff (n_patches) from the configured cutoff
+// and the device memory probe (total = stable clamp, free = hard-fit check only,
+// neither = conservative constant cap). Exposed for unit testing
+// (tests/test-clip-fa-cutoff.cpp); behavior documented at the definition.
+int clip_fa_effective_min_kv(int auto_min_kv, size_t total_mem, size_t free_mem, int n_head);
 #endif
 
 struct clip_cap {
