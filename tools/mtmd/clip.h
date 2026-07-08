@@ -157,7 +157,7 @@ int clip_model_n_temporal_merge(const struct clip_ctx * ctx); // TODO @ngxson : 
 // (and ultimately by common/fit.cpp's heuristic). Restored from upstream b9341.
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
 
-// qvac QVAC-21914: pure arithmetic of the flash-attention AUTO budget decision.
+// QVAC-21914: pure arithmetic of the flash-attention AUTO budget decision.
 // Returns the effective explicit-attention cutoff in n_patches given the
 // configured cutoff and the device memory probe:
 //

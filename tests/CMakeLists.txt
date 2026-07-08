@@ -296,9 +296,17 @@ llama_build_and_test(test-backend-ops.cpp)
 # GPU backend is available.
 llama_build_and_test(test-copy-tbq-subgroups.cpp)
 
-llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
-llama_build_and_test(test-model-load-disk.cpp   LABEL "model")
-llama_build_and_test(test-model-load-memory.cpp LABEL "model")
+# QVAC-21914: ggml-opencl flash-attention q-chunking parity vs the CPU
+# backend. Unconditional and self-skipping at runtime when no OpenCL device is
+# present (like test-copy-tbq-subgroups above), so it exercises chunking
+# wherever OpenCL exists (Adreno devices, desktop OpenCL, PoCL). Does not link
+# mtmd, so it is intentionally outside the LLAMA_MTMD block below.
+llama_build_and_test(test-opencl-fa-chunking.cpp)
+
+llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")
+llama_build_and_test(test-model-load-disk.cpp         LABEL "model")
+llama_build_and_test(test-model-load-memory.cpp       LABEL "model")
+target_include_directories(test-model-load-memory PRIVATE ${PROJECT_SOURCE_DIR}/common_test)
 llama_build_and_test(test-model-load-memory-split.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
@@ -337,7 +345,7 @@ if (LLAMA_MTMD)
     target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
     unset(LLAMA_TEST_NAME)
 
-    # qvac QVAC-21914: clip flash-attention AUTO budget arithmetic (pure CPU).
+    # QVAC-21914: clip flash-attention AUTO budget arithmetic (pure CPU).
     set(LLAMA_TEST_NAME test-clip-fa-cutoff)
     llama_build_and_test(test-clip-fa-cutoff.cpp)
     target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
@@ -347,12 +355,6 @@ endif()
 
 llama_build_and_test(test-mtmd-impl.cpp)
 target_link_libraries(test-mtmd-impl PRIVATE mtmd)
-
-# qvac QVAC-21914: ggml-opencl flash-attention q-chunking parity vs the CPU
-# backend. Self-skipping at runtime when no OpenCL device is present, so it is
-# registered unconditionally and exercises chunking wherever OpenCL exists
-# (Adreno devices, desktop OpenCL, PoCL).
-llama_build_and_test(test-opencl-fa-chunking.cpp)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

@@ -7344,10 +7344,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     // from cl_a8x_cmdbuf_mgr_submit_ibs (os_exit) — observed on Galaxy S25
     // Ultra / Adreno 830. Flushing whenever the estimated enqueued work
     // exceeds flush_work_budget hands the driver bounded batches instead.
-    // Gating on WORK (not a node count) keeps the per-token LLM decode hot
-    // path submission-free by construction: a decode step never accumulates
-    // anywhere near the budget, while the giant encode flushes dozens of
-    // times. clFlush only submits (no host stall).
+    // Gating on WORK (not a node count) scales the flush cadence to the batch
+    // size: the ~48 s encode flushes many times, while a per-token LLM decode
+    // (its work ~= the model size streamed once, i.e. a few flushes per token
+    // at the default budget for a multi-GB model) is far lighter. clFlush only
+    // submits (no host stall), so the decode-path cost is negligible in
+    // practice (measured GPU decode TPS within noise of pre-hardening), but it
+    // is NOT literally zero for large models — raise flush_work_budget past the
+    // model size, or set it to 0, to make decode fully submission-free.
     int64_t work_since_flush = 0;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -15141,6 +15145,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
     std::lock_guard<std::mutex> fa_lock(backend_ctx->fa.mutex);
 
+    // QVAC-21914: n_q is int; the q-chunk loop below accumulates into an int
+    // (q_base += chunk_rows) and derives cl_ulong byte offsets from it. Guard
+    // the int64->int truncation so a pathological q-row count can't wrap
+    // negative and produce an out-of-bounds device offset.
+    GGML_ASSERT(q->ne[1] <= INT32_MAX);
     const int n_q = q->ne[1];
     const int n_kv = k->ne[1];
     const int d_head_q = q->ne[0];
