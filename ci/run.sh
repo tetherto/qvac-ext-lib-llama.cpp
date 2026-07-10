@@ -203,17 +203,8 @@ function gg_wget {
     mkdir -p $out
     cd $out
 
-    if command -v wget >/dev/null 2>&1; then
-        wget -nv -c -N $url
-    else
-        # macOS runners don't ship wget; emulate `wget -N` with curl
-        local fname=$(basename "$url")
-        if [ -f "$fname" ]; then
-            curl -fsSL --remote-time -z "$fname" -o "$fname" "$url"
-        else
-            curl -fsSL --remote-time -o "$fname" "$url"
-        fi
-    fi
+    # should not re-download if file is the same
+    wget -nv -c -N $url
 
     cd $cwd
 }
@@ -743,7 +734,6 @@ if [ -z ${GG_BUILD_LOW_PERF} ]; then
 
     pip install -r ${SRC}/requirements.txt --disable-pip-version-check
     pip install --editable gguf-py --disable-pip-version-check
-    pip install jinja2 --disable-pip-version-check
 fi
 
 ret=0
