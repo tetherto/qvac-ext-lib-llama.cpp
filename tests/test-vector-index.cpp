@@ -1,10 +1,11 @@
-// test-vector-index.cpp - standalone C-API smoke test for the POC vector
+// test-vector-index.cpp - standalone C-API smoke test for the vector
 // index. Exercises lifecycle, add, search, remove, contains, write, load,
 // search-after-load. No model, no llama; only the new ggml-vector-index
 // public C API.
 
 #include "ggml-vector-index.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cfloat>
@@ -12,9 +13,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 namespace {
 
@@ -36,6 +44,110 @@ std::vector<float> normalize(std::vector<float> v) {
     return v;
 }
 
+float q8_dot_reference(const std::vector<float> & vector, const std::vector<float> & query) {
+    CHECK(vector.size() == query.size());
+
+    float max_abs = 0.0f;
+    for (float value : vector) {
+        max_abs = std::max(max_abs, std::fabs(value));
+    }
+    const float scale = max_abs == 0.0f ? 1.0f : max_abs / 127.0f;
+
+    float acc = 0.0f;
+    for (size_t i = 0; i < vector.size(); ++i) {
+        int code = max_abs == 0.0f ?
+            0 : static_cast<int>(std::nearbyint(vector[i] / scale));
+        code = std::max(-127, std::min(127, code));
+        acc += query[i] * (static_cast<float>(code) * scale);
+    }
+    return acc;
+}
+
+uint8_t read_file_byte(const std::string & path, std::streamoff offset) {
+    std::ifstream f(path, std::ios::binary);
+    CHECK(f.is_open());
+    f.seekg(offset);
+    char c = 0;
+    f.read(&c, 1);
+    CHECK(f.good());
+    return static_cast<uint8_t>(c);
+}
+
+std::vector<uint8_t> read_file_bytes(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    CHECK(f.is_open());
+    const auto size = std::filesystem::file_size(path);
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    if (!bytes.empty()) {
+        f.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        CHECK(f.gcount() == static_cast<std::streamsize>(bytes.size()));
+    }
+    return bytes;
+}
+
+void write_file_bytes(const std::string & path, const std::vector<uint8_t> & bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    CHECK(f.is_open());
+    if (!bytes.empty()) {
+        f.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    CHECK(static_cast<bool>(f));
+}
+
+void append_u32_le(std::vector<uint8_t> & bytes, uint32_t value) {
+    for (int i = 0; i < 4; ++i) {
+        bytes.push_back(static_cast<uint8_t>(value >> (8 * i)));
+    }
+}
+
+void append_u64_le(std::vector<uint8_t> & bytes, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+        bytes.push_back(static_cast<uint8_t>(value >> (8 * i)));
+    }
+}
+
+void append_f32_le(std::vector<uint8_t> & bytes, float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    append_u32_le(bytes, bits);
+}
+
+void write_v1_index(
+        const std::string & path,
+        int dim,
+        int bit_width,
+        const std::vector<float> & vectors,
+        const std::vector<uint64_t> & ids) {
+    CHECK(vectors.size() == ids.size() * static_cast<size_t>(dim));
+
+    std::vector<uint8_t> bytes = { 'T', 'V', 'P', 'I', 1,
+                                   static_cast<uint8_t>(bit_width), 0, 0 };
+    append_u32_le(bytes, static_cast<uint32_t>(dim));
+    append_u32_le(bytes, static_cast<uint32_t>(ids.size()));
+    for (float value : vectors) {
+        append_f32_le(bytes, value);
+    }
+    for (uint64_t id : ids) {
+        append_u64_le(bytes, id);
+    }
+    write_file_bytes(path, bytes);
+}
+
+template <typename Fn>
+void expect_corrupt_load_fails(
+        const std::string & source_path,
+        const std::string & corrupt_path,
+        Fn mutate) {
+    std::vector<uint8_t> bytes = read_file_bytes(source_path);
+    mutate(bytes);
+    write_file_bytes(corrupt_path, bytes);
+
+    auto * bad = ggml_vec_index_load(corrupt_path.c_str());
+    CHECK(bad == nullptr);
+    ggml_vec_index_free(bad);
+    std::filesystem::remove(corrupt_path);
+}
+
 } // namespace
 
 int main() {
@@ -44,6 +156,17 @@ int main() {
     CHECK(ggml_vec_index_dim(idx) == kDim);
     CHECK(ggml_vec_index_len(idx) == 0);
     CHECK(ggml_vec_index_bit_width(idx) == 32);
+
+    // Non-finite vectors are rejected without mutation.
+    {
+        const std::array<float, kDim> bad_vector = {
+            1.0f, 0.0f, std::numeric_limits<float>::infinity(), 0.0f,
+        };
+        const uint64_t bad_id = 777ULL;
+        CHECK(ggml_vec_index_add(idx, bad_vector.data(), 1, &bad_id)
+              == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_len(idx) == 0);
+    }
 
     // Add 4 well-separated unit vectors. IDs are non-trivial uint64 to
     // catch sign-extension or BigInt round-trip bugs at the JS boundary
@@ -69,6 +192,18 @@ int main() {
     CHECK(ggml_vec_index_len(idx) == 4);
     CHECK(ggml_vec_index_contains(idx, ids[0]) == 1);
     CHECK(ggml_vec_index_contains(idx, 999ULL) == 0);
+
+    // Non-finite queries are rejected before search.
+    {
+        const std::array<float, kDim> bad_query = {
+            1.0f, std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f,
+        };
+        std::array<float, 1> scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(
+            idx, bad_query.data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+    }
 
     // Duplicate add must fail without mutating state.
     {
@@ -143,6 +278,13 @@ int main() {
                      "ggml-vector-index-test.tvim";
     const std::string path = tmp.string();
     CHECK(ggml_vec_index_write(idx, path.c_str()) == 0);
+#ifndef _WIN32
+    CHECK(::chmod(path.c_str(), 0600) == 0);
+    CHECK(ggml_vec_index_write(idx, path.c_str()) == 0);
+    struct stat persisted_stat;
+    CHECK(::stat(path.c_str(), &persisted_stat) == 0);
+    CHECK((persisted_stat.st_mode & 0777) == 0600);
+#endif
 
     ggml_vec_index_free(idx);
 
@@ -169,6 +311,284 @@ int main() {
 
     ggml_vec_index_free(loaded);
     std::filesystem::remove(path);
+
+    // v1 f32 snapshots migrate into current f32 or q8 storage.
+    {
+        const std::vector<uint64_t> v1_ids = {
+            (1ULL << 37) + 1ULL,
+            (1ULL << 37) + 2ULL,
+        };
+        std::vector<float> v1_vectors;
+        v1_vectors.insert(v1_vectors.end(), seeds[0].begin(), seeds[0].end());
+        v1_vectors.insert(v1_vectors.end(), seeds[1].begin(), seeds[1].end());
+
+        for (int bit_width : { 32, 8, 4 }) {
+            const auto v1_tmp = std::filesystem::temp_directory_path() /
+                                ("ggml-vector-index-v1-" + std::to_string(bit_width) + ".tvim");
+            const std::string v1_path = v1_tmp.string();
+            write_v1_index(v1_path, kDim, bit_width, v1_vectors, v1_ids);
+
+            auto * v1 = ggml_vec_index_load(v1_path.c_str());
+            CHECK(v1 != nullptr);
+            CHECK(ggml_vec_index_dim(v1) == kDim);
+            CHECK(ggml_vec_index_len(v1) == 2);
+            CHECK(ggml_vec_index_bit_width(v1) == (bit_width == 8 ? 8 : 32));
+
+            std::array<float, 1> scores{};
+            std::array<uint64_t, 1> out_ids{};
+            CHECK(ggml_vec_index_search(
+                v1, seeds[1].data(), 1, /*k=*/1,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == v1_ids[1]);
+            CHECK(std::fabs(scores[0] - 1.0f) < 1e-5f);
+
+            ggml_vec_index_free(v1);
+            std::filesystem::remove(v1_path);
+        }
+    }
+
+    // q8 score parity for a dimension that exercises the SIMD tail.
+    {
+        constexpr int tail_dim = 13;
+        const std::vector<float> tail_vector = {
+            -1.0f, 0.75f, -0.5f, 0.25f, 0.125f, -0.875f, 0.625f,
+            -0.375f, 0.9f, -0.7f, 0.3f, -0.2f, 0.05f,
+        };
+        const std::vector<float> tail_query = {
+            0.2f, -0.4f, 0.6f, -0.8f, 1.0f, 0.3f, -0.5f,
+            0.7f, -0.9f, 0.11f, -0.22f, 0.33f, -0.44f,
+        };
+        const uint64_t tail_id = (1ULL << 55) + 321ULL;
+
+        auto * tail_idx = ggml_vec_index_create(tail_dim, /*bit_width=*/8);
+        CHECK(tail_idx != nullptr);
+        CHECK(ggml_vec_index_add(
+            tail_idx, tail_vector.data(), 1, &tail_id) == GGML_VEC_INDEX_OK);
+
+        std::array<float, 1> scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(
+            tail_idx, tail_query.data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == tail_id);
+
+        const float expected = q8_dot_reference(tail_vector, tail_query);
+        const float tolerance = 1e-5f * std::max(1.0f, std::fabs(expected));
+        CHECK(std::fabs(scores[0] - expected) <= tolerance);
+
+        ggml_vec_index_free(tail_idx);
+
+        std::vector<float> zero_vector(tail_dim, 0.0f);
+        auto * zero_idx = ggml_vec_index_create(tail_dim, /*bit_width=*/8);
+        CHECK(zero_idx != nullptr);
+        CHECK(ggml_vec_index_add(
+            zero_idx, zero_vector.data(), 1, &tail_id) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(
+            zero_idx, tail_query.data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(scores[0] == 0.0f);
+        ggml_vec_index_free(zero_idx);
+    }
+
+    // Applying the q8 scale after accumulation can overflow even when the
+    // dequantized dot product is finite.
+    {
+        constexpr int overflow_dim = 8;
+        const std::vector<float> small_vector(overflow_dim, 1e-30f);
+        const std::vector<float> large_query(overflow_dim, 1e38f);
+        const uint64_t overflow_id = 123456789ULL;
+
+        auto * overflow_idx = ggml_vec_index_create(overflow_dim, /*bit_width=*/8);
+        CHECK(overflow_idx != nullptr);
+        CHECK(ggml_vec_index_add(
+            overflow_idx, small_vector.data(), 1, &overflow_id) == GGML_VEC_INDEX_OK);
+
+        std::array<float, 1> scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(
+            overflow_idx, large_query.data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        const float expected = static_cast<float>(
+            overflow_dim * static_cast<double>(small_vector[0]) * large_query[0]);
+        CHECK(out_ids[0] == overflow_id);
+        CHECK(std::isfinite(scores[0]));
+        CHECK(std::fabs(scores[0] - expected) <= std::fabs(expected) * 1e-5f);
+
+        ggml_vec_index_free(overflow_idx);
+    }
+
+    // Header metadata is protected even when all payload sections are empty.
+    {
+        auto * empty_idx = ggml_vec_index_create(kDim, /*bit_width=*/8);
+        CHECK(empty_idx != nullptr);
+        const std::string empty_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-empty-test.tvim").string();
+        const std::string corrupt_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-empty-corrupt-test.tvim").string();
+        CHECK(ggml_vec_index_write(empty_idx, empty_path.c_str()) == GGML_VEC_INDEX_OK);
+        expect_corrupt_load_fails(
+            empty_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+                bytes[8] += 1; // valid dimension change must fail the header CRC
+            });
+        ggml_vec_index_free(empty_idx);
+        std::filesystem::remove(empty_path);
+    }
+
+    // q8 production path: stores quantized codes, searches directly against
+    // q8 storage, and persists as .tvim v2 with q8 metadata.
+    {
+        auto * q8 = ggml_vec_index_create(kDim, /*bit_width=*/8);
+        CHECK(q8 != nullptr);
+        CHECK(ggml_vec_index_dim(q8) == kDim);
+        CHECK(ggml_vec_index_bit_width(q8) == 8);
+
+        const std::vector<uint64_t> q8_ids = {
+            (1ULL << 33) + 99ULL,
+            (1ULL << 48) + 77ULL,
+        };
+        std::vector<float> q8_vecs;
+        q8_vecs.insert(q8_vecs.end(), seeds[0].begin(), seeds[0].end());
+        q8_vecs.insert(q8_vecs.end(), seeds[2].begin(), seeds[2].end());
+        CHECK(ggml_vec_index_add(q8, q8_vecs.data(), 2, q8_ids.data()) == 0);
+
+        std::array<float, 4> scores{};
+        std::array<uint64_t, 4> out_ids{};
+        CHECK(ggml_vec_index_search(
+            q8, seeds[2].data(), 1, /*k=*/4,
+            scores.data(), out_ids.data()) == 0);
+        CHECK(out_ids[0] == q8_ids[1]);
+        CHECK(std::fabs(scores[0] - 1.0f) < 1e-5f);
+        CHECK(scores[2] == -FLT_MAX);
+        CHECK(out_ids[2] == UINT64_MAX);
+        CHECK(scores[3] == -FLT_MAX);
+        CHECK(out_ids[3] == UINT64_MAX);
+
+        const auto q8_tmp = std::filesystem::temp_directory_path() /
+                            "ggml-vector-index-q8-test.tvim";
+        const std::string q8_path = q8_tmp.string();
+        CHECK(ggml_vec_index_write(q8, q8_path.c_str()) == 0);
+        CHECK(read_file_byte(q8_path, 4) == 2); // .tvim v2
+        CHECK(read_file_byte(q8_path, 5) == 8); // q8 bit width
+        CHECK(read_file_byte(q8_path, 6) == 2); // q8 storage kind
+        CHECK(read_file_byte(q8_path, 7) == 1); // checksum trailer present
+
+        const auto corrupt_tmp = std::filesystem::temp_directory_path() /
+                                 "ggml-vector-index-corrupt-test.tvim";
+        const std::string corrupt_path = corrupt_tmp.string();
+
+        // Legacy v2 files without a checksum remain readable.
+        const auto legacy_v2_tmp = std::filesystem::temp_directory_path() /
+                                   "ggml-vector-index-legacy-v2-test.tvim";
+        const std::string legacy_v2_path = legacy_v2_tmp.string();
+        std::vector<uint8_t> legacy_v2 = read_file_bytes(q8_path);
+        legacy_v2[7] = 0;
+        legacy_v2.resize(legacy_v2.size() - 4 * sizeof(uint32_t));
+        write_file_bytes(legacy_v2_path, legacy_v2);
+        auto * legacy_loaded = ggml_vec_index_load(legacy_v2_path.c_str());
+        CHECK(legacy_loaded != nullptr);
+        CHECK(ggml_vec_index_len(legacy_loaded) == 2);
+        ggml_vec_index_free(legacy_loaded);
+        expect_corrupt_load_fails(
+            legacy_v2_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+                bytes[32] = 0;
+                bytes[33] = 0;
+                bytes[34] = 0;
+                bytes[35] = 0; // q8 scale must be positive and finite
+            });
+        expect_corrupt_load_fails(
+            legacy_v2_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+                bytes[40] = 0x80; // q8 codes are restricted to [-127, 127]
+            });
+        expect_corrupt_load_fails(
+            legacy_v2_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+                const size_t id_offset =
+                    32 + 2 * sizeof(float) + 2 * kDim * sizeof(int8_t);
+                for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+                    bytes[id_offset + sizeof(uint64_t) + i] = bytes[id_offset + i];
+                }
+            });
+        std::filesystem::remove(legacy_v2_path);
+
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[0] = 'X';
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[4] = 99; // unsupported version
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[6] = 1; // storage kind does not match bit_width=8
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[7] |= 0x80; // unknown flags are rejected
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[16] = 0; // qparam_type must be scale-f32 for q8
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[28] = 1; // reserved u32 must be zero
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[32] ^= 1; // q8 scale payload bit flip
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[40] ^= 1; // q8 code payload bit flip
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[48] ^= 1; // id payload bit flip
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[bytes.size() - 16] ^= 1; // header checksum bit flip
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[bytes.size() - 12] ^= 1; // qparams checksum bit flip
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[bytes.size() - 8] ^= 1; // vectors checksum bit flip
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[bytes.size() - 4] ^= 1; // ids checksum bit flip
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes.resize(35); // truncated q8 scales
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes.resize(43); // truncated q8 codes
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes.resize(bytes.size() - 1); // truncated ids
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes.push_back(0); // trailing data is not part of the declared file
+        });
+        expect_corrupt_load_fails(q8_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[12] = 0xff;
+            bytes[13] = 0xff;
+            bytes[14] = 0xff;
+            bytes[15] = 0xff; // impossible vector count for this file size
+        });
+        ggml_vec_index_free(q8);
+
+        auto * q8_loaded = ggml_vec_index_load(q8_path.c_str());
+        CHECK(q8_loaded != nullptr);
+        CHECK(ggml_vec_index_dim(q8_loaded) == kDim);
+        CHECK(ggml_vec_index_len(q8_loaded) == 2);
+        CHECK(ggml_vec_index_bit_width(q8_loaded) == 8);
+        CHECK(ggml_vec_index_contains(q8_loaded, q8_ids[0]) == 1);
+        CHECK(ggml_vec_index_contains(q8_loaded, q8_ids[1]) == 1);
+
+        scores = {};
+        out_ids = {};
+        CHECK(ggml_vec_index_search(
+            q8_loaded, seeds[0].data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == 0);
+        CHECK(out_ids[0] == q8_ids[0]);
+        CHECK(std::fabs(scores[0] - 1.0f) < 1e-5f);
+
+        ggml_vec_index_free(q8_loaded);
+        std::filesystem::remove(q8_path);
+    }
 
     std::printf("test-vector-index: OK\n");
     return 0;
