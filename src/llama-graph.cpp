@@ -646,7 +646,7 @@ static void dsv4_set_kq_mask(
         return;
     }
 
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(n_tokens%n_stream == 0);
     GGML_ASSERT(dst->ne[0] == plan.n_kv);
@@ -656,13 +656,27 @@ static void dsv4_set_kq_mask(
     GGML_ASSERT((int64_t) plan.n_visible.size() == (int64_t) n_tokens);
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
-    float * data = (float *) dst->data;
+    if (dst->type == GGML_TYPE_F32) {
+        float * data = (float *) dst->data;
 
-    for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-        const int32_t n_visible = plan.n_visible[i];
+        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
+            const int32_t n_visible = plan.n_visible[i];
 
-        for (int64_t j = 0; j < dst->ne[0]; ++j) {
-            data[i*dst->ne[0] + j] = j < n_visible ? 0.0f : -INFINITY;
+            for (int64_t j = 0; j < dst->ne[0]; ++j) {
+                data[i*dst->ne[0] + j] = j < n_visible ? 0.0f : -INFINITY;
+            }
+        }
+    } else if (dst->type == GGML_TYPE_F16) {
+        ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
+        const ggml_fp16_t fp16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
+        const ggml_fp16_t fp16_zero = llama_cast<ggml_fp16_t>(0.0f);
+
+        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
+            const int32_t n_visible = plan.n_visible[i];
+
+            for (int64_t j = 0; j < dst->ne[0]; ++j) {
+                data[i*dst->ne[0] + j] = j < n_visible ? fp16_zero : fp16_ninf;
+            }
         }
     }
 }
@@ -679,8 +693,7 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(n_tokens%n_stream == 0);
 
-    const bool use_fattn = cparams.flash_attn && (!cparams.kv_unified || n_stream == 1);
-    const auto type = use_fattn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
@@ -829,7 +842,10 @@ static void dsv4_build_comp_inputs(
         GGML_ASSERT(n_stream > 0);
         GGML_ASSERT(n_tokens%n_stream == 0);
 
-        inp.kq_mask = ggml_new_tensor_4d(ctx, strcmp(name, "lid") == 0 && cparams.fused_lid ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+        inp.kq_mask = ggml_new_tensor_4d(ctx,
+                (strcmp(name, "lid") != 0 && cparams.flash_attn) ||
+                (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32,
+                plan.n_kv, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(inp.kq_mask);
         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
     }
