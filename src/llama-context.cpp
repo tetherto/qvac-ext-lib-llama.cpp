@@ -202,6 +202,9 @@ llama_context::llama_context(
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
 
+    cparams.fused_lid    = true;
+    cparams.auto_flid    = true;
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -600,6 +603,45 @@ void llama_context::sched_reserve() {
         }
 
         cparams.auto_fgdn = false;
+    }
+
+    if (cparams.auto_flid) {
+        LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", __func__);
+
+        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+        if (!gf) {
+            throw std::runtime_error("failed to reserve graph for fused Lightning Indexer check");
+        }
+
+        const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FLID) + 1;
+        bool lid_device_mismatch = false;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor * n = ggml_graph_node(gf, i);
+            if (n->op != GGML_OP_LIGHTNING_INDEXER) {
+                continue;
+            }
+            ggml_backend_dev_t device_lid = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
+
+            GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FLID "-", prefix_len) == 0);
+            const int il = std::stoi(n->name + prefix_len);
+            ggml_backend_dev_t device_kv = model.dev_layer(il);
+            if (device_lid != device_kv) {
+                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Lightning Indexer tensor "
+                        "is assigned to device %s (usually due to missing support)\n",
+                        __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_lid));
+                lid_device_mismatch = true;
+                break;
+            }
+        }
+
+        if (lid_device_mismatch) {
+            cparams.fused_lid = false;
+            LLAMA_LOG_WARN("%s: fused Lightning Indexer not supported, set to disabled\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: fused Lightning Indexer enabled\n", __func__);
+        }
+
+        cparams.auto_flid = false;
     }
 
     // reserve worst-case graph

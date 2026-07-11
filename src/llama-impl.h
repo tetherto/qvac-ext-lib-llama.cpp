@@ -94,3 +94,4 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
 #define LLAMA_TENSOR_NAME_FATTN   "__fattn__"
 #define LLAMA_TENSOR_NAME_FGDN_AR "__fgdn_ar__"
 #define LLAMA_TENSOR_NAME_FGDN_CH "__fgdn_ch__"
+#define LLAMA_TENSOR_NAME_FLID    "__flid__"
