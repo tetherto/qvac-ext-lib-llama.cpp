@@ -1820,12 +1820,26 @@ class vk_perf_logger {
             return;
         }
         print_count = 0;
+        last_report_json = build_report_json();
         GGML_LOG_DEBUG("================\nVulkan Profiling Results:\n================\n\n");
         print_legacy_timings();
         print_triplet_timings();
         timings.clear();
         flops.clear();
         triplet_timings.clear();
+    }
+
+    // Copies the most recently completed graph's compact timing report. The
+    // report is retained after print_timings() clears the live accumulators so
+    // callers can retrieve it through the Vulkan registry proc-address API.
+    size_t copy_last_report_json(char * dst, size_t dst_size) const {
+        const size_t size = last_report_json.size();
+        if (dst != nullptr && dst_size > 0) {
+            const size_t n = std::min(size, dst_size - 1);
+            memcpy(dst, last_report_json.data(), n);
+            dst[n] = '\0';
+        }
+        return size;
     }
 
     std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops) {
@@ -1949,7 +1963,56 @@ class vk_perf_logger {
     std::map<std::string, std::vector<uint64_t>> timings;
     std::map<std::string, std::vector<uint64_t>> flops;
     std::map<std::string, triplet_timing_info> triplet_timings;
+    std::string last_report_json;
     uint32_t print_count {};
+
+    static std::string json_escape(const std::string & value) {
+        std::string escaped;
+        escaped.reserve(value.size());
+        for (const char c : value) {
+            switch (c) {
+                case '"':  escaped += "\\\""; break;
+                case '\\': escaped += "\\\\"; break;
+                case '\b': escaped += "\\b";  break;
+                case '\f': escaped += "\\f";  break;
+                case '\n': escaped += "\\n";  break;
+                case '\r': escaped += "\\r";  break;
+                case '\t': escaped += "\\t";  break;
+                default:
+                    if (static_cast<unsigned char>(c) >= 0x20) {
+                        escaped += c;
+                    }
+                    break;
+            }
+        }
+        return escaped;
+    }
+
+    std::string build_report_json() const {
+        std::stringstream ss;
+        ss << "{\"ops\":[";
+        bool first = true;
+        for (const auto & entry : timings) {
+            uint64_t total_ns = 0;
+            for (const uint64_t time : entry.second) {
+                total_ns += time;
+            }
+            const size_t count = entry.second.size();
+            if (!first) {
+                ss << ",";
+            }
+            first = false;
+            ss << "{\"name\":\"" << json_escape(entry.first)
+               << "\",\"count\":" << count
+               << ",\"total_us\":" << std::fixed << std::setprecision(3)
+               << (static_cast<double>(total_ns) / 1000.0)
+               << ",\"avg_us\":"
+               << (count == 0 ? 0.0 : static_cast<double>(total_ns) / count / 1000.0)
+               << "}";
+        }
+        ss << "]}";
+        return ss.str();
+    }
 
     void log_triplet_timing(const ggml_tensor * node, uint64_t time, const std::string& operation_type = "generic_matmul") {
         if (!node || !node->src[0] || !node->src[1] || time == 0) return;
@@ -18076,10 +18139,30 @@ static bool ggml_backend_vk_supports_efficient_fa(ggml_backend_t backend) {
     return ctx->device->coopmat2 || ctx->device->coopmat1_fa_support;
 }
 
+// Vulkan-only extension retrieved through ggml_backend_reg_get_proc_address().
+// Returns the JSON size excluding the terminating NUL. Passing nullptr/0 queries
+// the required size. Returns 0 when profiling is disabled or no graph has completed.
+static size_t ggml_backend_vk_get_perf_report_json(
+        ggml_backend_t backend,
+        char * buffer,
+        size_t buffer_size) {
+    if (backend == nullptr || backend->context == nullptr) {
+        return 0;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (!ctx->perf_logger) {
+        return 0;
+    }
+    return ctx->perf_logger->copy_last_report_json(buffer, buffer_size);
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_supports_efficient_fa") == 0) {
         return (void *)ggml_backend_vk_supports_efficient_fa;
+    }
+    if (strcmp(name, "ggml_backend_vk_get_perf_report_json") == 0) {
+        return (void *)ggml_backend_vk_get_perf_report_json;
     }
     return NULL;
 }

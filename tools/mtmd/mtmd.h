@@ -264,6 +264,11 @@ MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
 // llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
 
+// JSON profile for the most recently completed vision encode. Returns nullptr
+// when the active backend does not expose structured profiling. The returned
+// pointer is owned by ctx and remains valid until the next vision encode.
+MTMD_API const char * mtmd_get_vision_profile_json(const mtmd_context * ctx);
+
 // Set callback for all future logging events.
 // If this is not called, or NULL is supplied, everything is output on stderr.
 MTMD_API void mtmd_log_set(ggml_log_callback log_callback, void * user_data);

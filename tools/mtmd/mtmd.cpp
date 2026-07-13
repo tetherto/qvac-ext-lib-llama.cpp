@@ -134,6 +134,7 @@ struct mtmd_context {
     struct clip_ctx * ctx_a; // audio
     const struct llama_model * text_model;
     std::vector<float> image_embd_v; // image embedding vector
+    std::string last_vision_profile_json;
 
     bool print_timings;
     int n_threads;
@@ -1136,11 +1137,25 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
             ctx->image_embd_v.data());
     }
 
+    if (ok) {
+        const char * profile = clip_get_backend_profile_json(ctx_clip);
+        ctx->last_vision_profile_json = profile ? profile : "";
+    } else {
+        ctx->last_vision_profile_json.clear();
+    }
+
     return ok ? 0 : 1;
 }
 
 float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->image_embd_v.data();
+}
+
+const char * mtmd_get_vision_profile_json(const mtmd_context * ctx) {
+    if (ctx == nullptr || ctx->last_vision_profile_json.empty()) {
+        return nullptr;
+    }
+    return ctx->last_vision_profile_json.c_str();
 }
 
 // qvac: const-qualifiers updated to match the declarations in mtmd.h. The

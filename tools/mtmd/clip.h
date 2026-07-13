@@ -142,4 +142,9 @@ bool clip_has_whisper_encoder(const struct clip_ctx * ctx);
 // summed with the scheduler's compute reservations. Used by mtmd_get_memory_usage
 // (and ultimately by common/fit.cpp's heuristic). Restored from upstream b9341.
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
+
+// JSON report for the most recently completed vision graph when the active
+// backend exposes structured profiling. The returned pointer is owned by ctx
+// and remains valid until the next image encode or clip_free().
+const char * clip_get_backend_profile_json(const struct clip_ctx * ctx);
 #endif

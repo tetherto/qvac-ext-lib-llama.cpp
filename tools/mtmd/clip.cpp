@@ -179,6 +179,9 @@ struct clip_ctx {
 
     bool debug_output_embeddings = false;
     clip_image_tile_mode tile_mode = CLIP_IMAGE_TILE_MODE_SEQUENTIAL;
+    // Most recent Vulkan graph profile, populated after a successful image encode
+    // when the backend exposes ggml_backend_vk_get_perf_report_json.
+    std::string last_backend_profile_json;
 
     // When the GPU backend lacks bf16 support but the GGUF has bf16 weights,
     // we declare the in-context tensors as f16 and convert on disk-load.
@@ -3431,6 +3434,38 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
     return clip_image_batch_encode(ctx, n_threads, &imgs, vec);
 }
 
+static void clip_capture_backend_profile(clip_ctx * ctx) {
+    ctx->last_backend_profile_json.clear();
+    if (ctx->backend == nullptr || ctx->backend == ctx->backend_cpu) {
+        return;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return;
+    }
+
+    // Vulkan exposes this as an optional registry extension. Keeping the lookup
+    // dynamic makes mtmd work unchanged for CPU, Metal, OpenCL, CUDA, and any
+    // backend which does not implement the profiler snapshot API.
+    using get_perf_report_t = size_t (*)(ggml_backend_t, char *, size_t);
+    auto get_perf_report = reinterpret_cast<get_perf_report_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_get_perf_report_json"));
+    if (get_perf_report == nullptr) {
+        return;
+    }
+
+    const size_t size = get_perf_report(ctx->backend, nullptr, 0);
+    if (size == 0) {
+        return;
+    }
+    std::vector<char> report(size + 1, '\0');
+    if (get_perf_report(ctx->backend, report.data(), report.size()) == size) {
+        ctx->last_backend_profile_json.assign(report.data(), size);
+    }
+}
+
 bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, float * vec) {
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
@@ -4091,6 +4126,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         return false;
     }
 
+    // Snapshot the completed vision graph before a subsequent graph overwrites
+    // the backend profiler state. No-op on non-Vulkan backends or when profiling
+    // is not compiled/enabled.
+    clip_capture_backend_profile(ctx);
+
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
@@ -4284,6 +4324,13 @@ std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * 
         }
     }
     return result;
+}
+
+const char * clip_get_backend_profile_json(const struct clip_ctx * ctx) {
+    if (ctx == nullptr || ctx->last_backend_profile_json.empty()) {
+        return nullptr;
+    }
+    return ctx->last_backend_profile_json.c_str();
 }
 
 bool clip_has_whisper_encoder(const struct clip_ctx * ctx) {
