@@ -4976,14 +4976,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
-            // ggml_cuda_out_prod dequantizes non-F32 src operands to F32 for the f32-only cuBLAS
-            // SGEMM, so any src type with a to-F32 conversion is fine — but a type that
-            // ggml_get_to_fp32_cuda() can't handle hits a GGML_ABORT at runtime. Advertise it as
-            // unsupported instead, so the scheduler routes it elsewhere and test-backend-ops marks
-            // it n/a rather than aborting the whole run (e.g. on HIP/rocBLAS).
-            return op->type == GGML_TYPE_F32
-                && (op->src[0]->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(op->src[0]->type) != nullptr)
-                && (op->src[1]->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(op->src[1]->type) != nullptr);
+            {
+                // ggml_cuda_out_prod dequantizes any non-F32 src to F32 via ggml_get_to_fp32_cuda
+                // before the f32-only cuBLAS GEMM. Only claim support for src types the kernel can
+                // actually handle, otherwise it aborts on e.g. TQ2_0 which has no CUDA dequantizer.
+                auto src_ok = [](const ggml_tensor * src) {
+                    return src->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(src->type) != nullptr;
+                };
+                return op->type == GGML_TYPE_F32 && src_ok(op->src[0]) && src_ok(op->src[1]);
+            }
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
