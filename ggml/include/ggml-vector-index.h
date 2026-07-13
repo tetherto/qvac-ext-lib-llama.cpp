@@ -5,7 +5,8 @@
 // This is the public C API for fabric's vector index. The implementation
 // under `ggml/src/ggml-vector-index.cpp` supports full f32 storage
 // (`bit_width=32`) and production q8 storage (`bit_width=8`) with CPU search
-// directly against quantized codes. ARM builds use NEON when available.
+// directly against quantized codes. ARM builds use NEON when available; x86
+// builds use AVX2 at runtime when supported.
 //
 // Threading: instances are NOT thread-safe. Callers must serialize access
 // to a given handle. Multiple handles can be used concurrently.

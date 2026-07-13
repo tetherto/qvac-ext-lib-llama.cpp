@@ -6,8 +6,8 @@
 // the slot->id reverse map. Remove uses swap-with-last.
 //
 // Search: dot product across all slots + min-heap of size k. q8 search scores
-// directly against stored codes and per-vector scales, with ARM NEON when
-// available and a scalar fallback.
+// directly against stored codes and per-vector scales, with ARM NEON or x86
+// AVX2 when available and a scalar fallback.
 
 #include "ggml-vector-index.h"
 
@@ -37,6 +37,19 @@
 #define GGML_VEC_INDEX_USE_NEON 1
 #else
 #define GGML_VEC_INDEX_USE_NEON 0
+#endif
+
+#if !GGML_VEC_INDEX_USE_NEON && (defined(__AVX2__) || ((defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))))
+#include <immintrin.h>
+#define GGML_VEC_INDEX_USE_AVX2 1
+#if defined(__AVX2__)
+#define GGML_VEC_INDEX_AVX2_ATTR
+#else
+#define GGML_VEC_INDEX_AVX2_ATTR __attribute__((target("avx2")))
+#endif
+#else
+#define GGML_VEC_INDEX_USE_AVX2 0
+#define GGML_VEC_INDEX_AVX2_ATTR
 #endif
 
 #ifndef _WIN32
@@ -798,9 +811,64 @@ inline float dot_q8_neon(const float * query, const int8_t * codes, float scale,
 
 #endif
 
+#if GGML_VEC_INDEX_USE_AVX2
+
+GGML_VEC_INDEX_AVX2_ATTR inline float horizontal_sum_avx2(__m256 v) {
+    const __m128 lo = _mm256_castps256_ps128(v);
+    const __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    return _mm_cvtss_f32(sum);
+}
+
+GGML_VEC_INDEX_AVX2_ATTR inline float dot_q8_avx2(
+        const float * query,
+        const int8_t * codes,
+        float scale,
+        int dim) {
+    const __m256 scale_v = _mm256_set1_ps(scale);
+    __m256 acc_v = _mm256_setzero_ps();
+
+    int i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        const __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(codes + i));
+        const __m256 q = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8)),
+            scale_v);
+        acc_v = _mm256_add_ps(acc_v, _mm256_mul_ps(_mm256_loadu_ps(query + i), q));
+    }
+
+    float acc = horizontal_sum_avx2(acc_v);
+    for (; i < dim; ++i) {
+        const float value = static_cast<float>(codes[i]) * scale;
+        acc += query[i] * value;
+    }
+    return acc;
+}
+
+bool cpu_has_avx2() {
+#if defined(__AVX2__)
+    return true;
+#elif defined(__GNUC__) || defined(__clang__)
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2");
+#else
+    return false;
+#endif
+}
+
+#endif
+
 inline float dot_q8(const float * query, const int8_t * codes, float scale, int dim) {
 #if GGML_VEC_INDEX_USE_NEON
     return dot_q8_neon(query, codes, scale, dim);
+#elif GGML_VEC_INDEX_USE_AVX2
+    static const bool has_avx2 = cpu_has_avx2();
+    if (has_avx2) {
+        return dot_q8_avx2(query, codes, scale, dim);
+    }
+    return dot_q8_scalar(query, codes, scale, dim);
 #else
     return dot_q8_scalar(query, codes, scale, dim);
 #endif
