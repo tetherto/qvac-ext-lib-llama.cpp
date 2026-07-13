@@ -2991,34 +2991,38 @@ static void ggml_vk_destroy_pipeline(vk::Device& device, vk_pipeline& pipeline) 
     device.destroyPipeline(pipeline->pipeline);
 }
 
+static void ggml_vk_load_shaders_big_stack(vk_device & device, vk_pipeline requested = nullptr) {
+#ifdef __APPLE__
+    struct compile_args {
+        vk_device *   device;
+        vk_pipeline * requested;
+    } args = { &device, &requested };
+
+    pthread_attr_t attr;
+    pthread_t      th;
+    bool           ok = pthread_attr_init(&attr) == 0 &&
+                        pthread_attr_setstacksize(&attr, 8u*1024u*1024u) == 0 &&
+                        pthread_create(&th, &attr, [](void * p) -> void * {
+                            compile_args * a = (compile_args *) p;
+                            ggml_vk_load_shaders(*a->device, *a->requested);
+                            return nullptr;
+                        }, &args) == 0;
+    if (ok) {
+        pthread_join(th, nullptr);
+    } else {
+        ggml_vk_load_shaders(device, requested);
+    }
+    pthread_attr_destroy(&attr);
+#else
+    ggml_vk_load_shaders(device, requested);
+#endif
+}
+
 static void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, vk_pipeline& pipeline, uint32_t n) {
     VK_LOG_DEBUG("ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
     ctx->pipeline_descriptor_set_requirements += n;
     if (!pipeline->compiled) {
-#ifdef __APPLE__
-        struct compile_args {
-            vk_device *   device;
-            vk_pipeline * pipeline;
-        } args = { &ctx->device, &pipeline };
-
-        pthread_attr_t attr;
-        pthread_t      th;
-        bool           ok = pthread_attr_init(&attr) == 0 &&
-                            pthread_attr_setstacksize(&attr, 8u*1024u*1024u) == 0 &&
-                            pthread_create(&th, &attr, [](void * p) -> void * {
-                                compile_args * a = (compile_args *) p;
-                                ggml_vk_load_shaders(*a->device, *a->pipeline);
-                                return nullptr;
-                            }, &args) == 0;
-        if (ok) {
-            pthread_join(th, nullptr);
-        } else {
-            ggml_vk_load_shaders(ctx->device, pipeline);
-        }
-        pthread_attr_destroy(&attr);
-#else
-        ggml_vk_load_shaders(ctx->device, pipeline);
-#endif
+        ggml_vk_load_shaders_big_stack(ctx->device, pipeline);
     }
     ggml_pipeline_allocate_descriptor_sets(ctx);
 }
@@ -7491,7 +7495,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         descriptor_set_layout_create_info.setPNext(&dslbfci);
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
-        ggml_vk_load_shaders(device);
+        ggml_vk_load_shaders_big_stack(device);
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
         const bool prefers_transfer_queue =
