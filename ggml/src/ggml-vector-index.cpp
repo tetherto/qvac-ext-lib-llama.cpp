@@ -54,6 +54,13 @@
 #include <windows.h>
 #endif
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+extern "C" {
+void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
+void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
+}
+#endif
+
 namespace {
 
 constexpr uint8_t  kTvimMagic[4]   = { 'T', 'V', 'P', 'I' };
@@ -69,6 +76,45 @@ constexpr size_t   kTvimHeaderSize = 32;
 constexpr size_t   kTvimChecksumSize = 16;
 
 static_assert(sizeof(float) == sizeof(uint32_t), "ggml-vector-index requires float32");
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+std::atomic<int64_t> g_test_oom_countdown{ -1 };
+std::atomic<int64_t> g_test_write_fail_after{ -1 };
+
+void test_maybe_throw_bad_alloc() {
+    const int64_t remaining = g_test_oom_countdown.load();
+    if (remaining < 0) {
+        return;
+    }
+    if (g_test_oom_countdown.fetch_sub(1) == 0) {
+        throw std::bad_alloc();
+    }
+}
+
+bool test_consume_write_bytes(size_t n) {
+    const int64_t current = g_test_write_fail_after.load();
+    if (current < 0) {
+        return true;
+    }
+    if (static_cast<uint64_t>(current) < n) {
+        g_test_write_fail_after.store(0);
+        return false;
+    }
+    g_test_write_fail_after.fetch_sub(static_cast<int64_t>(n));
+    return true;
+}
+#else
+#define test_maybe_throw_bad_alloc() ((void) 0)
+#endif
+
+inline bool write_bytes(std::FILE * f, const void * data, size_t size) {
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    if (!test_consume_write_bytes(size)) {
+        return false;
+    }
+#endif
+    return std::fwrite(data, 1, size, f) == size;
+}
 
 void put_u32_le(uint8_t * dst, uint32_t v) {
     dst[0] = static_cast<uint8_t>(v >> 0);
@@ -113,7 +159,7 @@ float u32_to_float(uint32_t bits) {
 bool write_u32_le(std::FILE * f, uint32_t v) {
     uint8_t bytes[4];
     put_u32_le(bytes, v);
-    return std::fwrite(bytes, 1, sizeof(bytes), f) == sizeof(bytes);
+    return write_bytes(f, bytes, sizeof(bytes));
 }
 
 bool read_u32_le(std::ifstream & f, uint32_t & v) {
@@ -172,7 +218,7 @@ bool read_u64_le_crc(std::ifstream & f, uint64_t & v, uint32_t & crc) {
 bool write_u32_le_crc(std::FILE * f, uint32_t v, uint32_t & crc) {
     uint8_t bytes[4];
     put_u32_le(bytes, v);
-    if (std::fwrite(bytes, 1, sizeof(bytes), f) != sizeof(bytes)) {
+    if (!write_bytes(f, bytes, sizeof(bytes))) {
         return false;
     }
     crc = crc32c_update(crc, bytes, sizeof(bytes));
@@ -182,7 +228,7 @@ bool write_u32_le_crc(std::FILE * f, uint32_t v, uint32_t & crc) {
 bool write_u64_le_crc(std::FILE * f, uint64_t v, uint32_t & crc) {
     uint8_t bytes[8];
     put_u64_le(bytes, v);
-    if (std::fwrite(bytes, 1, sizeof(bytes), f) != sizeof(bytes)) {
+    if (!write_bytes(f, bytes, sizeof(bytes))) {
         return false;
     }
     crc = crc32c_update(crc, bytes, sizeof(bytes));
@@ -434,6 +480,18 @@ bool rename_overwrite(const TempFile & temp, const char * dst) {
 
 } // namespace
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+extern "C" {
+void ggml_vec_index_test_set_oom_countdown(int64_t countdown) {
+    g_test_oom_countdown.store(countdown);
+}
+
+void ggml_vec_index_test_set_write_fail_after(int64_t bytes) {
+    g_test_write_fail_after.store(bytes);
+}
+}
+#endif
+
 // Lifetime-managed instance state. Lives behind the opaque
 // `ggml_vec_index_t` typedef.
 struct ggml_vec_index {
@@ -557,6 +615,7 @@ int ggml_vec_index_add(
 
         // Atomic add: detect duplicates first (against existing AND in-batch),
         // bail before mutating any state.
+        test_maybe_throw_bad_alloc();
         std::unordered_set<uint64_t> batch_ids;
         batch_ids.reserve(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
@@ -590,6 +649,7 @@ int ggml_vec_index_add(
             idx->data.resize(new_slots * dim_sz);
         }
         idx->slot_to_id.resize(new_slots);
+        test_maybe_throw_bad_alloc();
         idx->id_to_slot.reserve(new_slots);
 
         for (int i = 0; i < n; ++i) {
@@ -608,6 +668,7 @@ int ggml_vec_index_add(
                     dim_sz * sizeof(float));
             }
             idx->slot_to_id[slot] = ids[i];
+            test_maybe_throw_bad_alloc();
             idx->id_to_slot.emplace(ids[i], slot);
         }
     } catch (const std::bad_alloc &) {
@@ -757,6 +818,7 @@ void search_one(
     const int    dim     = idx.dim;
     const size_t n_slots = idx.slot_to_id.size();
 
+    test_maybe_throw_bad_alloc();
     std::priority_queue<ScoreId, std::vector<ScoreId>, MinHeapCmp> heap;
 
     for (size_t slot = 0; slot < n_slots; ++slot) {
@@ -873,10 +935,12 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
             return GGML_VEC_INDEX_E_INTERNAL;
         }
 
+        test_maybe_throw_bad_alloc();
         TempFile temp;
         if (!open_temp_file(path, temp)) {
             return GGML_VEC_INDEX_E_IO;
         }
+        test_maybe_throw_bad_alloc();
         auto fail_io = [&]() {
             if (temp.stream != nullptr) {
                 std::fclose(temp.stream);
@@ -903,7 +967,7 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         put_u32_le(header + 24, is_q8(*idx) ? 1u : 4u);
         put_u32_le(header + 28, 0);
 
-        if (std::fwrite(header, 1, sizeof(header), f) != sizeof(header)) {
+        if (!write_bytes(f, header, sizeof(header))) {
             return fail_io();
         }
 
@@ -919,11 +983,7 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
             }
 
             if (!idx->q8_data.empty()) {
-                if (std::fwrite(
-                        idx->q8_data.data(),
-                        sizeof(int8_t),
-                        idx->q8_data.size(),
-                        f) != idx->q8_data.size()) {
+                if (!write_bytes(f, idx->q8_data.data(), idx->q8_data.size())) {
                     return fail_io();
                 }
                 vectors_crc =
@@ -1097,6 +1157,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             return nullptr;
         }
 
+        test_maybe_throw_bad_alloc();
         if (is_q8(*idx)) {
             idx->q8_data.resize(n * dim_sz);
             idx->q8_scale.resize(n);

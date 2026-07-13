@@ -153,6 +153,19 @@ if (LLAMA_TESTS_INSTALL)
 endif()
 llama_test(test-vector-index)
 
+add_executable(
+    test-vector-index-faults
+    test-vector-index-faults.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index.cpp
+)
+target_compile_features(test-vector-index-faults PRIVATE cxx_std_17)
+target_compile_definitions(test-vector-index-faults PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+target_include_directories(test-vector-index-faults PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+if (NOT WIN32)
+    target_link_libraries(test-vector-index-faults PRIVATE m)
+endif()
+llama_test(test-vector-index-faults)
+
 add_executable(bench-vector-index bench-vector-index.cpp)
 target_compile_features(bench-vector-index PRIVATE cxx_std_17)
 target_link_libraries(bench-vector-index PRIVATE ggml)
