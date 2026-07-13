@@ -1,6 +1,5 @@
 #include "models.h"
 #include <cmath>
-#include <cstdlib>
 
 ggml_cgraph * clip_graph_gemma4v::build() {
     ggml_tensor * inp_raw = build_inp_raw();
@@ -113,40 +112,15 @@ ggml_cgraph * clip_graph_gemma4v::build() {
         // [out_x, out_y, n_embd, 1] -> [n_embd, out_x * out_y]
         cur = ggml_reshape_3d(ctx0, cur, out_x * out_y, n_embd, 1);
         cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+        cur = ggml_scale(ctx0, cur, sqrtf((float)n_embd));
         cb(cur, "pooled", -1);
     }
 
-    // hidden_states = (hidden_states * sqrt(n_embd) - std_bias) * std_scale
-    //
-    // QVAC-21901 sweep candidate #1 (Mali Vulkan): fold the sqrt(n_embd) magnitude
-    // scale into the per-channel std-norm affine instead of scaling the full pooled
-    // activation tensor ([n_embd, n_tokens]). Algebraically exact:
-    //     (k*p - b) * s  ==  (p - b/k) * (s*k)
-    // Pre-scales the tiny std_bias/std_scale vectors ([n_embd]) and drops the full
-    // tensor ggml_scale. Gated by QVAC_G4V_STDFOLD (default on) so the on-device
-    // A/B can measure fold-on vs fold-off and keep the winner; the knob is removed
-    // once the winning config is baked in (same flow as QVAC-21361's FA sweep).
+    // hidden_states = (hidden_states - self.std_bias) * self.std_scale
     if (model.std_bias && model.std_scale) {
-        static const bool stdfold = [] {
-            const char * e = getenv("QVAC_G4V_STDFOLD");
-            return e == nullptr || (e[0] != '0');  // default: enabled
-        }();
-        if (stdfold) {
-            const float k = sqrtf((float)n_embd);
-            ggml_tensor * bias_folded  = ggml_scale(ctx0, model.std_bias,  1.0f / k);
-            ggml_tensor * scale_folded = ggml_scale(ctx0, model.std_scale, k);
-            cur = ggml_sub(ctx0, cur, bias_folded);
-            cur = ggml_mul(ctx0, cur, scale_folded);
-        } else {
-            cur = ggml_scale(ctx0, cur, sqrtf((float)n_embd));
-            cur = ggml_sub(ctx0, cur, model.std_bias);
-            cur = ggml_mul(ctx0, cur, model.std_scale);
-        }
+        cur = ggml_sub(ctx0, cur, model.std_bias);
+        cur = ggml_mul(ctx0, cur, model.std_scale);
         cb(cur, "std_scaled", -1);
-    } else {
-        // no std affine present — keep the explicit magnitude scale
-        cur = ggml_scale(ctx0, cur, sqrtf((float)n_embd));
-        cb(cur, "pooled_scaled", -1);
     }
 
     // Gemma4MultimodalEmbedder
