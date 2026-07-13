@@ -77,6 +77,10 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <condition_variable>
 #include <thread>
 
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
+
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
@@ -2985,7 +2989,30 @@ static void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, 
     VK_LOG_DEBUG("ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
     ctx->pipeline_descriptor_set_requirements += n;
     if (!pipeline->compiled) {
+#ifdef __APPLE__
+        struct compile_args {
+            vk_device *   device;
+            vk_pipeline * pipeline;
+        } args = { &ctx->device, &pipeline };
+
+        pthread_attr_t attr;
+        pthread_t      th;
+        bool           ok = pthread_attr_init(&attr) == 0 &&
+                            pthread_attr_setstacksize(&attr, 8u*1024u*1024u) == 0 &&
+                            pthread_create(&th, &attr, [](void * p) -> void * {
+                                compile_args * a = (compile_args *) p;
+                                ggml_vk_load_shaders(*a->device, *a->pipeline);
+                                return nullptr;
+                            }, &args) == 0;
+        if (ok) {
+            pthread_join(th, nullptr);
+        } else {
+            ggml_vk_load_shaders(ctx->device, pipeline);
+        }
+        pthread_attr_destroy(&attr);
+#else
         ggml_vk_load_shaders(ctx->device, pipeline);
+#endif
     }
     ggml_pipeline_allocate_descriptor_sets(ctx);
 }
