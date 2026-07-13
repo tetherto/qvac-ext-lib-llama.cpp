@@ -13867,7 +13867,8 @@ static void ggml_vk_gated_delta_net_back(ggml_backend_vk_context * ctx, vk_conte
     const uint32_t off_ds = off_db + pad4(ggml_nelements(dst->src[4]));
     const uint32_t off_scratch = off_ds + pad4(ggml_nelements(dst->src[5]));
 
-    const uint32_t wg_stride = n_tokens * (2u * S_v * S_v + 2u * S_v) + S_v * S_v;
+    // sc_carry scratch region (S_v * S_v) is not needed / unused.
+    const uint32_t wg_stride = n_tokens * (2u * S_v * S_v + 2u * S_v);
 
     const float scale = 1.0f / sqrtf((float)S_v);
     const vk_op_gated_delta_net_back_push_constants pc = {
