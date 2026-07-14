@@ -70,10 +70,15 @@ GGML_API int ggml_vec_index_add(
     int                n,
     const uint64_t   * ids);
 
-// Removes the entry for `id` via swap-with-last (slot indices are NOT stable
-// across removes; external ids ARE). Returns 1 if removed, 0 if not present,
-// negative on error.
+// Removes the entry for `id` by marking its internal slot deleted. Physical
+// storage is compacted only when writing a snapshot. Returns 1 if removed,
+// 0 if not present, negative on error.
 GGML_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
+
+// Physically removes deleted slots from in-memory storage. This does not write
+// to disk. If any slots are removed, prepared filters and IVF state are
+// invalidated. Returns 0 on success, negative on error.
+GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 
 // Logged mutations for incremental persistence. These update `idx` and append
 // a durable delta record to `delta_path`. Replay the log on top of a full .tvim
@@ -183,6 +188,14 @@ GGML_API int ggml_vec_index_write(
 // are quantized to q8; all other legacy bit widths migrate to f32/32-bit.
 // Returns NULL on failure.
 GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
+
+// Loads a v2 .tvim snapshot with its vector section memory-mapped read-only.
+// IDs and quantization scales are copied into memory for lookup and scoring.
+// Mutating APIs return GGML_VEC_INDEX_E_INVALID_ARG on mmap-backed handles.
+// `ggml_vec_index_write` can snapshot mmap-backed handles, but callers should
+// write to a different path than the mapped source file.
+// Returns NULL on failure or unsupported file format.
+GGML_API ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path);
 
 // Loads a full .tvim snapshot and replays an append-only delta log. Missing
 // delta logs are treated as empty.

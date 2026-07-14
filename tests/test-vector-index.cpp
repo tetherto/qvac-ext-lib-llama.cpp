@@ -553,6 +553,134 @@ int main() {
     ggml_vec_index_free(loaded);
     std::filesystem::remove(path);
 
+    // Tombstone removal: later adds append, searches skip deleted slots, IVF
+    // rebuilds exclude them, and snapshots write only live rows.
+    {
+        for (int bit_width : { 32, 8, 4 }) {
+            const std::string tombstone_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-tombstone-" + std::to_string(bit_width) + ".tvim")).string();
+            std::filesystem::remove(tombstone_path);
+
+            auto * tombstone_idx = ggml_vec_index_create(kDim, bit_width);
+            CHECK(tombstone_idx != nullptr);
+            CHECK(ggml_vec_index_add(
+                tombstone_idx, vecs.data(), static_cast<int>(ids.size()), ids.data()) ==
+                GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_remove(tombstone_idx, ids[1]) == 1);
+            CHECK(ggml_vec_index_len(tombstone_idx) == 3);
+
+            const uint64_t appended_id =
+                (1ULL << 40) + 123ULL + static_cast<uint64_t>(bit_width);
+            CHECK(ggml_vec_index_add(
+                tombstone_idx, seeds[1].data(), 1, &appended_id) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_len(tombstone_idx) == 4);
+            CHECK(ggml_vec_index_contains(tombstone_idx, ids[1]) == 0);
+            CHECK(ggml_vec_index_contains(tombstone_idx, appended_id) == 1);
+
+            std::array<float, 4> scores{};
+            std::array<uint64_t, 4> out_ids{};
+            CHECK(ggml_vec_index_search(
+                tombstone_idx, seeds[1].data(), 1, /*k=*/4,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            for (uint64_t result_id : out_ids) {
+                CHECK(result_id != ids[1]);
+            }
+            CHECK(out_ids[0] == appended_id);
+
+            const std::array<uint64_t, 2> allowed = { ids[1], appended_id };
+            scores = {};
+            out_ids = {};
+            CHECK(ggml_vec_index_search_filtered(
+                tombstone_idx, seeds[1].data(), 1, /*k=*/2,
+                allowed.data(), static_cast<int>(allowed.size()),
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == appended_id);
+            CHECK(out_ids[1] == UINT64_MAX);
+
+            auto * filter = ggml_vec_index_filter_create(
+                tombstone_idx, allowed.data(), static_cast<int>(allowed.size()));
+            CHECK(filter != nullptr);
+            scores = {};
+            out_ids = {};
+            CHECK(ggml_vec_index_search_prepared_filtered(
+                tombstone_idx, filter, seeds[1].data(), 1, /*k=*/2,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == appended_id);
+            CHECK(out_ids[1] == UINT64_MAX);
+            ggml_vec_index_filter_free(filter);
+
+            CHECK(ggml_vec_index_build_ivf(tombstone_idx, /*n_lists=*/8, /*n_iter=*/2) ==
+                  GGML_VEC_INDEX_OK);
+            scores = {};
+            out_ids = {};
+            CHECK(ggml_vec_index_search_ivf(
+                tombstone_idx, seeds[1].data(), 1, /*k=*/4, /*nprobe=*/8,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == appended_id);
+            for (uint64_t result_id : out_ids) {
+                CHECK(result_id != ids[1]);
+            }
+
+            auto * stale_filter = ggml_vec_index_filter_create(
+                tombstone_idx, allowed.data(), static_cast<int>(allowed.size()));
+            CHECK(stale_filter != nullptr);
+            CHECK(ggml_vec_index_compact(tombstone_idx) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_len(tombstone_idx) == 4);
+            CHECK(ggml_vec_index_contains(tombstone_idx, ids[1]) == 0);
+            CHECK(ggml_vec_index_contains(tombstone_idx, appended_id) == 1);
+            CHECK(ggml_vec_index_search_prepared_filtered(
+                tombstone_idx, stale_filter, seeds[1].data(), 1, /*k=*/2,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+            ggml_vec_index_filter_free(stale_filter);
+            CHECK(ggml_vec_index_search_ivf(
+                tombstone_idx, seeds[1].data(), 1, /*k=*/1, /*nprobe=*/1,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+            scores = {};
+            out_ids = {};
+            CHECK(ggml_vec_index_search_filtered(
+                tombstone_idx, seeds[1].data(), 1, /*k=*/2,
+                allowed.data(), static_cast<int>(allowed.size()),
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == appended_id);
+            CHECK(out_ids[1] == UINT64_MAX);
+            CHECK(ggml_vec_index_build_ivf(tombstone_idx, /*n_lists=*/8, /*n_iter=*/2) ==
+                  GGML_VEC_INDEX_OK);
+            scores = {};
+            out_ids = {};
+            CHECK(ggml_vec_index_search_ivf(
+                tombstone_idx, seeds[1].data(), 1, /*k=*/4, /*nprobe=*/8,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == appended_id);
+            for (uint64_t result_id : out_ids) {
+                CHECK(result_id != ids[1]);
+            }
+
+            CHECK(ggml_vec_index_write(tombstone_idx, tombstone_path.c_str()) ==
+                  GGML_VEC_INDEX_OK);
+            ggml_vec_index_free(tombstone_idx);
+
+            auto * tombstone_loaded = ggml_vec_index_load(tombstone_path.c_str());
+            CHECK(tombstone_loaded != nullptr);
+            CHECK(ggml_vec_index_bit_width(tombstone_loaded) == bit_width);
+            CHECK(ggml_vec_index_len(tombstone_loaded) == 4);
+            CHECK(ggml_vec_index_contains(tombstone_loaded, ids[1]) == 0);
+            CHECK(ggml_vec_index_contains(tombstone_loaded, appended_id) == 1);
+            scores = {};
+            out_ids = {};
+            CHECK(ggml_vec_index_search(
+                tombstone_loaded, seeds[1].data(), 1, /*k=*/4,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == appended_id);
+            for (uint64_t result_id : out_ids) {
+                CHECK(result_id != ids[1]);
+            }
+            ggml_vec_index_free(tombstone_loaded);
+            std::filesystem::remove(tombstone_path);
+        }
+    }
+
     // Incremental persistence: replay add/remove deltas on top of a snapshot.
     {
         const std::string snapshot_path =
@@ -697,6 +825,60 @@ int main() {
         std::filesystem::remove(corrupt_delta_path);
     }
 
+    // Delta replay supports tombstone delete followed by re-adding the same ID.
+    {
+        for (int bit_width : { 32, 8, 4 }) {
+            const std::string snapshot_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-delta-tombstone-" +
+                  std::to_string(bit_width) + ".tvim")).string();
+            const std::string delta_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-delta-tombstone-" +
+                  std::to_string(bit_width) + ".tvid")).string();
+            std::filesystem::remove(snapshot_path);
+            std::filesystem::remove(delta_path);
+
+            auto * delta_tombstone = ggml_vec_index_create(kDim, bit_width);
+            CHECK(delta_tombstone != nullptr);
+            std::vector<float> base_vecs;
+            base_vecs.insert(base_vecs.end(), seeds[0].begin(), seeds[0].end());
+            base_vecs.insert(base_vecs.end(), seeds[1].begin(), seeds[1].end());
+            CHECK(ggml_vec_index_add(
+                delta_tombstone, base_vecs.data(), 2, ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_write(
+                delta_tombstone, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+
+            CHECK(ggml_vec_index_remove_logged(
+                delta_tombstone, ids[0], delta_path.c_str()) == 1);
+            CHECK(ggml_vec_index_add_logged(
+                delta_tombstone, seeds[2].data(), 1, &ids[0], delta_path.c_str()) ==
+                GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_len(delta_tombstone) == 2);
+            CHECK(ggml_vec_index_contains(delta_tombstone, ids[0]) == 1);
+
+            auto * replayed_tombstone = ggml_vec_index_load_with_delta(
+                snapshot_path.c_str(), delta_path.c_str());
+            CHECK(replayed_tombstone != nullptr);
+            CHECK(ggml_vec_index_bit_width(replayed_tombstone) == bit_width);
+            CHECK(ggml_vec_index_len(replayed_tombstone) == 2);
+            CHECK(ggml_vec_index_contains(replayed_tombstone, ids[0]) == 1);
+            CHECK(ggml_vec_index_contains(replayed_tombstone, ids[1]) == 1);
+
+            std::array<float, 2> scores{};
+            std::array<uint64_t, 2> out_ids{};
+            CHECK(ggml_vec_index_search(
+                replayed_tombstone, seeds[2].data(), 1, /*k=*/2,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == ids[0]);
+
+            ggml_vec_index_free(replayed_tombstone);
+            ggml_vec_index_free(delta_tombstone);
+            std::filesystem::remove(snapshot_path);
+            std::filesystem::remove(delta_path);
+        }
+    }
+
     // v1 f32 snapshots migrate to q8 only for legacy bit_width=8; other
     // legacy widths, including bit_width=4, migrate to f32.
     {
@@ -716,6 +898,7 @@ int main() {
 
             auto * v1 = ggml_vec_index_load(v1_path.c_str());
             CHECK(v1 != nullptr);
+            CHECK(ggml_vec_index_load_mmap(v1_path.c_str()) == nullptr);
             CHECK(ggml_vec_index_dim(v1) == kDim);
             CHECK(ggml_vec_index_len(v1) == 2);
             CHECK(ggml_vec_index_bit_width(v1) == (bit_width == 8 ? 8 : 32));
@@ -730,6 +913,81 @@ int main() {
 
             ggml_vec_index_free(v1);
             std::filesystem::remove(v1_path);
+        }
+    }
+
+    // mmap loading maps the vector section read-only and keeps search parity.
+    {
+        const std::vector<uint64_t> mmap_ids = {
+            (1ULL << 38) + 1ULL,
+            (1ULL << 38) + 2ULL,
+            (1ULL << 38) + 3ULL,
+            (1ULL << 38) + 4ULL,
+        };
+        std::array<float, 4> normal_scores{};
+        std::array<float, 4> mmap_scores{};
+        std::array<uint64_t, 4> normal_ids{};
+        std::array<uint64_t, 4> mmap_out_ids{};
+        const std::vector<float> query = normalize({0.5f, -0.25f, 0.75f, 0.125f});
+
+        for (int bit_width : { 32, 8, 4 }) {
+            const auto mmap_tmp = std::filesystem::temp_directory_path() /
+                                  ("ggml-vector-index-mmap-" + std::to_string(bit_width) + ".tvim");
+            const auto mmap_copy_tmp = std::filesystem::temp_directory_path() /
+                                       ("ggml-vector-index-mmap-copy-" + std::to_string(bit_width) + ".tvim");
+            const std::string mmap_path = mmap_tmp.string();
+            const std::string mmap_copy_path = mmap_copy_tmp.string();
+            std::filesystem::remove(mmap_path);
+            std::filesystem::remove(mmap_copy_path);
+
+            auto * source = ggml_vec_index_create(kDim, bit_width);
+            CHECK(source != nullptr);
+            CHECK(ggml_vec_index_add(
+                source, vecs.data(), static_cast<int>(mmap_ids.size()), mmap_ids.data()) ==
+                GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_write(source, mmap_path.c_str()) == GGML_VEC_INDEX_OK);
+
+            auto * normal = ggml_vec_index_load(mmap_path.c_str());
+            auto * mapped = ggml_vec_index_load_mmap(mmap_path.c_str());
+            CHECK(normal != nullptr);
+            CHECK(mapped != nullptr);
+            CHECK(ggml_vec_index_bit_width(mapped) == bit_width);
+            CHECK(ggml_vec_index_len(mapped) == static_cast<int>(mmap_ids.size()));
+
+            CHECK(ggml_vec_index_search(
+                normal, query.data(), 1, /*k=*/4,
+                normal_scores.data(), normal_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search(
+                mapped, query.data(), 1, /*k=*/4,
+                mmap_scores.data(), mmap_out_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(mmap_out_ids[i] == normal_ids[i]);
+                CHECK(std::fabs(mmap_scores[i] - normal_scores[i]) <= 1e-6f);
+            }
+
+            CHECK(ggml_vec_index_build_ivf(mapped, /*n_lists=*/2, /*n_iter=*/2)
+                  == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search_ivf(
+                mapped, query.data(), 1, /*k=*/2, /*nprobe=*/2,
+                mmap_scores.data(), mmap_out_ids.data()) == GGML_VEC_INDEX_OK);
+
+            const uint64_t new_id = (1ULL << 38) + 99ULL;
+            CHECK(ggml_vec_index_add(mapped, seeds[0].data(), 1, &new_id)
+                  == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_remove(mapped, mmap_ids[0])
+                  == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_compact(mapped) == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_write(mapped, mmap_copy_path.c_str()) == GGML_VEC_INDEX_OK);
+            auto * copied = ggml_vec_index_load(mmap_copy_path.c_str());
+            CHECK(copied != nullptr);
+            CHECK(ggml_vec_index_len(copied) == static_cast<int>(mmap_ids.size()));
+
+            ggml_vec_index_free(copied);
+            ggml_vec_index_free(mapped);
+            ggml_vec_index_free(normal);
+            ggml_vec_index_free(source);
+            std::filesystem::remove(mmap_path);
+            std::filesystem::remove(mmap_copy_path);
         }
     }
 

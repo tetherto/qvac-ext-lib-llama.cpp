@@ -36,6 +36,7 @@ struct BenchConfig {
     int ivf_lists = 64;
     int ivf_iters = 4;
     int ivf_nprobe = 4;
+    int delete_stride = 2;
 };
 
 struct TimedSearch {
@@ -283,6 +284,54 @@ struct DeltaBenchResult {
     uintmax_t delta_bytes_after = 0;
 };
 
+struct DeleteBenchResult {
+    int deleted = 0;
+    int live = 0;
+    double full_search_ms = 0.0;
+    double tombstone_search_ms = 0.0;
+    double compact_ms = 0.0;
+    double compacted_search_ms = 0.0;
+};
+
+DeleteBenchResult run_delete_bench(
+        int bit_width,
+        const std::vector<float> & vectors,
+        const std::vector<uint64_t> & ids,
+        const std::vector<float> & queries,
+        const BenchConfig & cfg) {
+    CHECK(cfg.delete_stride > 0);
+
+    ggml_vec_index_t * idx = ggml_vec_index_create(cfg.dim, bit_width);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
+
+    DeleteBenchResult result;
+    result.full_search_ms = run_search(
+        idx, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats).ms;
+
+    for (int row = 0; row < cfg.n_vec; row += cfg.delete_stride) {
+        CHECK(ggml_vec_index_remove(idx, ids[static_cast<size_t>(row)]) == 1);
+        ++result.deleted;
+    }
+    result.live = ggml_vec_index_len(idx);
+    CHECK(result.live == cfg.n_vec - result.deleted);
+
+    result.tombstone_search_ms = run_search(
+        idx, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats).ms;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(ggml_vec_index_compact(idx) == GGML_VEC_INDEX_OK);
+    const auto t1 = std::chrono::steady_clock::now();
+    result.compact_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    CHECK(ggml_vec_index_len(idx) == result.live);
+
+    result.compacted_search_ms = run_search(
+        idx, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats).ms;
+
+    ggml_vec_index_free(idx);
+    return result;
+}
+
 DeltaBenchResult run_delta_bench(
         int bit_width,
         const std::vector<float> & vectors,
@@ -517,6 +566,21 @@ int main() {
     const uintmax_t f32_file_size = std::filesystem::file_size(f32_path);
     const uintmax_t q8_file_size  = std::filesystem::file_size(q8_path);
     const uintmax_t q4_file_size  = std::filesystem::file_size(q4_path);
+    const double f32_mmap_load_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
+        ggml_vec_index_t * loaded = ggml_vec_index_load_mmap(f32_path.string().c_str());
+        CHECK(loaded != nullptr);
+        ggml_vec_index_free(loaded);
+    });
+    const double q8_mmap_load_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
+        ggml_vec_index_t * loaded = ggml_vec_index_load_mmap(q8_path.string().c_str());
+        CHECK(loaded != nullptr);
+        ggml_vec_index_free(loaded);
+    });
+    const double q4_mmap_load_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
+        ggml_vec_index_t * loaded = ggml_vec_index_load_mmap(q4_path.string().c_str());
+        CHECK(loaded != nullptr);
+        ggml_vec_index_free(loaded);
+    });
     std::filesystem::remove(f32_path);
     std::filesystem::remove(q8_path);
     std::filesystem::remove(q4_path);
@@ -542,6 +606,9 @@ int main() {
         cfg,
         "ggml-vector-index-bench-delta-q4.tvim",
         "ggml-vector-index-bench-delta-q4.tvid");
+    const DeleteBenchResult f32_delete = run_delete_bench(32, vectors, ids, queries, cfg);
+    const DeleteBenchResult q8_delete = run_delete_bench(8, vectors, ids, queries, cfg);
+    const DeleteBenchResult q4_delete = run_delete_bench(4, vectors, ids, queries, cfg);
 
     const size_t f32_memory_bytes =
         static_cast<size_t>(cfg.n_vec) * static_cast<size_t>(cfg.dim) * sizeof(float) +
@@ -570,6 +637,8 @@ int main() {
         static_cast<unsigned long long>(q4_file_size),
         static_cast<double>(q8_file_size) / static_cast<double>(f32_file_size),
         static_cast<double>(q4_file_size) / static_cast<double>(f32_file_size));
+    std::printf("  mmap load:        f32=%.3f ms q8=%.3f ms q4=%.3f ms\n",
+        f32_mmap_load_ms, q8_mmap_load_ms, q4_mmap_load_ms);
     std::printf("  median latency:   f32=%.3f ms q8=%.3f ms q4=%.3f ms q8/f32=%.3f q4/f32=%.3f\n",
         f32_res.ms, q8_res.ms, q4_res.ms, q8_res.ms / f32_res.ms, q4_res.ms / f32_res.ms);
     std::printf(
@@ -648,6 +717,35 @@ int main() {
         static_cast<unsigned long long>(q4_delta.delta_bytes_before),
         static_cast<unsigned long long>(q4_delta.snapshot_bytes_after),
         static_cast<unsigned long long>(q4_delta.delta_bytes_after));
+    std::printf(
+        "  delete-heavy:      deleted=%d live=%d stride=%d\n",
+        f32_delete.deleted,
+        f32_delete.live,
+        cfg.delete_stride);
+    std::printf(
+        "  delete f32:        full_before=%.3f ms tombstoned=%.3f ms compact=%.3f ms compacted=%.3f ms tomb/full_before=%.3f compacted/tomb=%.3f\n",
+        f32_delete.full_search_ms,
+        f32_delete.tombstone_search_ms,
+        f32_delete.compact_ms,
+        f32_delete.compacted_search_ms,
+        f32_delete.tombstone_search_ms / f32_delete.full_search_ms,
+        f32_delete.compacted_search_ms / f32_delete.tombstone_search_ms);
+    std::printf(
+        "  delete q8:         full_before=%.3f ms tombstoned=%.3f ms compact=%.3f ms compacted=%.3f ms tomb/full_before=%.3f compacted/tomb=%.3f\n",
+        q8_delete.full_search_ms,
+        q8_delete.tombstone_search_ms,
+        q8_delete.compact_ms,
+        q8_delete.compacted_search_ms,
+        q8_delete.tombstone_search_ms / q8_delete.full_search_ms,
+        q8_delete.compacted_search_ms / q8_delete.tombstone_search_ms);
+    std::printf(
+        "  delete q4:         full_before=%.3f ms tombstoned=%.3f ms compact=%.3f ms compacted=%.3f ms tomb/full_before=%.3f compacted/tomb=%.3f\n",
+        q4_delete.full_search_ms,
+        q4_delete.tombstone_search_ms,
+        q4_delete.compact_ms,
+        q4_delete.compacted_search_ms,
+        q4_delete.tombstone_search_ms / q4_delete.full_search_ms,
+        q4_delete.compacted_search_ms / q4_delete.tombstone_search_ms);
     std::printf("  quality q8:       recall@%d=%.4f mean_abs_score_drift=%.6f max_abs_score_drift=%.6f\n",
         cfg.k, q8_recall_at_k, q8_mean_abs_drift, q8_max_abs_drift);
     std::printf("  quality q4:       recall@%d=%.4f mean_abs_score_drift=%.6f max_abs_score_drift=%.6f\n",
