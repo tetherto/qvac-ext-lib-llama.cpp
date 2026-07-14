@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <string>
 #include <unordered_set>
@@ -43,6 +44,36 @@ struct TimedSearch {
     double ms = 0.0;
     std::vector<float> scores;
     std::vector<uint64_t> ids;
+};
+
+struct QualityMetrics {
+    double recall_at_k = 0.0;
+    double mean_abs_score_drift = 0.0;
+    double max_abs_score_drift = 0.0;
+};
+
+struct QualityBenchResult {
+    const char * name = "";
+    QualityMetrics q8;
+    QualityMetrics q4;
+    std::vector<QualityMetrics> q4_calibrated;
+};
+
+struct Q4CalibrationMode {
+    const char * name = "";
+    float percentile = 1.0f;
+    float rms_factor = 0.0f;
+};
+
+struct Q4SimulatedIndex {
+    int dim = 0;
+    std::vector<int8_t> codes;
+    std::vector<float> scales;
+};
+
+struct ScoreId {
+    float score = 0.0f;
+    uint64_t id = 0;
 };
 
 template <typename Fn>
@@ -94,6 +125,100 @@ std::vector<float> make_normalized_vectors(int n, int dim, uint32_t seed) {
         float * v = vectors.data() + static_cast<size_t>(row) * static_cast<size_t>(dim);
         for (int i = 0; i < dim; ++i) {
             v[i] = dist(rng);
+            norm2 += v[i] * v[i];
+        }
+        const float inv_norm = norm2 > 0.0f ? 1.0f / std::sqrt(norm2) : 1.0f;
+        for (int i = 0; i < dim; ++i) {
+            v[i] *= inv_norm;
+        }
+    }
+    return vectors;
+}
+
+std::vector<float> make_gaussian_vectors(int n, int dim, uint32_t seed, bool normalize_rows) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+
+    std::vector<float> vectors(static_cast<size_t>(n) * static_cast<size_t>(dim));
+    for (int row = 0; row < n; ++row) {
+        float norm2 = 0.0f;
+        float * v = vectors.data() + static_cast<size_t>(row) * static_cast<size_t>(dim);
+        for (int i = 0; i < dim; ++i) {
+            v[i] = dist(rng);
+            norm2 += v[i] * v[i];
+        }
+        if (normalize_rows) {
+            const float inv_norm = norm2 > 0.0f ? 1.0f / std::sqrt(norm2) : 1.0f;
+            for (int i = 0; i < dim; ++i) {
+                v[i] *= inv_norm;
+            }
+        }
+    }
+    return vectors;
+}
+
+std::vector<float> make_sparse_vectors(int n, int dim, uint32_t seed, int nnz) {
+    CHECK(nnz > 0 && nnz <= dim);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::uniform_int_distribution<int> coord_dist(0, dim - 1);
+
+    std::vector<float> vectors(static_cast<size_t>(n) * static_cast<size_t>(dim), 0.0f);
+    for (int row = 0; row < n; ++row) {
+        float * v = vectors.data() + static_cast<size_t>(row) * static_cast<size_t>(dim);
+        for (int j = 0; j < nnz; ++j) {
+            v[coord_dist(rng)] += dist(rng);
+        }
+        float norm2 = 0.0f;
+        for (int i = 0; i < dim; ++i) {
+            norm2 += v[i] * v[i];
+        }
+        const float inv_norm = norm2 > 0.0f ? 1.0f / std::sqrt(norm2) : 1.0f;
+        for (int i = 0; i < dim; ++i) {
+            v[i] *= inv_norm;
+        }
+    }
+    return vectors;
+}
+
+std::vector<float> make_cluster_centers(int dim, uint32_t seed, int n_clusters) {
+    CHECK(n_clusters > 0);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> center_dist(0.0f, 1.0f);
+    std::vector<float> centers(static_cast<size_t>(n_clusters) * static_cast<size_t>(dim));
+    for (int cluster = 0; cluster < n_clusters; ++cluster) {
+        float norm2 = 0.0f;
+        float * center = centers.data() + static_cast<size_t>(cluster) * static_cast<size_t>(dim);
+        for (int i = 0; i < dim; ++i) {
+            center[i] = center_dist(rng);
+            norm2 += center[i] * center[i];
+        }
+        const float inv_norm = norm2 > 0.0f ? 1.0f / std::sqrt(norm2) : 1.0f;
+        for (int i = 0; i < dim; ++i) {
+            center[i] *= inv_norm;
+        }
+    }
+    return centers;
+}
+
+std::vector<float> make_clustered_vectors(
+        int n,
+        int dim,
+        uint32_t seed,
+        const std::vector<float> & centers,
+        int n_clusters) {
+    CHECK(n_clusters > 0);
+    CHECK(centers.size() == static_cast<size_t>(n_clusters) * static_cast<size_t>(dim));
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> noise_dist(0.0f, 0.05f);
+    std::vector<float> vectors(static_cast<size_t>(n) * static_cast<size_t>(dim));
+    for (int row = 0; row < n; ++row) {
+        const float * center =
+            centers.data() + static_cast<size_t>(row % n_clusters) * static_cast<size_t>(dim);
+        float * v = vectors.data() + static_cast<size_t>(row) * static_cast<size_t>(dim);
+        float norm2 = 0.0f;
+        for (int i = 0; i < dim; ++i) {
+            v[i] = center[i] + noise_dist(rng);
             norm2 += v[i] * v[i];
         }
         const float inv_norm = norm2 > 0.0f ? 1.0f / std::sqrt(norm2) : 1.0f;
@@ -217,6 +342,110 @@ float dot_exact(
     return acc;
 }
 
+float q4_reference_abs_for_mode(const float * row, int dim, const Q4CalibrationMode & mode) {
+    float max_abs = 0.0f;
+    float sumsq = 0.0f;
+    std::vector<float> abs_values;
+    abs_values.reserve(static_cast<size_t>(dim));
+    for (int i = 0; i < dim; ++i) {
+        const float a = std::fabs(row[i]);
+        max_abs = std::max(max_abs, a);
+        sumsq += row[i] * row[i];
+        abs_values.push_back(a);
+    }
+    if (max_abs == 0.0f) {
+        return 0.0f;
+    }
+
+    if (mode.rms_factor > 0.0f) {
+        const float rms = std::sqrt(sumsq / static_cast<float>(dim));
+        return std::min(max_abs, mode.rms_factor * rms);
+    }
+
+    if (mode.percentile < 1.0f) {
+        std::sort(abs_values.begin(), abs_values.end());
+        const size_t rank = static_cast<size_t>(
+            std::floor(mode.percentile * static_cast<float>(dim - 1)));
+        return std::max(abs_values[rank], std::numeric_limits<float>::min());
+    }
+
+    return max_abs;
+}
+
+Q4SimulatedIndex build_simulated_q4(
+        const std::vector<float> & vectors,
+        int n,
+        int dim,
+        const Q4CalibrationMode & mode) {
+    Q4SimulatedIndex sim;
+    sim.dim = dim;
+    sim.codes.resize(static_cast<size_t>(n) * static_cast<size_t>(dim));
+    sim.scales.resize(static_cast<size_t>(n));
+    for (int row = 0; row < n; ++row) {
+        const float * src = vectors.data() + static_cast<size_t>(row) * static_cast<size_t>(dim);
+        const float ref_abs = q4_reference_abs_for_mode(src, dim, mode);
+        float scale = ref_abs == 0.0f ? 1.0f : ref_abs / 7.0f;
+        if (scale == 0.0f) {
+            scale = ref_abs;
+        }
+        sim.scales[static_cast<size_t>(row)] = scale;
+        int8_t * dst = sim.codes.data() + static_cast<size_t>(row) * static_cast<size_t>(dim);
+        for (int i = 0; i < dim; ++i) {
+            const float scaled = src[i] / scale;
+            int q = static_cast<int>(std::nearbyint(scaled));
+            q = std::max(-7, std::min(7, q));
+            dst[i] = static_cast<int8_t>(q);
+        }
+    }
+    return sim;
+}
+
+float dot_simulated_q4(const Q4SimulatedIndex & sim, const float * query, int row) {
+    const int8_t * codes =
+        sim.codes.data() + static_cast<size_t>(row) * static_cast<size_t>(sim.dim);
+    const float scale = sim.scales[static_cast<size_t>(row)];
+    float acc = 0.0f;
+    for (int i = 0; i < sim.dim; ++i) {
+        acc += query[i] * (static_cast<float>(codes[i]) * scale);
+    }
+    return acc;
+}
+
+TimedSearch run_simulated_q4_search(
+        const Q4SimulatedIndex & sim,
+        const std::vector<uint64_t> & ids,
+        const std::vector<float> & queries,
+        int n_query,
+        int k) {
+    TimedSearch result;
+    result.scores.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+    result.ids.resize(static_cast<size_t>(n_query) * static_cast<size_t>(k));
+    std::vector<ScoreId> candidates(ids.size());
+    for (int q = 0; q < n_query; ++q) {
+        const float * query = queries.data() + static_cast<size_t>(q) * static_cast<size_t>(sim.dim);
+        for (size_t row = 0; row < ids.size(); ++row) {
+            candidates[row] = {
+                dot_simulated_q4(sim, query, static_cast<int>(row)),
+                ids[row],
+            };
+        }
+        std::partial_sort(
+            candidates.begin(),
+            candidates.begin() + k,
+            candidates.end(),
+            [](const ScoreId & a, const ScoreId & b) {
+                return a.score > b.score;
+            });
+        for (int i = 0; i < k; ++i) {
+            const size_t out = static_cast<size_t>(q) * static_cast<size_t>(k) +
+                static_cast<size_t>(i);
+            result.scores[out] = candidates[static_cast<size_t>(i)].score;
+            result.ids[out] = candidates[static_cast<size_t>(i)].id;
+        }
+    }
+    return result;
+}
+
 std::filesystem::path write_index_file(ggml_vec_index_t * idx, const char * name) {
     const auto path = std::filesystem::temp_directory_path() / name;
     CHECK(ggml_vec_index_write(idx, path.string().c_str()) == GGML_VEC_INDEX_OK);
@@ -271,6 +500,91 @@ double recall_against(const TimedSearch & exact, const TimedSearch & candidate, 
         }
     }
     return static_cast<double>(overlap) / static_cast<double>(n_query * k);
+}
+
+QualityMetrics quality_against(
+        const TimedSearch & exact,
+        const TimedSearch & candidate,
+        const std::vector<float> & vectors,
+        const std::vector<float> & queries,
+        int n_query,
+        int k,
+        int dim) {
+    QualityMetrics metrics;
+    int overlap = 0;
+    int drift_count = 0;
+    for (int q = 0; q < n_query; ++q) {
+        std::unordered_set<uint64_t> exact_topk;
+        for (int j = 0; j < k; ++j) {
+            exact_topk.insert(exact.ids[static_cast<size_t>(q) * static_cast<size_t>(k) + j]);
+        }
+
+        const float * query = queries.data() + static_cast<size_t>(q) * static_cast<size_t>(dim);
+        for (int j = 0; j < k; ++j) {
+            const size_t pos = static_cast<size_t>(q) * static_cast<size_t>(k) +
+                static_cast<size_t>(j);
+            const uint64_t id = candidate.ids[pos];
+            if (exact_topk.count(id) != 0) {
+                ++overlap;
+            }
+            const float exact_score = dot_exact(vectors, query, id, dim);
+            const double drift = std::fabs(static_cast<double>(exact_score) - candidate.scores[pos]);
+            metrics.mean_abs_score_drift += drift;
+            metrics.max_abs_score_drift = std::max(metrics.max_abs_score_drift, drift);
+            ++drift_count;
+        }
+    }
+    metrics.recall_at_k = static_cast<double>(overlap) /
+        static_cast<double>(n_query * k);
+    metrics.mean_abs_score_drift /= static_cast<double>(drift_count);
+    return metrics;
+}
+
+QualityBenchResult run_quality_bench(
+        const char * name,
+        const std::vector<float> & vectors,
+        const std::vector<float> & queries,
+        const std::vector<Q4CalibrationMode> & q4_calibration_modes,
+        const BenchConfig & cfg) {
+    std::vector<uint64_t> ids(static_cast<size_t>(cfg.n_vec));
+    for (int i = 0; i < cfg.n_vec; ++i) {
+        ids[static_cast<size_t>(i)] = static_cast<uint64_t>(i) + 1;
+    }
+
+    ggml_vec_index_t * f32 = ggml_vec_index_create(cfg.dim, 32);
+    ggml_vec_index_t * q8 = ggml_vec_index_create(cfg.dim, 8);
+    ggml_vec_index_t * q4 = ggml_vec_index_create(cfg.dim, 4);
+    CHECK(f32 != nullptr);
+    CHECK(q8 != nullptr);
+    CHECK(q4 != nullptr);
+    CHECK(ggml_vec_index_add(f32, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add(q8, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add(q4, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
+
+    const TimedSearch f32_res = run_search(
+        f32, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    const TimedSearch q8_res = run_search(
+        q8, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    const TimedSearch q4_res = run_search(
+        q4, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+
+    QualityBenchResult result;
+    result.name = name;
+    result.q8 = quality_against(f32_res, q8_res, vectors, queries, cfg.n_query, cfg.k, cfg.dim);
+    result.q4 = quality_against(f32_res, q4_res, vectors, queries, cfg.n_query, cfg.k, cfg.dim);
+    result.q4_calibrated.reserve(q4_calibration_modes.size());
+    for (const Q4CalibrationMode & mode : q4_calibration_modes) {
+        const Q4SimulatedIndex sim = build_simulated_q4(vectors, cfg.n_vec, cfg.dim, mode);
+        const TimedSearch sim_res = run_simulated_q4_search(
+            sim, ids, queries, cfg.n_query, cfg.k);
+        result.q4_calibrated.push_back(
+            quality_against(f32_res, sim_res, vectors, queries, cfg.n_query, cfg.k, cfg.dim));
+    }
+
+    ggml_vec_index_free(f32);
+    ggml_vec_index_free(q8);
+    ggml_vec_index_free(q4);
+    return result;
 }
 
 struct DeltaBenchResult {
@@ -510,49 +824,6 @@ int main() {
         ggml_vec_index_filter_free(q8_filter);
     }
 
-    double q8_mean_abs_drift = 0.0;
-    double q8_max_abs_drift = 0.0;
-    double q4_mean_abs_drift = 0.0;
-    double q4_max_abs_drift = 0.0;
-    int q8_overlap = 0;
-    int q4_overlap = 0;
-    int drift_count = 0;
-
-    for (int q = 0; q < cfg.n_query; ++q) {
-        std::unordered_set<uint64_t> f32_topk;
-        for (int j = 0; j < cfg.k; ++j) {
-            f32_topk.insert(f32_res.ids[static_cast<size_t>(q) * cfg.k + j]);
-        }
-
-        const float * query = queries.data() + static_cast<size_t>(q) * static_cast<size_t>(cfg.dim);
-        for (int j = 0; j < cfg.k; ++j) {
-            const size_t pos = static_cast<size_t>(q) * static_cast<size_t>(cfg.k) + static_cast<size_t>(j);
-            const uint64_t id = q8_res.ids[pos];
-            if (f32_topk.count(id) != 0) {
-                ++q8_overlap;
-            }
-            const float exact = dot_exact(vectors, query, id, cfg.dim);
-            const double drift = std::fabs(static_cast<double>(exact) - q8_res.scores[pos]);
-            q8_mean_abs_drift += drift;
-            q8_max_abs_drift = std::max(q8_max_abs_drift, drift);
-
-            const uint64_t q4_id = q4_res.ids[pos];
-            if (f32_topk.count(q4_id) != 0) {
-                ++q4_overlap;
-            }
-            const float q4_exact = dot_exact(vectors, query, q4_id, cfg.dim);
-            const double q4_drift = std::fabs(static_cast<double>(q4_exact) - q4_res.scores[pos]);
-            q4_mean_abs_drift += q4_drift;
-            q4_max_abs_drift = std::max(q4_max_abs_drift, q4_drift);
-            ++drift_count;
-        }
-    }
-    q8_mean_abs_drift /= static_cast<double>(drift_count);
-    q4_mean_abs_drift /= static_cast<double>(drift_count);
-    const double q8_recall_at_k = static_cast<double>(q8_overlap) /
-                                  static_cast<double>(cfg.n_query * cfg.k);
-    const double q4_recall_at_k = static_cast<double>(q4_overlap) /
-                                  static_cast<double>(cfg.n_query * cfg.k);
     const double f32_ivf_recall_at_k =
         recall_against(f32_res, f32_ivf_res, cfg.n_query, cfg.k);
     const double q8_ivf_recall_at_k =
@@ -609,6 +880,33 @@ int main() {
     const DeleteBenchResult f32_delete = run_delete_bench(32, vectors, ids, queries, cfg);
     const DeleteBenchResult q8_delete = run_delete_bench(8, vectors, ids, queries, cfg);
     const DeleteBenchResult q4_delete = run_delete_bench(4, vectors, ids, queries, cfg);
+    const std::vector<Q4CalibrationMode> q4_calibration_modes = {
+        { "p99_abs", 0.99f, 0.0f },
+        { "p95_abs", 0.95f, 0.0f },
+        { "rms_3", 1.0f, 3.0f },
+    };
+    std::vector<QualityBenchResult> quality_suite;
+    quality_suite.push_back(run_quality_bench(
+        "normalized_gaussian", vectors, queries, q4_calibration_modes, cfg));
+    quality_suite.push_back(run_quality_bench(
+        "raw_gaussian",
+        make_gaussian_vectors(cfg.n_vec, cfg.dim, 0x12345678, false),
+        make_gaussian_vectors(cfg.n_query, cfg.dim, 0x87654321, false),
+        q4_calibration_modes,
+        cfg));
+    quality_suite.push_back(run_quality_bench(
+        "sparse_16",
+        make_sparse_vectors(cfg.n_vec, cfg.dim, 0x51a2b3c4, 16),
+        make_sparse_vectors(cfg.n_query, cfg.dim, 0x15a2b3c4, 16),
+        q4_calibration_modes,
+        cfg));
+    const std::vector<float> cluster_centers = make_cluster_centers(cfg.dim, 0x0ddc0ffe, 64);
+    quality_suite.push_back(run_quality_bench(
+        "clustered_64",
+        make_clustered_vectors(cfg.n_vec, cfg.dim, 0x0ddc0ffd, cluster_centers, 64),
+        make_clustered_vectors(cfg.n_query, cfg.dim, 0x0ddc0fff, cluster_centers, 64),
+        q4_calibration_modes,
+        cfg));
 
     const size_t f32_memory_bytes =
         static_cast<size_t>(cfg.n_vec) * static_cast<size_t>(cfg.dim) * sizeof(float) +
@@ -746,11 +1044,27 @@ int main() {
         q4_delete.compacted_search_ms,
         q4_delete.tombstone_search_ms / q4_delete.full_search_ms,
         q4_delete.compacted_search_ms / q4_delete.tombstone_search_ms);
-    std::printf("  quality q8:       recall@%d=%.4f mean_abs_score_drift=%.6f max_abs_score_drift=%.6f\n",
-        cfg.k, q8_recall_at_k, q8_mean_abs_drift, q8_max_abs_drift);
-    std::printf("  quality q4:       recall@%d=%.4f mean_abs_score_drift=%.6f max_abs_score_drift=%.6f\n",
-        cfg.k, q4_recall_at_k, q4_mean_abs_drift, q4_max_abs_drift);
-
+    for (const QualityBenchResult & quality : quality_suite) {
+        std::printf(
+            "  quality %-19s q8_recall=%.4f q8_mean_drift=%.6f q8_max_drift=%.6f q4_recall=%.4f q4_mean_drift=%.6f q4_max_drift=%.6f\n",
+            quality.name,
+            quality.q8.recall_at_k,
+            quality.q8.mean_abs_score_drift,
+            quality.q8.max_abs_score_drift,
+            quality.q4.recall_at_k,
+            quality.q4.mean_abs_score_drift,
+            quality.q4.max_abs_score_drift);
+        for (size_t i = 0; i < q4_calibration_modes.size(); ++i) {
+            const QualityMetrics & metrics = quality.q4_calibrated[i];
+            std::printf(
+                "  q4cal   %-19s mode=%-7s recall=%.4f mean_drift=%.6f max_drift=%.6f\n",
+                quality.name,
+                q4_calibration_modes[i].name,
+                metrics.recall_at_k,
+                metrics.mean_abs_score_drift,
+                metrics.max_abs_score_drift);
+        }
+    }
     ggml_vec_index_free(f32);
     ggml_vec_index_free(q8);
     ggml_vec_index_free(q4);
