@@ -4944,6 +4944,38 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
             opts += " -D FA_K_LDS_T";
         }
     }
+
+    // Flash attention relies on +/-INFINITY (the online-softmax init m_i =
+    // -INFINITY and the masking of padded/out-of-range scores), so the FA
+    // programs must NOT be built with the Inf-assuming fast-math flags used for
+    // the other kernels. Under -cl-finite-math-only / -cl-fast-relaxed-math /
+    // -cl-unsafe-math-optimizations the compiler assumes no Inf/NaN, which makes
+    // the init and masking path produce deterministically wrong results (e.g.
+    // the Qwen3-VL vision encoder loses semantics). Strip those flags here, the
+    // single choke point every FA variant is compiled through; -cl-mad-enable
+    // and the rest are kept for speed.
+    //
+    // Erase EVERY occurrence of each flag: the strip must not depend on a flag
+    // appearing exactly once or in a particular position. A surviving copy would
+    // silently rebuild FA with finite-math and reintroduce the -INFINITY
+    // miscompile this strip exists to prevent.
+    for (const char * unsafe_flag : { " -cl-fast-relaxed-math",
+                                      " -cl-finite-math-only",
+                                      " -cl-unsafe-math-optimizations" }) {
+        for (size_t pos = opts.find(unsafe_flag);
+             pos != std::string::npos;
+             pos = opts.find(unsafe_flag)) {
+            opts.erase(pos, std::string(unsafe_flag).size());
+        }
+    }
+    // Fail loudly if any Inf-assuming flag survived (e.g. a future change to the
+    // compile-opts spelling/spacing that the strip above misses), rather than
+    // shipping a silently miscompiled flash-attention kernel.
+    GGML_ASSERT(opts.find("finite-math")  == std::string::npos &&
+                opts.find("fast-relaxed") == std::string::npos &&
+                opts.find("unsafe-math")  == std::string::npos &&
+                "flash-attn kernels must not be built with finite-math/fast-math flags");
+
     return opts;
 }
 
