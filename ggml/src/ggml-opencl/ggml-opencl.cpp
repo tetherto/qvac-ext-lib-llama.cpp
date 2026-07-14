@@ -15498,10 +15498,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
 
     // Flash-Decoding K-split decision. Resolved here, before the prefill
     // prepass, because KV-pad and blk prepass are pure overhead when FD fires.
-    // Do not infer causality from tensor shapes: a NULL mask means full
-    // (bidirectional) attention, e.g. ViT encoders, where n_q == n_kv as well.
-    // Causal attention in llama.cpp always comes with an explicit KQ mask.
-    // Inferring is_causal here corrupted mmproj output on OpenCL (see #23800).
+    // A null mask means no masking, i.e. bidirectional attention (e.g. the
+    // SigLIP vision / embedding encoders). Causal attention always supplies an
+    // explicit causal mask in this codebase (llama-graph.cpp build_attn passes a
+    // kq_mask filled with -INFINITY), so a null mask must NOT be inferred as
+    // causal. The previous `mask == NULL && n_q == n_kv` heuristic wrongly made
+    // the bidirectional Qwen3-VL vision tower attend causally, corrupting the
+    // image embedding (each patch only saw earlier patches).
+    //
+    // INVARIANT: this backend treats a null mask as bidirectional. Any caller
+    // that needs causal masking MUST supply an explicit causal mask; relying on
+    // shape inference here will silently produce bidirectional (wrong) output.
+    // The q-chunking path below already GGML_ASSERTs is_causal == 0.
     const int is_causal = 0;
     const int fd_max_n_q = (d_head_q <= FD_MAX_DK_MULTI) ? FD_MAX_N_Q_MULTI : 1;
     cl_kernel fd_k_split = NULL;
