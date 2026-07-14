@@ -4,12 +4,16 @@
 //
 // This is the public C API for fabric's vector index. The implementation
 // under `ggml/src/ggml-vector-index.cpp` supports full f32 storage
-// (`bit_width=32`) and production q8 storage (`bit_width=8`) with CPU search
-// directly against quantized codes. ARM builds use NEON when available; x86
-// builds use AVX2 at runtime when supported.
+// (`bit_width=32`), production q8 storage (`bit_width=8`), and packed q4
+// storage (`bit_width=4`) with CPU search directly against quantized codes.
+// q8 uses NEON/AVX2 when available; q4 uses NEON when available.
 //
-// Threading: instances are NOT thread-safe. Callers must serialize access
-// to a given handle. Multiple handles can be used concurrently.
+// Threading: read-only APIs on the same handle can run concurrently. Mutations,
+// persistence writes, compaction, and IVF builds are serialized with reads and
+// with each other. The caller must still keep the handle alive for the duration
+// of every API call. Prepared filter handles must also remain alive for the
+// full duration of any `ggml_vec_index_search_prepared_filtered` call using
+// them; do not free a filter concurrently with a search that uses it.
 //
 // Endianness: persistence format is fixed little-endian.
 
@@ -24,6 +28,11 @@ extern "C" {
 // Opaque handle to a vector index instance.
 struct ggml_vec_index;
 typedef struct ggml_vec_index ggml_vec_index_t;
+
+// Prepared filtered-search handle. Valid only for the index generation it was
+// created from; any successful add/remove invalidates existing filters.
+struct ggml_vec_index_filter;
+typedef struct ggml_vec_index_filter ggml_vec_index_filter_t;
 
 // Error codes returned from int-valued APIs. 0 = OK. Negative = failure.
 // `_remove` is the exception: it returns 1 on removal and 0 on miss.
@@ -41,9 +50,9 @@ enum ggml_vec_index_error {
 
 // Lifecycle.
 //
-// `dim` must be > 0. `bit_width` must be 8 or 32. `bit_width=8` stores
-// per-vector symmetric q8 codes with one f32 scale per vector. `bit_width=32`
-// stores full f32 vectors. Returns NULL on bad args.
+// `dim` must be > 0. `bit_width` must be 4, 8, or 32. `bit_width=4` and
+// `bit_width=8` store per-vector symmetric quantized codes with one f32 scale
+// per vector. `bit_width=32` stores full f32 vectors. Returns NULL on bad args.
 GGML_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
 
 GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
@@ -66,12 +75,37 @@ GGML_API int ggml_vec_index_add(
 // negative on error.
 GGML_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
 
+// Logged mutations for incremental persistence. These update `idx` and append
+// a durable delta record to `delta_path`. Replay the log on top of a full .tvim
+// snapshot with `ggml_vec_index_load_with_delta`.
+GGML_API int ggml_vec_index_add_logged(
+    ggml_vec_index_t * idx,
+    const float      * vectors,
+    int                n,
+    const uint64_t   * ids,
+    const char       * delta_path);
+
+GGML_API int ggml_vec_index_remove_logged(
+    ggml_vec_index_t * idx,
+    uint64_t           id,
+    const char       * delta_path);
+
 // Returns 1 if the id is in the index, 0 otherwise. Read-only.
 GGML_API int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id);
 
 // Placeholder for cache warming / codebook resolution after a bulk add.
-// Currently a no-op.
+// Currently a no-op. Use `ggml_vec_index_build_ivf` to build ANN state.
 GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
+
+// Builds an in-memory IVF-flat approximate nearest-neighbor structure. This is
+// not persisted in .tvim files; call again after loading if ANN search is
+// needed. Successful add/remove calls invalidate the IVF structure.
+// `n_lists` is capped to the current index length. `n_iter` controls centroid
+// refinement; 0 uses deterministic initial centroids only.
+GGML_API int ggml_vec_index_build_ivf(
+    ggml_vec_index_t * idx,
+    int                n_lists,
+    int                n_iter);
 
 // Top-k search. `queries` is `n_q * dim` row-major. `out_scores` and
 // `out_ids` are caller-allocated buffers of size `n_q * k`. Each row is
@@ -81,8 +115,8 @@ GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // against the index (does not mutate state).
 //
 // Score semantics: dot product. For f32 storage this is a full-precision dot
-// product. For q8 storage, the query remains f32 and each indexed component is
-// scored as `q8_code * per_vector_scale` without expanding the stored matrix
+// product. For q4/q8 storage, the query remains f32 and each indexed component
+// is scored as `q_code * per_vector_scale` without expanding the stored matrix
 // back to f32. Callers that want cosine similarity must L2-normalize their
 // vectors before insert AND before query; the index does NOT normalize
 // internally. All query components must be finite.
@@ -91,6 +125,52 @@ GGML_API int ggml_vec_index_search(
     const float            * queries,
     int                      n_q,
     int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids);
+
+// Filtered top-k search. Only entries whose ids appear in `allowed_ids` are
+// considered. Missing ids are ignored; duplicate filter ids are treated once.
+// `allowed_ids` may be NULL only when `n_allowed == 0`, which produces only
+// sentinel results. The same filter is applied to every query row.
+GGML_API int ggml_vec_index_search_filtered(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    const uint64_t         * allowed_ids,
+    int                      n_allowed,
+    float                  * out_scores,
+    uint64_t               * out_ids);
+
+// Prepared filtered search. Creating a filter maps, sorts, and deduplicates
+// `allowed_ids` once, so callers can reuse it for repeated searches over the
+// same allowlist. Stale filters return GGML_VEC_INDEX_E_INVALID_ARG.
+GGML_API ggml_vec_index_filter_t * ggml_vec_index_filter_create(
+    const ggml_vec_index_t * idx,
+    const uint64_t         * allowed_ids,
+    int                      n_allowed);
+
+GGML_API void ggml_vec_index_filter_free(ggml_vec_index_filter_t * filter);
+
+GGML_API int ggml_vec_index_search_prepared_filtered(
+    const ggml_vec_index_t        * idx,
+    const ggml_vec_index_filter_t * filter,
+    const float                   * queries,
+    int                             n_q,
+    int                             k,
+    float                         * out_scores,
+    uint64_t                      * out_ids);
+
+// IVF-flat ANN top-k search. `ggml_vec_index_build_ivf` must have been called
+// after the most recent mutation. `nprobe` controls how many centroid lists are
+// searched; higher values improve recall and lower the latency win. If nprobe
+// is greater than the number of built lists, all lists are searched.
+GGML_API int ggml_vec_index_search_ivf(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    int                      nprobe,
     float                  * out_scores,
     uint64_t               * out_ids);
 
@@ -104,6 +184,19 @@ GGML_API int ggml_vec_index_write(
 // Returns NULL on failure.
 GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 
+// Loads a full .tvim snapshot and replays an append-only delta log. Missing
+// delta logs are treated as empty.
+GGML_API ggml_vec_index_t * ggml_vec_index_load_with_delta(
+    const char * snapshot_path,
+    const char * delta_path);
+
+// Compacts incremental persistence by writing a full snapshot and replacing
+// the delta log with an empty matching .tvid header.
+GGML_API int ggml_vec_index_compact_delta(
+    ggml_vec_index_t * idx,
+    const char       * snapshot_path,
+    const char       * delta_path);
+
 // Stats.
 GGML_API int ggml_vec_index_len(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_dim(const ggml_vec_index_t * idx);
@@ -115,21 +208,22 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 //   ------  -----  -------------------------------------------------------
 //   0       4      magic = "TVPI" (bytes 0x54, 0x56, 0x50, 0x49)
 //   4       1      version = 2
-//   5       1      bit_width (8 or 32)
-//   6       1      storage kind (1 = f32, 2 = q8)
+//   5       1      bit_width (4, 8, or 32)
+//   6       1      storage kind (1 = f32, 2 = q8, 3 = q4)
 //   7       1      flags (bit 0 = checksum trailer present)
 //   8       4      dim (uint32)
 //   12      4      n_vectors (uint32)
 //   16      4      qparam_type (0 = none, 1 = per-vector f32 scale)
 //   20      4      qparam_bytes_per_vector (0 or 4)
-//   24      4      bytes_per_component (1 or 4)
+//   24      4      bytes_per_component (0 for packed q4, 1 for q8, 4 for f32)
 //   28      4      reserved (zero)
 //   32      ...    qparams:
 //                    - f32: empty
-//                    - q8:  N float32 scales
+//                    - q4/q8: N float32 scales
 //   ...     ...    vectors:
 //                    - f32: N*D float32 values, row-major
 //                    - q8:  N*D int8 codes, row-major
+//                    - q4:  N*ceil(D/2) packed unsigned nibbles, row-major
 //   ...     N*8    ids (uint64)
 //   ...     4      header CRC32C, when flag bit 0 is set
 //   ...     4      qparams CRC32C, when flag bit 0 is set
@@ -138,13 +232,40 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 //
 // Where N = n_vectors and D = dim. q8 uses symmetric per-vector quantization:
 // scale = max(abs(v)) / 127, code = round(v / scale) clamped to [-127, 127].
-// Zero vectors use scale = 1 and all-zero codes. Each CRC32C covers exactly its
+// q4 uses scale = max(abs(v)) / 7, code = round(v / scale) clamped to [-7, 7],
+// stored as unsigned nibble `code + 8` (0 is invalid). Zero vectors use
+// scale = 1 and all-zero dequantized codes. Each CRC32C covers exactly its
 // corresponding serialized section; the header CRC covers bytes [0, 32), and
 // the CRC32C of an empty section is zero.
 // Legacy v2 files with flags=0 and no checksum trailer remain readable.
 // Writers emit checksummed v2 files. Readers reject unknown versions and v2
 // flag bits; they also accept legacy v1 f32 snapshots. Legacy bit_width=8
 // snapshots migrate to q8, while all other legacy widths migrate to f32.
+//
+// Delta log (.tvid version 1, all little-endian):
+//
+//   file header:
+//     0   4   magic = "TVDL"
+//     4   1   version = 1
+//     5   1   bit_width (4, 8, or 32)
+//     6   2   reserved (zero)
+//     8   4   dim (uint32)
+//     12  4   base snapshot state CRC32C
+//
+//   record header:
+//     0   1   op (1 = add, 2 = remove)
+//     1   3   reserved (zero)
+//     4   4   n (add count; remove uses 1)
+//     8   8   payload bytes
+//     16  4   CRC32C over record header bytes [0, 16), state CRC, and payload
+//     20  4   state CRC32C after applying this record
+//
+//   add payload:    N uint64 ids, then N*D float32 vectors
+//   remove payload: one uint64 id
+//
+// The base snapshot CRC binds the log to the snapshot state it extends. Record
+// state CRCs let loading validate the final replay state and recognize a
+// compacted snapshot when a process crashed before replacing the old delta log.
 
 #ifdef __cplusplus
 }

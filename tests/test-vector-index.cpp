@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
@@ -63,6 +65,25 @@ float q8_dot_reference(const std::vector<float> & vector, const std::vector<floa
     return acc;
 }
 
+float q4_dot_reference(const std::vector<float> & vector, const std::vector<float> & query) {
+    CHECK(vector.size() == query.size());
+
+    float max_abs = 0.0f;
+    for (float value : vector) {
+        max_abs = std::max(max_abs, std::fabs(value));
+    }
+    const float scale = max_abs == 0.0f ? 1.0f : max_abs / 7.0f;
+
+    float acc = 0.0f;
+    for (size_t i = 0; i < vector.size(); ++i) {
+        int code = max_abs == 0.0f ?
+            0 : static_cast<int>(std::nearbyint(vector[i] / scale));
+        code = std::max(-7, std::min(7, code));
+        acc += query[i] * (static_cast<float>(code) * scale);
+    }
+    return acc;
+}
+
 uint8_t read_file_byte(const std::string & path, std::streamoff offset) {
     std::ifstream f(path, std::ios::binary);
     CHECK(f.is_open());
@@ -87,6 +108,15 @@ std::vector<uint8_t> read_file_bytes(const std::string & path) {
 
 void write_file_bytes(const std::string & path, const std::vector<uint8_t> & bytes) {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    CHECK(f.is_open());
+    if (!bytes.empty()) {
+        f.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    CHECK(static_cast<bool>(f));
+}
+
+void append_file_bytes(const std::string & path, const std::vector<uint8_t> & bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::app);
     CHECK(f.is_open());
     if (!bytes.empty()) {
         f.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
@@ -227,6 +257,140 @@ int main() {
         CHECK(ggml_vec_index_contains(idx, new_id) == 0);
     }
 
+    // IVF-flat ANN search is explicit and stale builds are rejected.
+    {
+        auto * ann = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(ann != nullptr);
+        CHECK(ggml_vec_index_add(
+            ann, vecs.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+
+        const std::vector<float> query = normalize({0.9f, 0.3f, 0.1f, -0.2f});
+        std::array<float, 4> exact_scores{};
+        std::array<float, 4> ann_scores{};
+        std::array<uint64_t, 4> exact_ids{};
+        std::array<uint64_t, 4> ann_ids{};
+
+        CHECK(ggml_vec_index_search_ivf(
+            ann, query.data(), 1, /*k=*/1, /*nprobe=*/1,
+            ann_scores.data(), ann_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_build_ivf(ann, /*n_lists=*/0, /*n_iter=*/1)
+              == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_build_ivf(ann, /*n_lists=*/16, /*n_iter=*/3)
+              == GGML_VEC_INDEX_OK);
+
+        CHECK(ggml_vec_index_search(
+            ann, query.data(), 1, /*k=*/4,
+            exact_scores.data(), exact_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_ivf(
+            ann, query.data(), 1, /*k=*/4, /*nprobe=*/16,
+            ann_scores.data(), ann_ids.data()) == GGML_VEC_INDEX_OK);
+        for (int i = 0; i < 4; ++i) {
+            CHECK(ann_ids[i] == exact_ids[i]);
+            CHECK(std::fabs(ann_scores[i] - exact_scores[i]) < 1e-5f);
+        }
+
+        CHECK(ggml_vec_index_search_ivf(
+            ann, seeds[0].data(), 1, /*k=*/1, /*nprobe=*/1,
+            ann_scores.data(), ann_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ann_ids[0] == ids[0]);
+
+        const uint64_t ann_new_id = 9999991ULL;
+        CHECK(ggml_vec_index_add(ann, seeds[3].data(), 1, &ann_new_id)
+              == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_ivf(
+            ann, query.data(), 1, /*k=*/1, /*nprobe=*/1,
+            ann_scores.data(), ann_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+        CHECK(ggml_vec_index_build_ivf(ann, /*n_lists=*/16, /*n_iter=*/3)
+              == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_ivf(
+            ann, query.data(), 1, /*k=*/1, /*nprobe=*/16,
+            ann_scores.data(), ann_ids.data()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(ann);
+    }
+
+    // Read-only APIs on one handle can run concurrently.
+    {
+        constexpr int n_rows = 16;
+        std::vector<float> rows;
+        std::vector<uint64_t> row_ids;
+        rows.reserve(static_cast<size_t>(n_rows) * kDim);
+        row_ids.reserve(n_rows);
+        for (int row = 0; row < n_rows; ++row) {
+            const std::vector<float> v = normalize({
+                static_cast<float>((row % 5) - 2),
+                static_cast<float>(((row + 1) % 7) - 3),
+                static_cast<float>(((row * 3) % 11) - 5),
+                1.0f,
+            });
+            rows.insert(rows.end(), v.begin(), v.end());
+            row_ids.push_back(static_cast<uint64_t>(7000 + row));
+        }
+
+        auto * concurrent = ggml_vec_index_create(kDim, /*bit_width=*/8);
+        CHECK(concurrent != nullptr);
+        CHECK(ggml_vec_index_add(concurrent, rows.data(), n_rows, row_ids.data())
+              == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_build_ivf(concurrent, /*n_lists=*/4, /*n_iter=*/2)
+              == GGML_VEC_INDEX_OK);
+
+        const std::array<uint64_t, 5> allowed = {
+            row_ids[0], row_ids[2], row_ids[4], row_ids[6], row_ids[8],
+        };
+        ggml_vec_index_filter_t * filter = ggml_vec_index_filter_create(
+            concurrent, allowed.data(), static_cast<int>(allowed.size()));
+        CHECK(filter != nullptr);
+
+        std::atomic<int> ready{ 0 };
+        std::atomic<bool> start{ false };
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 8; ++t) {
+            threads.emplace_back([&, t]() {
+                std::array<float, 4> query = {
+                    rows[static_cast<size_t>((t % n_rows) * kDim + 0)],
+                    rows[static_cast<size_t>((t % n_rows) * kDim + 1)],
+                    rows[static_cast<size_t>((t % n_rows) * kDim + 2)],
+                    rows[static_cast<size_t>((t % n_rows) * kDim + 3)],
+                };
+                std::array<float, 3> scores{};
+                std::array<uint64_t, 3> out_ids{};
+                ready.fetch_add(1);
+                while (!start.load()) {
+                    std::this_thread::yield();
+                }
+                for (int iter = 0; iter < 200; ++iter) {
+                    CHECK(ggml_vec_index_search(
+                        concurrent, query.data(), 1, /*k=*/3,
+                        scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(ggml_vec_index_search_filtered(
+                        concurrent, query.data(), 1, /*k=*/3,
+                        allowed.data(), static_cast<int>(allowed.size()),
+                        scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(ggml_vec_index_search_prepared_filtered(
+                        concurrent, filter, query.data(), 1, /*k=*/3,
+                        scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(ggml_vec_index_search_ivf(
+                        concurrent, query.data(), 1, /*k=*/3, /*nprobe=*/4,
+                        scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(ggml_vec_index_contains(concurrent, row_ids[static_cast<size_t>(t % n_rows)]) == 1);
+                    CHECK(ggml_vec_index_len(concurrent) == n_rows);
+                    CHECK(ggml_vec_index_dim(concurrent) == kDim);
+                    CHECK(ggml_vec_index_bit_width(concurrent) == 8);
+                }
+            });
+        }
+        while (ready.load() != 8) {
+            std::this_thread::yield();
+        }
+        start.store(true);
+        for (std::thread & thread : threads) {
+            thread.join();
+        }
+
+        ggml_vec_index_filter_free(filter);
+        ggml_vec_index_free(concurrent);
+    }
+
     // Top-1 of querying with each unit vector should retrieve itself with
     // score very close to 1.0 (full f32, no quantization noise).
     {
@@ -254,6 +418,83 @@ int main() {
             CHECK(scores[i] == -FLT_MAX);
             CHECK(out_ids[i] == UINT64_MAX);
         }
+    }
+
+    // Filtered search only considers ids present in the allowlist. Missing
+    // and duplicate filter ids do not produce duplicate result rows.
+    {
+        const uint64_t missing_id = (1ULL << 60) + 99ULL;
+        const std::array<uint64_t, 4> allowed = {
+            ids[2], missing_id, ids[0], ids[0],
+        };
+        std::array<float, 3> scores{};
+        std::array<uint64_t, 3> out_ids{};
+        CHECK(ggml_vec_index_search_filtered(
+            idx, seeds[0].data(), 1, /*k=*/3,
+            allowed.data(), static_cast<int>(allowed.size()),
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == ids[0]);
+        CHECK(out_ids[1] == ids[2]);
+        CHECK(out_ids[2] == UINT64_MAX);
+        CHECK(scores[2] == -FLT_MAX);
+
+        CHECK(ggml_vec_index_search_filtered(
+            idx, seeds[0].data(), 1, /*k=*/2,
+            nullptr, /*n_allowed=*/0,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == UINT64_MAX);
+        CHECK(out_ids[1] == UINT64_MAX);
+        CHECK(scores[0] == -FLT_MAX);
+        CHECK(scores[1] == -FLT_MAX);
+
+        CHECK(ggml_vec_index_search_filtered(
+            idx, seeds[0].data(), 1, /*k=*/1,
+            nullptr, /*n_allowed=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+        auto * filter = ggml_vec_index_filter_create(
+            idx, allowed.data(), static_cast<int>(allowed.size()));
+        CHECK(filter != nullptr);
+        scores = {};
+        out_ids = {};
+        CHECK(ggml_vec_index_search_prepared_filtered(
+            idx, filter, seeds[0].data(), 1, /*k=*/3,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == ids[0]);
+        CHECK(out_ids[1] == ids[2]);
+        CHECK(out_ids[2] == UINT64_MAX);
+        CHECK(scores[2] == -FLT_MAX);
+        ggml_vec_index_filter_free(filter);
+
+        auto * empty_filter = ggml_vec_index_filter_create(
+            idx, nullptr, /*n_allowed=*/0);
+        CHECK(empty_filter != nullptr);
+        CHECK(ggml_vec_index_search_prepared_filtered(
+            idx, empty_filter, seeds[0].data(), 1, /*k=*/2,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == UINT64_MAX);
+        CHECK(out_ids[1] == UINT64_MAX);
+        CHECK(scores[0] == -FLT_MAX);
+        CHECK(scores[1] == -FLT_MAX);
+        ggml_vec_index_filter_free(empty_filter);
+
+        CHECK(ggml_vec_index_filter_create(
+            idx, nullptr, /*n_allowed=*/1) == nullptr);
+        CHECK(ggml_vec_index_search_prepared_filtered(
+            idx, nullptr, seeds[0].data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+        auto * stale_filter = ggml_vec_index_filter_create(
+            idx, allowed.data(), static_cast<int>(allowed.size()));
+        CHECK(stale_filter != nullptr);
+        const uint64_t stale_new_id = (1ULL << 60) + 100ULL;
+        CHECK(ggml_vec_index_add(
+            idx, seeds[3].data(), 1, &stale_new_id) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_prepared_filtered(
+            idx, stale_filter, seeds[0].data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove(idx, stale_new_id) == 1);
+        ggml_vec_index_filter_free(stale_filter);
     }
 
     // Remove + search: the removed id must no longer surface.
@@ -312,7 +553,152 @@ int main() {
     ggml_vec_index_free(loaded);
     std::filesystem::remove(path);
 
-    // v1 f32 snapshots migrate into current f32 or q8 storage.
+    // Incremental persistence: replay add/remove deltas on top of a snapshot.
+    {
+        const std::string snapshot_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-delta-base.tvim").string();
+        const std::string delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-delta-log.tvid").string();
+        const std::string missing_delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-missing-delta-log.tvid").string();
+        const std::string mismatched_snapshot_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-delta-mismatch.tvim").string();
+        const std::string corrupt_delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-delta-corrupt.tvid").string();
+        std::filesystem::remove(snapshot_path);
+        std::filesystem::remove(delta_path);
+        std::filesystem::remove(missing_delta_path);
+        std::filesystem::remove(mismatched_snapshot_path);
+        std::filesystem::remove(corrupt_delta_path);
+
+        auto * base = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(base != nullptr);
+        std::vector<float> base_vecs;
+        base_vecs.insert(base_vecs.end(), seeds[0].begin(), seeds[0].end());
+        base_vecs.insert(base_vecs.end(), seeds[1].begin(), seeds[1].end());
+        CHECK(ggml_vec_index_add(base, base_vecs.data(), 2, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(base, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+
+        auto * base_only = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), missing_delta_path.c_str());
+        CHECK(base_only != nullptr);
+        CHECK(ggml_vec_index_len(base_only) == 2);
+        ggml_vec_index_free(base_only);
+
+        const uint64_t delta_id = (1ULL << 41) + 7ULL;
+        CHECK(ggml_vec_index_add_logged(
+            base, seeds[2].data(), 1, &delta_id, delta_path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_remove_logged(
+            base, ids[0], delta_path.c_str()) == 1);
+        CHECK(ggml_vec_index_add_logged(
+            base, seeds[2].data(), 1, &delta_id, delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_DUPLICATE);
+
+        auto * replayed = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(replayed != nullptr);
+        CHECK(ggml_vec_index_len(replayed) == 2);
+        CHECK(ggml_vec_index_contains(replayed, ids[0]) == 0);
+        CHECK(ggml_vec_index_contains(replayed, ids[1]) == 1);
+        CHECK(ggml_vec_index_contains(replayed, delta_id) == 1);
+
+        std::array<float, 2> scores{};
+        std::array<uint64_t, 2> out_ids{};
+        CHECK(ggml_vec_index_search(
+            replayed, seeds[2].data(), 1, /*k=*/2,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == delta_id);
+
+        std::vector<uint8_t> corrupt_delta = read_file_bytes(delta_path);
+        corrupt_delta[16 + 20] ^= 1; // state CRC is covered by record CRC
+        write_file_bytes(corrupt_delta_path, corrupt_delta);
+        auto * corrupt_delta_loaded = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), corrupt_delta_path.c_str());
+        CHECK(corrupt_delta_loaded == nullptr);
+        ggml_vec_index_free(corrupt_delta_loaded);
+
+        auto * mismatch = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(mismatch != nullptr);
+        std::vector<float> mismatch_vecs;
+        mismatch_vecs.insert(mismatch_vecs.end(), seeds[0].begin(), seeds[0].end());
+        mismatch_vecs.insert(mismatch_vecs.end(), seeds[3].begin(), seeds[3].end());
+        CHECK(ggml_vec_index_add(
+            mismatch, mismatch_vecs.data(), 2, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(
+            mismatch, mismatched_snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * mismatch_loaded = ggml_vec_index_load_with_delta(
+            mismatched_snapshot_path.c_str(), delta_path.c_str());
+        CHECK(mismatch_loaded == nullptr);
+        ggml_vec_index_free(mismatch_loaded);
+        const uint64_t mismatch_new_id = (1ULL << 41) + 9ULL;
+        CHECK(ggml_vec_index_add_logged(
+            mismatch, seeds[2].data(), 1, &mismatch_new_id, delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_IO);
+        CHECK(ggml_vec_index_contains(mismatch, mismatch_new_id) == 0);
+        ggml_vec_index_free(mismatch);
+
+        const std::vector<uint8_t> pre_compact_delta = read_file_bytes(delta_path);
+        CHECK(ggml_vec_index_compact_delta(
+            base, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(std::filesystem::file_size(delta_path) == 16);
+
+        auto * compacted = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(compacted != nullptr);
+        CHECK(ggml_vec_index_len(compacted) == 2);
+        CHECK(ggml_vec_index_contains(compacted, ids[0]) == 0);
+        CHECK(ggml_vec_index_contains(compacted, ids[1]) == 1);
+        CHECK(ggml_vec_index_contains(compacted, delta_id) == 1);
+        ggml_vec_index_free(compacted);
+
+        // Crash window: the compacted snapshot is durable but the old log
+        // survived. Replay must remain idempotent.
+        write_file_bytes(delta_path, pre_compact_delta);
+        auto * compacted_with_old_log = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(compacted_with_old_log != nullptr);
+        CHECK(ggml_vec_index_len(compacted_with_old_log) == 2);
+        CHECK(ggml_vec_index_contains(compacted_with_old_log, ids[0]) == 0);
+        CHECK(ggml_vec_index_contains(compacted_with_old_log, ids[1]) == 1);
+        CHECK(ggml_vec_index_contains(compacted_with_old_log, delta_id) == 1);
+        ggml_vec_index_free(compacted_with_old_log);
+
+        CHECK(ggml_vec_index_compact_delta(
+            base, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_OK);
+        const uint64_t post_compact_id = (1ULL << 41) + 8ULL;
+        CHECK(ggml_vec_index_add_logged(
+            base, seeds[3].data(), 1, &post_compact_id, delta_path.c_str()) ==
+            GGML_VEC_INDEX_OK);
+        auto * replayed_after_compact = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(replayed_after_compact != nullptr);
+        CHECK(ggml_vec_index_len(replayed_after_compact) == 3);
+        CHECK(ggml_vec_index_contains(replayed_after_compact, post_compact_id) == 1);
+        ggml_vec_index_free(replayed_after_compact);
+
+        append_file_bytes(delta_path, { 0x01, 0x00, 0x00 });
+        auto * replayed_with_torn_tail = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(replayed_with_torn_tail != nullptr);
+        CHECK(ggml_vec_index_contains(replayed_with_torn_tail, delta_id) == 1);
+        CHECK(ggml_vec_index_contains(replayed_with_torn_tail, post_compact_id) == 1);
+
+        ggml_vec_index_free(replayed_with_torn_tail);
+        ggml_vec_index_free(replayed);
+        ggml_vec_index_free(base);
+        std::filesystem::remove(snapshot_path);
+        std::filesystem::remove(delta_path);
+        std::filesystem::remove(mismatched_snapshot_path);
+        std::filesystem::remove(corrupt_delta_path);
+    }
+
+    // v1 f32 snapshots migrate to q8 only for legacy bit_width=8; other
+    // legacy widths, including bit_width=4, migrate to f32.
     {
         const std::vector<uint64_t> v1_ids = {
             (1ULL << 37) + 1ULL,
@@ -417,6 +803,160 @@ int main() {
         ggml_vec_index_free(overflow_idx);
     }
 
+    // q4 production path: packed nibbles with one f32 scale per vector.
+    {
+        constexpr int tail_dim = 13;
+        const std::vector<float> tail_vector = {
+            -1.0f, 0.75f, -0.5f, 0.25f, 0.125f, -0.875f, 0.625f,
+            -0.375f, 0.9f, -0.7f, 0.3f, -0.2f, 0.05f,
+        };
+        const std::vector<float> tail_query = {
+            0.2f, -0.4f, 0.6f, -0.8f, 1.0f, 0.3f, -0.5f,
+            0.7f, -0.9f, 0.11f, -0.22f, 0.33f, -0.44f,
+        };
+        const uint64_t q4_id = (1ULL << 55) + 654ULL;
+
+        auto * q4 = ggml_vec_index_create(tail_dim, /*bit_width=*/4);
+        CHECK(q4 != nullptr);
+        CHECK(ggml_vec_index_bit_width(q4) == 4);
+        CHECK(ggml_vec_index_add(q4, tail_vector.data(), 1, &q4_id) == GGML_VEC_INDEX_OK);
+
+        std::array<float, 2> scores{};
+        std::array<uint64_t, 2> out_ids{};
+        CHECK(ggml_vec_index_search(
+            q4, tail_query.data(), 1, /*k=*/2,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == q4_id);
+        CHECK(out_ids[1] == UINT64_MAX);
+        CHECK(scores[1] == -FLT_MAX);
+
+        const float expected = q4_dot_reference(tail_vector, tail_query);
+        const float tolerance = 1e-5f * std::max(1.0f, std::fabs(expected));
+        CHECK(std::fabs(scores[0] - expected) <= tolerance);
+
+        const std::string q4_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-q4-test.tvim").string();
+        const std::string corrupt_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-q4-corrupt-test.tvim").string();
+        CHECK(ggml_vec_index_write(q4, q4_path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(read_file_byte(q4_path, 4) == 2); // .tvim v2
+        CHECK(read_file_byte(q4_path, 5) == 4); // q4 bit width
+        CHECK(read_file_byte(q4_path, 6) == 3); // q4 storage kind
+        CHECK(read_file_byte(q4_path, 24) == 0); // packed components
+
+        auto * q4_loaded = ggml_vec_index_load(q4_path.c_str());
+        CHECK(q4_loaded != nullptr);
+        CHECK(ggml_vec_index_bit_width(q4_loaded) == 4);
+        CHECK(ggml_vec_index_len(q4_loaded) == 1);
+        scores = {};
+        out_ids = {};
+        CHECK(ggml_vec_index_search(
+            q4_loaded, tail_query.data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == q4_id);
+        CHECK(std::fabs(scores[0] - expected) <= tolerance);
+
+        constexpr size_t q4_vector_offset = 32 + sizeof(float);
+        constexpr size_t q4_row_bytes = (tail_dim + 1) / 2;
+        expect_corrupt_load_fails(q4_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            bytes[q4_vector_offset] =
+                static_cast<uint8_t>(bytes[q4_vector_offset] & 0xf0u); // low nibble 0 is invalid
+        });
+        expect_corrupt_load_fails(q4_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+            const size_t tail_byte = q4_vector_offset + q4_row_bytes - 1;
+            bytes[tail_byte] =
+                static_cast<uint8_t>((bytes[tail_byte] & 0x0fu) | 0x90u); // odd tail high nibble must be zero-code
+        });
+
+        ggml_vec_index_free(q4_loaded);
+        ggml_vec_index_free(q4);
+        std::filesystem::remove(q4_path);
+    }
+
+    // q4 parity for a dimension that exercises the optimized loop and tail.
+    {
+        constexpr int q4_dim = 33;
+        std::vector<float> q4_vector(q4_dim);
+        std::vector<float> q4_query(q4_dim);
+        for (int i = 0; i < q4_dim; ++i) {
+            q4_vector[static_cast<size_t>(i)] =
+                static_cast<float>((i % 11) - 5) / 5.0f;
+            q4_query[static_cast<size_t>(i)] =
+                static_cast<float>(((i * 7) % 13) - 6) / 7.0f;
+        }
+        const uint64_t q4_id = (1ULL << 56) + 123ULL;
+        auto * q4 = ggml_vec_index_create(q4_dim, /*bit_width=*/4);
+        CHECK(q4 != nullptr);
+        CHECK(ggml_vec_index_add(q4, q4_vector.data(), 1, &q4_id) == GGML_VEC_INDEX_OK);
+
+        std::array<float, 1> scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(
+            q4, q4_query.data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == q4_id);
+
+        const float expected = q4_dot_reference(q4_vector, q4_query);
+        const float tolerance = 1e-5f * std::max(1.0f, std::fabs(expected));
+        CHECK(std::fabs(scores[0] - expected) <= tolerance);
+        ggml_vec_index_free(q4);
+    }
+
+    // Delta replay keeps q8 storage q8 and reuses the normal q8 quantization path.
+    {
+        const std::string snapshot_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-q8-delta-base.tvim").string();
+        const std::string delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-q8-delta-log.tvid").string();
+        std::filesystem::remove(snapshot_path);
+        std::filesystem::remove(delta_path);
+
+        const uint64_t base_id = (1ULL << 42) + 1ULL;
+        const uint64_t delta_id = (1ULL << 42) + 2ULL;
+        auto * q8_delta = ggml_vec_index_create(kDim, /*bit_width=*/8);
+        CHECK(q8_delta != nullptr);
+        CHECK(ggml_vec_index_add(
+            q8_delta, seeds[0].data(), 1, &base_id) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(q8_delta, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add_logged(
+            q8_delta, seeds[3].data(), 1, &delta_id, delta_path.c_str()) ==
+            GGML_VEC_INDEX_OK);
+
+        auto * replayed_q8 = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(replayed_q8 != nullptr);
+        CHECK(ggml_vec_index_bit_width(replayed_q8) == 8);
+        CHECK(ggml_vec_index_len(replayed_q8) == 2);
+
+        std::array<float, 1> scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(
+            replayed_q8, seeds[3].data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == delta_id);
+        CHECK(std::fabs(scores[0] - 1.0f) < 1e-5f);
+
+        CHECK(ggml_vec_index_compact_delta(
+            q8_delta, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(std::filesystem::file_size(delta_path) == 16);
+        auto * compacted_q8 = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(compacted_q8 != nullptr);
+        CHECK(ggml_vec_index_bit_width(compacted_q8) == 8);
+        CHECK(ggml_vec_index_len(compacted_q8) == 2);
+        CHECK(ggml_vec_index_contains(compacted_q8, delta_id) == 1);
+
+        ggml_vec_index_free(compacted_q8);
+        ggml_vec_index_free(replayed_q8);
+        ggml_vec_index_free(q8_delta);
+        std::filesystem::remove(snapshot_path);
+        std::filesystem::remove(delta_path);
+    }
+
     // Header metadata is protected even when all payload sections are empty.
     {
         auto * empty_idx = ggml_vec_index_create(kDim, /*bit_width=*/8);
@@ -464,6 +1004,46 @@ int main() {
         CHECK(out_ids[2] == UINT64_MAX);
         CHECK(scores[3] == -FLT_MAX);
         CHECK(out_ids[3] == UINT64_MAX);
+
+        const uint64_t q8_missing_id = (1ULL << 59) + 17ULL;
+        const std::array<uint64_t, 3> q8_allowed = {
+            q8_missing_id, q8_ids[0], q8_ids[0],
+        };
+        scores = {};
+        out_ids = {};
+        CHECK(ggml_vec_index_search_filtered(
+            q8, seeds[2].data(), 1, /*k=*/3,
+            q8_allowed.data(), static_cast<int>(q8_allowed.size()),
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == q8_ids[0]);
+        CHECK(out_ids[1] == UINT64_MAX);
+        CHECK(out_ids[2] == UINT64_MAX);
+        CHECK(scores[1] == -FLT_MAX);
+        CHECK(scores[2] == -FLT_MAX);
+
+        CHECK(ggml_vec_index_search_filtered(
+            q8, seeds[2].data(), 1, /*k=*/2,
+            nullptr, /*n_allowed=*/0,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == UINT64_MAX);
+        CHECK(out_ids[1] == UINT64_MAX);
+        CHECK(scores[0] == -FLT_MAX);
+        CHECK(scores[1] == -FLT_MAX);
+
+        auto * q8_filter = ggml_vec_index_filter_create(
+            q8, q8_allowed.data(), static_cast<int>(q8_allowed.size()));
+        CHECK(q8_filter != nullptr);
+        scores = {};
+        out_ids = {};
+        CHECK(ggml_vec_index_search_prepared_filtered(
+            q8, q8_filter, seeds[2].data(), 1, /*k=*/3,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == q8_ids[0]);
+        CHECK(out_ids[1] == UINT64_MAX);
+        CHECK(out_ids[2] == UINT64_MAX);
+        CHECK(scores[1] == -FLT_MAX);
+        CHECK(scores[2] == -FLT_MAX);
+        ggml_vec_index_filter_free(q8_filter);
 
         const auto q8_tmp = std::filesystem::temp_directory_path() /
                             "ggml-vector-index-q8-test.tvim";

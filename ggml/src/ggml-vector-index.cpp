@@ -25,8 +25,10 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <queue>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -81,12 +83,19 @@ constexpr uint8_t  kTvimVersionV1  = 1;
 constexpr uint8_t  kTvimVersion    = 2;
 constexpr uint8_t  kStorageF32     = 1;
 constexpr uint8_t  kStorageQ8      = 2;
+constexpr uint8_t  kStorageQ4      = 3;
 constexpr uint8_t  kFlagCRC32C     = 1;
 constexpr uint32_t kQParamNone     = 0;
 constexpr uint32_t kQParamScaleF32 = 1;
 constexpr size_t   kTvimV1HeaderSize = 16;
 constexpr size_t   kTvimHeaderSize = 32;
 constexpr size_t   kTvimChecksumSize = 16;
+constexpr uint8_t  kTvidMagic[4]   = { 'T', 'V', 'D', 'L' };
+constexpr uint8_t  kTvidVersion    = 1;
+constexpr uint8_t  kTvidOpAdd      = 1;
+constexpr uint8_t  kTvidOpRemove   = 2;
+constexpr size_t   kTvidHeaderSize = 16;
+constexpr size_t   kTvidRecordHeaderSize = 24;
 
 static_assert(sizeof(float) == sizeof(uint32_t), "ggml-vector-index requires float32");
 
@@ -263,7 +272,7 @@ struct MinHeapCmp {
 };
 
 bool is_supported_bit_width(int bit_width) {
-    return bit_width == 8 || bit_width == 32;
+    return bit_width == 4 || bit_width == 8 || bit_width == 32;
 }
 
 bool all_finite(const float * values, size_t n) {
@@ -302,9 +311,20 @@ bool expected_file_size(
     uint64_t components = 0;
     uint64_t ids = 0;
     uint64_t total = header_size;
+    if (component_bytes == 0) {
+        uint64_t row_bytes = 0;
+        if (!checked_add_u64(dim, 1, row_bytes)) {
+            return false;
+        }
+        row_bytes /= 2;
+        if (!checked_mul_u64(n, row_bytes, components)) {
+            return false;
+        }
+    } else if (!checked_mul_u64(n, dim, components) ||
+               !checked_mul_u64(components, component_bytes, components)) {
+        return false;
+    }
     if (!checked_mul_u64(n, qparam_bytes, qparams) ||
-        !checked_mul_u64(n, dim, components) ||
-        !checked_mul_u64(components, component_bytes, components) ||
         !checked_mul_u64(n, sizeof(uint64_t), ids) ||
         !checked_add_u64(total, qparams, total) ||
         !checked_add_u64(total, components, total) ||
@@ -508,8 +528,11 @@ void ggml_vec_index_test_set_write_fail_after(int64_t bytes) {
 // Lifetime-managed instance state. Lives behind the opaque
 // `ggml_vec_index_t` typedef.
 struct ggml_vec_index {
+    mutable std::shared_mutex mutex;
+
     int dim       = 0;
     int bit_width = 32;
+    uint64_t generation = 0;
 
     // Flat row-major f32 storage for bit_width=32.
     std::vector<float> data;
@@ -518,19 +541,63 @@ struct ggml_vec_index {
     std::vector<int8_t> q8_data;
     std::vector<float>  q8_scale;
 
+    // Packed row-major q4 storage for bit_width=4 plus one scale per vector.
+    std::vector<uint8_t> q4_data;
+    std::vector<float>   q4_scale;
+
     // slot -> external id (parallel to logical slot index).
     std::vector<uint64_t> slot_to_id;
 
     // external id -> slot.
     std::unordered_map<uint64_t, size_t> id_to_slot;
+
+    // In-memory IVF-flat ANN structure. Rebuilt explicitly after mutations.
+    uint64_t ivf_generation = std::numeric_limits<uint64_t>::max();
+    int ivf_n_lists = 0;
+    std::vector<float> ivf_centroids;
+    std::vector<std::vector<size_t>> ivf_lists;
 };
+
+struct ggml_vec_index_filter {
+    int dim = 0;
+    int bit_width = 32;
+    uint64_t generation = 0;
+    std::vector<size_t> slots;
+};
+
+static void invalidate_ivf(ggml_vec_index & idx) {
+    idx.ivf_generation = std::numeric_limits<uint64_t>::max();
+    idx.ivf_n_lists = 0;
+    idx.ivf_centroids.clear();
+    idx.ivf_lists.clear();
+}
 
 static bool is_q8(const ggml_vec_index & idx) {
     return idx.bit_width == 8;
 }
 
+static bool is_q4(const ggml_vec_index & idx) {
+    return idx.bit_width == 4;
+}
+
+static bool is_quantized(const ggml_vec_index & idx) {
+    return is_q4(idx) || is_q8(idx);
+}
+
 static uint8_t storage_kind(const ggml_vec_index & idx) {
-    return is_q8(idx) ? kStorageQ8 : kStorageF32;
+    return is_q4(idx) ? kStorageQ4 : (is_q8(idx) ? kStorageQ8 : kStorageF32);
+}
+
+static size_t q4_row_bytes(size_t dim) {
+    return (dim + 1) / 2;
+}
+
+static uint8_t q4_encode(int q) {
+    return static_cast<uint8_t>(q + 8);
+}
+
+static int q4_decode(uint8_t nibble) {
+    return static_cast<int>(nibble) - 8;
 }
 
 static void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
@@ -556,6 +623,515 @@ static void quantize_q8_row(const float * src, int8_t * dst, int dim, float & sc
         dst[i] = static_cast<int8_t>(q);
     }
 }
+
+static void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < dim; ++i) {
+        max_abs = std::max(max_abs, std::fabs(src[i]));
+    }
+
+    std::memset(dst, 0x88, q4_row_bytes(static_cast<size_t>(dim)));
+    if (max_abs == 0.0f) {
+        scale = 1.0f;
+        return;
+    }
+
+    scale = max_abs / 7.0f;
+    if (scale == 0.0f) {
+        scale = max_abs;
+    }
+    for (int i = 0; i < dim; ++i) {
+        const float scaled = src[i] / scale;
+        int q = static_cast<int>(std::nearbyint(scaled));
+        q = std::max(-7, std::min(7, q));
+        const uint8_t code = q4_encode(q);
+        uint8_t & byte = dst[static_cast<size_t>(i) / 2];
+        if ((i & 1) == 0) {
+            byte = static_cast<uint8_t>((byte & 0xf0u) | code);
+        } else {
+            byte = static_cast<uint8_t>((byte & 0x0fu) | (code << 4));
+        }
+    }
+}
+
+namespace {
+
+uint32_t crc32c_update_u32(uint32_t crc, uint32_t v) {
+    uint8_t bytes[4];
+    put_u32_le(bytes, v);
+    return crc32c_update(crc, bytes, sizeof(bytes));
+}
+
+uint32_t crc32c_update_u64(uint32_t crc, uint64_t v) {
+    uint8_t bytes[8];
+    put_u64_le(bytes, v);
+    return crc32c_update(crc, bytes, sizeof(bytes));
+}
+
+uint32_t index_state_crc32c(const ggml_vec_index & idx) {
+    uint32_t crc = 0xffffffffu;
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(idx.dim));
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(idx.bit_width));
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(storage_kind(idx)));
+    crc = crc32c_update_u64(crc, static_cast<uint64_t>(idx.slot_to_id.size()));
+    if (is_q4(idx)) {
+        for (float scale : idx.q4_scale) {
+            crc = crc32c_update_u32(crc, float_to_u32(scale));
+        }
+        if (!idx.q4_data.empty()) {
+            crc = crc32c_update(crc, idx.q4_data.data(), idx.q4_data.size());
+        }
+    } else if (is_q8(idx)) {
+        for (float scale : idx.q8_scale) {
+            crc = crc32c_update_u32(crc, float_to_u32(scale));
+        }
+        if (!idx.q8_data.empty()) {
+            crc = crc32c_update(crc, idx.q8_data.data(), idx.q8_data.size());
+        }
+    } else {
+        for (float v : idx.data) {
+            crc = crc32c_update_u32(crc, float_to_u32(v));
+        }
+    }
+    for (uint64_t id : idx.slot_to_id) {
+        crc = crc32c_update_u64(crc, id);
+    }
+    return crc ^ 0xffffffffu;
+}
+
+uint32_t index_state_crc32c_after_remove(const ggml_vec_index & idx, uint64_t id) {
+    const auto it = idx.id_to_slot.find(id);
+    if (it == idx.id_to_slot.end()) {
+        return index_state_crc32c(idx);
+    }
+    const size_t removed = it->second;
+    const size_t last = idx.slot_to_id.size() - 1;
+    const size_t dim_sz = static_cast<size_t>(idx.dim);
+
+    uint32_t crc = 0xffffffffu;
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(idx.dim));
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(idx.bit_width));
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(storage_kind(idx)));
+    crc = crc32c_update_u64(crc, static_cast<uint64_t>(last));
+
+    auto logical_slot = [&](size_t out_slot) {
+        return out_slot == removed ? last : out_slot;
+    };
+
+    if (is_q4(idx)) {
+        const size_t row_bytes = q4_row_bytes(dim_sz);
+        for (size_t slot = 0; slot < last; ++slot) {
+            crc = crc32c_update_u32(crc, float_to_u32(idx.q4_scale[logical_slot(slot)]));
+        }
+        for (size_t slot = 0; slot < last; ++slot) {
+            const size_t src_slot = logical_slot(slot);
+            crc = crc32c_update(
+                crc,
+                idx.q4_data.data() + src_slot * row_bytes,
+                row_bytes * sizeof(uint8_t));
+        }
+    } else if (is_q8(idx)) {
+        for (size_t slot = 0; slot < last; ++slot) {
+            crc = crc32c_update_u32(crc, float_to_u32(idx.q8_scale[logical_slot(slot)]));
+        }
+        for (size_t slot = 0; slot < last; ++slot) {
+            const size_t src_slot = logical_slot(slot);
+            crc = crc32c_update(
+                crc,
+                idx.q8_data.data() + src_slot * dim_sz,
+                dim_sz * sizeof(int8_t));
+        }
+    } else {
+        for (size_t slot = 0; slot < last; ++slot) {
+            const size_t src_slot = logical_slot(slot);
+            for (size_t i = 0; i < dim_sz; ++i) {
+                crc = crc32c_update_u32(crc, float_to_u32(idx.data[src_slot * dim_sz + i]));
+            }
+        }
+    }
+    for (size_t slot = 0; slot < last; ++slot) {
+        crc = crc32c_update_u64(crc, idx.slot_to_id[logical_slot(slot)]);
+    }
+    return crc ^ 0xffffffffu;
+}
+
+bool filesystem_path_from_utf8(const char * path, std::filesystem::path & out) {
+#ifdef _WIN32
+    std::wstring wide;
+    if (!utf8_to_wide(path, wide)) {
+        return false;
+    }
+    out = std::filesystem::path(wide);
+#else
+    out = std::filesystem::path(path);
+#endif
+    return true;
+}
+
+bool open_append_file(const char * path, std::FILE ** out) {
+#ifdef _WIN32
+    std::wstring wide;
+    if (!utf8_to_wide(path, wide)) {
+        return false;
+    }
+    *out = _wfopen(wide.c_str(), L"a+b");
+#else
+    *out = std::fopen(path, "a+b");
+#endif
+    return *out != nullptr;
+}
+
+void fill_delta_header(const ggml_vec_index & idx, uint32_t base_crc, uint8_t * header) {
+    std::memset(header, 0, kTvidHeaderSize);
+    std::memcpy(header, kTvidMagic, 4);
+    header[4] = kTvidVersion;
+    header[5] = static_cast<uint8_t>(idx.bit_width);
+    put_u32_le(header + 8, static_cast<uint32_t>(idx.dim));
+    put_u32_le(header + 12, base_crc);
+}
+
+bool validate_delta_header(
+        const char * path,
+        const ggml_vec_index & idx,
+        uint64_t & size,
+        uint32_t & base_crc) {
+    std::filesystem::path fs_path;
+    if (!filesystem_path_from_utf8(path, fs_path)) {
+        return false;
+    }
+    if (!std::filesystem::exists(fs_path)) {
+        size = 0;
+        base_crc = index_state_crc32c(idx);
+        return true;
+    }
+    size = static_cast<uint64_t>(std::filesystem::file_size(fs_path));
+    if (size == 0) {
+        base_crc = index_state_crc32c(idx);
+        return true;
+    }
+    if (size < kTvidHeaderSize) {
+        return false;
+    }
+
+    std::ifstream f(fs_path, std::ios::binary);
+    if (!f.is_open()) {
+        return false;
+    }
+    uint8_t header[kTvidHeaderSize] = {};
+    f.read(reinterpret_cast<char *>(header), sizeof(header));
+    if (!f) {
+        return false;
+    }
+    if (std::memcmp(header, kTvidMagic, 4) != 0 ||
+        header[4] != kTvidVersion ||
+        header[5] != static_cast<uint8_t>(idx.bit_width) ||
+        header[6] != 0 ||
+        header[7] != 0 ||
+        get_u32_le(header + 8) != static_cast<uint32_t>(idx.dim)) {
+        return false;
+    }
+    base_crc = get_u32_le(header + 12);
+    return true;
+}
+
+bool truncate_file_to(const char * path, uint64_t size) {
+    try {
+        std::filesystem::path fs_path;
+        if (!filesystem_path_from_utf8(path, fs_path)) {
+            return false;
+        }
+        std::filesystem::resize_file(fs_path, size);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool inspect_delta_log_tail(
+        const char * path,
+        const ggml_vec_index & idx,
+        uint32_t & last_state_crc,
+        uint64_t & complete_size) {
+    std::filesystem::path fs_path;
+    if (!filesystem_path_from_utf8(path, fs_path)) {
+        return false;
+    }
+    const uint64_t file_size = static_cast<uint64_t>(std::filesystem::file_size(fs_path));
+    if (file_size < kTvidHeaderSize) {
+        return false;
+    }
+
+    std::ifstream f(fs_path, std::ios::binary);
+    if (!f.is_open()) {
+        return false;
+    }
+
+    uint8_t header[kTvidHeaderSize] = {};
+    f.read(reinterpret_cast<char *>(header), sizeof(header));
+    if (!f ||
+        std::memcmp(header, kTvidMagic, 4) != 0 ||
+        header[4] != kTvidVersion ||
+        header[5] != static_cast<uint8_t>(idx.bit_width) ||
+        header[6] != 0 ||
+        header[7] != 0 ||
+        get_u32_le(header + 8) != static_cast<uint32_t>(idx.dim)) {
+        return false;
+    }
+
+    last_state_crc = get_u32_le(header + 12);
+    complete_size = kTvidHeaderSize;
+    uint64_t offset = kTvidHeaderSize;
+    while (offset < file_size) {
+        uint8_t record[kTvidRecordHeaderSize] = {};
+        f.read(reinterpret_cast<char *>(record), sizeof(record));
+        if (f.gcount() != static_cast<std::streamsize>(sizeof(record))) {
+            return true;
+        }
+        offset += kTvidRecordHeaderSize;
+
+        const uint8_t op = record[0];
+        const uint64_t payload_bytes = get_u64_le(record + 8);
+        const uint32_t expected_crc = get_u32_le(record + 16);
+        const uint32_t state_crc = get_u32_le(record + 20);
+        if (record[1] != 0 || record[2] != 0 || record[3] != 0 ||
+            (op != kTvidOpAdd && op != kTvidOpRemove)) {
+            return false;
+        }
+        if (payload_bytes > file_size - offset) {
+            return true;
+        }
+
+        if (payload_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+            payload_bytes > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+            return false;
+        }
+        std::vector<uint8_t> payload(static_cast<size_t>(payload_bytes));
+        if (!payload.empty()) {
+            f.read(
+                reinterpret_cast<char *>(payload.data()),
+                static_cast<std::streamsize>(payload.size()));
+        }
+        if (!f) {
+            return true;
+        }
+        offset += payload_bytes;
+
+        uint32_t crc = crc32c_update(0xffffffffu, record, 16);
+        crc = crc32c_update(crc, record + 20, 4);
+        if (!payload.empty()) {
+            crc = crc32c_update(crc, payload.data(), payload.size());
+        }
+        if ((crc ^ 0xffffffffu) != expected_crc) {
+            return false;
+        }
+        last_state_crc = state_crc;
+        complete_size = offset;
+    }
+    return true;
+}
+
+int append_delta_record(
+        const ggml_vec_index & idx,
+        const char * delta_path,
+        uint8_t op,
+        uint32_t n,
+        uint32_t base_crc_for_new_log,
+        uint32_t state_crc,
+        const std::vector<uint8_t> & payload) {
+    if (delta_path == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    uint64_t old_size = 0;
+    uint32_t existing_base_crc = 0;
+    if (!validate_delta_header(delta_path, idx, old_size, existing_base_crc)) {
+        return GGML_VEC_INDEX_E_IO;
+    }
+    if (old_size != 0) {
+        uint32_t tail_crc = 0;
+        uint64_t complete_size = 0;
+        if (!inspect_delta_log_tail(delta_path, idx, tail_crc, complete_size)) {
+            return GGML_VEC_INDEX_E_IO;
+        }
+        if (tail_crc != base_crc_for_new_log) {
+            return GGML_VEC_INDEX_E_IO;
+        }
+        if (complete_size != old_size) {
+            if (!truncate_file_to(delta_path, complete_size)) {
+                return GGML_VEC_INDEX_E_INTERNAL;
+            }
+            old_size = complete_size;
+        }
+    }
+    (void) existing_base_crc;
+
+    std::FILE * f = nullptr;
+    if (!open_append_file(delta_path, &f)) {
+        return GGML_VEC_INDEX_E_IO;
+    }
+    auto close_file = [&]() {
+        if (f != nullptr) {
+            std::fclose(f);
+            f = nullptr;
+        }
+    };
+    auto fail_io = [&]() {
+        close_file();
+        return truncate_file_to(delta_path, old_size) ?
+            GGML_VEC_INDEX_E_IO :
+            GGML_VEC_INDEX_E_INTERNAL;
+    };
+
+    if (old_size == 0) {
+        uint8_t header[kTvidHeaderSize] = {};
+        fill_delta_header(idx, base_crc_for_new_log, header);
+        if (!write_bytes(f, header, sizeof(header))) {
+            return fail_io();
+        }
+    }
+
+    uint8_t record[kTvidRecordHeaderSize] = {};
+    record[0] = op;
+    put_u32_le(record + 4, n);
+    put_u64_le(record + 8, static_cast<uint64_t>(payload.size()));
+    put_u32_le(record + 20, state_crc);
+    uint32_t crc = crc32c_update(0xffffffffu, record, 16);
+    crc = crc32c_update(crc, record + 20, 4);
+    if (!payload.empty()) {
+        crc = crc32c_update(crc, payload.data(), payload.size());
+    }
+    put_u32_le(record + 16, crc ^ 0xffffffffu);
+
+    if (!write_bytes(f, record, sizeof(record)) ||
+        (!payload.empty() && !write_bytes(f, payload.data(), payload.size())) ||
+        !flush_and_sync(f)) {
+        return fail_io();
+    }
+    const int close_result = std::fclose(f);
+    f = nullptr;
+    if (close_result != 0 || !fsync_parent_dir(delta_path)) {
+        return truncate_file_to(delta_path, old_size) ?
+            GGML_VEC_INDEX_E_IO :
+            GGML_VEC_INDEX_E_INTERNAL;
+    }
+    return GGML_VEC_INDEX_OK;
+}
+
+int write_empty_delta_log(const ggml_vec_index & idx, const char * delta_path) {
+    if (delta_path == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        TempFile temp;
+        if (!open_temp_file(delta_path, temp)) {
+            return GGML_VEC_INDEX_E_IO;
+        }
+        auto fail_io = [&]() {
+            if (temp.stream != nullptr) {
+                std::fclose(temp.stream);
+                temp.stream = nullptr;
+            }
+            remove_temp_file(temp);
+            return GGML_VEC_INDEX_E_IO;
+        };
+
+        uint8_t header[kTvidHeaderSize] = {};
+        fill_delta_header(idx, index_state_crc32c(idx), header);
+        if (!write_bytes(temp.stream, header, sizeof(header)) ||
+            !flush_and_sync(temp.stream)) {
+            return fail_io();
+        }
+        const int close_result = std::fclose(temp.stream);
+        temp.stream = nullptr;
+        if (close_result != 0) {
+            remove_temp_file(temp);
+            return GGML_VEC_INDEX_E_IO;
+        }
+        if (!rename_overwrite(temp, delta_path)) {
+            return fail_io();
+        }
+        temp.path.clear();
+        if (!fsync_parent_dir(delta_path)) {
+            return GGML_VEC_INDEX_E_IO;
+        }
+        return GGML_VEC_INDEX_OK;
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+bool validate_logged_add_args(
+        const ggml_vec_index_t * idx,
+        const float * vectors,
+        int n,
+        const uint64_t * ids) {
+    if (idx == nullptr || vectors == nullptr || ids == nullptr || n < 0) {
+        return false;
+    }
+    if (n == 0) {
+        return true;
+    }
+    const size_t n_sz = static_cast<size_t>(n);
+    const size_t dim_sz = static_cast<size_t>(idx->dim);
+    if (dim_sz != 0 && n_sz > std::numeric_limits<size_t>::max() / dim_sz) {
+        return false;
+    }
+    return all_finite(vectors, n_sz * dim_sz);
+}
+
+int check_logged_add_duplicates(
+        const ggml_vec_index_t * idx,
+        int n,
+        const uint64_t * ids) {
+    std::unordered_set<uint64_t> batch_ids;
+    batch_ids.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        if (idx->id_to_slot.find(ids[i]) != idx->id_to_slot.end()) {
+            return GGML_VEC_INDEX_E_DUPLICATE;
+        }
+        if (!batch_ids.insert(ids[i]).second) {
+            return GGML_VEC_INDEX_E_DUPLICATE;
+        }
+    }
+    return GGML_VEC_INDEX_OK;
+}
+
+bool build_add_delta_payload(
+        const ggml_vec_index_t * idx,
+        const float * vectors,
+        int n,
+        const uint64_t * ids,
+        std::vector<uint8_t> & payload) {
+    const size_t n_sz = static_cast<size_t>(n);
+    const size_t dim_sz = static_cast<size_t>(idx->dim);
+    const size_t id_bytes = n_sz * sizeof(uint64_t);
+    const size_t vector_count = n_sz * dim_sz;
+    if (vector_count > (std::numeric_limits<size_t>::max() - id_bytes) / sizeof(uint32_t)) {
+        return false;
+    }
+    payload.clear();
+    payload.reserve(id_bytes + vector_count * sizeof(uint32_t));
+    for (int i = 0; i < n; ++i) {
+        uint8_t bytes[8];
+        put_u64_le(bytes, ids[i]);
+        payload.insert(payload.end(), bytes, bytes + sizeof(bytes));
+    }
+    for (size_t i = 0; i < vector_count; ++i) {
+        uint8_t bytes[4];
+        put_u32_le(bytes, float_to_u32(vectors[i]));
+        payload.insert(payload.end(), bytes, bytes + sizeof(bytes));
+    }
+    return true;
+}
+
+std::vector<uint8_t> build_remove_delta_payload(uint64_t id) {
+    std::vector<uint8_t> payload(sizeof(uint64_t));
+    put_u64_le(payload.data(), id);
+    return payload;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -589,7 +1165,7 @@ void ggml_vec_index_free(ggml_vec_index_t * idx) {
 // Mutation
 // ---------------------------------------------------------------------------
 
-int ggml_vec_index_add(
+static int ggml_vec_index_add_unlocked(
     ggml_vec_index_t * idx,
     const float      * vectors,
     int                n,
@@ -606,7 +1182,10 @@ int ggml_vec_index_add(
         for (int i = 0; i < n; ++i) {
             idx->id_to_slot.erase(ids[i]);
         }
-        if (is_q8(*idx)) {
+        if (is_q4(*idx)) {
+            idx->q4_data.resize(base_slot * q4_row_bytes(dim_sz));
+            idx->q4_scale.resize(base_slot);
+        } else if (is_q8(*idx)) {
             idx->q8_data.resize(base_slot * dim_sz);
             idx->q8_scale.resize(base_slot);
         } else {
@@ -655,7 +1234,10 @@ int ggml_vec_index_add(
         }
 
         resized = true;
-        if (is_q8(*idx)) {
+        if (is_q4(*idx)) {
+            idx->q4_data.resize(new_slots * q4_row_bytes(dim_sz));
+            idx->q4_scale.resize(new_slots);
+        } else if (is_q8(*idx)) {
             idx->q8_data.resize(new_slots * dim_sz);
             idx->q8_scale.resize(new_slots);
         } else {
@@ -668,7 +1250,13 @@ int ggml_vec_index_add(
         for (int i = 0; i < n; ++i) {
             const size_t slot = base_slot + static_cast<size_t>(i);
             const float * src = vectors + static_cast<size_t>(i) * dim_sz;
-            if (is_q8(*idx)) {
+            if (is_q4(*idx)) {
+                quantize_q4_row(
+                    src,
+                    idx->q4_data.data() + slot * q4_row_bytes(dim_sz),
+                    idx->dim,
+                    idx->q4_scale[slot]);
+            } else if (is_q8(*idx)) {
                 quantize_q8_row(
                     src,
                     idx->q8_data.data() + slot * dim_sz,
@@ -684,6 +1272,8 @@ int ggml_vec_index_add(
             test_maybe_throw_bad_alloc();
             idx->id_to_slot.emplace(ids[i], slot);
         }
+        ++idx->generation;
+        invalidate_ivf(*idx);
     } catch (const std::bad_alloc &) {
         rollback();
         return GGML_VEC_INDEX_E_OOM;
@@ -694,7 +1284,23 @@ int ggml_vec_index_add(
     return GGML_VEC_INDEX_OK;
 }
 
-int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id) {
+int ggml_vec_index_add(
+    ggml_vec_index_t * idx,
+    const float      * vectors,
+    int                n,
+    const uint64_t   * ids) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        return ggml_vec_index_add_unlocked(idx, vectors, n, ids);
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+static int ggml_vec_index_remove_unlocked(ggml_vec_index_t * idx, uint64_t id) {
     try {
         if (idx == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -709,7 +1315,14 @@ int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id) {
 
         if (slot != last) {
             // Move last vector into the freed slot and update its id mapping.
-            if (is_q8(*idx)) {
+            if (is_q4(*idx)) {
+                const size_t row_bytes = q4_row_bytes(dim_sz);
+                std::memcpy(
+                    idx->q4_data.data() + slot * row_bytes,
+                    idx->q4_data.data() + last * row_bytes,
+                    row_bytes * sizeof(uint8_t));
+                idx->q4_scale[slot] = idx->q4_scale[last];
+            } else if (is_q8(*idx)) {
                 std::memcpy(
                     idx->q8_data.data() + slot * dim_sz,
                     idx->q8_data.data() + last * dim_sz,
@@ -727,14 +1340,136 @@ int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id) {
         }
 
         idx->slot_to_id.pop_back();
-        if (is_q8(*idx)) {
+        if (is_q4(*idx)) {
+            idx->q4_data.resize(last * q4_row_bytes(dim_sz));
+            idx->q4_scale.resize(last);
+        } else if (is_q8(*idx)) {
             idx->q8_data.resize(last * dim_sz);
             idx->q8_scale.resize(last);
         } else {
             idx->data.resize(last * dim_sz);
         }
         idx->id_to_slot.erase(it);
+        ++idx->generation;
+        invalidate_ivf(*idx);
         return 1;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        return ggml_vec_index_remove_unlocked(idx, id);
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_add_logged(
+    ggml_vec_index_t * idx,
+    const float      * vectors,
+    int                n,
+    const uint64_t   * ids,
+    const char       * delta_path) {
+    bool added = false;
+    std::unique_lock<std::shared_mutex> lock;
+    try {
+        if (idx == nullptr || delta_path == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        lock = std::unique_lock<std::shared_mutex>(idx->mutex);
+        if (!validate_logged_add_args(idx, vectors, n, ids)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (n == 0) {
+            return GGML_VEC_INDEX_OK;
+        }
+
+        const int duplicate_status = check_logged_add_duplicates(idx, n, ids);
+        if (duplicate_status != GGML_VEC_INDEX_OK) {
+            return duplicate_status;
+        }
+
+        std::vector<uint8_t> payload;
+        if (!build_add_delta_payload(idx, vectors, n, ids, payload)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const uint32_t base_crc = index_state_crc32c(*idx);
+        const int add_status = ggml_vec_index_add_unlocked(idx, vectors, n, ids);
+        if (add_status != GGML_VEC_INDEX_OK) {
+            return add_status;
+        }
+        added = true;
+
+        const int append_status = append_delta_record(
+            *idx,
+            delta_path,
+            kTvidOpAdd,
+            static_cast<uint32_t>(n),
+            base_crc,
+            index_state_crc32c(*idx),
+            payload);
+        if (append_status != GGML_VEC_INDEX_OK) {
+            if (append_status == GGML_VEC_INDEX_E_IO) {
+                for (int i = 0; i < n; ++i) {
+                    ggml_vec_index_remove_unlocked(idx, ids[i]);
+                }
+            }
+            return append_status;
+        }
+        return GGML_VEC_INDEX_OK;
+    } catch (const std::bad_alloc &) {
+        if (added) {
+            for (int i = 0; i < n; ++i) {
+                ggml_vec_index_remove_unlocked(idx, ids[i]);
+            }
+        }
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        if (added) {
+            for (int i = 0; i < n; ++i) {
+                ggml_vec_index_remove_unlocked(idx, ids[i]);
+            }
+        }
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_remove_logged(
+    ggml_vec_index_t * idx,
+    uint64_t           id,
+    const char       * delta_path) {
+    try {
+        if (idx == nullptr || delta_path == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        if (idx->id_to_slot.count(id) == 0) {
+            return 0;
+        }
+        const std::vector<uint8_t> payload = build_remove_delta_payload(id);
+        const uint32_t base_crc = index_state_crc32c(*idx);
+        const uint32_t post_remove_crc = index_state_crc32c_after_remove(*idx, id);
+        const int append_status = append_delta_record(
+            *idx,
+            delta_path,
+            kTvidOpRemove,
+            1,
+            base_crc,
+            post_remove_crc,
+            payload);
+        if (append_status != GGML_VEC_INDEX_OK) {
+            return append_status;
+        }
+        return ggml_vec_index_remove_unlocked(idx, id);
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
@@ -744,7 +1479,12 @@ int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id) {
     if (idx == nullptr) {
         return 0;
     }
-    return idx->id_to_slot.count(id) != 0 ? 1 : 0;
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return idx->id_to_slot.count(id) != 0 ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 void ggml_vec_index_prepare(ggml_vec_index_t * /*idx*/) {
@@ -770,6 +1510,19 @@ inline float dot_q8_scalar(const float * query, const int8_t * codes, float scal
     float acc = 0.0f;
     for (int i = 0; i < dim; ++i) {
         const float value = static_cast<float>(codes[i]) * scale;
+        acc += query[i] * value;
+    }
+    return acc;
+}
+
+inline float dot_q4_scalar(const float * query, const uint8_t * codes, float scale, int dim) {
+    float acc = 0.0f;
+    for (int i = 0; i < dim; ++i) {
+        const uint8_t byte = codes[static_cast<size_t>(i) / 2];
+        const uint8_t nibble = (i & 1) == 0 ?
+            static_cast<uint8_t>(byte & 0x0f) :
+            static_cast<uint8_t>(byte >> 4);
+        const float value = static_cast<float>(q4_decode(nibble)) * scale;
         acc += query[i] * value;
     }
     return acc;
@@ -804,6 +1557,54 @@ inline float dot_q8_neon(const float * query, const int8_t * codes, float scale,
     float acc = horizontal_sum(acc0) + horizontal_sum(acc1);
     for (; i < dim; ++i) {
         const float value = static_cast<float>(codes[i]) * scale;
+        acc += query[i] * value;
+    }
+    return acc;
+}
+
+inline void dot_q4_neon_accum8(
+        const float * query,
+        uint8x8_t codes,
+        float scale,
+        float32x4_t & acc0,
+        float32x4_t & acc1) {
+    const int16x8_t q16 = vsubq_s16(
+        vreinterpretq_s16_u16(vmovl_u8(codes)),
+        vdupq_n_s16(8));
+    const float32x4_t q0 =
+        vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
+    const float32x4_t q1 =
+        vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))), scale);
+    acc0 = vmlaq_f32(acc0, vld1q_f32(query), q0);
+    acc1 = vmlaq_f32(acc1, vld1q_f32(query + 4), q1);
+}
+
+inline float dot_q4_neon(const float * query, const uint8_t * codes, float scale, int dim) {
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    int i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        const uint8x8_t packed = vld1_u8(codes + static_cast<size_t>(i) / 2);
+        const uint8x8_t low = vand_u8(packed, vdup_n_u8(0x0f));
+        const uint8x8_t high = vshr_n_u8(packed, 4);
+        const uint8x8x2_t zipped = vzip_u8(low, high);
+
+        dot_q4_neon_accum8(query + i, zipped.val[0], scale, acc0, acc1);
+        dot_q4_neon_accum8(query + i + 8, zipped.val[1], scale, acc2, acc3);
+    }
+
+    float acc =
+        horizontal_sum(acc0) + horizontal_sum(acc1) +
+        horizontal_sum(acc2) + horizontal_sum(acc3);
+    for (; i < dim; ++i) {
+        const uint8_t byte = codes[static_cast<size_t>(i) / 2];
+        const uint8_t nibble = (i & 1) == 0 ?
+            static_cast<uint8_t>(byte & 0x0f) :
+            static_cast<uint8_t>(byte >> 4);
+        const float value = static_cast<float>(q4_decode(nibble)) * scale;
         acc += query[i] * value;
     }
     return acc;
@@ -874,6 +1675,74 @@ inline float dot_q8(const float * query, const int8_t * codes, float scale, int 
 #endif
 }
 
+inline float dot_q4(const float * query, const uint8_t * codes, float scale, int dim) {
+#if GGML_VEC_INDEX_USE_NEON
+    return dot_q4_neon(query, codes, scale, dim);
+#else
+    return dot_q4_scalar(query, codes, scale, dim);
+#endif
+}
+
+inline float score_slot(const ggml_vec_index_t & idx, const float * query, size_t slot) {
+    const int dim = idx.dim;
+    return is_q4(idx) ?
+        dot_q4(
+            query,
+            idx.q4_data.data() + slot * q4_row_bytes(static_cast<size_t>(dim)),
+            idx.q4_scale[slot],
+            dim) :
+        is_q8(idx) ?
+        dot_q8(
+            query,
+            idx.q8_data.data() + slot * static_cast<size_t>(dim),
+            idx.q8_scale[slot],
+            dim) :
+        dot(
+            query,
+            idx.data.data() + slot * static_cast<size_t>(dim),
+            dim);
+}
+
+void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) {
+    const int dim = idx.dim;
+    if (is_q4(idx)) {
+        const uint8_t * codes =
+            idx.q4_data.data() + slot * q4_row_bytes(static_cast<size_t>(dim));
+        const float scale = idx.q4_scale[slot];
+        for (int i = 0; i < dim; ++i) {
+            const uint8_t byte = codes[static_cast<size_t>(i) / 2];
+            const uint8_t nibble = (i & 1) == 0 ?
+                static_cast<uint8_t>(byte & 0x0f) :
+                static_cast<uint8_t>(byte >> 4);
+            dst[i] = static_cast<float>(q4_decode(nibble)) * scale;
+        }
+    } else if (is_q8(idx)) {
+        const int8_t * codes = idx.q8_data.data() + slot * static_cast<size_t>(dim);
+        const float scale = idx.q8_scale[slot];
+        for (int i = 0; i < dim; ++i) {
+            dst[i] = static_cast<float>(codes[i]) * scale;
+        }
+    } else {
+        std::memcpy(
+            dst,
+            idx.data.data() + slot * static_cast<size_t>(dim),
+            static_cast<size_t>(dim) * sizeof(float));
+    }
+}
+
+size_t best_centroid(const float * query, const std::vector<float> & centroids, int n_lists, int dim) {
+    size_t best = 0;
+    float best_score = -FLT_MAX;
+    for (int list = 0; list < n_lists; ++list) {
+        const float s = dot(query, centroids.data() + static_cast<size_t>(list) * dim, dim);
+        if (s > best_score) {
+            best_score = s;
+            best = static_cast<size_t>(list);
+        }
+    }
+    return best;
+}
+
 // Run a single query against all slots, write top-k into out_scores/out_ids.
 // If the index holds fewer than k entries, pad with sentinels.
 void search_one(
@@ -881,30 +1750,33 @@ void search_one(
     const float            * query,
     int                      k,
     float                  * out_scores,
-    uint64_t               * out_ids) {
+    uint64_t               * out_ids,
+    const std::vector<size_t> * allowed_slots = nullptr) {
 
-    const int    dim     = idx.dim;
     const size_t n_slots = idx.slot_to_id.size();
 
     test_maybe_throw_bad_alloc();
     std::priority_queue<ScoreId, std::vector<ScoreId>, MinHeapCmp> heap;
 
-    for (size_t slot = 0; slot < n_slots; ++slot) {
-        const float s = is_q8(idx) ?
-            dot_q8(
-                query,
-                idx.q8_data.data() + slot * static_cast<size_t>(dim),
-                idx.q8_scale[slot],
-                dim) :
-            dot(
-                query,
-                idx.data.data() + slot * static_cast<size_t>(dim),
-                dim);
+    auto visit_slot = [&](size_t slot) {
+        const float s = score_slot(idx, query, slot);
         if (heap.size() < static_cast<size_t>(k)) {
             heap.push({ s, idx.slot_to_id[slot] });
         } else if (s > heap.top().score) {
             heap.pop();
             heap.push({ s, idx.slot_to_id[slot] });
+        }
+    };
+
+    if (allowed_slots != nullptr) {
+        for (size_t slot : *allowed_slots) {
+            if (slot < n_slots) {
+                visit_slot(slot);
+            }
+        }
+    } else {
+        for (size_t slot = 0; slot < n_slots; ++slot) {
+            visit_slot(slot);
         }
     }
 
@@ -928,13 +1800,125 @@ void search_one(
     }
 }
 
+std::vector<size_t> allowed_slots_for_ids(
+    const ggml_vec_index_t & idx,
+    const uint64_t         * allowed_ids,
+    int                      n_allowed) {
+    std::vector<size_t> slots;
+    slots.reserve(static_cast<size_t>(n_allowed));
+    for (int i = 0; i < n_allowed; ++i) {
+        const auto it = idx.id_to_slot.find(allowed_ids[i]);
+        if (it != idx.id_to_slot.end()) {
+            slots.push_back(it->second);
+        }
+    }
+    std::sort(slots.begin(), slots.end());
+    slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+    return slots;
+}
+
 } // namespace
 
-int ggml_vec_index_search(
+static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists, int n_iter) {
+    try {
+        if (idx == nullptr || n_lists <= 0 || n_iter < 0) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t n_slots = idx->slot_to_id.size();
+        const int dim = idx->dim;
+        if (n_slots == 0) {
+            invalidate_ivf(*idx);
+            idx->ivf_generation = idx->generation;
+            return GGML_VEC_INDEX_OK;
+        }
+
+        const int actual_lists = static_cast<int>(
+            std::min(static_cast<size_t>(n_lists), n_slots));
+        const size_t dim_sz = static_cast<size_t>(dim);
+        test_maybe_throw_bad_alloc();
+
+        std::vector<float> centroids(static_cast<size_t>(actual_lists) * dim_sz);
+        std::vector<float> next_centroids(centroids.size());
+        std::vector<int> counts(static_cast<size_t>(actual_lists));
+        std::vector<float> row(dim_sz);
+        std::vector<std::vector<size_t>> lists(static_cast<size_t>(actual_lists));
+
+        for (int list = 0; list < actual_lists; ++list) {
+            const size_t slot = static_cast<size_t>(list) * n_slots /
+                static_cast<size_t>(actual_lists);
+            float * centroid = centroids.data() + static_cast<size_t>(list) * dim_sz;
+            decode_slot_to_f32(*idx, slot, centroid);
+        }
+
+        for (int iter = 0; iter < n_iter; ++iter) {
+            std::fill(next_centroids.begin(), next_centroids.end(), 0.0f);
+            std::fill(counts.begin(), counts.end(), 0);
+
+            for (size_t slot = 0; slot < n_slots; ++slot) {
+                decode_slot_to_f32(*idx, slot, row.data());
+                const size_t list = best_centroid(row.data(), centroids, actual_lists, dim);
+                float * dst = next_centroids.data() + list * dim_sz;
+                for (int i = 0; i < dim; ++i) {
+                    dst[i] += row[static_cast<size_t>(i)];
+                }
+                ++counts[list];
+            }
+
+            for (int list = 0; list < actual_lists; ++list) {
+                float * centroid = centroids.data() + static_cast<size_t>(list) * dim_sz;
+                if (counts[static_cast<size_t>(list)] == 0) {
+                    continue;
+                }
+                const float inv_count = 1.0f /
+                    static_cast<float>(counts[static_cast<size_t>(list)]);
+                const float * src =
+                    next_centroids.data() + static_cast<size_t>(list) * dim_sz;
+                for (int i = 0; i < dim; ++i) {
+                    centroid[i] = src[static_cast<size_t>(i)] * inv_count;
+                }
+            }
+        }
+
+        for (size_t slot = 0; slot < n_slots; ++slot) {
+            decode_slot_to_f32(*idx, slot, row.data());
+            const size_t list = best_centroid(row.data(), centroids, actual_lists, dim);
+            lists[list].push_back(slot);
+        }
+
+        idx->ivf_centroids = std::move(centroids);
+        idx->ivf_lists = std::move(lists);
+        idx->ivf_n_lists = actual_lists;
+        idx->ivf_generation = idx->generation;
+        return GGML_VEC_INDEX_OK;
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_build_ivf(ggml_vec_index_t * idx, int n_lists, int n_iter) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        return ggml_vec_index_build_ivf_unlocked(idx, n_lists, n_iter);
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+static int ggml_vec_index_search_impl(
     const ggml_vec_index_t * idx,
     const float            * queries,
     int                      n_q,
     int                      k,
+    bool                     filtered,
+    const uint64_t         * allowed_ids,
+    int                      n_allowed,
+    const ggml_vec_index_filter_t * prepared_filter,
     float                  * out_scores,
     uint64_t               * out_ids) {
 
@@ -942,7 +1926,9 @@ int ggml_vec_index_search(
         out_scores == nullptr || out_ids == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
-    if (n_q < 0 || k <= 0) {
+    if (n_q < 0 || k <= 0 ||
+        (filtered && prepared_filter == nullptr &&
+         (n_allowed < 0 || (n_allowed > 0 && allowed_ids == nullptr)))) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     if (n_q == 0) {
@@ -950,6 +1936,7 @@ int ggml_vec_index_search(
     }
 
     try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
         const int dim = idx->dim;
         const size_t n_q_sz = static_cast<size_t>(n_q);
         const size_t k_sz   = static_cast<size_t>(k);
@@ -962,13 +1949,28 @@ int ggml_vec_index_search(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
+        std::vector<size_t> allowed_slots;
+        const std::vector<size_t> * allowed_ptr = nullptr;
+        if (prepared_filter != nullptr) {
+            if (prepared_filter->dim != idx->dim ||
+                prepared_filter->bit_width != idx->bit_width ||
+                prepared_filter->generation != idx->generation) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
+            allowed_ptr = &prepared_filter->slots;
+        } else if (filtered) {
+            allowed_slots = allowed_slots_for_ids(*idx, allowed_ids, n_allowed);
+            allowed_ptr = &allowed_slots;
+        }
+
         for (int q = 0; q < n_q; ++q) {
             search_one(
                 *idx,
                 queries + static_cast<size_t>(q) * static_cast<size_t>(dim),
                 k,
                 out_scores + static_cast<size_t>(q) * static_cast<size_t>(k),
-                out_ids    + static_cast<size_t>(q) * static_cast<size_t>(k));
+                out_ids    + static_cast<size_t>(q) * static_cast<size_t>(k),
+                allowed_ptr);
         }
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
@@ -978,11 +1980,169 @@ int ggml_vec_index_search(
     return GGML_VEC_INDEX_OK;
 }
 
+int ggml_vec_index_search(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    float                  * out_scores,
+    uint64_t               * out_ids) {
+    return ggml_vec_index_search_impl(
+        idx, queries, n_q, k, false, nullptr, 0, nullptr, out_scores, out_ids);
+}
+
+int ggml_vec_index_search_filtered(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    const uint64_t         * allowed_ids,
+    int                      n_allowed,
+    float                  * out_scores,
+    uint64_t               * out_ids) {
+    return ggml_vec_index_search_impl(
+        idx, queries, n_q, k, true, allowed_ids, n_allowed, nullptr, out_scores, out_ids);
+}
+
+ggml_vec_index_filter_t * ggml_vec_index_filter_create(
+    const ggml_vec_index_t * idx,
+    const uint64_t         * allowed_ids,
+    int                      n_allowed) {
+    try {
+        if (idx == nullptr || n_allowed < 0 ||
+            (n_allowed > 0 && allowed_ids == nullptr)) {
+            return nullptr;
+        }
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        auto * filter = new (std::nothrow) ggml_vec_index_filter();
+        if (filter == nullptr) {
+            return nullptr;
+        }
+        std::unique_ptr<ggml_vec_index_filter> owned(filter);
+        owned->dim = idx->dim;
+        owned->bit_width = idx->bit_width;
+        owned->generation = idx->generation;
+        owned->slots = allowed_slots_for_ids(*idx, allowed_ids, n_allowed);
+        return owned.release();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void ggml_vec_index_filter_free(ggml_vec_index_filter_t * filter) {
+    delete filter;
+}
+
+int ggml_vec_index_search_prepared_filtered(
+    const ggml_vec_index_t        * idx,
+    const ggml_vec_index_filter_t * filter,
+    const float                   * queries,
+    int                             n_q,
+    int                             k,
+    float                         * out_scores,
+    uint64_t                      * out_ids) {
+    if (filter == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    return ggml_vec_index_search_impl(
+        idx, queries, n_q, k, true, nullptr, 0, filter, out_scores, out_ids);
+}
+
+int ggml_vec_index_search_ivf(
+    const ggml_vec_index_t * idx,
+    const float            * queries,
+    int                      n_q,
+    int                      k,
+    int                      nprobe,
+    float                  * out_scores,
+    uint64_t               * out_ids) {
+
+    if (idx == nullptr || queries == nullptr ||
+        out_scores == nullptr || out_ids == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q < 0 || k <= 0 || nprobe <= 0) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    if (n_q == 0) {
+        return GGML_VEC_INDEX_OK;
+    }
+
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        const int dim = idx->dim;
+        const size_t n_q_sz = static_cast<size_t>(n_q);
+        const size_t k_sz = static_cast<size_t>(k);
+        const size_t dim_sz = static_cast<size_t>(dim);
+        if ((dim_sz != 0 && n_q_sz > std::numeric_limits<size_t>::max() / dim_sz) ||
+            n_q_sz > std::numeric_limits<size_t>::max() / k_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (!all_finite(queries, n_q_sz * dim_sz)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (idx->ivf_generation != idx->generation ||
+            idx->ivf_n_lists < 0 ||
+            static_cast<size_t>(idx->ivf_n_lists) != idx->ivf_lists.size() ||
+            idx->ivf_centroids.size() != static_cast<size_t>(idx->ivf_n_lists) * dim_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const int probe_count = std::min(nprobe, idx->ivf_n_lists);
+        for (int q = 0; q < n_q; ++q) {
+            const float * query = queries + static_cast<size_t>(q) * dim_sz;
+            float * scores = out_scores + static_cast<size_t>(q) * k_sz;
+            uint64_t * ids = out_ids + static_cast<size_t>(q) * k_sz;
+
+            if (idx->ivf_n_lists == 0) {
+                const std::vector<size_t> empty_slots;
+                search_one(*idx, query, k, scores, ids, &empty_slots);
+                continue;
+            }
+
+            std::vector<ScoreId> centroid_scores;
+            centroid_scores.reserve(static_cast<size_t>(idx->ivf_n_lists));
+            for (int list = 0; list < idx->ivf_n_lists; ++list) {
+                const float score = dot(
+                    query,
+                    idx->ivf_centroids.data() + static_cast<size_t>(list) * dim_sz,
+                    dim);
+                centroid_scores.push_back({ score, static_cast<uint64_t>(list) });
+            }
+            std::sort(
+                centroid_scores.begin(),
+                centroid_scores.end(),
+                [](const ScoreId & a, const ScoreId & b) {
+                    return a.score > b.score;
+                });
+
+            size_t candidate_count = 0;
+            for (int probe = 0; probe < probe_count; ++probe) {
+                candidate_count +=
+                    idx->ivf_lists[static_cast<size_t>(centroid_scores[probe].id)].size();
+            }
+            std::vector<size_t> candidate_slots;
+            candidate_slots.reserve(candidate_count);
+            for (int probe = 0; probe < probe_count; ++probe) {
+                const auto & list =
+                    idx->ivf_lists[static_cast<size_t>(centroid_scores[probe].id)];
+                candidate_slots.insert(candidate_slots.end(), list.begin(), list.end());
+            }
+            search_one(*idx, query, k, scores, ids, &candidate_slots);
+        }
+        return GGML_VEC_INDEX_OK;
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
 
-int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
+static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * path) {
     try {
         if (idx == nullptr || path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -995,7 +2155,11 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         if (dim_sz != 0 && n > std::numeric_limits<size_t>::max() / dim_sz) {
             return GGML_VEC_INDEX_E_INTERNAL;
         }
-        if (is_q8(*idx)) {
+        if (is_q4(*idx)) {
+            if (idx->q4_data.size() != n * q4_row_bytes(dim_sz) || idx->q4_scale.size() != n) {
+                return GGML_VEC_INDEX_E_INTERNAL;
+            }
+        } else if (is_q8(*idx)) {
             if (idx->q8_data.size() != n * dim_sz || idx->q8_scale.size() != n) {
                 return GGML_VEC_INDEX_E_INTERNAL;
             }
@@ -1030,9 +2194,9 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         const uint32_t n_le   = static_cast<uint32_t>(idx->slot_to_id.size());
         put_u32_le(header + 8, dim_le);
         put_u32_le(header + 12, n_le);
-        put_u32_le(header + 16, is_q8(*idx) ? kQParamScaleF32 : kQParamNone);
-        put_u32_le(header + 20, is_q8(*idx) ? 4u : 0u);
-        put_u32_le(header + 24, is_q8(*idx) ? 1u : 4u);
+        put_u32_le(header + 16, is_quantized(*idx) ? kQParamScaleF32 : kQParamNone);
+        put_u32_le(header + 20, is_quantized(*idx) ? 4u : 0u);
+        put_u32_le(header + 24, is_q4(*idx) ? 0u : (is_q8(*idx) ? 1u : 4u));
         put_u32_le(header + 28, 0);
 
         if (!write_bytes(f, header, sizeof(header))) {
@@ -1043,14 +2207,24 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         uint32_t qparams_crc = 0xffffffffu;
         uint32_t vectors_crc = 0xffffffffu;
         uint32_t ids_crc     = 0xffffffffu;
-        if (is_q8(*idx)) {
-            for (float scale : idx->q8_scale) {
+        if (is_quantized(*idx)) {
+            const std::vector<float> & scales = is_q4(*idx) ? idx->q4_scale : idx->q8_scale;
+            for (float scale : scales) {
                 if (!write_u32_le_crc(f, float_to_u32(scale), qparams_crc)) {
                     return fail_io();
                 }
             }
 
-            if (!idx->q8_data.empty()) {
+            if (is_q4(*idx)) {
+                if (!idx->q4_data.empty() &&
+                    !write_bytes(f, idx->q4_data.data(), idx->q4_data.size())) {
+                    return fail_io();
+                }
+                if (!idx->q4_data.empty()) {
+                    vectors_crc =
+                        crc32c_update(vectors_crc, idx->q4_data.data(), idx->q4_data.size());
+                }
+            } else if (!idx->q8_data.empty()) {
                 if (!write_bytes(f, idx->q8_data.data(), idx->q8_data.size())) {
                     return fail_io();
                 }
@@ -1096,6 +2270,18 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        return ggml_vec_index_write_unlocked(idx, path);
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
@@ -1173,7 +2359,9 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             return nullptr;
         }
         if (version == kTvimVersion &&
-            ((bit_width == 8 && (kind != kStorageQ8 || qparam_type != kQParamScaleF32 ||
+            ((bit_width == 4 && (kind != kStorageQ4 || qparam_type != kQParamScaleF32 ||
+                                  qparam_bytes != 4 || comp_bytes != 0)) ||
+             (bit_width == 8 && (kind != kStorageQ8 || qparam_type != kQParamScaleF32 ||
                                   qparam_bytes != 4 || comp_bytes != 1)) ||
              (bit_width == 32 && (kind != kStorageF32 || qparam_type != kQParamNone ||
                                    qparam_bytes != 0 || comp_bytes != 4)))) {
@@ -1226,7 +2414,10 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         }
 
         test_maybe_throw_bad_alloc();
-        if (is_q8(*idx)) {
+        if (is_q4(*idx)) {
+            idx->q4_data.resize(n * q4_row_bytes(dim_sz));
+            idx->q4_scale.resize(n);
+        } else if (is_q8(*idx)) {
             idx->q8_data.resize(n * dim_sz);
             idx->q8_scale.resize(n);
         } else {
@@ -1242,7 +2433,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         uint32_t vectors_crc = 0xffffffffu;
         uint32_t ids_crc = 0xffffffffu;
 
-        if (version == kTvimVersionV1 && is_q8(*idx)) {
+        if (version == kTvimVersionV1 && is_quantized(*idx)) {
             std::vector<float> row(dim_sz);
             for (size_t slot = 0; slot < n; ++slot) {
                 for (float & v : row) {
@@ -1255,14 +2446,23 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                         return nullptr;
                     }
                 }
-                quantize_q8_row(
-                    row.data(),
-                    idx->q8_data.data() + slot * dim_sz,
-                    dim,
-                    idx->q8_scale[slot]);
+                if (is_q4(*idx)) {
+                    quantize_q4_row(
+                        row.data(),
+                        idx->q4_data.data() + slot * q4_row_bytes(dim_sz),
+                        dim,
+                        idx->q4_scale[slot]);
+                } else {
+                    quantize_q8_row(
+                        row.data(),
+                        idx->q8_data.data() + slot * dim_sz,
+                        dim,
+                        idx->q8_scale[slot]);
+                }
             }
-        } else if (is_q8(*idx)) {
-            for (float & scale : idx->q8_scale) {
+        } else if (is_quantized(*idx)) {
+            std::vector<float> & scales = is_q4(*idx) ? idx->q4_scale : idx->q8_scale;
+            for (float & scale : scales) {
                 uint32_t bits = 0;
                 const bool read_ok = checksummed ?
                     read_u32_le_crc(f, bits, qparams_crc) :
@@ -1276,29 +2476,66 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 }
             }
 
-            if (!idx->q8_data.empty()) {
-                if (idx->q8_data.size() >
-                    static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
-                    return nullptr;
-                }
-                f.read(
-                    reinterpret_cast<char *>(idx->q8_data.data()),
-                    static_cast<std::streamsize>(idx->q8_data.size() * sizeof(int8_t)));
-                if (!f) {
-                    return nullptr;
-                }
-                if (checksummed) {
-                    vectors_crc = crc32c_update(
-                        vectors_crc, idx->q8_data.data(), idx->q8_data.size());
-                }
-            }
-            for (size_t slot = 0; slot < n; ++slot) {
-                const float scale = idx->q8_scale[slot];
-                const int8_t * row = idx->q8_data.data() + slot * dim_sz;
-                for (size_t i = 0; i < dim_sz; ++i) {
-                    if (row[i] == std::numeric_limits<int8_t>::min() ||
-                        !std::isfinite(static_cast<float>(row[i]) * scale)) {
+            std::vector<uint8_t> * q4_data = is_q4(*idx) ? &idx->q4_data : nullptr;
+            if (is_q4(*idx)) {
+                if (!q4_data->empty()) {
+                    if (q4_data->size() >
+                        static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
                         return nullptr;
+                    }
+                    f.read(
+                        reinterpret_cast<char *>(q4_data->data()),
+                        static_cast<std::streamsize>(q4_data->size() * sizeof(uint8_t)));
+                    if (!f) {
+                        return nullptr;
+                    }
+                    if (checksummed) {
+                        vectors_crc = crc32c_update(vectors_crc, q4_data->data(), q4_data->size());
+                    }
+                }
+                const size_t row_bytes = q4_row_bytes(dim_sz);
+                for (size_t slot = 0; slot < n; ++slot) {
+                    const float scale = idx->q4_scale[slot];
+                    const uint8_t * row = idx->q4_data.data() + slot * row_bytes;
+                    for (size_t i = 0; i < dim_sz; ++i) {
+                        const uint8_t byte = row[i / 2];
+                        const uint8_t nibble = (i & 1) == 0 ?
+                            static_cast<uint8_t>(byte & 0x0f) :
+                            static_cast<uint8_t>(byte >> 4);
+                        if (nibble == 0 ||
+                            !std::isfinite(static_cast<float>(q4_decode(nibble)) * scale)) {
+                            return nullptr;
+                        }
+                    }
+                    if ((dim_sz & 1) != 0 && (row[row_bytes - 1] >> 4) != 8) {
+                        return nullptr;
+                    }
+                }
+            } else {
+                if (!idx->q8_data.empty()) {
+                    if (idx->q8_data.size() >
+                        static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+                        return nullptr;
+                    }
+                    f.read(
+                        reinterpret_cast<char *>(idx->q8_data.data()),
+                        static_cast<std::streamsize>(idx->q8_data.size() * sizeof(int8_t)));
+                    if (!f) {
+                        return nullptr;
+                    }
+                    if (checksummed) {
+                        vectors_crc = crc32c_update(
+                            vectors_crc, idx->q8_data.data(), idx->q8_data.size());
+                    }
+                }
+                for (size_t slot = 0; slot < n; ++slot) {
+                    const float scale = idx->q8_scale[slot];
+                    const int8_t * row = idx->q8_data.data() + slot * dim_sz;
+                    for (size_t i = 0; i < dim_sz; ++i) {
+                        if (row[i] == std::numeric_limits<int8_t>::min() ||
+                            !std::isfinite(static_cast<float>(row[i]) * scale)) {
+                            return nullptr;
+                        }
                     }
                 }
             }
@@ -1360,18 +2597,259 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
     }
 }
 
+namespace {
+
+bool expected_add_delta_payload_size(uint64_t n, uint64_t dim, uint64_t & size) {
+    uint64_t id_bytes = 0;
+    uint64_t values = 0;
+    uint64_t vector_bytes = 0;
+    if (!checked_mul_u64(n, sizeof(uint64_t), id_bytes) ||
+        !checked_mul_u64(n, dim, values) ||
+        !checked_mul_u64(values, sizeof(uint32_t), vector_bytes) ||
+        !checked_add_u64(id_bytes, vector_bytes, size)) {
+        return false;
+    }
+    return true;
+}
+
+bool read_delta_payload(std::ifstream & f, uint64_t payload_bytes, std::vector<uint8_t> & payload) {
+    if (payload_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        payload_bytes > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        return false;
+    }
+    payload.resize(static_cast<size_t>(payload_bytes));
+    if (!payload.empty()) {
+        f.read(
+            reinterpret_cast<char *>(payload.data()),
+            static_cast<std::streamsize>(payload.size()));
+        if (!f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool replay_add_delta(
+        ggml_vec_index_t * idx,
+        uint32_t n,
+        const std::vector<uint8_t> & payload) {
+    if (n == 0 || n > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    uint64_t expected_payload = 0;
+    if (!expected_add_delta_payload_size(n, static_cast<uint64_t>(idx->dim), expected_payload) ||
+        expected_payload != payload.size()) {
+        return false;
+    }
+
+    const size_t n_sz = static_cast<size_t>(n);
+    const size_t dim_sz = static_cast<size_t>(idx->dim);
+    std::vector<uint64_t> ids(n_sz);
+    std::vector<float> vectors(n_sz * dim_sz);
+
+    const uint8_t * ptr = payload.data();
+    for (size_t i = 0; i < n_sz; ++i) {
+        ids[i] = get_u64_le(ptr);
+        ptr += sizeof(uint64_t);
+    }
+    for (float & v : vectors) {
+        v = u32_to_float(get_u32_le(ptr));
+        if (!std::isfinite(v)) {
+            return false;
+        }
+        ptr += sizeof(uint32_t);
+    }
+
+    const int status = ggml_vec_index_add(
+        idx,
+        vectors.data(),
+        static_cast<int>(n),
+        ids.data());
+    return status == GGML_VEC_INDEX_OK;
+}
+
+bool replay_remove_delta(ggml_vec_index_t * idx, uint32_t n, const std::vector<uint8_t> & payload) {
+    if (n != 1 || payload.size() != sizeof(uint64_t)) {
+        return false;
+    }
+    const uint64_t id = get_u64_le(payload.data());
+    return ggml_vec_index_remove(idx, id) >= 0;
+}
+
+bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
+    std::filesystem::path fs_path;
+    if (!filesystem_path_from_utf8(delta_path, fs_path)) {
+        return false;
+    }
+    if (!std::filesystem::exists(fs_path) || std::filesystem::file_size(fs_path) == 0) {
+        return true;
+    }
+    const uint64_t file_size = static_cast<uint64_t>(std::filesystem::file_size(fs_path));
+    if (file_size < kTvidHeaderSize) {
+        return false;
+    }
+
+    std::ifstream f(fs_path, std::ios::binary);
+    if (!f.is_open()) {
+        return false;
+    }
+    uint8_t header[kTvidHeaderSize] = {};
+    f.read(reinterpret_cast<char *>(header), sizeof(header));
+    if (!f ||
+        std::memcmp(header, kTvidMagic, 4) != 0 ||
+        header[4] != kTvidVersion ||
+        header[5] != static_cast<uint8_t>(idx->bit_width) ||
+        header[6] != 0 ||
+        header[7] != 0 ||
+        get_u32_le(header + 8) != static_cast<uint32_t>(idx->dim)) {
+        return false;
+    }
+
+    const uint32_t base_crc = get_u32_le(header + 12);
+    const uint32_t snapshot_crc = index_state_crc32c(*idx);
+    const bool apply_records = snapshot_crc == base_crc;
+    uint32_t last_state_crc = base_crc;
+
+    uint64_t offset = kTvidHeaderSize;
+    while (offset < file_size) {
+        uint8_t record[kTvidRecordHeaderSize] = {};
+        f.read(reinterpret_cast<char *>(record), sizeof(record));
+        if (f.gcount() == 0 && f.eof()) {
+            break;
+        }
+        if (f.gcount() != static_cast<std::streamsize>(sizeof(record))) {
+            break; // torn trailing record header
+        }
+        offset += kTvidRecordHeaderSize;
+
+        const uint8_t op = record[0];
+        const uint32_t n = get_u32_le(record + 4);
+        const uint64_t payload_bytes = get_u64_le(record + 8);
+        const uint32_t expected_crc = get_u32_le(record + 16);
+        const uint32_t state_crc = get_u32_le(record + 20);
+        if (record[1] != 0 || record[2] != 0 || record[3] != 0 ||
+            (op != kTvidOpAdd && op != kTvidOpRemove)) {
+            return false;
+        }
+        if (payload_bytes > file_size - offset) {
+            break; // torn trailing record payload
+        }
+
+        std::vector<uint8_t> payload;
+        if (!read_delta_payload(f, payload_bytes, payload)) {
+            break;
+        }
+        offset += payload_bytes;
+
+        uint32_t crc = crc32c_update(0xffffffffu, record, 16);
+        crc = crc32c_update(crc, record + 20, 4);
+        if (!payload.empty()) {
+            crc = crc32c_update(crc, payload.data(), payload.size());
+        }
+        if ((crc ^ 0xffffffffu) != expected_crc) {
+            return false;
+        }
+
+        if (apply_records) {
+            if (op == kTvidOpAdd) {
+                if (!replay_add_delta(idx, n, payload)) {
+                    return false;
+                }
+            } else {
+                if (!replay_remove_delta(idx, n, payload)) {
+                    return false;
+                }
+            }
+        }
+        last_state_crc = state_crc;
+    }
+
+    return apply_records ?
+        index_state_crc32c(*idx) == last_state_crc :
+        snapshot_crc == last_state_crc;
+}
+
+} // namespace
+
+ggml_vec_index_t * ggml_vec_index_load_with_delta(
+    const char * snapshot_path,
+    const char * delta_path) {
+    try {
+        if (snapshot_path == nullptr || delta_path == nullptr) {
+            return nullptr;
+        }
+        std::unique_ptr<ggml_vec_index_t, decltype(&ggml_vec_index_free)> idx(
+            ggml_vec_index_load(snapshot_path),
+            ggml_vec_index_free);
+        if (idx == nullptr) {
+            return nullptr;
+        }
+        if (!replay_delta_log(idx.get(), delta_path)) {
+            return nullptr;
+        }
+        return idx.release();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+int ggml_vec_index_compact_delta(
+    ggml_vec_index_t * idx,
+    const char       * snapshot_path,
+    const char       * delta_path) {
+    try {
+        if (idx == nullptr || snapshot_path == nullptr || delta_path == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        const int write_status = ggml_vec_index_write_unlocked(idx, snapshot_path);
+        if (write_status != GGML_VEC_INDEX_OK) {
+            return write_status;
+        }
+        return write_empty_delta_log(*idx, delta_path);
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
 int ggml_vec_index_len(const ggml_vec_index_t * idx) {
-    return idx ? static_cast<int>(idx->slot_to_id.size()) : 0;
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return static_cast<int>(idx->slot_to_id.size());
+    } catch (...) {
+        return 0;
+    }
 }
 
 int ggml_vec_index_dim(const ggml_vec_index_t * idx) {
-    return idx ? idx->dim : 0;
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return idx->dim;
+    } catch (...) {
+        return 0;
+    }
 }
 
 int ggml_vec_index_bit_width(const ggml_vec_index_t * idx) {
-    return idx ? idx->bit_width : 0;
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return idx->bit_width;
+    } catch (...) {
+        return 0;
+    }
 }

@@ -115,6 +115,26 @@ int main() {
         reset_fault_hooks();
     }
 
+    {
+        std::array<float, 1> scores{};
+        std::array<uint64_t, 1> ids{};
+        CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/1)
+              == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_ivf(
+            idx, base_vectors.data(), 1, /*k=*/1, /*nprobe=*/2,
+            scores.data(), ids.data()) == GGML_VEC_INDEX_OK);
+
+        ggml_vec_index_test_set_oom_countdown(0);
+        CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/1)
+              == GGML_VEC_INDEX_E_OOM);
+        reset_fault_hooks();
+
+        CHECK(ggml_vec_index_search_ivf(
+            idx, base_vectors.data(), 1, /*k=*/1, /*nprobe=*/2,
+            scores.data(), ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ids[0] == base_ids[0]);
+    }
+
     const std::string path =
         (std::filesystem::temp_directory_path() /
          "ggml-vector-index-fault-test.tvim").string();
@@ -155,8 +175,41 @@ int main() {
     CHECK(loaded != nullptr);
     CHECK(ggml_vec_index_len(loaded) == 2);
     ggml_vec_index_free(loaded);
+
+    const std::string delta_path =
+        (std::filesystem::temp_directory_path() /
+         "ggml-vector-index-fault-test.tvid").string();
+    std::filesystem::remove(delta_path);
+
+    const std::array<float, 4> logged_vector = { 0.0f, 0.0f, 1.0f, 0.0f };
+    const uint64_t logged_id = 401;
+    ggml_vec_index_test_set_write_fail_after(8);
+    CHECK(ggml_vec_index_add_logged(
+        idx, logged_vector.data(), 1, &logged_id, delta_path.c_str()) ==
+        GGML_VEC_INDEX_E_IO);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(idx, logged_id) == 0);
+    CHECK(ggml_vec_index_len(idx) == 3);
+    if (std::filesystem::exists(delta_path)) {
+        CHECK(std::filesystem::file_size(delta_path) == 0);
+    }
+
+    CHECK(ggml_vec_index_add_logged(
+        idx, logged_vector.data(), 1, &logged_id, delta_path.c_str()) ==
+        GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_contains(idx, logged_id) == 1);
+    const std::vector<uint8_t> old_delta = read_file_bytes(delta_path);
+
+    ggml_vec_index_test_set_write_fail_after(8);
+    CHECK(ggml_vec_index_remove_logged(idx, logged_id, delta_path.c_str()) ==
+        GGML_VEC_INDEX_E_IO);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(idx, logged_id) == 1);
+    CHECK(read_file_bytes(delta_path) == old_delta);
+
     ggml_vec_index_free(idx);
     std::filesystem::remove(path);
+    std::filesystem::remove(delta_path);
 
     std::printf("test-vector-index-faults: OK\n");
     return 0;
