@@ -726,6 +726,7 @@ struct vk_device_struct {
     bool uma;
     bool prefer_host_memory;
     bool float_controls_rte_fp16;
+    bool float_controls_denorm_preserve_fp16;
     bool subgroup_basic;
     bool subgroup_arithmetic;
     bool subgroup_shuffle;
@@ -898,8 +899,9 @@ struct vk_device_struct {
     // extra f32->f16 pass, and the prior behaviour was to fall back to CPU).
     vk_pipeline pipeline_cpy_quant_f16[GGML_TYPE_COUNT];
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
-    vk_pipeline pipeline_set_rows_i32[GGML_TYPE_COUNT];
-    vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
+    // [src0 0=fp32,1=fp16][dst]
+    vk_pipeline pipeline_set_rows_i32[2][GGML_TYPE_COUNT];
+    vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_norm_mul_add_f32;
     vk_pipeline pipeline_group_norm_f32;
@@ -2773,10 +2775,10 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
 
-    // Patch SPIR-V to enable RTE rounding for FP16, avoiding the need for
-    // separate shader variants compiled with -DRTE16.
+    // Patch SPIR-V to enable supported FP16 float controls, avoiding the need
+    // for separate shader variants.
     std::vector<uint32_t> spirv;
-    if (device->float_controls_rte_fp16) {
+    if (device->float_controls_rte_fp16 || device->float_controls_denorm_preserve_fp16) {
         const uint32_t* spv_words = reinterpret_cast<const uint32_t *>(spv_data);
         size_t word_count = spv_size / sizeof(uint32_t);
         spirv.assign(spv_words, spv_words + word_count);
@@ -2813,9 +2815,17 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 
         // Insert from latest position first so earlier indices stay valid.
 
-        // OpExecutionMode %entrypoint RoundingModeRTE 16
-        uint32_t exec_mode[] = { (4u << spv::WordCountShift) | spv::OpExecutionMode, entry_point_id, spv::ExecutionModeRoundingModeRTE, 16 };
-        spirv.insert(spirv.begin() + exec_insert_pos, std::begin(exec_mode), std::end(exec_mode));
+        if (device->float_controls_rte_fp16) {
+            // OpExecutionMode %entrypoint RoundingModeRTE 16
+            uint32_t exec_mode[] = { (4u << spv::WordCountShift) | spv::OpExecutionMode, entry_point_id, spv::ExecutionModeRoundingModeRTE, 16 };
+            spirv.insert(spirv.begin() + exec_insert_pos, std::begin(exec_mode), std::end(exec_mode));
+        }
+
+        if (device->float_controls_denorm_preserve_fp16) {
+            // OpExecutionMode %entrypoint DenormPreserve 16
+            uint32_t exec_mode[] = { (4u << spv::WordCountShift) | spv::OpExecutionMode, entry_point_id, spv::ExecutionModeDenormPreserve, 16 };
+            spirv.insert(spirv.begin() + exec_insert_pos, std::begin(exec_mode), std::end(exec_mode));
+        }
 
         // OpExtension "SPV_KHR_float_controls"
         const char ext_str[] = "SPV_KHR_float_controls";
@@ -2825,9 +2835,17 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         memcpy(&extension[1], ext_str, sizeof(ext_str));
         spirv.insert(spirv.begin() + ext_insert_pos, extension.begin(), extension.end());
 
-        // OpCapability RoundingModeRTE
-        uint32_t capability[] = { (2u << spv::WordCountShift) | spv::OpCapability, spv::CapabilityRoundingModeRTE };
-        spirv.insert(spirv.begin() + cap_insert_pos, std::begin(capability), std::end(capability));
+        if (device->float_controls_rte_fp16) {
+            // OpCapability RoundingModeRTE
+            uint32_t capability[] = { (2u << spv::WordCountShift) | spv::OpCapability, spv::CapabilityRoundingModeRTE };
+            spirv.insert(spirv.begin() + cap_insert_pos, std::begin(capability), std::end(capability));
+        }
+
+        if (device->float_controls_denorm_preserve_fp16) {
+            // OpCapability DenormPreserve
+            uint32_t capability[] = { (2u << spv::WordCountShift) | spv::OpCapability, spv::CapabilityDenormPreserve };
+            spirv.insert(spirv.begin() + cap_insert_pos, std::begin(capability), std::end(capability));
+        }
 
         shader_module_create_info = vk::ShaderModuleCreateInfo({}, spirv.size() * sizeof(uint32_t), spirv.data());
     }
@@ -5811,51 +5829,53 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
-#define SET_ROWS_BASE(itype, rte) \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_F32],  "set_rows_f32" #itype,  set_rows_f32 ## itype ## rte ## _len,  set_rows_f32 ## itype ## rte ## _data,  "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_F16],  "set_rows_f16" #itype,  set_rows_f16 ## itype ## rte ## _len,  set_rows_f16 ## itype ## rte ## _data,  "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_BF16], "set_rows_bf16" #itype, set_rows_bf16 ## itype ## rte ## _len, set_rows_bf16 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q1_0], "set_rows_q1_0" #itype, set_rows_q1_0 ## itype ## rte ## _len, set_rows_q1_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q4_0], "set_rows_q4_0" #itype, set_rows_q4_0 ## itype ## rte ## _len, set_rows_q4_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q4_1], "set_rows_q4_1" #itype, set_rows_q4_1 ## itype ## rte ## _len, set_rows_q4_1 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_0], "set_rows_q5_0" #itype, set_rows_q5_0 ## itype ## rte ## _len, set_rows_q5_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_1], "set_rows_q5_1" #itype, set_rows_q5_1 ## itype ## rte ## _len, set_rows_q5_1 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q8_0], "set_rows_q8_0" #itype, set_rows_q8_0 ## itype ## rte ## _len, set_rows_q8_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL], "set_rows_iq4_nl" #itype, set_rows_iq4_nl ## itype ## rte ## _len, set_rows_iq4_nl ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+#define SET_ROWS(src_idx, src, itype) \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_F32],  "set_rows_" #src "_f32" #itype,  set_rows_ ## src ## _f32 ## itype ## _len,  set_rows_ ## src ## _f32 ## itype ## _data,  "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_F16],  "set_rows_" #src "_f16" #itype,  set_rows_ ## src ## _f16 ## itype ## _len,  set_rows_ ## src ## _f16 ## itype ## _data,  "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_BF16], "set_rows_" #src "_bf16" #itype, set_rows_ ## src ## _bf16 ## itype ## _len, set_rows_ ## src ## _bf16 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q1_0], "set_rows_" #src "_q1_0" #itype, set_rows_ ## src ## _q1_0 ## itype ## _len, set_rows_ ## src ## _q1_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q4_0], "set_rows_" #src "_q4_0" #itype, set_rows_ ## src ## _q4_0 ## itype ## _len, set_rows_ ## src ## _q4_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q4_1], "set_rows_" #src "_q4_1" #itype, set_rows_ ## src ## _q4_1 ## itype ## _len, set_rows_ ## src ## _q4_1 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q5_0], "set_rows_" #src "_q5_0" #itype, set_rows_ ## src ## _q5_0 ## itype ## _len, set_rows_ ## src ## _q5_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q5_1], "set_rows_" #src "_q5_1" #itype, set_rows_ ## src ## _q5_1 ## itype ## _len, set_rows_ ## src ## _q5_1 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_Q8_0], "set_rows_" #src "_q8_0" #itype, set_rows_ ## src ## _q8_0 ## itype ## _len, set_rows_ ## src ## _q8_0 ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [src_idx][GGML_TYPE_IQ4_NL], "set_rows_" #src "_iq4_nl" #itype, set_rows_ ## src ## _iq4_nl ## itype ## _len, set_rows_ ## src ## _iq4_nl ## itype ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
 
 #define SET_ROWS_TQ(itype, rte) \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TBQ3_0], "set_rows_tbq3_0" #itype, set_rows_tbq3_0 ## itype ## rte ## _len, set_rows_tbq3_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_PQ3_0],  "set_rows_pq3_0"  #itype, set_rows_pq3_0  ## itype ## rte ## _len, set_rows_pq3_0  ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TBQ4_0], "set_rows_tbq4_0" #itype, set_rows_tbq4_0 ## itype ## rte ## _len, set_rows_tbq4_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_PQ4_0],  "set_rows_pq4_0"  #itype, set_rows_pq4_0  ## itype ## rte ## _len, set_rows_pq4_0  ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_TBQ3_0], "set_rows_tbq3_0" #itype, set_rows_tbq3_0 ## itype ## rte ## _len, set_rows_tbq3_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_PQ3_0],  "set_rows_pq3_0"  #itype, set_rows_pq3_0  ## itype ## rte ## _len, set_rows_pq3_0  ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_TBQ4_0], "set_rows_tbq4_0" #itype, set_rows_tbq4_0 ## itype ## rte ## _len, set_rows_tbq4_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_PQ4_0],  "set_rows_pq4_0"  #itype, set_rows_pq4_0  ## itype ## rte ## _len, set_rows_pq4_0  ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req);
 
 #define SET_ROWS_TQ_NC(itype, rte) \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TBQ3_0], "set_rows_tbq3_0" #itype "_nc", set_rows_tbq3_0 ## itype ## _nc ## rte ## _len, set_rows_tbq3_0 ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_PQ3_0],  "set_rows_pq3_0"  #itype "_nc", set_rows_pq3_0  ## itype ## _nc ## rte ## _len, set_rows_pq3_0  ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TBQ4_0], "set_rows_tbq4_0" #itype "_nc", set_rows_tbq4_0 ## itype ## _nc ## rte ## _len, set_rows_tbq4_0 ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_PQ4_0],  "set_rows_pq4_0"  #itype "_nc", set_rows_pq4_0  ## itype ## _nc ## rte ## _len, set_rows_pq4_0  ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_TBQ3_0], "set_rows_tbq3_0" #itype "_nc", set_rows_tbq3_0 ## itype ## _nc ## rte ## _len, set_rows_tbq3_0 ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_PQ3_0],  "set_rows_pq3_0"  #itype "_nc", set_rows_pq3_0  ## itype ## _nc ## rte ## _len, set_rows_pq3_0  ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_TBQ4_0], "set_rows_tbq4_0" #itype "_nc", set_rows_tbq4_0 ## itype ## _nc ## rte ## _len, set_rows_tbq4_0 ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_PQ4_0],  "set_rows_pq4_0"  #itype "_nc", set_rows_pq4_0  ## itype ## _nc ## rte ## _len, set_rows_pq4_0  ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req);
 
 #define SET_ROWS_TQ64(itype, rte) \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TBQ3_0_64], "set_rows_tbq3_0_64" #itype, set_rows_tbq3_0_64 ## itype ## rte ## _len, set_rows_tbq3_0_64 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_PQ3_0_64],  "set_rows_pq3_0_64"  #itype, set_rows_pq3_0_64  ## itype ## rte ## _len, set_rows_pq3_0_64  ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TBQ4_0_64], "set_rows_tbq4_0_64" #itype, set_rows_tbq4_0_64 ## itype ## rte ## _len, set_rows_tbq4_0_64 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_PQ4_0_64],  "set_rows_pq4_0_64"  #itype, set_rows_pq4_0_64  ## itype ## rte ## _len, set_rows_pq4_0_64  ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_TBQ3_0_64], "set_rows_tbq3_0_64" #itype, set_rows_tbq3_0_64 ## itype ## rte ## _len, set_rows_tbq3_0_64 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_PQ3_0_64],  "set_rows_pq3_0_64"  #itype, set_rows_pq3_0_64  ## itype ## rte ## _len, set_rows_pq3_0_64  ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_TBQ4_0_64], "set_rows_tbq4_0_64" #itype, set_rows_tbq4_0_64 ## itype ## rte ## _len, set_rows_tbq4_0_64 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_PQ4_0_64],  "set_rows_pq4_0_64"  #itype, set_rows_pq4_0_64  ## itype ## rte ## _len, set_rows_pq4_0_64  ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req);
 
 #define SET_ROWS_TQ64_NC(itype, rte) \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TBQ3_0_64], "set_rows_tbq3_0_64" #itype "_nc", set_rows_tbq3_0_64 ## itype ## _nc ## rte ## _len, set_rows_tbq3_0_64 ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_PQ3_0_64],  "set_rows_pq3_0_64"  #itype "_nc", set_rows_pq3_0_64  ## itype ## _nc ## rte ## _len, set_rows_pq3_0_64  ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TBQ4_0_64], "set_rows_tbq4_0_64" #itype "_nc", set_rows_tbq4_0_64 ## itype ## _nc ## rte ## _len, set_rows_tbq4_0_64 ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_PQ4_0_64],  "set_rows_pq4_0_64"  #itype "_nc", set_rows_pq4_0_64  ## itype ## _nc ## rte ## _len, set_rows_pq4_0_64  ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_TBQ3_0_64], "set_rows_tbq3_0_64" #itype "_nc", set_rows_tbq3_0_64 ## itype ## _nc ## rte ## _len, set_rows_tbq3_0_64 ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_PQ3_0_64],  "set_rows_pq3_0_64"  #itype "_nc", set_rows_pq3_0_64  ## itype ## _nc ## rte ## _len, set_rows_pq3_0_64  ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_TBQ4_0_64], "set_rows_tbq4_0_64" #itype "_nc", set_rows_tbq4_0_64 ## itype ## _nc ## rte ## _len, set_rows_tbq4_0_64 ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req); \
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [0][GGML_TYPE_PQ4_0_64],  "set_rows_pq4_0_64"  #itype "_nc", set_rows_pq4_0_64  ## itype ## _nc ## rte ## _len, set_rows_pq4_0_64  ## itype ## _nc ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, tbq_set_rows_spec_consts, 1, true, false, tbq_copy_sg_req);
 
     // RTE rounding is programmatic now; no `_rte_` shader variants exist.
     (void)device->float_controls_rte_fp16; // kept for potential future use
     {
-        SET_ROWS_BASE(_i32, )
-        SET_ROWS_BASE(_i64, )
+        SET_ROWS(0, f32, _i32)
+        SET_ROWS(0, f32, _i64)
+        SET_ROWS(1, f16, _i32)
+        SET_ROWS(1, f16, _i64)
         if (tq_nc) { SET_ROWS_TQ_NC(_i32, ) SET_ROWS_TQ_NC(_i64, ) SET_ROWS_TQ64_NC(_i32, ) SET_ROWS_TQ64_NC(_i64, ) }
         else       { SET_ROWS_TQ(_i32, )    SET_ROWS_TQ(_i64, )    SET_ROWS_TQ64(_i32, )    SET_ROWS_TQ64(_i64, )    }
     }
-#undef SET_ROWS_BASE
+#undef SET_ROWS
 #undef SET_ROWS_TQ
 #undef SET_ROWS_TQ_NC
 #undef SET_ROWS_TQ64
@@ -6780,6 +6800,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->shader_core_count = 0;
         }
         device->float_controls_rte_fp16 = vk12_props.shaderRoundingModeRTEFloat16;
+        device->float_controls_denorm_preserve_fp16 = vk12_props.shaderDenormPreserveFloat16;
 
         device->subgroup_basic = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
                                  (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eBasic);
@@ -12284,10 +12305,17 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_DUP:
         return ggml_vk_get_cpy_pipeline(ctx, src0, dst, dst->type);
     case GGML_OP_SET_ROWS:
-        if (src1->type == GGML_TYPE_I64) {
-            return ctx->device->pipeline_set_rows_i64[dst->type];
-        } else {
-            return ctx->device->pipeline_set_rows_i32[dst->type];
+        {
+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+                return nullptr;
+            }
+            const int src_idx = src0->type == GGML_TYPE_F16;
+            if (src1->type == GGML_TYPE_I64) {
+                return ctx->device->pipeline_set_rows_i64[src_idx][dst->type];
+            } else if (src1->type == GGML_TYPE_I32) {
+                return ctx->device->pipeline_set_rows_i32[src_idx][dst->type];
+            }
+            return nullptr;
         }
     case GGML_OP_SILU_BACK:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -19636,7 +19664,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SET_ROWS:
             {
-                if (op->src[0]->type != GGML_TYPE_F32) {
+                if ((op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) ||
+                    (op->src[1]->type != GGML_TYPE_I32 && op->src[1]->type != GGML_TYPE_I64)) {
                     return false;
                 }
                 switch (op->type) {
@@ -19650,7 +19679,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
-                        break;
+                        return true;
                     case GGML_TYPE_TBQ3_0:
                     case GGML_TYPE_PQ3_0:
                     case GGML_TYPE_TBQ4_0:
@@ -19659,6 +19688,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_PQ3_0_64:
                     case GGML_TYPE_TBQ4_0_64:
                     case GGML_TYPE_PQ4_0_64: {
+                        if (op->src[0]->type != GGML_TYPE_F32) {
+                            return false;
+                        }
                         // TBQ/PQ SET_ROWS pipelines need a cooperative shader
                         // that depends on subgroup features the device may not
                         // provide (the GLSL pipeline-create can silently fail
@@ -19670,9 +19702,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         // buffer that cannot run the operation (SET_ROWS)".
                         auto device = ggml_vk_get_device(ctx->device);
                         const bool has_i32 =
-                            device->pipeline_set_rows_i32[op->type] != nullptr;
+                            device->pipeline_set_rows_i32[0][op->type] != nullptr;
                         const bool has_i64 =
-                            device->pipeline_set_rows_i64[op->type] != nullptr;
+                            device->pipeline_set_rows_i64[0][op->type] != nullptr;
                         if (op->src[1] && op->src[1]->type == GGML_TYPE_I64) {
                             return has_i64;
                         }
@@ -19681,7 +19713,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     default:
                         return false;
                 }
-                return true;
             }
         case GGML_OP_CONT:
         case GGML_OP_CPY:
