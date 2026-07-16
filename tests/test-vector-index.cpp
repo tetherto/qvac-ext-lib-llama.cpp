@@ -198,9 +198,21 @@ int main() {
         CHECK(ggml_vec_index_len(idx) == 0);
     }
 
+    // UINT64_MAX is reserved as the empty-result sentinel.
+    {
+        const std::array<float, kDim> vector = {
+            1.0f, 0.0f, 0.0f, 0.0f,
+        };
+        const uint64_t reserved_id = UINT64_MAX;
+        CHECK(ggml_vec_index_add(idx, vector.data(), 1, &reserved_id)
+              == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove(idx, reserved_id)
+              == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_len(idx) == 0);
+    }
+
     // Add 4 well-separated unit vectors. IDs are non-trivial uint64 to
-    // catch sign-extension or BigInt round-trip bugs at the JS boundary
-    // when this codepath is later exercised from Bare.
+    // catch sign-extension bugs when this codepath is called from bindings.
     std::vector<float> vecs;
     std::vector<uint64_t> ids = {
         42ULL,
@@ -464,6 +476,17 @@ int main() {
         CHECK(out_ids[1] == ids[2]);
         CHECK(out_ids[2] == UINT64_MAX);
         CHECK(scores[2] == -FLT_MAX);
+
+        auto * other_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(other_idx != nullptr);
+        CHECK(ggml_vec_index_add(
+            other_idx, vecs.data(), static_cast<int>(ids.size()), ids.data()) ==
+            GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_prepared_filtered(
+            other_idx, filter, seeds[0].data(), 1, /*k=*/1,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        ggml_vec_index_free(other_idx);
+
         ggml_vec_index_filter_free(filter);
 
         auto * empty_filter = ggml_vec_index_filter_create(
@@ -526,6 +549,17 @@ int main() {
     CHECK(::stat(path.c_str(), &persisted_stat) == 0);
     CHECK((persisted_stat.st_mode & 0777) == 0600);
 #endif
+
+    const std::string reserved_id_path =
+        (std::filesystem::temp_directory_path() /
+         "ggml-vector-index-reserved-id-corrupt.tvim").string();
+    expect_corrupt_load_fails(path, reserved_id_path, [](std::vector<uint8_t> & bytes) {
+        constexpr size_t ids_offset = 32 + 3 * kDim * sizeof(float);
+        CHECK(bytes.size() >= ids_offset + sizeof(uint64_t));
+        for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+            bytes[ids_offset + i] = 0xff;
+        }
+    });
 
     ggml_vec_index_free(idx);
 
@@ -718,6 +752,16 @@ int main() {
         CHECK(ggml_vec_index_len(base_only) == 2);
         ggml_vec_index_free(base_only);
 
+        const uint64_t reserved_delta_id = UINT64_MAX;
+        CHECK(ggml_vec_index_add_logged(
+            base, seeds[2].data(), 1, &reserved_delta_id, delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove_logged(
+            base, reserved_delta_id, delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_len(base) == 2);
+        CHECK(!std::filesystem::exists(delta_path));
+
         const uint64_t delta_id = (1ULL << 41) + 7ULL;
         CHECK(ggml_vec_index_add_logged(
             base, seeds[2].data(), 1, &delta_id, delta_path.c_str()) == GGML_VEC_INDEX_OK);
@@ -794,6 +838,20 @@ int main() {
         CHECK(ggml_vec_index_contains(compacted_with_old_log, ids[0]) == 0);
         CHECK(ggml_vec_index_contains(compacted_with_old_log, ids[1]) == 1);
         CHECK(ggml_vec_index_contains(compacted_with_old_log, delta_id) == 1);
+
+        const uint64_t post_crash_compact_id = (1ULL << 41) + 10ULL;
+        CHECK(ggml_vec_index_add_logged(
+            compacted_with_old_log, seeds[3].data(), 1, &post_crash_compact_id, delta_path.c_str()) ==
+            GGML_VEC_INDEX_OK);
+        auto * replayed_after_old_log_append = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(replayed_after_old_log_append != nullptr);
+        CHECK(ggml_vec_index_len(replayed_after_old_log_append) == 3);
+        CHECK(ggml_vec_index_contains(replayed_after_old_log_append, ids[0]) == 0);
+        CHECK(ggml_vec_index_contains(replayed_after_old_log_append, ids[1]) == 1);
+        CHECK(ggml_vec_index_contains(replayed_after_old_log_append, delta_id) == 1);
+        CHECK(ggml_vec_index_contains(replayed_after_old_log_append, post_crash_compact_id) == 1);
+        ggml_vec_index_free(replayed_after_old_log_append);
         ggml_vec_index_free(compacted_with_old_log);
 
         CHECK(ggml_vec_index_compact_delta(
@@ -1061,7 +1119,7 @@ int main() {
         ggml_vec_index_free(overflow_idx);
     }
 
-    // q4 production path: packed nibbles with one f32 scale per vector.
+    // q4 path: packed nibbles with one f32 scale per vector.
     {
         constexpr int tail_dim = 13;
         const std::vector<float> tail_vector = {
@@ -1234,7 +1292,7 @@ int main() {
         std::filesystem::remove(empty_path);
     }
 
-    // q8 production path: stores quantized codes, searches directly against
+    // q8 path: stores quantized codes, searches directly against
     // q8 storage, and persists as .tvim v2 with q8 metadata.
     {
         auto * q8 = ggml_vec_index_create(kDim, /*bit_width=*/8);
@@ -1345,6 +1403,14 @@ int main() {
                     32 + 2 * sizeof(float) + 2 * kDim * sizeof(int8_t);
                 for (size_t i = 0; i < sizeof(uint64_t); ++i) {
                     bytes[id_offset + sizeof(uint64_t) + i] = bytes[id_offset + i];
+                }
+            });
+        expect_corrupt_load_fails(
+            legacy_v2_path, corrupt_path, [](std::vector<uint8_t> & bytes) {
+                const size_t id_offset =
+                    32 + 2 * sizeof(float) + 2 * kDim * sizeof(int8_t);
+                for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+                    bytes[id_offset + i] = 0xff;
                 }
             });
         std::filesystem::remove(legacy_v2_path);

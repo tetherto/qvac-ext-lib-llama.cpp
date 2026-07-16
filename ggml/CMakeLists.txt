@@ -335,7 +335,6 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-rpc.h
     include/ggml-virtgpu.h
     include/ggml-sycl.h
-    include/ggml-vector-index.h
     include/ggml-vulkan.h
     include/ggml-webgpu.h
     include/ggml-zendnn.h
@@ -343,11 +342,12 @@ set(GGML_PUBLIC_HEADERS
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
+set_target_properties(ggml-vector-index PROPERTIES PUBLIC_HEADER include/ggml-vector-index.h)
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
 #endif()
 install(
-  TARGETS ggml ggml-base
+  TARGETS ggml ggml-base ggml-vector-index
   EXPORT ggml-targets)
 
 install(

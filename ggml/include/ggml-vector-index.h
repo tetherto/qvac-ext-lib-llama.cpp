@@ -1,10 +1,9 @@
 #pragma once
 //
-// ggml-vector-index: TurboVec-style vector-index C API.
+// ggml-vector-index: vector-index C API.
 //
-// This is the public C API for fabric's vector index. The implementation
-// under `ggml/src/ggml-vector-index.cpp` supports full f32 storage
-// (`bit_width=32`), production q8 storage (`bit_width=8`), and packed q4
+// This public C API supports full f32 storage (`bit_width=32`), q8 storage
+// (`bit_width=8`), and packed q4
 // storage (`bit_width=4`) with CPU search directly against quantized codes.
 // q8 uses NEON/AVX2 when available; q4 uses NEON when available.
 //
@@ -63,7 +62,8 @@ GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 // associating each with the corresponding `ids[i]` (caller-owned external id).
 // Returns 0 on success. Returns GGML_VEC_INDEX_E_DUPLICATE if any id already
 // exists in the index; in that case the index is unchanged (atomic add).
-// All vector components must be finite.
+// All vector components must be finite. UINT64_MAX is reserved for search
+// result padding and is not a valid id.
 GGML_API int ggml_vec_index_add(
     ggml_vec_index_t * idx,
     const float      * vectors,

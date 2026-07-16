@@ -191,7 +191,6 @@ add_library(ggml-base
             ../include/ggml-backend.h
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
-            ../include/ggml-vector-index.h
             ../include/gguf.h
             ../include/uint8-buff-stream.h
             ggml.c
@@ -205,7 +204,6 @@ add_library(ggml-base
             ggml-tbq-quants.c
             ggml-quants.c
             ggml-quants.h
-            ggml-vector-index.cpp
             gguf.cpp
             uint8-buff-stream.cpp)
 
@@ -262,6 +260,19 @@ target_link_libraries(ggml PUBLIC ggml-base)
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
+
+add_library(ggml-vector-index
+            ../include/ggml-vector-index.h
+            ggml-vector-index.cpp)
+add_library(ggml::ggml-vector-index ALIAS ggml-vector-index)
+add_library(ggml::vector-index ALIAS ggml-vector-index)
+
+set_target_properties(ggml-vector-index PROPERTIES
+    VERSION ${GGML_VERSION}
+    SOVERSION ${GGML_VERSION_MAJOR}
+)
+
+target_link_libraries(ggml-vector-index PUBLIC ggml-base)
 
 function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)
@@ -511,7 +522,7 @@ ggml_add_backend(Hexagon)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
 
-foreach (target ggml-base ggml)
+foreach (target ggml-base ggml ggml-vector-index)
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
 endforeach()
@@ -533,7 +544,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
 endif()
 
 if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
-    foreach (target ggml-base ggml)
+    foreach (target ggml-base ggml ggml-vector-index)
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
         target_compile_definitions(${target} PUBLIC  GGML_SHARED)

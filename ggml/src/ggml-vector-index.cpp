@@ -1,4 +1,4 @@
-// ggml-vector-index.cpp - CPU implementation of the fabric vector
+// ggml-vector-index.cpp - CPU implementation of the vector
 // index C API declared in `ggml/include/ggml-vector-index.h`.
 //
 // Storage: full f32 vectors or per-vector symmetric q8 codes. ID map uses
@@ -330,6 +330,10 @@ bool is_supported_bit_width(int bit_width) {
     return bit_width == 4 || bit_width == 8 || bit_width == 32;
 }
 
+bool is_valid_id(uint64_t id) {
+    return id != UINT64_MAX;
+}
+
 bool all_finite(const float * values, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(values[i])) {
@@ -652,6 +656,8 @@ struct ggml_vec_index {
     int bit_width = 32;
     uint64_t generation = 0;
     bool read_only_mmap = false;
+    bool delta_log_rebase_pending = false;
+    uint32_t delta_log_rebase_crc = 0;
 
     std::unique_ptr<MappedFile> mapped_file;
     size_t mapped_vector_bytes = 0;
@@ -686,6 +692,7 @@ struct ggml_vec_index {
 };
 
 struct ggml_vec_index_filter {
+    const ggml_vec_index_t * owner = nullptr;
     int dim = 0;
     int bit_width = 32;
     uint64_t generation = 0;
@@ -1155,7 +1162,7 @@ bool delta_log_ends_at_state(
 }
 
 int append_delta_record(
-        const ggml_vec_index & idx,
+        ggml_vec_index & idx,
         const char * delta_path,
         uint8_t op,
         uint32_t n,
@@ -1185,8 +1192,19 @@ int append_delta_record(
             }
             old_size = complete_size;
         }
+        if (idx.delta_log_rebase_pending &&
+            idx.delta_log_rebase_crc == base_crc_for_new_log &&
+            existing_base_crc != base_crc_for_new_log) {
+            // The snapshot already includes this log's records (e.g. crash after
+            // compacting the snapshot but before replacing the old delta log).
+            if (!truncate_file_to(delta_path, 0)) {
+                return GGML_VEC_INDEX_E_INTERNAL;
+            }
+            old_size = 0;
+            idx.delta_log_rebase_pending = false;
+            idx.delta_log_rebase_crc = 0;
+        }
     }
-    (void) existing_base_crc;
 
     std::FILE * f = nullptr;
     if (!open_append_file(delta_path, &f)) {
@@ -1311,6 +1329,9 @@ int check_logged_add_duplicates(
     std::unordered_set<uint64_t> batch_ids;
     batch_ids.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
+        if (!is_valid_id(ids[i])) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (idx->id_to_slot.find(ids[i]) != idx->id_to_slot.end()) {
             return GGML_VEC_INDEX_E_DUPLICATE;
         }
@@ -1453,6 +1474,9 @@ static int ggml_vec_index_add_unlocked(
         std::unordered_set<uint64_t> batch_ids;
         batch_ids.reserve(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
+            if (!is_valid_id(ids[i])) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
             if (idx->id_to_slot.find(ids[i]) != idx->id_to_slot.end()) {
                 return GGML_VEC_INDEX_E_DUPLICATE;
             }
@@ -1550,6 +1574,9 @@ int ggml_vec_index_add(
 static int ggml_vec_index_remove_unlocked(ggml_vec_index_t * idx, uint64_t id) {
     try {
         if (idx == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (!is_valid_id(id)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (idx->read_only_mmap) {
@@ -1790,6 +1817,9 @@ int ggml_vec_index_remove_logged(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        if (!is_valid_id(id)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (idx->read_only_mmap) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
@@ -2306,7 +2336,8 @@ static int ggml_vec_index_search_impl(
         std::vector<size_t> allowed_slots;
         const std::vector<size_t> * allowed_ptr = nullptr;
         if (prepared_filter != nullptr) {
-            if (prepared_filter->dim != idx->dim ||
+            if (prepared_filter->owner != idx ||
+                prepared_filter->dim != idx->dim ||
                 prepared_filter->bit_width != idx->bit_width ||
                 prepared_filter->generation != idx->generation) {
                 return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -2373,6 +2404,7 @@ ggml_vec_index_filter_t * ggml_vec_index_filter_create(
             return nullptr;
         }
         std::unique_ptr<ggml_vec_index_filter> owned(filter);
+        owned->owner = idx;
         owned->dim = idx->dim;
         owned->bit_width = idx->bit_width;
         owned->generation = idx->generation;
@@ -2938,6 +2970,9 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             if (!read_ok) {
                 return nullptr;
             }
+            if (!is_valid_id(id)) {
+                return nullptr;
+            }
         }
 
         if (checksummed) {
@@ -3160,6 +3195,9 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
         const uint8_t * ids = bytes + static_cast<size_t>(ids_offset);
         for (size_t slot = 0; slot < n; ++slot) {
             const uint64_t id = get_u64_le(ids + slot * sizeof(uint64_t));
+            if (!is_valid_id(id)) {
+                return nullptr;
+            }
             idx->slot_to_id[slot] = id;
             if (!idx->id_to_slot.emplace(id, slot).second) {
                 return nullptr;
@@ -3251,6 +3289,9 @@ bool replay_remove_delta(ggml_vec_index_t * idx, uint32_t n, const std::vector<u
         return false;
     }
     const uint64_t id = get_u64_le(payload.data());
+    if (!is_valid_id(id)) {
+        return false;
+    }
     return ggml_vec_index_remove(idx, id) >= 0;
 }
 
@@ -3342,9 +3383,15 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
         last_state_crc = state_crc;
     }
 
-    return apply_records ?
-        index_state_crc32c(*idx) == last_state_crc :
-        snapshot_crc == last_state_crc;
+    if (apply_records) {
+        return index_state_crc32c(*idx) == last_state_crc;
+    }
+    if (snapshot_crc != last_state_crc) {
+        return false;
+    }
+    idx->delta_log_rebase_pending = base_crc != snapshot_crc;
+    idx->delta_log_rebase_crc = snapshot_crc;
+    return true;
 }
 
 } // namespace
