@@ -11,6 +11,7 @@
 
 extern "C" void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 extern "C" void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
+extern "C" void ggml_vec_index_test_set_truncate_fail(int fail);
 
 namespace {
 
@@ -25,6 +26,7 @@ namespace {
 void reset_fault_hooks() {
     ggml_vec_index_test_set_oom_countdown(-1);
     ggml_vec_index_test_set_write_fail_after(-1);
+    ggml_vec_index_test_set_truncate_fail(0);
 }
 
 std::vector<uint8_t> read_file_bytes(const std::string & path) {
@@ -194,11 +196,49 @@ int main() {
         CHECK(std::filesystem::file_size(delta_path) == 0);
     }
 
+    const uint64_t allowed_id = base_ids[0];
+    std::array<float, 1> logged_scores{};
+    std::array<uint64_t, 1> logged_out_ids{};
+    auto * stale_filter = ggml_vec_index_filter_create(idx, &allowed_id, 1);
+    CHECK(stale_filter != nullptr);
+    CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/1)
+          == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_add_logged(
         idx, logged_vector.data(), 1, &logged_id, delta_path.c_str()) ==
         GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_contains(idx, logged_id) == 1);
+    CHECK(ggml_vec_index_search_prepared_filtered(
+        idx, stale_filter, base_vectors.data(), 1, /*k=*/1,
+        logged_scores.data(), logged_out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(ggml_vec_index_search_ivf(
+        idx, base_vectors.data(), 1, /*k=*/1, /*nprobe=*/2,
+        logged_scores.data(), logged_out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+    ggml_vec_index_filter_free(stale_filter);
     const std::vector<uint8_t> old_delta = read_file_bytes(delta_path);
+
+    auto * rollback_filter = ggml_vec_index_filter_create(idx, &allowed_id, 1);
+    CHECK(rollback_filter != nullptr);
+    CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/1)
+          == GGML_VEC_INDEX_OK);
+    const uint64_t failed_internal_id = 402;
+    ggml_vec_index_test_set_write_fail_after(8);
+    ggml_vec_index_test_set_truncate_fail(1);
+    CHECK(ggml_vec_index_add_logged(
+        idx, logged_vector.data(), 1, &failed_internal_id, delta_path.c_str()) ==
+        GGML_VEC_INDEX_E_INTERNAL);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(idx, failed_internal_id) == 0);
+    CHECK(ggml_vec_index_len(idx) == 4);
+    CHECK(read_file_bytes(delta_path) == old_delta);
+    CHECK(ggml_vec_index_search_prepared_filtered(
+        idx, rollback_filter, base_vectors.data(), 1, /*k=*/1,
+        logged_scores.data(), logged_out_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(logged_out_ids[0] == allowed_id);
+    CHECK(ggml_vec_index_search_ivf(
+        idx, base_vectors.data(), 1, /*k=*/1, /*nprobe=*/2,
+        logged_scores.data(), logged_out_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(logged_out_ids[0] == allowed_id);
+    ggml_vec_index_filter_free(rollback_filter);
 
     ggml_vec_index_test_set_write_fail_after(8);
     CHECK(ggml_vec_index_remove_logged(idx, logged_id, delta_path.c_str()) ==

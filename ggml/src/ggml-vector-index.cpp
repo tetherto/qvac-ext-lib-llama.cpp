@@ -74,6 +74,7 @@
 extern "C" {
 void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
+void ggml_vec_index_test_set_truncate_fail(int fail);
 }
 #endif
 
@@ -150,6 +151,7 @@ MappedFile::~MappedFile() {
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 std::atomic<int64_t> g_test_oom_countdown{ -1 };
 std::atomic<int64_t> g_test_write_fail_after{ -1 };
+std::atomic<bool> g_test_truncate_fail{ false };
 
 void test_maybe_throw_bad_alloc() {
     const int64_t remaining = g_test_oom_countdown.load();
@@ -634,6 +636,10 @@ void ggml_vec_index_test_set_oom_countdown(int64_t countdown) {
 void ggml_vec_index_test_set_write_fail_after(int64_t bytes) {
     g_test_write_fail_after.store(bytes);
 }
+
+void ggml_vec_index_test_set_truncate_fail(int fail) {
+    g_test_truncate_fail.store(fail != 0);
+}
 }
 #endif
 
@@ -1030,6 +1036,11 @@ bool validate_delta_header(
 
 bool truncate_file_to(const char * path, uint64_t size) {
     try {
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        if (g_test_truncate_fail.load()) {
+            return false;
+        }
+#endif
         std::filesystem::path fs_path;
         if (!filesystem_path_from_utf8(path, fs_path)) {
             return false;
@@ -1122,6 +1133,25 @@ bool inspect_delta_log_tail(
         complete_size = offset;
     }
     return true;
+}
+
+bool delta_log_ends_at_state(
+        const char * path,
+        const ggml_vec_index & idx,
+        uint32_t state_crc) {
+    try {
+        std::filesystem::path fs_path;
+        if (!filesystem_path_from_utf8(path, fs_path)) {
+            return false;
+        }
+        uint32_t tail_crc = 0;
+        uint64_t complete_size = 0;
+        return inspect_delta_log_tail(path, idx, tail_crc, complete_size) &&
+            complete_size == static_cast<uint64_t>(std::filesystem::file_size(fs_path)) &&
+            tail_crc == state_crc;
+    } catch (...) {
+        return false;
+    }
 }
 
 int append_delta_record(
@@ -1359,11 +1389,38 @@ void ggml_vec_index_free(ggml_vec_index_t * idx) {
 // Mutation
 // ---------------------------------------------------------------------------
 
+static void rollback_appended_slots_unlocked(
+        ggml_vec_index_t * idx,
+        size_t base_slot,
+        const uint64_t * ids,
+        int n) noexcept {
+    if (idx == nullptr) {
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        idx->id_to_slot.erase(ids[i]);
+    }
+    const size_t dim_sz = static_cast<size_t>(idx->dim);
+    if (is_q4(*idx)) {
+        idx->q4_data.resize(base_slot * q4_row_bytes(dim_sz));
+        idx->q4_scale.resize(base_slot);
+    } else if (is_q8(*idx)) {
+        idx->q8_data.resize(base_slot * dim_sz);
+        idx->q8_scale.resize(base_slot);
+    } else {
+        idx->data.resize(base_slot * dim_sz);
+    }
+    idx->slot_to_id.resize(base_slot);
+    idx->slot_active.resize(base_slot);
+    idx->n_active = idx->id_to_slot.size();
+}
+
 static int ggml_vec_index_add_unlocked(
     ggml_vec_index_t * idx,
     const float      * vectors,
     int                n,
-    const uint64_t   * ids) {
+    const uint64_t   * ids,
+    bool               finalize) {
 
     size_t base_slot = 0;
     size_t dim_sz    = 0;
@@ -1373,21 +1430,7 @@ static int ggml_vec_index_add_unlocked(
         if (idx == nullptr || !resized) {
             return;
         }
-        for (int i = 0; i < n; ++i) {
-            idx->id_to_slot.erase(ids[i]);
-        }
-        if (is_q4(*idx)) {
-            idx->q4_data.resize(base_slot * q4_row_bytes(dim_sz));
-            idx->q4_scale.resize(base_slot);
-        } else if (is_q8(*idx)) {
-            idx->q8_data.resize(base_slot * dim_sz);
-            idx->q8_scale.resize(base_slot);
-        } else {
-            idx->data.resize(base_slot * dim_sz);
-        }
-        idx->slot_to_id.resize(base_slot);
-        idx->slot_active.resize(base_slot);
-        idx->n_active = idx->id_to_slot.size();
+        rollback_appended_slots_unlocked(idx, base_slot, ids, n);
     };
 
     try {
@@ -1474,8 +1517,10 @@ static int ggml_vec_index_add_unlocked(
             idx->id_to_slot.emplace(ids[i], slot);
         }
         idx->n_active += n_sz;
-        ++idx->generation;
-        invalidate_ivf(*idx);
+        if (finalize) {
+            ++idx->generation;
+            invalidate_ivf(*idx);
+        }
     } catch (const std::bad_alloc &) {
         rollback();
         return GGML_VEC_INDEX_E_OOM;
@@ -1496,7 +1541,7 @@ int ggml_vec_index_add(
     }
     try {
         std::unique_lock<std::shared_mutex> lock(idx->mutex);
-        return ggml_vec_index_add_unlocked(idx, vectors, n, ids);
+        return ggml_vec_index_add_unlocked(idx, vectors, n, ids, true);
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
@@ -1662,6 +1707,7 @@ int ggml_vec_index_add_logged(
     const uint64_t   * ids,
     const char       * delta_path) {
     bool added = false;
+    size_t base_slot = 0;
     std::unique_lock<std::shared_mutex> lock;
     try {
         if (idx == nullptr || delta_path == nullptr) {
@@ -1689,41 +1735,47 @@ int ggml_vec_index_add_logged(
         }
 
         const uint32_t base_crc = index_state_crc32c(*idx);
-        const int add_status = ggml_vec_index_add_unlocked(idx, vectors, n, ids);
+        base_slot = idx->slot_to_id.size();
+        const int add_status = ggml_vec_index_add_unlocked(idx, vectors, n, ids, false);
         if (add_status != GGML_VEC_INDEX_OK) {
             return add_status;
         }
         added = true;
 
+        const uint32_t added_state_crc = index_state_crc32c(*idx);
         const int append_status = append_delta_record(
             *idx,
             delta_path,
             kTvidOpAdd,
             static_cast<uint32_t>(n),
             base_crc,
-            index_state_crc32c(*idx),
+            added_state_crc,
             payload);
         if (append_status != GGML_VEC_INDEX_OK) {
-            if (append_status == GGML_VEC_INDEX_E_IO) {
-                for (int i = 0; i < n; ++i) {
-                    ggml_vec_index_remove_unlocked(idx, ids[i]);
-                }
+            const bool record_is_complete =
+                append_status == GGML_VEC_INDEX_E_INTERNAL &&
+                delta_log_ends_at_state(delta_path, *idx, added_state_crc);
+            if (record_is_complete) {
+                ++idx->generation;
+                invalidate_ivf(*idx);
+            } else {
+                rollback_appended_slots_unlocked(idx, base_slot, ids, n);
             }
+            added = false;
             return append_status;
         }
+        ++idx->generation;
+        invalidate_ivf(*idx);
+        added = false;
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         if (added) {
-            for (int i = 0; i < n; ++i) {
-                ggml_vec_index_remove_unlocked(idx, ids[i]);
-            }
+            rollback_appended_slots_unlocked(idx, base_slot, ids, n);
         }
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
         if (added) {
-            for (int i = 0; i < n; ++i) {
-                ggml_vec_index_remove_unlocked(idx, ids[i]);
-            }
+            rollback_appended_slots_unlocked(idx, base_slot, ids, n);
         }
         return GGML_VEC_INDEX_E_INTERNAL;
     }
