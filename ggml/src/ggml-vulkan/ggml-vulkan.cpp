@@ -6487,8 +6487,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const uint32_t S_V = gdn_sizes[si];
             GGML_ASSERT(is_pow2(S_V));
 
+            // Adreno's subgroupClusteredAdd returns wrong results in the gated_delta_net
+            // shaders (seen on Adreno 840); use the full-subgroup / shmem reduce path
+            // instead, which Adreno 830 (no clustered support) already takes and passes.
+            const bool clustered_ok = device->subgroup_clustered &&
+                                      device->architecture != vk_device_architecture::QUALCOMM_ADRENO;
+
             uint32_t lanes_per_column;
-            if (S_V >= 128u && device->subgroup_clustered) {
+            if (S_V >= 128u && clustered_ok) {
                 lanes_per_column = 8u;
             } else {
                 // Use largest power-of-two that divides both S_V and subgroup_size so that
@@ -6514,7 +6520,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             GGML_ASSERT((S_V % (device->subgroup_size / lanes_per_column)) == 0);
 
             const bool need_partial_subgroup_reduce = lanes_per_column != 1u && lanes_per_column < device->subgroup_size;
-            const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
+            const bool use_clustered_reduce = device->subgroup_arithmetic && clustered_ok && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
             size_t gdn_len, gdn_back_len;
