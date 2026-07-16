@@ -793,8 +793,10 @@ int main() {
     std::vector<std::vector<uint64_t>> allowlists;
     std::vector<TimedSearch> f32_filtered;
     std::vector<TimedSearch> q8_filtered;
+    std::vector<TimedSearch> q4_filtered;
     std::vector<TimedSearch> f32_prepared_filtered;
     std::vector<TimedSearch> q8_prepared_filtered;
+    std::vector<TimedSearch> q4_prepared_filtered;
     for (int requested : filter_sizes) {
         const int n_allowed = std::min(requested, cfg.n_vec);
         allowlists.push_back(make_allowlist(cfg.n_vec, n_allowed));
@@ -814,12 +816,23 @@ int main() {
             allowlists.back(),
             cfg.warmups,
             cfg.repeats));
+        q4_filtered.push_back(run_filtered_search(
+            q4,
+            queries,
+            cfg.n_query,
+            cfg.k,
+            allowlists.back(),
+            cfg.warmups,
+            cfg.repeats));
         ggml_vec_index_filter_t * f32_filter = ggml_vec_index_filter_create(
             f32, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
         ggml_vec_index_filter_t * q8_filter = ggml_vec_index_filter_create(
             q8, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
+        ggml_vec_index_filter_t * q4_filter = ggml_vec_index_filter_create(
+            q4, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
         CHECK(f32_filter != nullptr);
         CHECK(q8_filter != nullptr);
+        CHECK(q4_filter != nullptr);
         f32_prepared_filtered.push_back(run_prepared_filtered_search(
             f32,
             f32_filter,
@@ -836,8 +849,17 @@ int main() {
             cfg.k,
             cfg.warmups,
             cfg.repeats));
+        q4_prepared_filtered.push_back(run_prepared_filtered_search(
+            q4,
+            q4_filter,
+            queries,
+            cfg.n_query,
+            cfg.k,
+            cfg.warmups,
+            cfg.repeats));
         ggml_vec_index_filter_free(f32_filter);
         ggml_vec_index_filter_free(q8_filter);
+        ggml_vec_index_filter_free(q4_filter);
     }
 
     const double f32_ivf_recall_at_k =
@@ -981,19 +1003,23 @@ int main() {
         q4_ivf_recall_at_k);
     for (size_t i = 0; i < allowlists.size(); ++i) {
         std::printf(
-            "  filtered latency: allowed=%zu f32=%.3f ms q8=%.3f ms f32/prepared=%.3f ms q8/prepared=%.3f ms\n",
+            "  filtered latency: allowed=%zu f32=%.3f ms q8=%.3f ms q4=%.3f ms f32/prepared=%.3f ms q8/prepared=%.3f ms q4/prepared=%.3f ms\n",
             allowlists[i].size(),
             f32_filtered[i].ms,
             q8_filtered[i].ms,
+            q4_filtered[i].ms,
             f32_prepared_filtered[i].ms,
-            q8_prepared_filtered[i].ms);
+            q8_prepared_filtered[i].ms,
+            q4_prepared_filtered[i].ms);
         std::printf(
-            "  filtered ratio:   allowed=%zu f32/full=%.3f q8/full=%.3f f32/prep_speedup=%.3f q8/prep_speedup=%.3f\n",
+            "  filtered ratio:   allowed=%zu f32/full=%.3f q8/full=%.3f q4/full=%.3f f32/prep_speedup=%.3f q8/prep_speedup=%.3f q4/prep_speedup=%.3f\n",
             allowlists[i].size(),
             f32_filtered[i].ms / f32_res.ms,
             q8_filtered[i].ms / q8_res.ms,
+            q4_filtered[i].ms / q4_res.ms,
             f32_filtered[i].ms / f32_prepared_filtered[i].ms,
-            q8_filtered[i].ms / q8_prepared_filtered[i].ms);
+            q8_filtered[i].ms / q8_prepared_filtered[i].ms,
+            q4_filtered[i].ms / q4_prepared_filtered[i].ms);
     }
     std::printf(
         "  delta load f32:    snapshot=%.3f ms replay=%.3f ms compact=%.3f ms post_compact=%.3f ms\n",

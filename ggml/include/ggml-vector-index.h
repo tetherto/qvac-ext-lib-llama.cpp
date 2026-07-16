@@ -16,9 +16,23 @@
 //
 // Endianness: persistence format is fixed little-endian.
 
-#include "ggml.h"
-
 #include <stdint.h>
+
+#ifndef GGML_API
+#    ifdef GGML_SHARED
+#        if defined(_WIN32) && !defined(__MINGW32__)
+#            ifdef GGML_BUILD
+#                define GGML_API __declspec(dllexport) extern
+#            else
+#                define GGML_API __declspec(dllimport) extern
+#            endif
+#        else
+#            define GGML_API __attribute__ ((visibility ("default"))) extern
+#        endif
+#    else
+#        define GGML_API extern
+#    endif
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,7 +52,6 @@ typedef struct ggml_vec_index_filter ggml_vec_index_filter_t;
 // `_remove` is the exception: it returns 1 on removal and 0 on miss.
 enum ggml_vec_index_error {
     GGML_VEC_INDEX_OK            =  0,
-    GGML_VEC_INDEX_E_INVALID_DIM = -1,
     GGML_VEC_INDEX_E_INVALID_ARG = -2,
     GGML_VEC_INDEX_E_DUPLICATE   = -3,
     GGML_VEC_INDEX_E_IO          = -4,
@@ -64,7 +77,7 @@ GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 // Returns 0 on success. Returns GGML_VEC_INDEX_E_DUPLICATE if any id already
 // exists in the index; in that case the index is unchanged (atomic add).
 // All vector components must be finite. UINT64_MAX is reserved for search
-// result padding and is not a valid id.
+// result padding and is not a valid id. Live index length is capped at INT_MAX.
 GGML_API int ggml_vec_index_add(
     ggml_vec_index_t * idx,
     const float      * vectors,
@@ -91,12 +104,15 @@ GGML_API int ggml_vec_index_add_logged(
     const uint64_t   * ids,
     const char       * delta_path);
 
+// Same return convention as `ggml_vec_index_remove`: 1 if removed, 0 if not
+// present, negative on error.
 GGML_API int ggml_vec_index_remove_logged(
     ggml_vec_index_t * idx,
     uint64_t           id,
     const char       * delta_path);
 
-// Returns 1 if the id is in the index, 0 otherwise. Read-only.
+// Returns 1 if the id is in the index, 0 otherwise. NULL handles return 0.
+// Read-only.
 GGML_API int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id);
 
 // Placeholder for cache warming / codebook resolution after a bulk add.
@@ -194,7 +210,7 @@ GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 // Loads a v2 .tvim snapshot with its vector section memory-mapped read-only.
 // IDs and quantization scales are copied into memory for lookup and scoring.
 // Mutating APIs return GGML_VEC_INDEX_E_INVALID_ARG on mmap-backed handles.
-// `ggml_vec_index_write` can snapshot mmap-backed handles, but callers should
+// `ggml_vec_index_write` can snapshot mmap-backed handles, but callers must
 // write to a different path than the mapped source file.
 // Returns NULL on failure or unsupported file format.
 GGML_API ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path);
@@ -212,7 +228,7 @@ GGML_API int ggml_vec_index_compact_delta(
     const char       * snapshot_path,
     const char       * delta_path);
 
-// Stats.
+// Stats. NULL handles return 0.
 GGML_API int ggml_vec_index_len(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_dim(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);

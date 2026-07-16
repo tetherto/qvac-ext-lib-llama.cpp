@@ -78,6 +78,94 @@ void expect_no_temp_siblings(const std::string & path) {
     }
 }
 
+void test_quantized_logged_faults(int bit_width) {
+    constexpr int dim = 4;
+    const std::array<float, 8> base_vectors = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+    };
+    const std::array<uint64_t, 2> base_ids = {
+        static_cast<uint64_t>(800 + bit_width),
+        static_cast<uint64_t>(900 + bit_width),
+    };
+    const std::array<float, 4> logged_vector = { 0.25f, -0.5f, 0.75f, -1.0f };
+    const std::array<float, 4> extra_vector = { -0.125f, 0.375f, -0.625f, 0.875f };
+
+    const std::string suffix = std::to_string(bit_width);
+    const std::string snapshot_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-quant-fault-base-" + suffix + ".tvim")).string();
+    const std::string delta_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-quant-fault-log-" + suffix + ".tvid")).string();
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_path + ".lock");
+
+    auto * idx = ggml_vec_index_create(dim, bit_width);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(
+        idx, base_vectors.data(), static_cast<int>(base_ids.size()), base_ids.data()) ==
+        GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(idx, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+
+    const uint64_t failed_initial_id = static_cast<uint64_t>(1000 + bit_width);
+    ggml_vec_index_test_set_write_fail_after(8);
+    CHECK(ggml_vec_index_add_logged(
+        idx, logged_vector.data(), 1, &failed_initial_id, delta_path.c_str()) ==
+        GGML_VEC_INDEX_E_IO);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(idx, failed_initial_id) == 0);
+    CHECK(ggml_vec_index_len(idx) == 2);
+    if (std::filesystem::exists(delta_path)) {
+        CHECK(std::filesystem::file_size(delta_path) == 0);
+    }
+
+    const uint64_t logged_id = static_cast<uint64_t>(1100 + bit_width);
+    CHECK(ggml_vec_index_add_logged(
+        idx, logged_vector.data(), 1, &logged_id, delta_path.c_str()) ==
+        GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_contains(idx, logged_id) == 1);
+    CHECK(ggml_vec_index_len(idx) == 3);
+    const std::vector<uint8_t> old_delta = read_file_bytes(delta_path);
+
+    const uint64_t failed_rollback_id = static_cast<uint64_t>(1200 + bit_width);
+    ggml_vec_index_test_set_write_fail_after(8);
+    ggml_vec_index_test_set_truncate_fail(1);
+    CHECK(ggml_vec_index_add_logged(
+        idx, extra_vector.data(), 1, &failed_rollback_id, delta_path.c_str()) ==
+        GGML_VEC_INDEX_E_INTERNAL);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(idx, failed_rollback_id) == 0);
+    CHECK(ggml_vec_index_len(idx) == 3);
+    CHECK(read_file_bytes(delta_path) == old_delta);
+
+    ggml_vec_index_test_set_write_fail_after(8);
+    CHECK(ggml_vec_index_remove_logged(idx, logged_id, delta_path.c_str()) ==
+          GGML_VEC_INDEX_E_IO);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(idx, logged_id) == 1);
+    CHECK(read_file_bytes(delta_path) == old_delta);
+
+    CHECK(ggml_vec_index_remove_logged(idx, base_ids[0], delta_path.c_str()) == 1);
+    CHECK(ggml_vec_index_contains(idx, base_ids[0]) == 0);
+    CHECK(ggml_vec_index_len(idx) == 2);
+
+    auto * replayed = ggml_vec_index_load_with_delta(snapshot_path.c_str(), delta_path.c_str());
+    CHECK(replayed != nullptr);
+    CHECK(ggml_vec_index_bit_width(replayed) == bit_width);
+    CHECK(ggml_vec_index_len(replayed) == 2);
+    CHECK(ggml_vec_index_contains(replayed, base_ids[0]) == 0);
+    CHECK(ggml_vec_index_contains(replayed, base_ids[1]) == 1);
+    CHECK(ggml_vec_index_contains(replayed, logged_id) == 1);
+
+    ggml_vec_index_free(replayed);
+    ggml_vec_index_free(idx);
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_path + ".lock");
+}
+
 } // namespace
 
 int main() {
@@ -208,7 +296,7 @@ int main() {
             GGML_VEC_INDEX_OK);
         ggml_vec_index_test_set_parent_fsync_fail(1);
         CHECK(ggml_vec_index_write(parent_fsync_idx, parent_fsync_path.c_str()) ==
-              GGML_VEC_INDEX_OK);
+              GGML_VEC_INDEX_E_IO);
         reset_fault_hooks();
         CHECK(read_file_bytes(parent_fsync_path) != before_parent_fsync);
 
@@ -391,9 +479,9 @@ int main() {
     CHECK(ggml_vec_index_compact_delta(
         compact_parent,
         compact_parent_snapshot_path.c_str(),
-        compact_parent_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+        compact_parent_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
     reset_fault_hooks();
-    CHECK(std::filesystem::file_size(compact_parent_delta_path) == 16);
+    CHECK(std::filesystem::file_size(compact_parent_delta_path) > 16);
     auto * compact_parent_replayed = ggml_vec_index_load_with_delta(
         compact_parent_snapshot_path.c_str(), compact_parent_delta_path.c_str());
     CHECK(compact_parent_replayed != nullptr);
@@ -446,6 +534,9 @@ int main() {
     std::filesystem::remove(cached_tail_snapshot_path);
     std::filesystem::remove(cached_tail_delta_path);
     std::filesystem::remove(cached_tail_delta_path + ".lock");
+
+    test_quantized_logged_faults(/*bit_width=*/8);
+    test_quantized_logged_faults(/*bit_width=*/4);
 
     const std::string shared_snapshot_path =
         (std::filesystem::temp_directory_path() /

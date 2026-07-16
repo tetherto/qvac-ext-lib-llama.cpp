@@ -105,6 +105,7 @@ constexpr uint8_t  kTvidOpAdd      = 1;
 constexpr uint8_t  kTvidOpRemove   = 2;
 constexpr size_t   kTvidHeaderSize = 16;
 constexpr size_t   kTvidRecordHeaderSize = 24;
+constexpr size_t   kMaxIndexLen    = static_cast<size_t>(std::numeric_limits<int>::max());
 
 static_assert(sizeof(float) == sizeof(uint32_t), "ggml-vector-index requires float32");
 
@@ -715,6 +716,7 @@ struct ggml_vec_index {
     uint32_t delta_tail_cache_crc = 0;
 
     std::unique_ptr<MappedFile> mapped_file;
+    std::string mapped_source_path;
     size_t mapped_vector_bytes = 0;
     const float   * mapped_data = nullptr;
     const int8_t  * mapped_q8_data = nullptr;
@@ -1118,11 +1120,6 @@ bool get_delta_tail_cache(
     return true;
 }
 
-std::mutex & delta_log_process_mutex() {
-    static std::mutex mutex;
-    return mutex;
-}
-
 bool delta_lock_path(const char * path, std::filesystem::path & out) {
     std::filesystem::path fs_path;
     if (!filesystem_path_from_utf8(path, fs_path)) {
@@ -1143,13 +1140,45 @@ bool delta_lock_path(const char * path, std::filesystem::path & out) {
     return true;
 }
 
+std::shared_ptr<std::mutex> delta_log_process_mutex_for(const std::filesystem::path & lock_path) {
+    static std::mutex registry_mutex;
+    static std::unordered_map<std::string, std::weak_ptr<std::mutex>> registry;
+
+    // POSIX advisory locks are process-owned, so same-process threads need an
+    // in-memory companion lock. Key it by path to avoid serializing every log.
+    const std::string key = lock_path.u8string();
+    std::lock_guard<std::mutex> guard(registry_mutex);
+    const auto found = registry.find(key);
+    if (found != registry.end()) {
+        std::shared_ptr<std::mutex> mutex = found->second.lock();
+        if (mutex != nullptr) {
+            return mutex;
+        }
+        registry.erase(found);
+    }
+
+    for (auto it = registry.begin(); it != registry.end();) {
+        if (it->second.expired()) {
+            it = registry.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    std::shared_ptr<std::mutex> mutex = std::make_shared<std::mutex>();
+    registry.emplace(key, mutex);
+    return mutex;
+}
+
 class DeltaLogLock {
 public:
-    explicit DeltaLogLock(const char * path) : process_lock(delta_log_process_mutex()) {
+    explicit DeltaLogLock(const char * path) {
         std::filesystem::path lock_path;
         if (!delta_lock_path(path, lock_path)) {
             return;
         }
+        process_mutex = delta_log_process_mutex_for(lock_path);
+        process_lock = std::unique_lock<std::mutex>(*process_mutex);
 #ifdef _WIN32
         file = CreateFileW(
             lock_path.wstring().c_str(),
@@ -1212,6 +1241,7 @@ public:
     }
 
 private:
+    std::shared_ptr<std::mutex> process_mutex;
     std::unique_lock<std::mutex> process_lock;
     bool locked = false;
 #ifdef _WIN32
@@ -1558,7 +1588,9 @@ int write_empty_delta_log_unlocked(const ggml_vec_index & idx, const char * delt
             return fail_io();
         }
         temp.path.clear();
-        (void) fsync_parent_dir(delta_path);
+        if (!fsync_parent_dir(delta_path)) {
+            return GGML_VEC_INDEX_E_IO;
+        }
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
@@ -1767,6 +1799,9 @@ static int ggml_vec_index_add_unlocked(
         base_slot = idx->slot_to_id.size();
         dim_sz    = static_cast<size_t>(idx->dim);
         const size_t n_sz = static_cast<size_t>(n);
+        if (n_sz > kMaxIndexLen || active_count(*idx) > kMaxIndexLen - n_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (n_sz > std::numeric_limits<size_t>::max() - base_slot) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
@@ -2791,16 +2826,25 @@ int ggml_vec_index_search_ivf(
                     return a.score > b.score;
                 });
 
+            std::vector<size_t> selected_lists;
+            selected_lists.reserve(static_cast<size_t>(probe_count));
             size_t candidate_count = 0;
-            for (int probe = 0; probe < probe_count; ++probe) {
-                candidate_count +=
-                    idx->ivf_lists[static_cast<size_t>(centroid_scores[probe].id)].size();
+            for (const ScoreId & centroid : centroid_scores) {
+                const size_t list_id = static_cast<size_t>(centroid.id);
+                const auto & list = idx->ivf_lists[list_id];
+                if (list.empty()) {
+                    continue;
+                }
+                selected_lists.push_back(list_id);
+                candidate_count += list.size();
+                if (selected_lists.size() == static_cast<size_t>(probe_count)) {
+                    break;
+                }
             }
             std::vector<size_t> candidate_slots;
             candidate_slots.reserve(candidate_count);
-            for (int probe = 0; probe < probe_count; ++probe) {
-                const auto & list =
-                    idx->ivf_lists[static_cast<size_t>(centroid_scores[probe].id)];
+            for (size_t list_id : selected_lists) {
+                const auto & list = idx->ivf_lists[list_id];
                 candidate_slots.insert(candidate_slots.end(), list.begin(), list.end());
             }
             search_one(*idx, query, k, scores, ids, &candidate_slots);
@@ -2820,6 +2864,11 @@ int ggml_vec_index_search_ivf(
 static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * path) {
     try {
         if (idx == nullptr || path == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (idx->read_only_mmap &&
+            !idx->mapped_source_path.empty() &&
+            filesystem_paths_equal(idx->mapped_source_path.c_str(), path)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (active_count(*idx) > std::numeric_limits<uint32_t>::max()) {
@@ -2959,7 +3008,9 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             return fail_io();
         }
         temp.path.clear();
-        (void) fsync_parent_dir(path);
+        if (!fsync_parent_dir(path)) {
+            return GGML_VEC_INDEX_E_IO;
+        }
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
@@ -3102,6 +3153,9 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         }
         const size_t dim_sz = static_cast<size_t>(dim);
         const size_t n      = static_cast<size_t>(n_le);
+        if (n > kMaxIndexLen) {
+            return nullptr;
+        }
         if (n != 0 && dim_sz > std::numeric_limits<size_t>::max() / n) {
             return nullptr;
         }
@@ -3416,6 +3470,9 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
         }
 
         const size_t n = static_cast<size_t>(n_le);
+        if (n > kMaxIndexLen) {
+            return nullptr;
+        }
         const size_t dim_sz = static_cast<size_t>(dim_le);
         idx->slot_to_id.resize(n);
         idx->slot_active.assign(n, 1);
@@ -3492,6 +3549,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
         }
 
         idx->read_only_mmap = true;
+        idx->mapped_source_path = path;
         idx->mapped_vector_bytes = static_cast<size_t>(vectors_bytes_u64);
         idx->mapped_file = std::move(mapped);
         return idx.release();
@@ -3725,7 +3783,13 @@ int ggml_vec_index_compact_delta(
         if (write_status != GGML_VEC_INDEX_OK) {
             return write_status;
         }
-        return write_empty_delta_log_unlocked(*idx, delta_path);
+        const int delta_status = write_empty_delta_log_unlocked(*idx, delta_path);
+        if (delta_status != GGML_VEC_INDEX_OK) {
+            return delta_status;
+        }
+        idx->delta_log_rebase_pending = false;
+        idx->delta_log_rebase_crc = 0;
+        return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
@@ -3743,7 +3807,8 @@ int ggml_vec_index_len(const ggml_vec_index_t * idx) {
     }
     try {
         std::shared_lock<std::shared_mutex> lock(idx->mutex);
-        return static_cast<int>(active_count(*idx));
+        const size_t n = active_count(*idx);
+        return n > kMaxIndexLen ? std::numeric_limits<int>::max() : static_cast<int>(n);
     } catch (...) {
         return 0;
     }

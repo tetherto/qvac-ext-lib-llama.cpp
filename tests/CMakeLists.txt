@@ -155,18 +155,18 @@ if (LLAMA_TESTS_INSTALL)
 endif()
 llama_test(test-vector-index)
 
-add_executable(
-    test-vector-index-faults
-    test-vector-index-faults.cpp
-    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index.cpp
-)
-target_compile_features(test-vector-index-faults PRIVATE cxx_std_17)
-target_compile_definitions(test-vector-index-faults PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
-target_include_directories(test-vector-index-faults PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
-target_link_libraries(test-vector-index-faults PRIVATE Threads::Threads)
+add_library(test-vector-index-fault-hooks STATIC ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index.cpp)
+target_compile_features(test-vector-index-fault-hooks PRIVATE cxx_std_17)
+target_compile_definitions(test-vector-index-fault-hooks PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+target_include_directories(test-vector-index-fault-hooks PUBLIC ${PROJECT_SOURCE_DIR}/ggml/include)
+target_link_libraries(test-vector-index-fault-hooks PRIVATE Threads::Threads)
 if (NOT WIN32)
-    target_link_libraries(test-vector-index-faults PRIVATE m)
+    target_link_libraries(test-vector-index-fault-hooks PRIVATE m)
 endif()
+
+add_executable(test-vector-index-faults test-vector-index-faults.cpp)
+target_compile_features(test-vector-index-faults PRIVATE cxx_std_17)
+target_link_libraries(test-vector-index-faults PRIVATE test-vector-index-fault-hooks)
 llama_test(test-vector-index-faults)
 
 add_executable(bench-vector-index bench-vector-index.cpp)
@@ -175,6 +175,7 @@ target_link_libraries(bench-vector-index PRIVATE ggml-vector-index)
 if (LLAMA_TESTS_INSTALL)
     install(TARGETS bench-vector-index RUNTIME)
 endif()
+llama_test(bench-vector-index LABEL bench)
 
 if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)

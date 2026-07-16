@@ -215,11 +215,25 @@ if(NOT TARGET ggml::ggml)
         PROPERTIES
             INTERFACE_LINK_LIBRARIES "${GGML_INTERFACE_LINK_LIBRARIES}")
 
+endif()
+
+if(NOT TARGET ggml::all)
+    set(_ggml_all_targets "")
+    if (NOT GGML_BACKEND_DL)
+        foreach(_ggml_backend ${GGML_AVAILABLE_BACKENDS})
+            if(TARGET ggml::${_ggml_backend})
+                list(APPEND _ggml_all_targets ggml::${_ggml_backend})
+            endif()
+        endforeach()
+    endif()
+    if(TARGET ggml::vector-index)
+        list(APPEND _ggml_all_targets ggml::vector-index)
+    endif()
     add_library(ggml::all INTERFACE IMPORTED)
     set_target_properties(ggml::all
         PROPERTIES
             INTERFACE_LINK_LIBRARIES "${_ggml_all_targets}")
-
+    unset(_ggml_all_targets)
 endif()
 
 check_required_components(ggml)
