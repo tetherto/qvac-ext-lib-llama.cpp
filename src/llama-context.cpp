@@ -205,6 +205,11 @@ llama_context::llama_context(
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
 
+    cparams.fused_dsv4_hc_pre  = true;
+    cparams.fused_dsv4_hc_comb = true;
+    cparams.fused_dsv4_hc_post = true;
+    cparams.auto_fhc           = true;
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -642,6 +647,59 @@ void llama_context::sched_reserve() {
         }
 
         cparams.auto_flid = false;
+    }
+
+    if (cparams.auto_fhc) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", __func__);
+
+        auto resolve = [&](enum ggml_op op, const char * tensor_name, const char * name, bool & enabled) {
+            if (!enabled) {
+                return;
+            }
+
+            auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+            if (!gf) {
+                throw std::runtime_error(std::string("failed to reserve graph for ") + name + " check");
+            }
+
+            const size_t prefix_len = strlen(tensor_name) + 1;
+            bool device_mismatch = false;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                ggml_tensor * n = ggml_graph_node(gf, i);
+                if (n->op != op) {
+                    continue;
+                }
+                ggml_backend_dev_t device_hc =
+                    ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
+
+                GGML_ASSERT(strncmp(n->name, tensor_name, prefix_len - 1) == 0);
+                GGML_ASSERT(n->name[prefix_len - 1] == '-');
+                const int il = std::stoi(n->name + prefix_len);
+                ggml_backend_dev_t device_layer = model.dev_layer(il);
+                if (device_hc != device_layer) {
+                    LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the %s tensor "
+                            "is assigned to device %s (usually due to missing support)\n",
+                            __func__, il, ggml_backend_dev_name(device_layer), name, ggml_backend_dev_name(device_hc));
+                    device_mismatch = true;
+                    break;
+                }
+            }
+
+            if (device_mismatch) {
+                enabled = false;
+                LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", __func__, name);
+            } else {
+                LLAMA_LOG_INFO("%s: %s enabled\n", __func__, name);
+            }
+        };
+
+        resolve(GGML_OP_DSV4_HC_PRE,  LLAMA_TENSOR_NAME_FHC_PRE,  "fused DeepSeek V4 HC pre",
+                cparams.fused_dsv4_hc_pre);
+        resolve(GGML_OP_DSV4_HC_COMB, LLAMA_TENSOR_NAME_FHC_COMB, "fused DeepSeek V4 HC comb",
+                cparams.fused_dsv4_hc_comb);
+        resolve(GGML_OP_DSV4_HC_POST, LLAMA_TENSOR_NAME_FHC_POST, "fused DeepSeek V4 HC post",
+                cparams.fused_dsv4_hc_post);
+        cparams.auto_fhc = false;
     }
 
     // reserve worst-case graph
