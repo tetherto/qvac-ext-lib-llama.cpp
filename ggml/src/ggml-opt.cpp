@@ -1360,7 +1360,8 @@ bool ggml_opt_load_tensors(ggml_opt_context_t opt_ctx, const char* filename) {
             struct ggml_tensor* grad_v = ggml_opt_get_grad_v(opt_ctx, param_idx);
             
             if (grad_m && strlen(grad_m->name) > 0 && strcmp(tensor_name, grad_m->name) == 0) {
-                if (ggml_nelements(grad_m) == ggml_nelements(gguf_tensor)) {
+                if (grad_m->type == gguf_tensor->type &&
+                    ggml_nelements(grad_m) == ggml_nelements(gguf_tensor)) {
                     if (grad_m->data) {
                         ggml_backend_tensor_set(grad_m, gguf_tensor->data, 0, ggml_nbytes(grad_m));
                         grad_m_loaded++;
@@ -1368,9 +1369,10 @@ bool ggml_opt_load_tensors(ggml_opt_context_t opt_ctx, const char* filename) {
                 }
                 break;
             }
-            
+
             if (grad_v && strlen(grad_v->name) > 0 && strcmp(tensor_name, grad_v->name) == 0) {
-                if (ggml_nelements(grad_v) == ggml_nelements(gguf_tensor)) {
+                if (grad_v->type == gguf_tensor->type &&
+                    ggml_nelements(grad_v) == ggml_nelements(gguf_tensor)) {
                     if (grad_v->data) {
                         ggml_backend_tensor_set(grad_v, gguf_tensor->data, 0, ggml_nbytes(grad_v));
                         grad_v_loaded++;
