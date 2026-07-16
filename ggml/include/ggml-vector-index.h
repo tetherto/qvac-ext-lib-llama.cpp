@@ -5,7 +5,9 @@
 // This public C API supports full f32 storage (`bit_width=32`), q8 storage
 // (`bit_width=8`), and packed q4
 // storage (`bit_width=4`) with CPU search directly against quantized codes.
-// q8 uses NEON/AVX2 when available; q4 uses NEON when available.
+// q8 uses NEON when available; on x86 it uses AVX2 when compiled with AVX2,
+// and GCC/Clang builds can runtime-dispatch AVX2 from a non-AVX2 baseline.
+// q4 uses NEON when available.
 //
 // Threading: read-only APIs on the same handle can run concurrently. Mutations,
 // persistence writes, compaction, and IVF builds are serialized with reads and
@@ -137,10 +139,11 @@ GGML_API int ggml_vec_index_build_ivf(
 // against the index (does not mutate state).
 //
 // Score semantics: dot product. For f32 storage this is a full-precision dot
-// product. For q4/q8 storage, the query remains f32 and each indexed component
-// is scored as `q_code * per_vector_scale` without expanding the stored matrix
-// back to f32. Callers that want cosine similarity must L2-normalize their
-// vectors before insert AND before query; the index does NOT normalize
+// product. For q4/q8 storage, the query remains f32 and the dot product is
+// computed against dequantized indexed components:
+// `query[i] * (q_code * per_vector_scale)`, without expanding the stored
+// matrix back to f32. Callers that want cosine similarity must L2-normalize
+// their vectors before insert AND before query; the index does NOT normalize
 // internally. All query components must be finite.
 GGML_API int ggml_vec_index_search(
     const ggml_vec_index_t * idx,
@@ -186,8 +189,9 @@ GGML_API int ggml_vec_index_search_prepared_filtered(
 
 // IVF-flat ANN top-k search. `ggml_vec_index_build_ivf` must have been called
 // after the most recent mutation. `nprobe` controls how many centroid lists are
-// searched; higher values improve recall and lower the latency win. If nprobe
-// is greater than the number of built lists, all lists are searched.
+// searched; higher values improve recall and lower the latency win. `nprobe`
+// must be >= 1. If nprobe is greater than the number of built lists, all lists
+// are searched.
 GGML_API int ggml_vec_index_search_ivf(
     const ggml_vec_index_t * idx,
     const float            * queries,
@@ -212,6 +216,7 @@ GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 // Mutating APIs return GGML_VEC_INDEX_E_INVALID_ARG on mmap-backed handles.
 // `ggml_vec_index_write` can snapshot mmap-backed handles, but callers must
 // write to a different path than the mapped source file.
+// Requires a little-endian host; use `ggml_vec_index_load` on other hosts.
 // Returns NULL on failure or unsupported file format.
 GGML_API ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path);
 

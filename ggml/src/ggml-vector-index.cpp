@@ -1440,7 +1440,12 @@ bool delta_log_ends_at_state(
     }
 }
 
-int append_delta_record(
+struct DeltaAppendResult {
+    int status = GGML_VEC_INDEX_OK;
+    bool record_complete = false;
+};
+
+DeltaAppendResult append_delta_record(
         ggml_vec_index & idx,
         const char * delta_path,
         uint8_t op,
@@ -1449,33 +1454,33 @@ int append_delta_record(
         uint32_t state_crc,
         const std::vector<uint8_t> & payload) {
     if (delta_path == nullptr) {
-        return GGML_VEC_INDEX_E_INVALID_ARG;
+        return { GGML_VEC_INDEX_E_INVALID_ARG, false };
     }
     DeltaLogLock delta_lock(delta_path);
     if (!delta_lock.ok()) {
-        return GGML_VEC_INDEX_E_IO;
+        return { GGML_VEC_INDEX_E_IO, false };
     }
 
     uint64_t old_size = 0;
     uint32_t existing_base_crc = 0;
     if (!validate_delta_header(delta_path, idx, old_size, existing_base_crc)) {
-        return GGML_VEC_INDEX_E_IO;
+        return { GGML_VEC_INDEX_E_IO, false };
     }
     if (old_size != 0) {
         uint32_t tail_crc = 0;
         uint64_t complete_size = 0;
         if (!get_delta_tail_cache(idx, delta_path, old_size, tail_crc, complete_size) &&
             !inspect_delta_log_tail(delta_path, idx, tail_crc, complete_size)) {
-            return GGML_VEC_INDEX_E_IO;
+            return { GGML_VEC_INDEX_E_IO, false };
         }
         if (tail_crc != base_crc_for_new_log) {
             invalidate_delta_tail_cache(idx);
-            return GGML_VEC_INDEX_E_IO;
+            return { GGML_VEC_INDEX_E_IO, false };
         }
         if (complete_size != old_size) {
             if (!truncate_file_to(delta_path, complete_size)) {
                 invalidate_delta_tail_cache(idx);
-                return GGML_VEC_INDEX_E_INTERNAL;
+                return { GGML_VEC_INDEX_E_INTERNAL, false };
             }
             old_size = complete_size;
         }
@@ -1486,7 +1491,7 @@ int append_delta_record(
             // compacting the snapshot but before replacing the old delta log).
             if (!truncate_file_to(delta_path, 0)) {
                 invalidate_delta_tail_cache(idx);
-                return GGML_VEC_INDEX_E_INTERNAL;
+                return { GGML_VEC_INDEX_E_INTERNAL, false };
             }
             old_size = 0;
             idx.delta_log_rebase_pending = false;
@@ -1498,7 +1503,7 @@ int append_delta_record(
 
     std::FILE * f = nullptr;
     if (!open_append_file(delta_path, &f)) {
-        return GGML_VEC_INDEX_E_IO;
+        return { GGML_VEC_INDEX_E_IO, false };
     }
     auto close_file = [&]() {
         if (f != nullptr) {
@@ -1506,11 +1511,16 @@ int append_delta_record(
             f = nullptr;
         }
     };
-    auto fail_io = [&]() {
+    auto fail_io = [&]() -> DeltaAppendResult {
         close_file();
         const bool truncated = truncate_file_to(delta_path, old_size);
+        const bool record_complete =
+            !truncated && delta_log_ends_at_state(delta_path, idx, state_crc);
         invalidate_delta_tail_cache(idx);
-        return truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_INTERNAL;
+        return {
+            truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_INTERNAL,
+            record_complete,
+        };
     };
 
     if (old_size == 0) {
@@ -1542,8 +1552,13 @@ int append_delta_record(
     f = nullptr;
     if (close_result != 0 || !fsync_parent_dir(delta_path)) {
         const bool truncated = truncate_file_to(delta_path, old_size);
+        const bool record_complete =
+            !truncated && delta_log_ends_at_state(delta_path, idx, state_crc);
         invalidate_delta_tail_cache(idx);
-        return truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_INTERNAL;
+        return {
+            truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_INTERNAL,
+            record_complete,
+        };
     }
     const uint64_t written_size =
         old_size +
@@ -1551,7 +1566,7 @@ int append_delta_record(
         kTvidRecordHeaderSize +
         static_cast<uint64_t>(payload.size());
     set_delta_tail_cache(idx, delta_path, written_size, state_crc);
-    return GGML_VEC_INDEX_OK;
+    return { GGML_VEC_INDEX_OK, true };
 }
 
 int write_empty_delta_log_unlocked(const ggml_vec_index & idx, const char * delta_path) {
@@ -2084,7 +2099,7 @@ int ggml_vec_index_add_logged(
         added = true;
 
         const uint32_t added_state_crc = index_state_crc32c(*idx);
-        const int append_status = append_delta_record(
+        const DeltaAppendResult append_result = append_delta_record(
             *idx,
             delta_path,
             kTvidOpAdd,
@@ -2092,11 +2107,8 @@ int ggml_vec_index_add_logged(
             base_crc,
             added_state_crc,
             payload);
-        if (append_status != GGML_VEC_INDEX_OK) {
-            const bool record_is_complete =
-                append_status == GGML_VEC_INDEX_E_INTERNAL &&
-                delta_log_ends_at_state(delta_path, *idx, added_state_crc);
-            if (record_is_complete) {
+        if (append_result.status != GGML_VEC_INDEX_OK) {
+            if (append_result.record_complete) {
                 ++idx->generation;
                 invalidate_ivf(*idx);
                 added = false;
@@ -2105,7 +2117,7 @@ int ggml_vec_index_add_logged(
                 rollback_appended_slots_unlocked(idx, base_slot, ids, n);
             }
             added = false;
-            return append_status;
+            return append_result.status;
         }
         ++idx->generation;
         invalidate_ivf(*idx);
@@ -2145,7 +2157,7 @@ int ggml_vec_index_remove_logged(
         const std::vector<uint8_t> payload = build_remove_delta_payload(id);
         const uint32_t base_crc = index_state_crc32c(*idx);
         const uint32_t post_remove_crc = index_state_crc32c_after_remove(*idx, id);
-        const int append_status = append_delta_record(
+        const DeltaAppendResult append_result = append_delta_record(
             *idx,
             delta_path,
             kTvidOpRemove,
@@ -2153,14 +2165,11 @@ int ggml_vec_index_remove_logged(
             base_crc,
             post_remove_crc,
             payload);
-        if (append_status != GGML_VEC_INDEX_OK) {
-            const bool record_is_complete =
-                append_status == GGML_VEC_INDEX_E_INTERNAL &&
-                delta_log_ends_at_state(delta_path, *idx, post_remove_crc);
-            if (record_is_complete) {
+        if (append_result.status != GGML_VEC_INDEX_OK) {
+            if (append_result.record_complete) {
                 return ggml_vec_index_remove_unlocked(idx, id);
             }
-            return append_status;
+            return append_result.status;
         }
         return ggml_vec_index_remove_unlocked(idx, id);
     } catch (const std::bad_alloc &) {

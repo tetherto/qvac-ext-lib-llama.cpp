@@ -448,6 +448,7 @@ if (MSVC)
 
     configure_msvc_target(ggml-base)
     configure_msvc_target(ggml)
+    configure_msvc_target(ggml-vector-index)
     configure_msvc_target(ggml-cpu)
     configure_msvc_target(ggml-cpu-x64)
     configure_msvc_target(ggml-cpu-sse42)
