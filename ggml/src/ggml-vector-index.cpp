@@ -80,6 +80,8 @@ void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void ggml_vec_index_test_set_truncate_fail(int fail);
 void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 void ggml_vec_index_test_set_delta_append_wait_target(int target);
+void ggml_vec_index_test_reset_delta_tail_scan_count(void);
+int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
 }
 #endif
 
@@ -160,6 +162,7 @@ std::atomic<bool> g_test_truncate_fail{ false };
 std::atomic<bool> g_test_parent_fsync_fail{ false };
 std::atomic<int> g_test_delta_append_wait_target{ 0 };
 std::atomic<int> g_test_delta_append_waiters{ 0 };
+std::atomic<int64_t> g_test_delta_tail_scan_count{ 0 };
 
 void test_maybe_throw_bad_alloc() {
     const int64_t remaining = g_test_oom_countdown.load();
@@ -681,6 +684,14 @@ void ggml_vec_index_test_set_delta_append_wait_target(int target) {
     g_test_delta_append_waiters.store(0);
     g_test_delta_append_wait_target.store(target);
 }
+
+void ggml_vec_index_test_reset_delta_tail_scan_count(void) {
+    g_test_delta_tail_scan_count.store(0);
+}
+
+int64_t ggml_vec_index_test_get_delta_tail_scan_count(void) {
+    return g_test_delta_tail_scan_count.load();
+}
 }
 #endif
 
@@ -698,6 +709,10 @@ struct ggml_vec_index {
     bool read_only_mmap = false;
     bool delta_log_rebase_pending = false;
     uint32_t delta_log_rebase_crc = 0;
+    bool delta_tail_cache_valid = false;
+    std::string delta_tail_cache_path;
+    uint64_t delta_tail_cache_size = 0;
+    uint32_t delta_tail_cache_crc = 0;
 
     std::unique_ptr<MappedFile> mapped_file;
     size_t mapped_vector_bytes = 0;
@@ -1060,6 +1075,49 @@ bool filesystem_paths_equal(const char * lhs, const char * rhs) {
     return lhs_resolved.lexically_normal() == rhs_resolved.lexically_normal();
 }
 
+void invalidate_delta_tail_cache(ggml_vec_index & idx) noexcept {
+    idx.delta_tail_cache_valid = false;
+    idx.delta_tail_cache_size = 0;
+    idx.delta_tail_cache_crc = 0;
+}
+
+void set_delta_tail_cache(
+        ggml_vec_index & idx,
+        const char * path,
+        uint64_t size,
+        uint32_t tail_crc) noexcept {
+    try {
+        idx.delta_tail_cache_path = path;
+        idx.delta_tail_cache_size = size;
+        idx.delta_tail_cache_crc = tail_crc;
+        idx.delta_tail_cache_valid = true;
+    } catch (...) {
+        invalidate_delta_tail_cache(idx);
+    }
+}
+
+bool get_delta_tail_cache(
+        ggml_vec_index & idx,
+        const char * path,
+        uint64_t file_size,
+        uint32_t & tail_crc,
+        uint64_t & complete_size) {
+    if (!idx.delta_tail_cache_valid ||
+        idx.delta_tail_cache_size != file_size ||
+        idx.delta_tail_cache_path.empty()) {
+        return false;
+    }
+    const bool same_path =
+        idx.delta_tail_cache_path == path ||
+        filesystem_paths_equal(idx.delta_tail_cache_path.c_str(), path);
+    if (!same_path) {
+        return false;
+    }
+    tail_crc = idx.delta_tail_cache_crc;
+    complete_size = idx.delta_tail_cache_size;
+    return true;
+}
+
 std::mutex & delta_log_process_mutex() {
     static std::mutex mutex;
     return mutex;
@@ -1252,6 +1310,9 @@ bool inspect_delta_log_tail(
         const ggml_vec_index & idx,
         uint32_t & last_state_crc,
         uint64_t & complete_size) {
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    g_test_delta_tail_scan_count.fetch_add(1);
+#endif
     std::filesystem::path fs_path;
     if (!filesystem_path_from_utf8(path, fs_path)) {
         return false;
@@ -1373,14 +1434,17 @@ int append_delta_record(
     if (old_size != 0) {
         uint32_t tail_crc = 0;
         uint64_t complete_size = 0;
-        if (!inspect_delta_log_tail(delta_path, idx, tail_crc, complete_size)) {
+        if (!get_delta_tail_cache(idx, delta_path, old_size, tail_crc, complete_size) &&
+            !inspect_delta_log_tail(delta_path, idx, tail_crc, complete_size)) {
             return GGML_VEC_INDEX_E_IO;
         }
         if (tail_crc != base_crc_for_new_log) {
+            invalidate_delta_tail_cache(idx);
             return GGML_VEC_INDEX_E_IO;
         }
         if (complete_size != old_size) {
             if (!truncate_file_to(delta_path, complete_size)) {
+                invalidate_delta_tail_cache(idx);
                 return GGML_VEC_INDEX_E_INTERNAL;
             }
             old_size = complete_size;
@@ -1391,11 +1455,13 @@ int append_delta_record(
             // The snapshot already includes this log's records (e.g. crash after
             // compacting the snapshot but before replacing the old delta log).
             if (!truncate_file_to(delta_path, 0)) {
+                invalidate_delta_tail_cache(idx);
                 return GGML_VEC_INDEX_E_INTERNAL;
             }
             old_size = 0;
             idx.delta_log_rebase_pending = false;
             idx.delta_log_rebase_crc = 0;
+            invalidate_delta_tail_cache(idx);
         }
     }
     test_wait_after_delta_validate();
@@ -1412,9 +1478,9 @@ int append_delta_record(
     };
     auto fail_io = [&]() {
         close_file();
-        return truncate_file_to(delta_path, old_size) ?
-            GGML_VEC_INDEX_E_IO :
-            GGML_VEC_INDEX_E_INTERNAL;
+        const bool truncated = truncate_file_to(delta_path, old_size);
+        invalidate_delta_tail_cache(idx);
+        return truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_INTERNAL;
     };
 
     if (old_size == 0) {
@@ -1445,10 +1511,16 @@ int append_delta_record(
     const int close_result = std::fclose(f);
     f = nullptr;
     if (close_result != 0 || !fsync_parent_dir(delta_path)) {
-        return truncate_file_to(delta_path, old_size) ?
-            GGML_VEC_INDEX_E_IO :
-            GGML_VEC_INDEX_E_INTERNAL;
+        const bool truncated = truncate_file_to(delta_path, old_size);
+        invalidate_delta_tail_cache(idx);
+        return truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_INTERNAL;
     }
+    const uint64_t written_size =
+        old_size +
+        (old_size == 0 ? kTvidHeaderSize : 0) +
+        kTvidRecordHeaderSize +
+        static_cast<uint64_t>(payload.size());
+    set_delta_tail_cache(idx, delta_path, written_size, state_crc);
     return GGML_VEC_INDEX_OK;
 }
 
@@ -1486,9 +1558,7 @@ int write_empty_delta_log_unlocked(const ggml_vec_index & idx, const char * delt
             return fail_io();
         }
         temp.path.clear();
-        if (!fsync_parent_dir(delta_path)) {
-            return GGML_VEC_INDEX_E_IO;
-        }
+        (void) fsync_parent_dir(delta_path);
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
@@ -2053,7 +2123,7 @@ int ggml_vec_index_remove_logged(
                 append_status == GGML_VEC_INDEX_E_INTERNAL &&
                 delta_log_ends_at_state(delta_path, *idx, post_remove_crc);
             if (record_is_complete) {
-                (void) ggml_vec_index_remove_unlocked(idx, id);
+                return ggml_vec_index_remove_unlocked(idx, id);
             }
             return append_status;
         }
@@ -2889,9 +2959,7 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             return fail_io();
         }
         temp.path.clear();
-        if (!fsync_parent_dir(path)) {
-            return GGML_VEC_INDEX_E_IO;
-        }
+        (void) fsync_parent_dir(path);
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;

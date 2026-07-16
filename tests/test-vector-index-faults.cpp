@@ -16,6 +16,8 @@ extern "C" void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 extern "C" void ggml_vec_index_test_set_truncate_fail(int fail);
 extern "C" void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 extern "C" void ggml_vec_index_test_set_delta_append_wait_target(int target);
+extern "C" void ggml_vec_index_test_reset_delta_tail_scan_count(void);
+extern "C" int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
 
 namespace {
 
@@ -33,6 +35,7 @@ void reset_fault_hooks() {
     ggml_vec_index_test_set_truncate_fail(0);
     ggml_vec_index_test_set_parent_fsync_fail(0);
     ggml_vec_index_test_set_delta_append_wait_target(0);
+    ggml_vec_index_test_reset_delta_tail_scan_count();
 }
 
 std::vector<uint8_t> read_file_bytes(const std::string & path) {
@@ -184,6 +187,40 @@ int main() {
     CHECK(ggml_vec_index_len(loaded) == 2);
     ggml_vec_index_free(loaded);
 
+    {
+        const std::string parent_fsync_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-parent-fsync-test.tvim").string();
+        std::filesystem::remove(parent_fsync_path);
+
+        auto * parent_fsync_idx = ggml_vec_index_create(dim, /*bit_width=*/32);
+        CHECK(parent_fsync_idx != nullptr);
+        CHECK(ggml_vec_index_add(
+            parent_fsync_idx, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(parent_fsync_idx, parent_fsync_path.c_str()) ==
+              GGML_VEC_INDEX_OK);
+        const std::vector<uint8_t> before_parent_fsync =
+            read_file_bytes(parent_fsync_path);
+
+        const uint64_t parent_fsync_id = 302;
+        CHECK(ggml_vec_index_add(
+            parent_fsync_idx, extra_vector.data(), 1, &parent_fsync_id) ==
+            GGML_VEC_INDEX_OK);
+        ggml_vec_index_test_set_parent_fsync_fail(1);
+        CHECK(ggml_vec_index_write(parent_fsync_idx, parent_fsync_path.c_str()) ==
+              GGML_VEC_INDEX_OK);
+        reset_fault_hooks();
+        CHECK(read_file_bytes(parent_fsync_path) != before_parent_fsync);
+
+        auto * parent_fsync_loaded = ggml_vec_index_load(parent_fsync_path.c_str());
+        CHECK(parent_fsync_loaded != nullptr);
+        CHECK(ggml_vec_index_len(parent_fsync_loaded) == 3);
+        CHECK(ggml_vec_index_contains(parent_fsync_loaded, parent_fsync_id) == 1);
+        ggml_vec_index_free(parent_fsync_loaded);
+        ggml_vec_index_free(parent_fsync_idx);
+        std::filesystem::remove(parent_fsync_path);
+    }
+
     const std::string delta_path =
         (std::filesystem::temp_directory_path() /
          "ggml-vector-index-fault-test.tvid").string();
@@ -281,8 +318,7 @@ int main() {
           == GGML_VEC_INDEX_OK);
     ggml_vec_index_test_set_parent_fsync_fail(1);
     ggml_vec_index_test_set_truncate_fail(1);
-    CHECK(ggml_vec_index_remove_logged(idx, logged_id, delta_path.c_str()) ==
-        GGML_VEC_INDEX_E_INTERNAL);
+    CHECK(ggml_vec_index_remove_logged(idx, logged_id, delta_path.c_str()) == 1);
     reset_fault_hooks();
     CHECK(ggml_vec_index_contains(idx, logged_id) == 0);
     CHECK(ggml_vec_index_len(idx) == 4);
@@ -330,6 +366,86 @@ int main() {
     std::filesystem::remove(committed_add_snapshot_path);
     std::filesystem::remove(committed_add_delta_path);
     std::filesystem::remove(committed_add_delta_path + ".lock");
+
+    const std::string compact_parent_snapshot_path =
+        (std::filesystem::temp_directory_path() /
+         "ggml-vector-index-compact-parent-fsync-base.tvim").string();
+    const std::string compact_parent_delta_path =
+        (std::filesystem::temp_directory_path() /
+         "ggml-vector-index-compact-parent-fsync-log.tvid").string();
+    std::filesystem::remove(compact_parent_snapshot_path);
+    std::filesystem::remove(compact_parent_delta_path);
+    std::filesystem::remove(compact_parent_delta_path + ".lock");
+
+    auto * compact_parent = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(compact_parent != nullptr);
+    CHECK(ggml_vec_index_add(
+        compact_parent, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(compact_parent, compact_parent_snapshot_path.c_str()) ==
+          GGML_VEC_INDEX_OK);
+    const uint64_t compact_parent_id = 602;
+    CHECK(ggml_vec_index_add_logged(
+        compact_parent, extra_vector.data(), 1,
+        &compact_parent_id, compact_parent_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_test_set_parent_fsync_fail(1);
+    CHECK(ggml_vec_index_compact_delta(
+        compact_parent,
+        compact_parent_snapshot_path.c_str(),
+        compact_parent_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    reset_fault_hooks();
+    CHECK(std::filesystem::file_size(compact_parent_delta_path) == 16);
+    auto * compact_parent_replayed = ggml_vec_index_load_with_delta(
+        compact_parent_snapshot_path.c_str(), compact_parent_delta_path.c_str());
+    CHECK(compact_parent_replayed != nullptr);
+    CHECK(ggml_vec_index_len(compact_parent_replayed) == 3);
+    CHECK(ggml_vec_index_contains(compact_parent_replayed, compact_parent_id) == 1);
+    ggml_vec_index_free(compact_parent_replayed);
+    ggml_vec_index_free(compact_parent);
+    std::filesystem::remove(compact_parent_snapshot_path);
+    std::filesystem::remove(compact_parent_delta_path);
+    std::filesystem::remove(compact_parent_delta_path + ".lock");
+
+    const std::string cached_tail_snapshot_path =
+        (std::filesystem::temp_directory_path() /
+         "ggml-vector-index-cached-tail-base.tvim").string();
+    const std::string cached_tail_delta_path =
+        (std::filesystem::temp_directory_path() /
+         "ggml-vector-index-cached-tail-log.tvid").string();
+    std::filesystem::remove(cached_tail_snapshot_path);
+    std::filesystem::remove(cached_tail_delta_path);
+    std::filesystem::remove(cached_tail_delta_path + ".lock");
+
+    auto * cached_tail = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(cached_tail != nullptr);
+    CHECK(ggml_vec_index_add(
+        cached_tail, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(cached_tail, cached_tail_snapshot_path.c_str()) ==
+          GGML_VEC_INDEX_OK);
+    const uint64_t cached_tail_id_a = 701;
+    const uint64_t cached_tail_id_b = 702;
+    ggml_vec_index_test_reset_delta_tail_scan_count();
+    CHECK(ggml_vec_index_add_logged(
+        cached_tail, logged_vector.data(), 1,
+        &cached_tail_id_a, cached_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add_logged(
+        cached_tail, extra_vector.data(), 1,
+        &cached_tail_id_b, cached_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_remove_logged(
+        cached_tail, base_ids[0], cached_tail_delta_path.c_str()) == 1);
+    CHECK(ggml_vec_index_test_get_delta_tail_scan_count() == 0);
+
+    auto * cached_tail_replayed = ggml_vec_index_load_with_delta(
+        cached_tail_snapshot_path.c_str(), cached_tail_delta_path.c_str());
+    CHECK(cached_tail_replayed != nullptr);
+    CHECK(ggml_vec_index_len(cached_tail_replayed) == 3);
+    CHECK(ggml_vec_index_contains(cached_tail_replayed, base_ids[0]) == 0);
+    CHECK(ggml_vec_index_contains(cached_tail_replayed, cached_tail_id_a) == 1);
+    CHECK(ggml_vec_index_contains(cached_tail_replayed, cached_tail_id_b) == 1);
+    ggml_vec_index_free(cached_tail_replayed);
+    ggml_vec_index_free(cached_tail);
+    std::filesystem::remove(cached_tail_snapshot_path);
+    std::filesystem::remove(cached_tail_delta_path);
+    std::filesystem::remove(cached_tail_delta_path + ".lock");
 
     const std::string shared_snapshot_path =
         (std::filesystem::temp_directory_path() /
