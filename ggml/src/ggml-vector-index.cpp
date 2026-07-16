@@ -16,6 +16,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -30,6 +31,8 @@
 #include <queue>
 #include <shared_mutex>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -75,6 +78,8 @@ extern "C" {
 void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void ggml_vec_index_test_set_truncate_fail(int fail);
+void ggml_vec_index_test_set_parent_fsync_fail(int fail);
+void ggml_vec_index_test_set_delta_append_wait_target(int target);
 }
 #endif
 
@@ -152,6 +157,9 @@ MappedFile::~MappedFile() {
 std::atomic<int64_t> g_test_oom_countdown{ -1 };
 std::atomic<int64_t> g_test_write_fail_after{ -1 };
 std::atomic<bool> g_test_truncate_fail{ false };
+std::atomic<bool> g_test_parent_fsync_fail{ false };
+std::atomic<int> g_test_delta_append_wait_target{ 0 };
+std::atomic<int> g_test_delta_append_waiters{ 0 };
 
 void test_maybe_throw_bad_alloc() {
     const int64_t remaining = g_test_oom_countdown.load();
@@ -175,8 +183,23 @@ bool test_consume_write_bytes(size_t n) {
     g_test_write_fail_after.fetch_sub(static_cast<int64_t>(n));
     return true;
 }
+
+void test_wait_after_delta_validate() {
+    const int target = g_test_delta_append_wait_target.load();
+    if (target <= 0) {
+        return;
+    }
+
+    g_test_delta_append_waiters.fetch_add(1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    while (g_test_delta_append_waiters.load() < target &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 #else
 #define test_maybe_throw_bad_alloc() ((void) 0)
+#define test_wait_after_delta_validate() ((void) 0)
 #endif
 
 inline bool write_bytes(std::FILE * f, const void * data, size_t size) {
@@ -589,6 +612,11 @@ bool flush_and_sync(std::FILE * stream) {
 }
 
 bool fsync_parent_dir(const char * path) {
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    if (g_test_parent_fsync_fail.load()) {
+        return false;
+    }
+#endif
 #ifdef _WIN32
     (void) path;
     return true;
@@ -644,8 +672,19 @@ void ggml_vec_index_test_set_write_fail_after(int64_t bytes) {
 void ggml_vec_index_test_set_truncate_fail(int fail) {
     g_test_truncate_fail.store(fail != 0);
 }
+
+void ggml_vec_index_test_set_parent_fsync_fail(int fail) {
+    g_test_parent_fsync_fail.store(fail != 0);
+}
+
+void ggml_vec_index_test_set_delta_append_wait_target(int target) {
+    g_test_delta_append_waiters.store(0);
+    g_test_delta_append_wait_target.store(target);
+}
 }
 #endif
+
+static std::atomic<uint64_t> g_next_filter_cookie{ 1 };
 
 // Lifetime-managed instance state. Lives behind the opaque
 // `ggml_vec_index_t` typedef.
@@ -655,6 +694,7 @@ struct ggml_vec_index {
     int dim       = 0;
     int bit_width = 32;
     uint64_t generation = 0;
+    uint64_t filter_cookie = 0;
     bool read_only_mmap = false;
     bool delta_log_rebase_pending = false;
     uint32_t delta_log_rebase_crc = 0;
@@ -693,6 +733,7 @@ struct ggml_vec_index {
 
 struct ggml_vec_index_filter {
     const ggml_vec_index_t * owner = nullptr;
+    uint64_t owner_cookie = 0;
     int dim = 0;
     int bit_width = 32;
     uint64_t generation = 0;
@@ -784,6 +825,22 @@ static int q4_decode(uint8_t nibble) {
     return static_cast<int>(nibble) - 8;
 }
 
+static int round_nearest_even(float value) {
+    const float lower_f = std::floor(value);
+    const float upper_f = lower_f + 1.0f;
+    const float lower_dist = value - lower_f;
+    const float upper_dist = upper_f - value;
+    if (lower_dist < upper_dist) {
+        return static_cast<int>(lower_f);
+    }
+    if (upper_dist < lower_dist) {
+        return static_cast<int>(upper_f);
+    }
+
+    const int lower = static_cast<int>(lower_f);
+    return (lower % 2) == 0 ? lower : static_cast<int>(upper_f);
+}
+
 static void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
     float max_abs = 0.0f;
     for (int i = 0; i < dim; ++i) {
@@ -802,7 +859,7 @@ static void quantize_q8_row(const float * src, int8_t * dst, int dim, float & sc
     }
     for (int i = 0; i < dim; ++i) {
         const float scaled = src[i] / scale;
-        int q = static_cast<int>(std::nearbyint(scaled));
+        int q = round_nearest_even(scaled);
         q = std::max(-127, std::min(127, q));
         dst[i] = static_cast<int8_t>(q);
     }
@@ -826,7 +883,7 @@ static void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & s
     }
     for (int i = 0; i < dim; ++i) {
         const float scaled = src[i] / scale;
-        int q = static_cast<int>(std::nearbyint(scaled));
+        int q = round_nearest_even(scaled);
         q = std::max(-7, std::min(7, q));
         const uint8_t code = q4_encode(q);
         uint8_t & byte = dst[static_cast<size_t>(i) / 2];
@@ -974,6 +1031,137 @@ bool filesystem_path_from_utf8(const char * path, std::filesystem::path & out) {
 #endif
     return true;
 }
+
+bool filesystem_paths_equal(const char * lhs, const char * rhs) {
+    if (std::strcmp(lhs, rhs) == 0) {
+        return true;
+    }
+
+    std::filesystem::path lhs_path;
+    std::filesystem::path rhs_path;
+    if (!filesystem_path_from_utf8(lhs, lhs_path) ||
+        !filesystem_path_from_utf8(rhs, rhs_path)) {
+        return false;
+    }
+
+    std::error_code lhs_ec;
+    std::error_code rhs_ec;
+    std::filesystem::path lhs_resolved = std::filesystem::weakly_canonical(lhs_path, lhs_ec);
+    std::filesystem::path rhs_resolved = std::filesystem::weakly_canonical(rhs_path, rhs_ec);
+    if (lhs_ec || rhs_ec) {
+        lhs_ec.clear();
+        rhs_ec.clear();
+        lhs_resolved = std::filesystem::absolute(lhs_path, lhs_ec);
+        rhs_resolved = std::filesystem::absolute(rhs_path, rhs_ec);
+        if (lhs_ec || rhs_ec) {
+            return false;
+        }
+    }
+    return lhs_resolved.lexically_normal() == rhs_resolved.lexically_normal();
+}
+
+std::mutex & delta_log_process_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+bool delta_lock_path(const char * path, std::filesystem::path & out) {
+    std::filesystem::path fs_path;
+    if (!filesystem_path_from_utf8(path, fs_path)) {
+        return false;
+    }
+
+    std::error_code ec;
+    out = std::filesystem::weakly_canonical(fs_path, ec);
+    if (ec) {
+        ec.clear();
+        out = std::filesystem::absolute(fs_path, ec);
+        if (ec) {
+            return false;
+        }
+    }
+    out = out.lexically_normal();
+    out += ".lock";
+    return true;
+}
+
+class DeltaLogLock {
+public:
+    explicit DeltaLogLock(const char * path) : process_lock(delta_log_process_mutex()) {
+        std::filesystem::path lock_path;
+        if (!delta_lock_path(path, lock_path)) {
+            return;
+        }
+#ifdef _WIN32
+        file = CreateFileW(
+            lock_path.wstring().c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            return;
+        }
+        OVERLAPPED overlapped = {};
+        if (LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped) == 0) {
+            CloseHandle(file);
+            file = INVALID_HANDLE_VALUE;
+            return;
+        }
+#else
+        fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
+        if (fd < 0) {
+            return;
+        }
+        struct flock lock = {};
+        lock.l_type = F_WRLCK;
+        lock.l_whence = SEEK_SET;
+        while (::fcntl(fd, F_SETLKW, &lock) != 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ::close(fd);
+            fd = -1;
+            return;
+        }
+#endif
+        locked = true;
+    }
+
+    ~DeltaLogLock() {
+        if (!locked) {
+            return;
+        }
+#ifdef _WIN32
+        OVERLAPPED overlapped = {};
+        UnlockFileEx(file, 0, MAXDWORD, MAXDWORD, &overlapped);
+        CloseHandle(file);
+        file = INVALID_HANDLE_VALUE;
+#else
+        struct flock lock = {};
+        lock.l_type = F_UNLCK;
+        lock.l_whence = SEEK_SET;
+        (void) ::fcntl(fd, F_SETLK, &lock);
+        ::close(fd);
+        fd = -1;
+#endif
+    }
+
+    bool ok() const {
+        return locked;
+    }
+
+private:
+    std::unique_lock<std::mutex> process_lock;
+    bool locked = false;
+#ifdef _WIN32
+    HANDLE file = INVALID_HANDLE_VALUE;
+#else
+    int fd = -1;
+#endif
+};
 
 bool open_append_file(const char * path, std::FILE ** out) {
 #ifdef _WIN32
@@ -1172,6 +1360,11 @@ int append_delta_record(
     if (delta_path == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
+    DeltaLogLock delta_lock(delta_path);
+    if (!delta_lock.ok()) {
+        return GGML_VEC_INDEX_E_IO;
+    }
+
     uint64_t old_size = 0;
     uint32_t existing_base_crc = 0;
     if (!validate_delta_header(delta_path, idx, old_size, existing_base_crc)) {
@@ -1205,6 +1398,7 @@ int append_delta_record(
             idx.delta_log_rebase_crc = 0;
         }
     }
+    test_wait_after_delta_validate();
 
     std::FILE * f = nullptr;
     if (!open_append_file(delta_path, &f)) {
@@ -1258,7 +1452,7 @@ int append_delta_record(
     return GGML_VEC_INDEX_OK;
 }
 
-int write_empty_delta_log(const ggml_vec_index & idx, const char * delta_path) {
+int write_empty_delta_log_unlocked(const ggml_vec_index & idx, const char * delta_path) {
     if (delta_path == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
@@ -1301,6 +1495,17 @@ int write_empty_delta_log(const ggml_vec_index & idx, const char * delta_path) {
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
+}
+
+int write_empty_delta_log(const ggml_vec_index & idx, const char * delta_path) {
+    if (delta_path == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    DeltaLogLock delta_lock(delta_path);
+    if (!delta_lock.ok()) {
+        return GGML_VEC_INDEX_E_IO;
+    }
+    return write_empty_delta_log_unlocked(idx, delta_path);
 }
 
 bool validate_logged_add_args(
@@ -1396,6 +1601,10 @@ ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width) {
         }
         idx->dim       = dim;
         idx->bit_width = bit_width;
+        idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
+        if (idx->filter_cookie == 0) {
+            idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
+        }
         return idx;
     } catch (...) {
         return nullptr;
@@ -1785,6 +1994,8 @@ int ggml_vec_index_add_logged(
             if (record_is_complete) {
                 ++idx->generation;
                 invalidate_ivf(*idx);
+                added = false;
+                return GGML_VEC_INDEX_OK;
             } else {
                 rollback_appended_slots_unlocked(idx, base_slot, ids, n);
             }
@@ -1838,6 +2049,12 @@ int ggml_vec_index_remove_logged(
             post_remove_crc,
             payload);
         if (append_status != GGML_VEC_INDEX_OK) {
+            const bool record_is_complete =
+                append_status == GGML_VEC_INDEX_E_INTERNAL &&
+                delta_log_ends_at_state(delta_path, *idx, post_remove_crc);
+            if (record_is_complete) {
+                (void) ggml_vec_index_remove_unlocked(idx, id);
+            }
             return append_status;
         }
         return ggml_vec_index_remove_unlocked(idx, id);
@@ -2337,6 +2554,7 @@ static int ggml_vec_index_search_impl(
         const std::vector<size_t> * allowed_ptr = nullptr;
         if (prepared_filter != nullptr) {
             if (prepared_filter->owner != idx ||
+                prepared_filter->owner_cookie != idx->filter_cookie ||
                 prepared_filter->dim != idx->dim ||
                 prepared_filter->bit_width != idx->bit_width ||
                 prepared_filter->generation != idx->generation) {
@@ -2405,6 +2623,7 @@ ggml_vec_index_filter_t * ggml_vec_index_filter_create(
         }
         std::unique_ptr<ggml_vec_index_filter> owned(filter);
         owned->owner = idx;
+        owned->owner_cookie = idx->filter_cookie;
         owned->dim = idx->dim;
         owned->bit_width = idx->bit_width;
         owned->generation = idx->generation;
@@ -3426,12 +3645,19 @@ int ggml_vec_index_compact_delta(
         if (idx == nullptr || snapshot_path == nullptr || delta_path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
+        if (filesystem_paths_equal(snapshot_path, delta_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        DeltaLogLock delta_lock(delta_path);
+        if (!delta_lock.ok()) {
+            return GGML_VEC_INDEX_E_IO;
+        }
         const int write_status = ggml_vec_index_write_unlocked(idx, snapshot_path);
         if (write_status != GGML_VEC_INDEX_OK) {
             return write_status;
         }
-        return write_empty_delta_log(*idx, delta_path);
+        return write_empty_delta_log_unlocked(*idx, delta_path);
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {

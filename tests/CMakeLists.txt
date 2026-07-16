@@ -145,9 +145,11 @@ if (NOT WIN32)
 endif()
 
 # Vector-index regression test: no model required, no llama runtime touched.
+find_package(Threads REQUIRED)
+
 add_executable(test-vector-index test-vector-index.cpp)
 target_compile_features(test-vector-index PRIVATE cxx_std_17)
-target_link_libraries(test-vector-index PRIVATE ggml-vector-index)
+target_link_libraries(test-vector-index PRIVATE ggml-vector-index Threads::Threads)
 if (LLAMA_TESTS_INSTALL)
     install(TARGETS test-vector-index RUNTIME)
 endif()
@@ -161,6 +163,7 @@ add_executable(
 target_compile_features(test-vector-index-faults PRIVATE cxx_std_17)
 target_compile_definitions(test-vector-index-faults PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
 target_include_directories(test-vector-index-faults PRIVATE ${PROJECT_SOURCE_DIR}/ggml/include)
+target_link_libraries(test-vector-index-faults PRIVATE Threads::Threads)
 if (NOT WIN32)
     target_link_libraries(test-vector-index-faults PRIVATE m)
 endif()

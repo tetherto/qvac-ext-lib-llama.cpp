@@ -272,7 +272,7 @@ set_target_properties(ggml-vector-index PROPERTIES
     SOVERSION ${GGML_VERSION_MAJOR}
 )
 
-target_link_libraries(ggml-vector-index PUBLIC ggml-base)
+target_link_libraries(ggml-vector-index PUBLIC ggml-base PRIVATE Threads::Threads)
 
 function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)

@@ -28,8 +28,9 @@ extern "C" {
 struct ggml_vec_index;
 typedef struct ggml_vec_index ggml_vec_index_t;
 
-// Prepared filtered-search handle. Valid only for the index generation it was
-// created from; any successful add/remove invalidates existing filters.
+// Prepared filtered-search handle. Valid only while the source index remains
+// alive and at the generation it was created from; any successful add/remove
+// invalidates existing filters.
 struct ggml_vec_index_filter;
 typedef struct ggml_vec_index_filter ggml_vec_index_filter_t;
 
@@ -149,7 +150,8 @@ GGML_API int ggml_vec_index_search_filtered(
 
 // Prepared filtered search. Creating a filter maps, sorts, and deduplicates
 // `allowed_ids` once, so callers can reuse it for repeated searches over the
-// same allowlist. Stale filters return GGML_VEC_INDEX_E_INVALID_ARG.
+// same allowlist. The source index must outlive every filter created from it.
+// Stale filters return GGML_VEC_INDEX_E_INVALID_ARG.
 GGML_API ggml_vec_index_filter_t * ggml_vec_index_filter_create(
     const ggml_vec_index_t * idx,
     const uint64_t         * allowed_ids,

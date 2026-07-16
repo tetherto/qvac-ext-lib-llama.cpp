@@ -10,6 +10,7 @@
 #include <cassert>
 #include <atomic>
 #include <cfloat>
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +47,22 @@ std::vector<float> normalize(std::vector<float> v) {
     return v;
 }
 
+int round_nearest_even(float value) {
+    const float lower_f = std::floor(value);
+    const float upper_f = lower_f + 1.0f;
+    const float lower_dist = value - lower_f;
+    const float upper_dist = upper_f - value;
+    if (lower_dist < upper_dist) {
+        return static_cast<int>(lower_f);
+    }
+    if (upper_dist < lower_dist) {
+        return static_cast<int>(upper_f);
+    }
+
+    const int lower = static_cast<int>(lower_f);
+    return (lower % 2) == 0 ? lower : static_cast<int>(upper_f);
+}
+
 float q8_dot_reference(const std::vector<float> & vector, const std::vector<float> & query) {
     CHECK(vector.size() == query.size());
 
@@ -58,7 +75,7 @@ float q8_dot_reference(const std::vector<float> & vector, const std::vector<floa
     float acc = 0.0f;
     for (size_t i = 0; i < vector.size(); ++i) {
         int code = max_abs == 0.0f ?
-            0 : static_cast<int>(std::nearbyint(vector[i] / scale));
+            0 : round_nearest_even(vector[i] / scale);
         code = std::max(-127, std::min(127, code));
         acc += query[i] * (static_cast<float>(code) * scale);
     }
@@ -77,7 +94,7 @@ float q4_dot_reference(const std::vector<float> & vector, const std::vector<floa
     float acc = 0.0f;
     for (size_t i = 0; i < vector.size(); ++i) {
         int code = max_abs == 0.0f ?
-            0 : static_cast<int>(std::nearbyint(vector[i] / scale));
+            0 : round_nearest_even(vector[i] / scale);
         code = std::max(-7, std::min(7, code));
         acc += query[i] * (static_cast<float>(code) * scale);
     }
@@ -815,6 +832,18 @@ int main() {
         ggml_vec_index_free(mismatch);
 
         const std::vector<uint8_t> pre_compact_delta = read_file_bytes(delta_path);
+        const std::vector<uint8_t> pre_same_path_snapshot = read_file_bytes(snapshot_path);
+        CHECK(ggml_vec_index_compact_delta(
+            base, snapshot_path.c_str(), snapshot_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(read_file_bytes(snapshot_path) == pre_same_path_snapshot);
+        auto * same_path_snapshot = ggml_vec_index_load(snapshot_path.c_str());
+        CHECK(same_path_snapshot != nullptr);
+        CHECK(ggml_vec_index_len(same_path_snapshot) == 2);
+        CHECK(ggml_vec_index_contains(same_path_snapshot, ids[0]) == 1);
+        CHECK(ggml_vec_index_contains(same_path_snapshot, delta_id) == 0);
+        ggml_vec_index_free(same_path_snapshot);
+
         CHECK(ggml_vec_index_compact_delta(
             base, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_OK);
         CHECK(std::filesystem::file_size(delta_path) == 16);
@@ -1218,6 +1247,95 @@ int main() {
         const float tolerance = 1e-5f * std::max(1.0f, std::fabs(expected));
         CHECK(std::fabs(scores[0] - expected) <= tolerance);
         ggml_vec_index_free(q4);
+    }
+
+    // Quantization must not depend on the caller's active rounding mode.
+    {
+        const int saved_rounding_mode = std::fegetround();
+        CHECK(saved_rounding_mode != -1);
+
+        auto score_after_add_with_rounding = [&](int bit_width, int rounding_mode) {
+            const float max_code = bit_width == 8 ? 127.0f : 7.0f;
+            const std::array<float, kDim> rounding_vector = {
+                max_code, 2.5f, 0.0f, 0.0f,
+            };
+            const std::array<float, kDim> rounding_query = {
+                0.0f, 1.0f, 0.0f, 0.0f,
+            };
+            const uint64_t rounding_id =
+                (1ULL << 57) + static_cast<uint64_t>(bit_width) +
+                static_cast<uint64_t>(rounding_mode);
+            CHECK(std::fesetround(rounding_mode) == 0);
+            auto * rounding_idx = ggml_vec_index_create(kDim, bit_width);
+            CHECK(rounding_idx != nullptr);
+            CHECK(ggml_vec_index_add(
+                rounding_idx, rounding_vector.data(), 1, &rounding_id) ==
+                GGML_VEC_INDEX_OK);
+            CHECK(std::fesetround(saved_rounding_mode) == 0);
+
+            std::array<float, 1> scores{};
+            std::array<uint64_t, 1> out_ids{};
+            CHECK(ggml_vec_index_search(
+                rounding_idx, rounding_query.data(), 1, /*k=*/1,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == rounding_id);
+            ggml_vec_index_free(rounding_idx);
+            return scores[0];
+        };
+
+        for (int bit_width : { 8, 4 }) {
+            const float downward_score = score_after_add_with_rounding(bit_width, FE_DOWNWARD);
+            const float upward_score = score_after_add_with_rounding(bit_width, FE_UPWARD);
+            CHECK(downward_score == upward_score);
+            CHECK(downward_score == 2.0f);
+
+            const std::string snapshot_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-rounding-" + std::to_string(bit_width) + ".tvim")).string();
+            const std::string delta_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-rounding-" + std::to_string(bit_width) + ".tvid")).string();
+            std::filesystem::remove(snapshot_path);
+            std::filesystem::remove(delta_path);
+            std::filesystem::remove(delta_path + ".lock");
+
+            const float max_code = bit_width == 8 ? 127.0f : 7.0f;
+            const std::array<float, kDim> rounding_vector = {
+                max_code, 2.5f, 0.0f, 0.0f,
+            };
+            const std::array<float, kDim> rounding_query = {
+                0.0f, 1.0f, 0.0f, 0.0f,
+            };
+            const uint64_t rounding_id = (1ULL << 58) + static_cast<uint64_t>(bit_width);
+            auto * logged_rounding = ggml_vec_index_create(kDim, bit_width);
+            CHECK(logged_rounding != nullptr);
+            CHECK(ggml_vec_index_write(logged_rounding, snapshot_path.c_str()) ==
+                  GGML_VEC_INDEX_OK);
+            CHECK(std::fesetround(FE_DOWNWARD) == 0);
+            CHECK(ggml_vec_index_add_logged(
+                logged_rounding, rounding_vector.data(), 1, &rounding_id,
+                delta_path.c_str()) == GGML_VEC_INDEX_OK);
+            CHECK(std::fesetround(FE_UPWARD) == 0);
+            auto * replayed_rounding = ggml_vec_index_load_with_delta(
+                snapshot_path.c_str(), delta_path.c_str());
+            CHECK(std::fesetround(saved_rounding_mode) == 0);
+            CHECK(replayed_rounding != nullptr);
+
+            std::array<float, 1> scores{};
+            std::array<uint64_t, 1> out_ids{};
+            CHECK(ggml_vec_index_search(
+                replayed_rounding, rounding_query.data(), 1, /*k=*/1,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == rounding_id);
+            CHECK(scores[0] == 2.0f);
+
+            ggml_vec_index_free(replayed_rounding);
+            ggml_vec_index_free(logged_rounding);
+            std::filesystem::remove(snapshot_path);
+            std::filesystem::remove(delta_path);
+            std::filesystem::remove(delta_path + ".lock");
+        }
+        CHECK(std::fesetround(saved_rounding_mode) == 0);
     }
 
     // Delta replay keeps q8 storage q8 and reuses the normal q8 quantization path.

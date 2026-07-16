@@ -76,6 +76,22 @@ struct ScoreId {
     uint64_t id = 0;
 };
 
+int round_nearest_even(float value) {
+    const float lower_f = std::floor(value);
+    const float upper_f = lower_f + 1.0f;
+    const float lower_dist = value - lower_f;
+    const float upper_dist = upper_f - value;
+    if (lower_dist < upper_dist) {
+        return static_cast<int>(lower_f);
+    }
+    if (upper_dist < lower_dist) {
+        return static_cast<int>(upper_f);
+    }
+
+    const int lower = static_cast<int>(lower_f);
+    return (lower % 2) == 0 ? lower : static_cast<int>(upper_f);
+}
+
 template <typename Fn>
 double median_time_ms(int warmups, int repeats, Fn fn) {
     for (int i = 0; i < warmups; ++i) {
@@ -392,7 +408,7 @@ Q4SimulatedIndex build_simulated_q4(
         int8_t * dst = sim.codes.data() + static_cast<size_t>(row) * static_cast<size_t>(dim);
         for (int i = 0; i < dim; ++i) {
             const float scaled = src[i] / scale;
-            int q = static_cast<int>(std::nearbyint(scaled));
+            int q = round_nearest_even(scaled);
             q = std::max(-7, std::min(7, q));
             dst[i] = static_cast<int8_t>(q);
         }
