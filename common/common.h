@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -35,6 +36,11 @@
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
 
+#define print_build_info() do {                                                                     \
+    fprintf(stderr, "%s: build = %d (%s)\n",      __func__, LLAMA_BUILD_NUMBER, LLAMA_COMMIT);      \
+    fprintf(stderr, "%s: built with %s for %s\n", __func__, LLAMA_COMPILER, LLAMA_BUILD_TARGET);    \
+} while(0)
+
 struct common_time_meas {
     common_time_meas(int64_t & t_acc, bool disable = false);
     ~common_time_meas();
@@ -55,6 +61,14 @@ struct common_adapter_lora_info {
 };
 
 using llama_tokens = std::vector<llama_token>;
+
+// build info
+extern int LLAMA_BUILD_NUMBER;
+extern const char * LLAMA_COMMIT;
+extern const char * LLAMA_COMPILER;
+extern const char * LLAMA_BUILD_TARGET;
+
+const static std::string build_info("b" + std::to_string(LLAMA_BUILD_NUMBER) + "-" + LLAMA_COMMIT);
 
 struct common_control_vector_load_info;
 
@@ -320,7 +334,6 @@ struct common_params_model {
     }
 };
 
-// draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
@@ -395,9 +408,9 @@ struct common_params_speculative {
 struct common_params_vocoder {
     struct common_params_model model;
 
-    std::string speaker_file; // speaker file path
+    std::string speaker_file = ""; // speaker file path                                      // NOLINT
 
-    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy
+    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy            // NOLINT
 };
 
 struct common_params_diffusion {
@@ -412,6 +425,13 @@ struct common_params_diffusion {
 
     float   cfg_scale     = 0;        // classifier-free guidance scale
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
+};
+
+// tile encoding mode for multi-tile vision models (e.g. Qwen3VL)
+enum common_image_tile_mode {
+    COMMON_IMAGE_TILE_MODE_BATCHED    = 0, // all tiles in one forward pass
+    COMMON_IMAGE_TILE_MODE_SEQUENTIAL = 1, // encode tiles one-by-one (default)
+    COMMON_IMAGE_TILE_MODE_DISABLED   = 2, // tiling disabled - single tile only
 };
 
 // reasoning API response format (not to be confused as chat template's reasoning format)
@@ -579,6 +599,7 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+    bool training          = false; // enable training mode (affects LoRA K/V gradient flow)
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
@@ -592,11 +613,14 @@ struct common_params {
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
+    std::string mmproj_backend = "";    // GPU backend for multimodal model (e.g. "CUDA", "Metal", "Vulkan")
     bool no_mmproj = false;         // explicitly disable multimodal model
     std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
+    common_image_tile_mode image_tile_mode = COMMON_IMAGE_TILE_MODE_SEQUENTIAL;
     int mtmd_batch_max_tokens = 1024;
+    int image_max_tiles = -1;  // override preproc_max_tiles from GGUF; -1 = use model default
 
     // finetune
     struct lr_opt lr;
@@ -633,6 +657,8 @@ struct common_params {
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
+    int reasoning_budget = -1;
+    std::string reasoning_budget_message; // message injected before end tag when budget exhausted
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
@@ -893,13 +919,24 @@ struct common_init_result {
     std::vector<llama_adapter_lora_ptr> & lora();
 
 private:
+    // Empty result: no model is loaded from params.model.path. Used by the
+    // externally-loaded-model overload of common_init_from_model_and_params so
+    // it can adopt a caller-provided model without first building (and then
+    // freeing) a throwaway file-loaded model and its dependent context.
+    common_init_result();
+
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    friend std::unique_ptr<common_init_result> common_init_from_model_and_params(llama_model * model, common_params & params);
 };
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_init_result_ptr res,
+                                                         common_params & params);
+common_init_result_ptr common_init_from_model_and_params(llama_model * model, common_params & params);
 
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
@@ -1120,3 +1157,9 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+ggml_opt_dataset_t common_opt_sft_dataset_init(
+        struct llama_context * ctx,
+        const std::string    & json_content,
+        int64_t                stride,
+        const std::string    & chat_template_path = "");

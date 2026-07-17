@@ -11,12 +11,41 @@ find_package(Vulkan COMPONENTS glslc REQUIRED)
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
 endif()
-find_package(SPIRV-Headers CONFIG REQUIRED)
+# Desktop builds get SPIRV-Headers (and Vulkan-Hpp) from the Vulkan SDK. The
+# Android NDK ships neither, so on Android they are fetched in the ANDROID block
+# below; don't hard-require the system package there.
+find_package(SPIRV-Headers CONFIG QUIET)
+
+set(GGML_VULKAN_SPIRV_HEADERS_OK FALSE)
+if (TARGET SPIRV-Headers::SPIRV-Headers)
+    set(GGML_VULKAN_SPIRV_HEADERS_OK TRUE)
+    get_target_property(_ggml_spirv_incs SPIRV-Headers::SPIRV-Headers INTERFACE_INCLUDE_DIRECTORIES)
+    foreach(_ggml_spirv_inc IN LISTS _ggml_spirv_incs)
+        if (NOT EXISTS "${_ggml_spirv_inc}")
+            message(WARNING "Ignoring SPIRV-Headers package: include dir ${_ggml_spirv_inc} does not exist")
+            set(GGML_VULKAN_SPIRV_HEADERS_OK FALSE)
+        endif()
+    endforeach()
+endif()
+if (NOT ANDROID AND NOT GGML_VULKAN_SPIRV_HEADERS_OK)
+    # Fall back to locating the headers directly; the Vulkan SDK ships them
+    # next to the Vulkan headers.
+    find_path(GGML_VULKAN_SPIRV_INCLUDE_DIR spirv/unified1/spirv.hpp
+        HINTS ${Vulkan_INCLUDE_DIRS} ENV VULKAN_SDK
+        PATH_SUFFIXES include)
+    if (NOT GGML_VULKAN_SPIRV_INCLUDE_DIR)
+        message(FATAL_ERROR "SPIRV-Headers not found: need spirv/unified1/spirv.hpp (install SPIRV-Headers or the Vulkan SDK)")
+    endif()
+endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Parallel build object files
     add_definitions(/MP)
 endif()
+
+# Add options to disable cooperative matrix support
+option(GGML_VULKAN_DISABLE_COOPMAT "Disable VK_KHR_cooperative_matrix support" OFF)
+option(GGML_VULKAN_DISABLE_COOPMAT2 "Disable VK_NV_cooperative_matrix2 support" OFF)
 
 function(detect_host_compiler)
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
@@ -67,17 +96,25 @@ if (Vulkan_FOUND)
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
 
     # Test all shader extensions
-    test_shader_extension_support(
-        "GL_KHR_cooperative_matrix"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat.comp"
-        "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
-    )
+    if (NOT GGML_VULKAN_DISABLE_COOPMAT)
+        test_shader_extension_support(
+            "GL_KHR_cooperative_matrix"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat.comp"
+            "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
+        )
+    else()
+        message(STATUS "VK_KHR_cooperative_matrix support disabled by GGML_VULKAN_DISABLE_COOPMAT")
+    endif()
 
-    test_shader_extension_support(
-        "GL_NV_cooperative_matrix2"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
-        "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
-    )
+    if (NOT GGML_VULKAN_DISABLE_COOPMAT2)
+        test_shader_extension_support(
+            "GL_NV_cooperative_matrix2"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
+            "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
+        )
+    else()
+        message(STATUS "VK_NV_cooperative_matrix2 support disabled by GGML_VULKAN_DISABLE_COOPMAT2")
+    endif()
 
     test_shader_extension_support(
         "GL_NV_cooperative_matrix_decode_vector"
@@ -98,8 +135,58 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    if (GGML_VULKAN_SPIRV_HEADERS_OK)
+        # Provides <spirv/unified1/spirv.hpp> on platforms (e.g. Android NDK)
+        # whose Vulkan package does not bundle the SPIRV headers. It is a
+        # header-only dependency needed only to compile ggml-vulkan.cpp, so wrap
+        # it in BUILD_INTERFACE: as a static lib the PRIVATE link would otherwise
+        # leak into the installed ggml-targets export and break downstream
+        # find_package(ggml) on platforms whose Vulkan SDK ships the config
+        # target (e.g. Windows), which never call find_package(SPIRV-Headers).
+        target_link_libraries(ggml-vulkan PRIVATE $<BUILD_INTERFACE:SPIRV-Headers::SPIRV-Headers>)
+    elseif (GGML_VULKAN_SPIRV_INCLUDE_DIR)
+        target_include_directories(ggml-vulkan PRIVATE "${GGML_VULKAN_SPIRV_INCLUDE_DIR}")
+    endif()
+    target_include_directories(ggml-vulkan
+        PRIVATE
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ../../../vendor
 
+    )
+    if (ANDROID)
+        # The Android NDK ships only the C Vulkan headers (vulkan/vulkan.h). The
+        # ggml Vulkan backend additionally needs the C++ bindings
+        # (vulkan/vulkan.hpp) and SPIRV-Headers (spirv/unified1/spirv.hpp), which
+        # the NDK does not provide. Fetch pinned, header-only copies so the
+        # Android Vulkan build works out of the box.
+        include(FetchContent)
+        # SOURCE_SUBDIR points at a directory without a CMakeLists.txt so that
+        # FetchContent only downloads the headers and does NOT add_subdirectory()
+        # their projects (Vulkan-Headers would otherwise re-declare the
+        # Vulkan::Headers target already created by find_package(Vulkan)).
+        FetchContent_Declare(
+            vulkan_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_Declare(
+            spirv_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_MakeAvailable(vulkan_headers spirv_headers)
+        target_include_directories(ggml-vulkan PRIVATE
+            "${vulkan_headers_SOURCE_DIR}/include"
+            "${spirv_headers_SOURCE_DIR}/include")
+    endif()
+
+    if (FORCE_GGML_VK_PERF_LOGGER)
+      add_compile_definitions(FORCE_GGML_VK_PERF_LOGGER)
+    endif()
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
     if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -115,6 +202,11 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_DEBUG)
         add_compile_definitions(GGML_VULKAN_DEBUG)
+    endif()
+
+    if (GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        add_compile_definitions(GGML_VULKAN_BUILD_ADRENO_SHADERS)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_BUILD_ADRENO_SHADERS=ON)
     endif()
 
     if (GGML_VULKAN_MEMORY_DEBUG)
@@ -199,16 +291,19 @@ if (Vulkan_FOUND)
               CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.cpp"
                                 "${_ggml_vk_input_dir}/*.h")
 
+    set (_ggml_vk_common_cpp "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders-common.cpp")
+
     add_custom_command(
-        OUTPUT ${_ggml_vk_header}
+        OUTPUT ${_ggml_vk_header} ${_ggml_vk_common_cpp}
         COMMAND ${_ggml_vk_genshaders_cmd}
             --output-dir ${_ggml_vk_output_dir}
             --target-hpp ${_ggml_vk_header}
+            --target-common-cpp ${_ggml_vk_common_cpp}
         DEPENDS ${_ggml_vk_shaders_gen_sources}
                 vulkan-shaders-gen
-        COMMENT "Generate vulkan shaders header"
+        COMMENT "Generate vulkan shaders header and common cpp"
     )
-    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header})
+    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_header} ${_ggml_vk_common_cpp})
 
     foreach (file_full ${_ggml_vk_shader_files})
         get_filename_component(file ${file_full} NAME)

@@ -26,6 +26,11 @@
 
 #define MTMD_INTERNAL_HEADER
 
+// Upper bound on preproc_max_tiles, enforced at every site that sets it (GGUF read,
+// CLI/binding override). A larger value would flow into the O(max_tiles·log max_tiles)
+// grid-fitting reserve in mtmd-image.cpp and can request hundreds of GB -> std::bad_alloc.
+constexpr int CLIP_PREPROC_MAX_TILES_LIMIT = 256;
+
 #define KEY_FTYPE               "general.file_type"
 #define KEY_NAME                "general.name"
 #define KEY_DESCRIPTION         "general.description"
@@ -604,11 +609,19 @@ static void clip_log_callback_default(enum ggml_log_level level, const char * te
 }
 
 struct clip_logger_state {
+    enum ggml_log_level verbosity_thold;
     ggml_log_callback log_callback;
     void * log_callback_user_data;
 };
 
 extern struct clip_logger_state g_logger_state;
+
+// Function to set logging callback (can be used to redirect to llama's logging)
+// If not called, will use the default callback (logs to stderr)
+static inline void clip_log_set_callback(ggml_log_callback callback, void * user_data) {
+    g_logger_state.log_callback = callback;
+    g_logger_state.log_callback_user_data = user_data;
+}
 
 static void clip_log_internal_v(enum ggml_log_level level, const char * format, va_list args) {
     if (format == NULL) {
@@ -651,12 +664,19 @@ static void clip_log_internal(enum ggml_log_level level, const char * format, ..
 struct clip_image_f32_batch {
     std::vector<clip_image_f32> entries;
     bool is_audio = false;
+    int grid_x = 0;
+    int grid_y = 0;
+
+    // qwen3vl multi-tile: when true, entries[0] is a downscaled full-image overview
+    // (thumbnail) and entries[1..] are the grid_x*grid_y tiles.
+    bool has_overview = false;
 
     clip_image_f32_batch clone() const {
-        clip_image_f32_batch new_batch{
-            /* entries  */ {},
-            /* is_audio */ is_audio,
-        };
+        clip_image_f32_batch new_batch;
+        new_batch.is_audio     = is_audio;
+        new_batch.grid_x       = grid_x;
+        new_batch.grid_y       = grid_y;
+        new_batch.has_overview = has_overview;
         new_batch.entries.reserve(entries.size());
         for (const auto & entry : entries) {
             new_batch.entries.emplace_back(entry); // copy
