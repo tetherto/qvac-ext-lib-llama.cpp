@@ -65,6 +65,7 @@ set(${TARGET}_HEADERS
     console.h
     debug.h
     download.h
+    finetune.h
     fit.h   # qvac: declarations for the fit helpers (memory_breakdown_print, get_device_memory_data)
     hf-cache.h
     http.h
@@ -108,6 +109,7 @@ add_library(${TARGET} STATIC
     console.cpp
     debug.cpp
     download.cpp
+    finetune.cpp
     fit.cpp
     hf-cache.cpp
     imatrix-loader.cpp
