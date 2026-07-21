@@ -16,6 +16,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#endif
+
 namespace {
 
 #define CHECK(cond)                                                            \
@@ -110,30 +114,48 @@ double median_time_ms(int warmups, int repeats, Fn fn) {
     return times[times.size() / 2];
 }
 
-const char * q8_kernel_name() {
+bool x86_cpu_has_avx2() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    if (regs[0] < 7) {
+        return false;
+    }
+    __cpuidex(regs, 1, 0);
+    constexpr int kOsxsave = 1 << 27;
+    constexpr int kAvx = 1 << 28;
+    if ((regs[2] & (kOsxsave | kAvx)) != (kOsxsave | kAvx) ||
+        (_xgetbv(0) & 0x6) != 0x6) {
+        return false;
+    }
+    __cpuidex(regs, 7, 0);
+    return (regs[1] & (1 << 5)) != 0;
+#elif (defined(__GNUC__) || defined(__clang__)) && \
+      (defined(__x86_64__) || defined(__i386__))
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2");
+#else
+    return false;
+#endif
+}
+
+const char * quantized_kernel_name() {
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     return "arm-neon";
-#elif defined(__AVX2__)
-    return "avx2";
-#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
-    __builtin_cpu_init();
-    return __builtin_cpu_supports("avx2") ? "avx2" : "scalar";
+#elif defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && \
+      (defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__))
+    return x86_cpu_has_avx2() ? "avx2" : "scalar";
 #else
     return "scalar";
 #endif
 }
 
+const char * q8_kernel_name() {
+    return quantized_kernel_name();
+}
+
 const char * q4_kernel_name() {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    return "arm-neon";
-#elif defined(__AVX2__)
-    return "avx2";
-#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
-    __builtin_cpu_init();
-    return __builtin_cpu_supports("avx2") ? "avx2" : "scalar";
-#else
-    return "scalar";
-#endif
+    return quantized_kernel_name();
 }
 
 std::vector<float> make_normalized_vectors(int n, int dim, uint32_t seed) {

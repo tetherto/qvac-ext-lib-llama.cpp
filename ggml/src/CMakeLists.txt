@@ -261,11 +261,44 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
 
-add_library(ggml-vector-index
-            ../include/ggml-vector-index.h
-            ggml-vector-index.cpp)
+set(GGML_VECTOR_INDEX_SOURCES
+    ../include/ggml-vector-index.h
+    ggml-vector-index.cpp)
+
+set(GGML_VECTOR_INDEX_AVX2_FLAG "")
+if (GGML_SYSTEM_ARCH STREQUAL "x86")
+    if (MSVC)
+        check_cxx_compiler_flag("/arch:AVX2" GGML_VECTOR_INDEX_SUPPORTS_AVX2)
+        if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)
+            set(GGML_VECTOR_INDEX_AVX2_FLAG "/arch:AVX2")
+        endif()
+    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        check_cxx_compiler_flag("-mavx2" GGML_VECTOR_INDEX_SUPPORTS_AVX2)
+        if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)
+            set(GGML_VECTOR_INDEX_AVX2_FLAG "-mavx2")
+        endif()
+    endif()
+endif()
+
+if (GGML_VECTOR_INDEX_AVX2_FLAG)
+    list(APPEND GGML_VECTOR_INDEX_SOURCES
+         ggml-vector-index-avx2.h
+         ggml-vector-index-avx2.cpp)
+    set_source_files_properties(
+        ggml-vector-index-avx2.cpp
+        PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
+endif()
+
+add_library(ggml-vector-index ${GGML_VECTOR_INDEX_SOURCES})
 add_library(ggml::ggml-vector-index ALIAS ggml-vector-index)
 add_library(ggml::vector-index ALIAS ggml-vector-index)
+
+if (GGML_VECTOR_INDEX_AVX2_FLAG)
+    target_compile_definitions(ggml-vector-index PRIVATE GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+    set_property(TARGET ggml-vector-index PROPERTY GGML_VECTOR_INDEX_HAS_AVX2 TRUE)
+else()
+    set_property(TARGET ggml-vector-index PROPERTY GGML_VECTOR_INDEX_HAS_AVX2 FALSE)
+endif()
 
 set_target_properties(ggml-vector-index PROPERTIES
     VERSION ${GGML_VERSION}

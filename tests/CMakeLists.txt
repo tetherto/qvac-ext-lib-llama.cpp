@@ -172,6 +172,13 @@ llama_test(test-vector-index-faults)
 add_executable(bench-vector-index bench-vector-index.cpp)
 target_compile_features(bench-vector-index PRIVATE cxx_std_17)
 target_link_libraries(bench-vector-index PRIVATE ggml-vector-index)
+get_target_property(
+    GGML_VECTOR_INDEX_HAS_AVX2
+    ggml-vector-index
+    GGML_VECTOR_INDEX_HAS_AVX2)
+if (GGML_VECTOR_INDEX_HAS_AVX2)
+    target_compile_definitions(bench-vector-index PRIVATE GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+endif()
 if (LLAMA_TESTS_INSTALL)
     install(TARGETS bench-vector-index RUNTIME)
 endif()

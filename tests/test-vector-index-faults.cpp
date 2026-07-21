@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -16,8 +17,12 @@ extern "C" void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 extern "C" void ggml_vec_index_test_set_truncate_fail(int fail);
 extern "C" void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 extern "C" void ggml_vec_index_test_set_delta_append_wait_target(int target);
+extern "C" void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
 extern "C" void ggml_vec_index_test_reset_delta_tail_scan_count(void);
 extern "C" int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
+extern "C" void ggml_vec_index_test_reset_state_crc_scan_count(void);
+extern "C" int64_t ggml_vec_index_test_get_state_crc_scan_count(void);
+extern "C" int ggml_vec_index_test_get_load_with_delta_waiters(void);
 
 namespace {
 
@@ -29,13 +34,27 @@ namespace {
         }                                                                      \
     } while (0)
 
+std::string unique_temp_path(const std::string & filename) {
+    static std::atomic<uint64_t> counter{ 0 };
+    const std::filesystem::path path(filename);
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string unique_name =
+        path.stem().string() + "-" +
+        std::to_string(now) + "-" +
+        std::to_string(counter.fetch_add(1)) +
+        path.extension().string();
+    return (std::filesystem::temp_directory_path() / unique_name).string();
+}
+
 void reset_fault_hooks() {
     ggml_vec_index_test_set_oom_countdown(-1);
     ggml_vec_index_test_set_write_fail_after(-1);
     ggml_vec_index_test_set_truncate_fail(0);
     ggml_vec_index_test_set_parent_fsync_fail(0);
     ggml_vec_index_test_set_delta_append_wait_target(0);
+    ggml_vec_index_test_set_load_with_delta_pause_ms(0);
     ggml_vec_index_test_reset_delta_tail_scan_count();
+    ggml_vec_index_test_reset_state_crc_scan_count();
 }
 
 std::vector<uint8_t> read_file_bytes(const std::string & path) {
@@ -93,11 +112,9 @@ void test_quantized_logged_faults(int bit_width) {
 
     const std::string suffix = std::to_string(bit_width);
     const std::string snapshot_path =
-        (std::filesystem::temp_directory_path() /
-         ("ggml-vector-index-quant-fault-base-" + suffix + ".tvim")).string();
+        unique_temp_path("ggml-vector-index-quant-fault-base-" + suffix + ".tvim");
     const std::string delta_path =
-        (std::filesystem::temp_directory_path() /
-         ("ggml-vector-index-quant-fault-log-" + suffix + ".tvid")).string();
+        unique_temp_path("ggml-vector-index-quant-fault-log-" + suffix + ".tvid");
     std::filesystem::remove(snapshot_path);
     std::filesystem::remove(delta_path);
     std::filesystem::remove(delta_path + ".lock");
@@ -235,8 +252,7 @@ int main() {
     }
 
     const std::string path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-fault-test.tvim").string();
+        unique_temp_path("ggml-vector-index-fault-test.tvim");
     std::filesystem::remove(path);
     remove_temp_siblings(path);
     CHECK(ggml_vec_index_write(idx, path.c_str()) == GGML_VEC_INDEX_OK);
@@ -277,8 +293,7 @@ int main() {
 
     {
         const std::string parent_fsync_path =
-            (std::filesystem::temp_directory_path() /
-             "ggml-vector-index-parent-fsync-test.tvim").string();
+            unique_temp_path("ggml-vector-index-parent-fsync-test.tvim");
         std::filesystem::remove(parent_fsync_path);
 
         auto * parent_fsync_idx = ggml_vec_index_create(dim, /*bit_width=*/32);
@@ -310,8 +325,7 @@ int main() {
     }
 
     const std::string delta_path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-fault-test.tvid").string();
+        unique_temp_path("ggml-vector-index-fault-test.tvid");
     std::filesystem::remove(delta_path);
 
     const std::array<float, 4> logged_vector = { 0.0f, 0.0f, 1.0f, 0.0f };
@@ -420,11 +434,9 @@ int main() {
     ggml_vec_index_filter_free(remove_filter);
 
     const std::string committed_add_snapshot_path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-committed-add-base.tvim").string();
+        unique_temp_path("ggml-vector-index-committed-add-base.tvim");
     const std::string committed_add_delta_path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-committed-add-log.tvid").string();
+        unique_temp_path("ggml-vector-index-committed-add-log.tvid");
     std::filesystem::remove(committed_add_snapshot_path);
     std::filesystem::remove(committed_add_delta_path);
     std::filesystem::remove(committed_add_delta_path + ".lock");
@@ -456,11 +468,9 @@ int main() {
     std::filesystem::remove(committed_add_delta_path + ".lock");
 
     const std::string compact_parent_snapshot_path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-compact-parent-fsync-base.tvim").string();
+        unique_temp_path("ggml-vector-index-compact-parent-fsync-base.tvim");
     const std::string compact_parent_delta_path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-compact-parent-fsync-log.tvid").string();
+        unique_temp_path("ggml-vector-index-compact-parent-fsync-log.tvid");
     std::filesystem::remove(compact_parent_snapshot_path);
     std::filesystem::remove(compact_parent_delta_path);
     std::filesystem::remove(compact_parent_delta_path + ".lock");
@@ -479,7 +489,7 @@ int main() {
     CHECK(ggml_vec_index_compact_delta(
         compact_parent,
         compact_parent_snapshot_path.c_str(),
-        compact_parent_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+        compact_parent_delta_path.c_str()) == GGML_VEC_INDEX_E_PARTIAL_COMPACT);
     reset_fault_hooks();
     CHECK(std::filesystem::file_size(compact_parent_delta_path) > 16);
     auto * compact_parent_replayed = ggml_vec_index_load_with_delta(
@@ -494,11 +504,9 @@ int main() {
     std::filesystem::remove(compact_parent_delta_path + ".lock");
 
     const std::string cached_tail_snapshot_path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-cached-tail-base.tvim").string();
+        unique_temp_path("ggml-vector-index-cached-tail-base.tvim");
     const std::string cached_tail_delta_path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-cached-tail-log.tvid").string();
+        unique_temp_path("ggml-vector-index-cached-tail-log.tvid");
     std::filesystem::remove(cached_tail_snapshot_path);
     std::filesystem::remove(cached_tail_delta_path);
     std::filesystem::remove(cached_tail_delta_path + ".lock");
@@ -512,6 +520,7 @@ int main() {
     const uint64_t cached_tail_id_a = 701;
     const uint64_t cached_tail_id_b = 702;
     ggml_vec_index_test_reset_delta_tail_scan_count();
+    ggml_vec_index_test_reset_state_crc_scan_count();
     CHECK(ggml_vec_index_add_logged(
         cached_tail, logged_vector.data(), 1,
         &cached_tail_id_a, cached_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
@@ -520,7 +529,8 @@ int main() {
         &cached_tail_id_b, cached_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_remove_logged(
         cached_tail, base_ids[0], cached_tail_delta_path.c_str()) == 1);
-    CHECK(ggml_vec_index_test_get_delta_tail_scan_count() == 0);
+    CHECK(ggml_vec_index_test_get_delta_tail_scan_count() == 2);
+    CHECK(ggml_vec_index_test_get_state_crc_scan_count() == 0);
 
     auto * cached_tail_replayed = ggml_vec_index_load_with_delta(
         cached_tail_snapshot_path.c_str(), cached_tail_delta_path.c_str());
@@ -535,15 +545,129 @@ int main() {
     std::filesystem::remove(cached_tail_delta_path);
     std::filesystem::remove(cached_tail_delta_path + ".lock");
 
+    const std::string stale_tail_snapshot_path =
+        unique_temp_path("ggml-vector-index-stale-tail-base.tvim");
+    const std::string stale_tail_delta_path =
+        unique_temp_path("ggml-vector-index-stale-tail-log.tvid");
+    std::filesystem::remove(stale_tail_snapshot_path);
+    std::filesystem::remove(stale_tail_delta_path);
+    std::filesystem::remove(stale_tail_delta_path + ".lock");
+
+    auto * stale_base = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(stale_base != nullptr);
+    CHECK(ggml_vec_index_add(
+        stale_base, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(stale_base, stale_tail_snapshot_path.c_str()) ==
+          GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(stale_base);
+
+    auto * stale_writer = ggml_vec_index_load(stale_tail_snapshot_path.c_str());
+    CHECK(stale_writer != nullptr);
+    const uint64_t stale_tail_id_a = 801;
+    CHECK(ggml_vec_index_add_logged(
+        stale_writer, logged_vector.data(), 1,
+        &stale_tail_id_a, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    const uint64_t stale_tail_size = std::filesystem::file_size(stale_tail_delta_path);
+
+    auto * fresh_writer = ggml_vec_index_load_with_delta(
+        stale_tail_snapshot_path.c_str(), stale_tail_delta_path.c_str());
+    CHECK(fresh_writer != nullptr);
+    CHECK(ggml_vec_index_compact_delta(
+        fresh_writer,
+        stale_tail_snapshot_path.c_str(),
+        stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    const uint64_t stale_tail_id_b = 802;
+    CHECK(ggml_vec_index_add_logged(
+        fresh_writer, extra_vector.data(), 1,
+        &stale_tail_id_b, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(std::filesystem::file_size(stale_tail_delta_path) == stale_tail_size);
+
+    const uint64_t stale_tail_rejected_id = 803;
+    CHECK(ggml_vec_index_add_logged(
+        stale_writer, logged_vector.data(), 1,
+        &stale_tail_rejected_id, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+    CHECK(ggml_vec_index_contains(stale_writer, stale_tail_rejected_id) == 0);
+
+    auto * stale_tail_replayed = ggml_vec_index_load_with_delta(
+        stale_tail_snapshot_path.c_str(), stale_tail_delta_path.c_str());
+    CHECK(stale_tail_replayed != nullptr);
+    CHECK(ggml_vec_index_len(stale_tail_replayed) == 4);
+    CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_id_a) == 1);
+    CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_id_b) == 1);
+    CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_rejected_id) == 0);
+    ggml_vec_index_free(stale_tail_replayed);
+    ggml_vec_index_free(fresh_writer);
+    ggml_vec_index_free(stale_writer);
+    std::filesystem::remove(stale_tail_snapshot_path);
+    std::filesystem::remove(stale_tail_delta_path);
+    std::filesystem::remove(stale_tail_delta_path + ".lock");
+
+    const std::string load_compact_snapshot_path =
+        unique_temp_path("ggml-vector-index-load-compact-base.tvim");
+    const std::string load_compact_delta_path =
+        unique_temp_path("ggml-vector-index-load-compact-log.tvid");
+    std::filesystem::remove(load_compact_snapshot_path);
+    std::filesystem::remove(load_compact_delta_path);
+    std::filesystem::remove(load_compact_delta_path + ".lock");
+
+    auto * load_compact_base = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(load_compact_base != nullptr);
+    CHECK(ggml_vec_index_add(
+        load_compact_base, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(load_compact_base, load_compact_snapshot_path.c_str()) ==
+          GGML_VEC_INDEX_OK);
+    const uint64_t load_compact_id = 901;
+    CHECK(ggml_vec_index_add_logged(
+        load_compact_base, logged_vector.data(), 1,
+        &load_compact_id, load_compact_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+
+    auto * load_compact_writer = ggml_vec_index_load_with_delta(
+        load_compact_snapshot_path.c_str(), load_compact_delta_path.c_str());
+    CHECK(load_compact_writer != nullptr);
+
+    ggml_vec_index_t * concurrent_loaded = nullptr;
+    ggml_vec_index_test_set_load_with_delta_pause_ms(250);
+    std::thread load_thread([&]() {
+        concurrent_loaded = ggml_vec_index_load_with_delta(
+            load_compact_snapshot_path.c_str(), load_compact_delta_path.c_str());
+    });
+    const auto load_wait_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (ggml_vec_index_test_get_load_with_delta_waiters() == 0 &&
+           std::chrono::steady_clock::now() < load_wait_deadline) {
+        std::this_thread::yield();
+    }
+    CHECK(ggml_vec_index_test_get_load_with_delta_waiters() == 1);
+    CHECK(ggml_vec_index_compact_delta(
+        load_compact_writer,
+        load_compact_snapshot_path.c_str(),
+        load_compact_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    load_thread.join();
+    reset_fault_hooks();
+    CHECK(concurrent_loaded != nullptr);
+    CHECK(ggml_vec_index_len(concurrent_loaded) == 3);
+    CHECK(ggml_vec_index_contains(concurrent_loaded, load_compact_id) == 1);
+
+    auto * load_compact_replayed = ggml_vec_index_load_with_delta(
+        load_compact_snapshot_path.c_str(), load_compact_delta_path.c_str());
+    CHECK(load_compact_replayed != nullptr);
+    CHECK(ggml_vec_index_len(load_compact_replayed) == 3);
+    CHECK(ggml_vec_index_contains(load_compact_replayed, load_compact_id) == 1);
+    ggml_vec_index_free(load_compact_replayed);
+    ggml_vec_index_free(concurrent_loaded);
+    ggml_vec_index_free(load_compact_writer);
+    ggml_vec_index_free(load_compact_base);
+    std::filesystem::remove(load_compact_snapshot_path);
+    std::filesystem::remove(load_compact_delta_path);
+    std::filesystem::remove(load_compact_delta_path + ".lock");
+
     test_quantized_logged_faults(/*bit_width=*/8);
     test_quantized_logged_faults(/*bit_width=*/4);
 
     const std::string shared_snapshot_path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-shared-delta-base.tvim").string();
+        unique_temp_path("ggml-vector-index-shared-delta-base.tvim");
     const std::string shared_delta_path =
-        (std::filesystem::temp_directory_path() /
-         "ggml-vector-index-shared-delta-log.tvid").string();
+        unique_temp_path("ggml-vector-index-shared-delta-log.tvid");
     std::filesystem::remove(shared_snapshot_path);
     std::filesystem::remove(shared_delta_path);
     std::filesystem::remove(shared_delta_path + ".lock");

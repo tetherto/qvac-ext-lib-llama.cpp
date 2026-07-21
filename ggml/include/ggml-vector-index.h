@@ -5,8 +5,8 @@
 // This public C API supports full f32 storage (`bit_width=32`), q8 storage
 // (`bit_width=8`), and packed q4
 // storage (`bit_width=4`) with CPU search directly against quantized codes.
-// q8 and q4 use NEON when available; on x86 they use AVX2 when compiled with
-// AVX2, and GCC/Clang builds can runtime-dispatch AVX2 from a non-AVX2 baseline.
+// q8 and q4 use NEON when available. Supported x86 CMake builds compile AVX2
+// kernels separately and runtime-dispatch them from a non-AVX2 baseline.
 //
 // Threading: read-only APIs on the same handle can run concurrently. Mutations,
 // persistence writes, compaction, and IVF builds are serialized with reads and
@@ -59,6 +59,7 @@ enum ggml_vec_index_error {
     GGML_VEC_INDEX_E_BAD_MAGIC   = -5,
     GGML_VEC_INDEX_E_BAD_VERSION = -6,
     GGML_VEC_INDEX_E_OOM         = -7,
+    GGML_VEC_INDEX_E_PARTIAL_COMPACT = -8,
     GGML_VEC_INDEX_E_INTERNAL    = -99,
 };
 
@@ -141,8 +142,10 @@ GGML_API int ggml_vec_index_build_ivf(
 // `out_ids` are caller-allocated buffers of size `n_q * k`. Each row is
 // sorted descending by score (higher = closer / more similar). If the index
 // holds fewer than k entries, the remaining slots in each row are filled
-// with sentinel values: -FLT_MAX for scores, UINT64_MAX for ids. Read-only
-// against the index (does not mutate state).
+// with UINT64_MAX ids; callers must use out_ids[i] == UINT64_MAX to identify
+// padding. Padded score slots are filled with -FLT_MAX for compatibility, but
+// that value can also be a legitimate finite dot product. Read-only against
+// the index (does not mutate state).
 // Exact search scans all live entries; use filtered or IVF search to reduce
 // the candidate set.
 //
@@ -235,7 +238,9 @@ GGML_API ggml_vec_index_t * ggml_vec_index_load_with_delta(
     const char * delta_path);
 
 // Compacts incremental persistence by writing a full snapshot and replacing
-// the delta log with an empty matching .tvid header.
+// the delta log with an empty matching .tvid header. Returns
+// GGML_VEC_INDEX_E_PARTIAL_COMPACT if the snapshot was written but replacing
+// the delta log failed; loading snapshot+delta remains idempotent in this state.
 GGML_API int ggml_vec_index_compact_delta(
     ggml_vec_index_t * idx,
     const char       * snapshot_path,
@@ -286,30 +291,32 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 // flag bits; they also accept legacy v1 f32 snapshots. Legacy bit_width=8
 // snapshots migrate to q8, while all other legacy widths migrate to f32.
 //
-// Delta log (.tvid version 1, all little-endian):
+// Delta log (.tvid version 2, all little-endian):
 //
 //   file header:
 //     0   4   magic = "TVDL"
-//     4   1   version = 1
+//     4   1   version = 2
 //     5   1   bit_width (4, 8, or 32)
 //     6   2   reserved (zero)
 //     8   4   dim (uint32)
-//     12  4   base snapshot state CRC32C
+//     12  4   base snapshot state token
 //
 //   record header:
 //     0   1   op (1 = add, 2 = remove)
 //     1   3   reserved (zero)
 //     4   4   n (add count; remove uses 1)
 //     8   8   payload bytes
-//     16  4   CRC32C over record header bytes [0, 16), state CRC, and payload
-//     20  4   state CRC32C after applying this record
+//     16  4   CRC32C over record header bytes [0, 16), state token, and payload
+//     20  4   state token after applying this record
 //
 //   add payload:    N uint64 ids, then N*D float32 vectors
 //   remove payload: one uint64 id
 //
-// The base snapshot CRC binds the log to the snapshot state it extends. Record
-// state CRCs let loading validate the final replay state and recognize a
-// compacted snapshot when a process crashed before replacing the old delta log.
+// The base snapshot token binds the log to the snapshot state it extends.
+// Record state tokens let loading validate the final replay state and recognize
+// a compacted snapshot when a process crashed before replacing the old delta
+// log. Readers also accept legacy .tvid v1 logs, whose state field is a
+// full-index CRC32C.
 
 #ifdef __cplusplus
 }

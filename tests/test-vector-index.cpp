@@ -159,6 +159,70 @@ void append_f32_le(std::vector<uint8_t> & bytes, float value) {
     append_u32_le(bytes, bits);
 }
 
+uint32_t crc32c_update(uint32_t crc, const void * data, size_t size) {
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= p[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            const uint32_t mask = 0u - (crc & 1u);
+            crc = (crc >> 1) ^ (0x82f63b78u & mask);
+        }
+    }
+    return crc;
+}
+
+uint32_t crc32c_update_u32(uint32_t crc, uint32_t value) {
+    uint8_t bytes[4];
+    for (int i = 0; i < 4; ++i) {
+        bytes[i] = static_cast<uint8_t>(value >> (8 * i));
+    }
+    return crc32c_update(crc, bytes, sizeof(bytes));
+}
+
+uint32_t crc32c_update_u64(uint32_t crc, uint64_t value) {
+    uint8_t bytes[8];
+    for (int i = 0; i < 8; ++i) {
+        bytes[i] = static_cast<uint8_t>(value >> (8 * i));
+    }
+    return crc32c_update(crc, bytes, sizeof(bytes));
+}
+
+uint64_t rotl64(uint64_t value, int shift) {
+    return (value << shift) | (value >> (64 - shift));
+}
+
+uint64_t slot_state_hash_f32(uint64_t id, const std::vector<float> & vector) {
+    uint32_t crc0 = 0xffffffffu;
+    uint32_t crc1 = 0x82f63b78u;
+    crc0 = crc32c_update_u64(crc0, id);
+    crc1 = crc32c_update_u64(crc1, id ^ 0xa5a5a5a5a5a5a5a5ull);
+    for (float value : vector) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        crc0 = crc32c_update_u32(crc0, bits);
+        crc1 = crc32c_update_u32(crc1, bits ^ 0xa5a5a5a5u);
+    }
+    return (static_cast<uint64_t>(crc0 ^ 0xffffffffu) << 32) |
+        static_cast<uint64_t>(crc1 ^ 0xffffffffu);
+}
+
+uint32_t f32_state_token(
+        int dim,
+        size_t n_active,
+        uint64_t hash_xor,
+        uint64_t hash_sum,
+        uint64_t hash_sum_rot) {
+    uint32_t crc = 0xffffffffu;
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(dim));
+    crc = crc32c_update_u32(crc, 32);
+    crc = crc32c_update_u32(crc, 1);
+    crc = crc32c_update_u64(crc, static_cast<uint64_t>(n_active));
+    crc = crc32c_update_u64(crc, hash_xor);
+    crc = crc32c_update_u64(crc, hash_sum);
+    crc = crc32c_update_u64(crc, hash_sum_rot);
+    return crc ^ 0xffffffffu;
+}
+
 void write_v1_index(
         const std::string & path,
         int dim,
@@ -256,6 +320,30 @@ int main() {
               == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_remove(idx, reserved_id)
               == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_len(idx) == 0);
+    }
+
+    // Padding is identified by the id sentinel, not by score alone.
+    {
+        const std::array<float, kDim> min_score_vector = {
+            -FLT_MAX, 0.0f, 0.0f, 0.0f,
+        };
+        const std::array<float, kDim> min_score_query = {
+            1.0f, 0.0f, 0.0f, 0.0f,
+        };
+        const uint64_t min_score_id = 12345ULL;
+        CHECK(ggml_vec_index_add(idx, min_score_vector.data(), 1, &min_score_id) ==
+              GGML_VEC_INDEX_OK);
+        std::array<float, 2> scores{};
+        std::array<uint64_t, 2> out_ids{};
+        CHECK(ggml_vec_index_search(
+            idx, min_score_query.data(), 1, /*k=*/2,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == min_score_id);
+        CHECK(scores[0] == -FLT_MAX);
+        CHECK(out_ids[1] == UINT64_MAX);
+        CHECK(scores[1] == -FLT_MAX);
+        CHECK(ggml_vec_index_remove(idx, min_score_id) == 1);
         CHECK(ggml_vec_index_len(idx) == 0);
     }
 
@@ -1011,6 +1099,57 @@ int main() {
             GGML_VEC_INDEX_E_IO);
         CHECK(ggml_vec_index_contains(mismatch, mismatch_new_id) == 0);
         ggml_vec_index_free(mismatch);
+
+        const uint64_t missing_remove_id = (1ULL << 41) + 123ULL;
+        const std::string missing_remove_delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-missing-remove-delta.tvid").string();
+        uint64_t hash_xor = 0;
+        uint64_t hash_sum = 0;
+        uint64_t hash_sum_rot = 0;
+        for (size_t i = 0; i < 2; ++i) {
+            const uint64_t hash = slot_state_hash_f32(ids[i], seeds[i]);
+            hash_xor ^= hash;
+            hash_sum += hash;
+            hash_sum_rot += rotl64(hash, 17);
+        }
+        const uint32_t base_token =
+            f32_state_token(kDim, 2, hash_xor, hash_sum, hash_sum_rot);
+        // Claim an unchanged state so this only fails if replay rejects the
+        // missing remove, not because final state validation catches it later.
+        const uint32_t claimed_post_remove_token = base_token;
+        std::vector<uint8_t> missing_remove_log = {
+            'T', 'V', 'D', 'L',
+            2, 32, 0, 0,
+        };
+        append_u32_le(missing_remove_log, kDim);
+        append_u32_le(missing_remove_log, base_token);
+        const size_t record_offset = missing_remove_log.size();
+        missing_remove_log.push_back(2); // remove
+        missing_remove_log.insert(missing_remove_log.end(), { 0, 0, 0 });
+        append_u32_le(missing_remove_log, 1);
+        append_u64_le(missing_remove_log, sizeof(uint64_t));
+        append_u32_le(missing_remove_log, 0); // record CRC placeholder
+        append_u32_le(missing_remove_log, claimed_post_remove_token);
+        append_u64_le(missing_remove_log, missing_remove_id);
+        uint32_t record_crc = crc32c_update(
+            0xffffffffu,
+            missing_remove_log.data() + record_offset,
+            16);
+        record_crc = crc32c_update_u32(record_crc, claimed_post_remove_token);
+        record_crc = crc32c_update_u64(record_crc, missing_remove_id);
+        record_crc ^= 0xffffffffu;
+        for (int i = 0; i < 4; ++i) {
+            missing_remove_log[record_offset + 16 + static_cast<size_t>(i)] =
+                static_cast<uint8_t>(record_crc >> (8 * i));
+        }
+        write_file_bytes(missing_remove_delta_path, missing_remove_log);
+        auto * missing_remove_loaded = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), missing_remove_delta_path.c_str());
+        CHECK(missing_remove_loaded == nullptr);
+        ggml_vec_index_free(missing_remove_loaded);
+        std::filesystem::remove(missing_remove_delta_path);
+        std::filesystem::remove(missing_remove_delta_path + ".lock");
 
         const std::vector<uint8_t> pre_compact_delta = read_file_bytes(delta_path);
         const std::vector<uint8_t> pre_same_path_snapshot = read_file_bytes(snapshot_path);
