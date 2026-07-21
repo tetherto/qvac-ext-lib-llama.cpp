@@ -5,9 +5,8 @@
 // This public C API supports full f32 storage (`bit_width=32`), q8 storage
 // (`bit_width=8`), and packed q4
 // storage (`bit_width=4`) with CPU search directly against quantized codes.
-// q8 uses NEON when available; on x86 it uses AVX2 when compiled with AVX2,
-// and GCC/Clang builds can runtime-dispatch AVX2 from a non-AVX2 baseline.
-// q4 uses NEON when available.
+// q8 and q4 use NEON when available; on x86 they use AVX2 when compiled with
+// AVX2, and GCC/Clang builds can runtime-dispatch AVX2 from a non-AVX2 baseline.
 //
 // Threading: read-only APIs on the same handle can run concurrently. Mutations,
 // persistence writes, compaction, and IVF builds are serialized with reads and
@@ -99,6 +98,13 @@ GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 // Logged mutations for incremental persistence. These update `idx` and append
 // a durable delta record to `delta_path`. Replay the log on top of a full .tvim
 // snapshot with `ggml_vec_index_load_with_delta`.
+//
+// Delta logs are state-bound and single-writer per snapshot lineage. Use one
+// evolving writer handle for a given {snapshot, delta_path} pair. If another
+// handle or process appends to the same log, stale writers are rejected and
+// must reload with `ggml_vec_index_load_with_delta` before appending again.
+// If an append error occurs after a complete replayable record is observed,
+// the mutation is treated as committed and the API returns OK.
 GGML_API int ggml_vec_index_add_logged(
     ggml_vec_index_t * idx,
     const float      * vectors,
@@ -137,6 +143,8 @@ GGML_API int ggml_vec_index_build_ivf(
 // holds fewer than k entries, the remaining slots in each row are filled
 // with sentinel values: -FLT_MAX for scores, UINT64_MAX for ids. Read-only
 // against the index (does not mutate state).
+// Exact search scans all live entries; use filtered or IVF search to reduce
+// the candidate set.
 //
 // Score semantics: dot product. For f32 storage this is a full-precision dot
 // product. For q4/q8 storage, the query remains f32 and the dot product is

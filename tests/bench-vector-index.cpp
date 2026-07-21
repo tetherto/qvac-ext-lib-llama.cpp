@@ -126,6 +126,11 @@ const char * q8_kernel_name() {
 const char * q4_kernel_name() {
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     return "arm-neon";
+#elif defined(__AVX2__)
+    return "avx2";
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") ? "avx2" : "scalar";
 #else
     return "scalar";
 #endif

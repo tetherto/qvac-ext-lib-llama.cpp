@@ -5,7 +5,7 @@
 // std::unordered_map<uint64_t, size_t> for lookup and a parallel vector for
 // the slot->id reverse map. Remove marks slots deleted; snapshots compact live rows.
 //
-// Search: dot product across all slots + min-heap of size k. q8 search scores
+// Search: dot product across all slots + min-heap of size k. q8/q4 search scores
 // directly against stored codes and per-vector scales, with ARM NEON or x86
 // AVX2 when available and a scalar fallback.
 
@@ -2352,6 +2352,48 @@ GGML_VEC_INDEX_AVX2_ATTR inline float dot_q8_avx2(
     return acc;
 }
 
+GGML_VEC_INDEX_AVX2_ATTR inline float dot_q4_avx2(
+        const float * query,
+        const uint8_t * codes,
+        float scale,
+        int dim) {
+    const __m128i low_mask = _mm_set1_epi8(0x0f);
+    const __m128i zero_point = _mm_set1_epi8(8);
+    const __m256 scale_v = _mm256_set1_ps(scale);
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+
+    int i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        const __m128i packed =
+            _mm_loadl_epi64(reinterpret_cast<const __m128i *>(codes + static_cast<size_t>(i) / 2));
+        const __m128i low = _mm_and_si128(packed, low_mask);
+        const __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), low_mask);
+        const __m128i nibbles = _mm_unpacklo_epi8(low, high);
+        const __m128i qbytes = _mm_sub_epi8(nibbles, zero_point);
+
+        const __m256 q0 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(qbytes)),
+            scale_v);
+        const __m256 q1 = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(qbytes, 8))),
+            scale_v);
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(query + i), q0));
+        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(query + i + 8), q1));
+    }
+
+    float acc = horizontal_sum_avx2(acc0) + horizontal_sum_avx2(acc1);
+    for (; i < dim; ++i) {
+        const uint8_t byte = codes[static_cast<size_t>(i) / 2];
+        const uint8_t nibble = (i & 1) == 0 ?
+            static_cast<uint8_t>(byte & 0x0f) :
+            static_cast<uint8_t>(byte >> 4);
+        const float value = static_cast<float>(q4_decode(nibble)) * scale;
+        acc += query[i] * value;
+    }
+    return acc;
+}
+
 bool cpu_has_avx2() {
 #if defined(__AVX2__)
     return true;
@@ -2382,6 +2424,12 @@ inline float dot_q8(const float * query, const int8_t * codes, float scale, int 
 inline float dot_q4(const float * query, const uint8_t * codes, float scale, int dim) {
 #if GGML_VEC_INDEX_USE_NEON
     return dot_q4_neon(query, codes, scale, dim);
+#elif GGML_VEC_INDEX_USE_AVX2
+    static const bool has_avx2 = cpu_has_avx2();
+    if (has_avx2) {
+        return dot_q4_avx2(query, codes, scale, dim);
+    }
+    return dot_q4_scalar(query, codes, scale, dim);
 #else
     return dot_q4_scalar(query, codes, scale, dim);
 #endif
