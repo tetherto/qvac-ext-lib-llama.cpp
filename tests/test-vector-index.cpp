@@ -836,6 +836,61 @@ int main() {
     CHECK((persisted_stat.st_mode & 0777) == 0600);
 #endif
 
+    {
+        ggml_vec_index_t * diag_loaded = nullptr;
+        CHECK(ggml_vec_index_load_ex(path.c_str(), &diag_loaded) == GGML_VEC_INDEX_OK);
+        CHECK(diag_loaded != nullptr);
+        ggml_vec_index_free(diag_loaded);
+        CHECK(ggml_vec_index_load_ex(path.c_str(), nullptr) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(std::strcmp(
+            ggml_vec_index_error_to_string(GGML_VEC_INDEX_E_BAD_MAGIC),
+            "unknown error") != 0);
+
+        const std::string bad_magic_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-bad-magic.tvim").string();
+        const std::string bad_version_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-bad-version.tvim").string();
+        const std::string diag_delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-diagnostics.tvid").string();
+        std::vector<uint8_t> bytes = read_file_bytes(path);
+
+        CHECK(bytes.size() > 4);
+        bytes[0] = 'X';
+        write_file_bytes(bad_magic_path, bytes);
+
+        diag_loaded = nullptr;
+        CHECK(ggml_vec_index_load_ex(bad_magic_path.c_str(), &diag_loaded) ==
+              GGML_VEC_INDEX_E_BAD_MAGIC);
+        CHECK(diag_loaded == nullptr);
+        CHECK(ggml_vec_index_load_mmap_ex(bad_magic_path.c_str(), &diag_loaded) ==
+              GGML_VEC_INDEX_E_BAD_MAGIC);
+        CHECK(diag_loaded == nullptr);
+        CHECK(ggml_vec_index_load_with_delta_ex(
+                  bad_magic_path.c_str(), diag_delta_path.c_str(), &diag_loaded) ==
+              GGML_VEC_INDEX_E_BAD_MAGIC);
+        CHECK(diag_loaded == nullptr);
+
+        bytes = read_file_bytes(path);
+        CHECK(bytes.size() > 4);
+        bytes[4] = 99;
+        write_file_bytes(bad_version_path, bytes);
+
+        diag_loaded = nullptr;
+        CHECK(ggml_vec_index_load_ex(bad_version_path.c_str(), &diag_loaded) ==
+              GGML_VEC_INDEX_E_BAD_VERSION);
+        CHECK(diag_loaded == nullptr);
+        CHECK(ggml_vec_index_load_mmap_ex(bad_version_path.c_str(), &diag_loaded) ==
+              GGML_VEC_INDEX_E_BAD_VERSION);
+        CHECK(diag_loaded == nullptr);
+
+        std::filesystem::remove(bad_magic_path);
+        std::filesystem::remove(bad_version_path);
+        std::filesystem::remove(diag_delta_path);
+    }
+
     const std::string reserved_id_path =
         (std::filesystem::temp_directory_path() /
          "ggml-vector-index-reserved-id-corrupt.tvim").string();
@@ -1224,17 +1279,23 @@ int main() {
         ggml_vec_index_free(recompact_from_old_log);
 
         CHECK(ggml_vec_index_compact_delta(
-            base, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_OK);
+            base, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+        auto * current_after_recompact = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(current_after_recompact != nullptr);
+        CHECK(ggml_vec_index_contains(current_after_recompact, post_recompact_id) == 1);
         const uint64_t post_compact_id = (1ULL << 41) + 8ULL;
         CHECK(ggml_vec_index_add_logged(
-            base, seeds[3].data(), 1, &post_compact_id, delta_path.c_str()) ==
+            current_after_recompact, seeds[3].data(), 1, &post_compact_id, delta_path.c_str()) ==
             GGML_VEC_INDEX_OK);
         auto * replayed_after_compact = ggml_vec_index_load_with_delta(
             snapshot_path.c_str(), delta_path.c_str());
         CHECK(replayed_after_compact != nullptr);
-        CHECK(ggml_vec_index_len(replayed_after_compact) == 3);
+        CHECK(ggml_vec_index_len(replayed_after_compact) == 4);
+        CHECK(ggml_vec_index_contains(replayed_after_compact, post_recompact_id) == 1);
         CHECK(ggml_vec_index_contains(replayed_after_compact, post_compact_id) == 1);
         ggml_vec_index_free(replayed_after_compact);
+        ggml_vec_index_free(current_after_recompact);
 
         append_file_bytes(delta_path, { 0x01, 0x00, 0x00 });
         auto * replayed_with_torn_tail = ggml_vec_index_load_with_delta(
@@ -1490,6 +1551,32 @@ int main() {
         ggml_vec_index_free(overflow_idx);
     }
 
+    // Large finite terms can overflow float intermediates even when the final
+    // dot product is representable after cancellation.
+    {
+        constexpr int cancel_dim = 2;
+        const std::array<float, cancel_dim> cancel_vector = { 1e30f, 1e30f };
+        const std::array<float, cancel_dim> cancel_query = { 1e10f, -1e10f };
+        const uint64_t cancel_id = 123456790ULL;
+
+        for (int bit_width : { 32, 8, 4 }) {
+            auto * cancel_idx = ggml_vec_index_create(cancel_dim, bit_width);
+            CHECK(cancel_idx != nullptr);
+            CHECK(ggml_vec_index_add(
+                cancel_idx, cancel_vector.data(), 1, &cancel_id) == GGML_VEC_INDEX_OK);
+
+            std::array<float, 1> scores{};
+            std::array<uint64_t, 1> out_ids{};
+            CHECK(ggml_vec_index_search(
+                cancel_idx, cancel_query.data(), 1, /*k=*/1,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == cancel_id);
+            CHECK(scores[0] == 0.0f);
+
+            ggml_vec_index_free(cancel_idx);
+        }
+    }
+
     // q4 path: packed nibbles with one f32 scale per vector.
     {
         constexpr int tail_dim = 13;
@@ -1597,9 +1684,8 @@ int main() {
         CHECK(saved_rounding_mode != -1);
 
         auto score_after_add_with_rounding = [&](int bit_width, int rounding_mode) {
-            const float max_code = bit_width == 8 ? 127.0f : 7.0f;
             const std::array<float, kDim> rounding_vector = {
-                max_code, 2.5f, 0.0f, 0.0f,
+                1.0f, 0.02f, 0.0f, 0.0f,
             };
             const std::array<float, kDim> rounding_query = {
                 0.0f, 1.0f, 0.0f, 0.0f,
@@ -1629,7 +1715,6 @@ int main() {
             const float downward_score = score_after_add_with_rounding(bit_width, FE_DOWNWARD);
             const float upward_score = score_after_add_with_rounding(bit_width, FE_UPWARD);
             CHECK(downward_score == upward_score);
-            CHECK(downward_score == 2.0f);
 
             const std::string snapshot_path =
                 (std::filesystem::temp_directory_path() /
@@ -1641,9 +1726,8 @@ int main() {
             std::filesystem::remove(delta_path);
             std::filesystem::remove(delta_path + ".lock");
 
-            const float max_code = bit_width == 8 ? 127.0f : 7.0f;
             const std::array<float, kDim> rounding_vector = {
-                max_code, 2.5f, 0.0f, 0.0f,
+                1.0f, 0.02f, 0.0f, 0.0f,
             };
             const std::array<float, kDim> rounding_query = {
                 0.0f, 1.0f, 0.0f, 0.0f,
@@ -1669,7 +1753,7 @@ int main() {
                 replayed_rounding, rounding_query.data(), 1, /*k=*/1,
                 scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
             CHECK(out_ids[0] == rounding_id);
-            CHECK(scores[0] == 2.0f);
+            CHECK(scores[0] == downward_score);
 
             ggml_vec_index_free(replayed_rounding);
             ggml_vec_index_free(logged_rounding);

@@ -63,6 +63,9 @@ enum ggml_vec_index_error {
     GGML_VEC_INDEX_E_INTERNAL    = -99,
 };
 
+// Returns a stable string for ggml_vec_index_error values.
+GGML_API const char * ggml_vec_index_error_to_string(int error);
+
 // Lifecycle.
 //
 // `dim` must be > 0. `bit_width` must be 4, 8, or 32. `bit_width=4` and
@@ -219,6 +222,11 @@ GGML_API int ggml_vec_index_write(
 
 // Loads v2 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
 // are quantized to q8; all other legacy bit widths migrate to f32/32-bit.
+// Returns 0 on success and stores the loaded handle in `out`.
+GGML_API int ggml_vec_index_load_ex(
+    const char         * path,
+    ggml_vec_index_t  ** out);
+
 // Returns NULL on failure.
 GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 
@@ -228,11 +236,22 @@ GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 // `ggml_vec_index_write` can snapshot mmap-backed handles, but callers must
 // write to a different path than the mapped source file.
 // Requires a little-endian host; use `ggml_vec_index_load` on other hosts.
+// Returns 0 on success and stores the loaded handle in `out`.
+GGML_API int ggml_vec_index_load_mmap_ex(
+    const char         * path,
+    ggml_vec_index_t  ** out);
+
 // Returns NULL on failure or unsupported file format.
 GGML_API ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path);
 
 // Loads a full .tvim snapshot and replays an append-only delta log. Missing
 // delta logs are treated as empty.
+// Returns 0 on success and stores the loaded handle in `out`.
+GGML_API int ggml_vec_index_load_with_delta_ex(
+    const char         * snapshot_path,
+    const char         * delta_path,
+    ggml_vec_index_t  ** out);
+
 GGML_API ggml_vec_index_t * ggml_vec_index_load_with_delta(
     const char * snapshot_path,
     const char * delta_path);

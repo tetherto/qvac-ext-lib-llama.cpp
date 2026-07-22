@@ -261,51 +261,53 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
 
-set(GGML_VECTOR_INDEX_SOURCES
-    ../include/ggml-vector-index.h
-    ggml-vector-index.cpp)
+if (GGML_VECTOR_INDEX)
+    set(GGML_VECTOR_INDEX_SOURCES
+        ../include/ggml-vector-index.h
+        ggml-vector-index.cpp)
 
-set(GGML_VECTOR_INDEX_AVX2_FLAG "")
-if (GGML_SYSTEM_ARCH STREQUAL "x86")
-    if (MSVC)
-        check_cxx_compiler_flag("/arch:AVX2" GGML_VECTOR_INDEX_SUPPORTS_AVX2)
-        if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)
-            set(GGML_VECTOR_INDEX_AVX2_FLAG "/arch:AVX2")
-        endif()
-    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        check_cxx_compiler_flag("-mavx2" GGML_VECTOR_INDEX_SUPPORTS_AVX2)
-        if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)
-            set(GGML_VECTOR_INDEX_AVX2_FLAG "-mavx2")
+    set(GGML_VECTOR_INDEX_AVX2_FLAG "")
+    if (GGML_SYSTEM_ARCH STREQUAL "x86")
+        if (MSVC)
+            check_cxx_compiler_flag("/arch:AVX2" GGML_VECTOR_INDEX_SUPPORTS_AVX2)
+            if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)
+                set(GGML_VECTOR_INDEX_AVX2_FLAG "/arch:AVX2")
+            endif()
+        elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            check_cxx_compiler_flag("-mavx2" GGML_VECTOR_INDEX_SUPPORTS_AVX2)
+            if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)
+                set(GGML_VECTOR_INDEX_AVX2_FLAG "-mavx2")
+            endif()
         endif()
     endif()
+
+    if (GGML_VECTOR_INDEX_AVX2_FLAG)
+        list(APPEND GGML_VECTOR_INDEX_SOURCES
+             ggml-vector-index-avx2.h
+             ggml-vector-index-avx2.cpp)
+        set_source_files_properties(
+            ggml-vector-index-avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
+    endif()
+
+    add_library(ggml-vector-index ${GGML_VECTOR_INDEX_SOURCES})
+    add_library(ggml::ggml-vector-index ALIAS ggml-vector-index)
+    add_library(ggml::vector-index ALIAS ggml-vector-index)
+
+    if (GGML_VECTOR_INDEX_AVX2_FLAG)
+        target_compile_definitions(ggml-vector-index PRIVATE GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        set_property(TARGET ggml-vector-index PROPERTY GGML_VECTOR_INDEX_HAS_AVX2 TRUE)
+    else()
+        set_property(TARGET ggml-vector-index PROPERTY GGML_VECTOR_INDEX_HAS_AVX2 FALSE)
+    endif()
+
+    set_target_properties(ggml-vector-index PROPERTIES
+        VERSION ${GGML_VERSION}
+        SOVERSION ${GGML_VERSION_MAJOR}
+    )
+
+    target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)
 endif()
-
-if (GGML_VECTOR_INDEX_AVX2_FLAG)
-    list(APPEND GGML_VECTOR_INDEX_SOURCES
-         ggml-vector-index-avx2.h
-         ggml-vector-index-avx2.cpp)
-    set_source_files_properties(
-        ggml-vector-index-avx2.cpp
-        PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
-endif()
-
-add_library(ggml-vector-index ${GGML_VECTOR_INDEX_SOURCES})
-add_library(ggml::ggml-vector-index ALIAS ggml-vector-index)
-add_library(ggml::vector-index ALIAS ggml-vector-index)
-
-if (GGML_VECTOR_INDEX_AVX2_FLAG)
-    target_compile_definitions(ggml-vector-index PRIVATE GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
-    set_property(TARGET ggml-vector-index PROPERTY GGML_VECTOR_INDEX_HAS_AVX2 TRUE)
-else()
-    set_property(TARGET ggml-vector-index PROPERTY GGML_VECTOR_INDEX_HAS_AVX2 FALSE)
-endif()
-
-set_target_properties(ggml-vector-index PROPERTIES
-    VERSION ${GGML_VERSION}
-    SOVERSION ${GGML_VERSION_MAJOR}
-)
-
-target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)
 
 function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)
@@ -555,7 +557,12 @@ ggml_add_backend(Hexagon)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
 
-foreach (target ggml-base ggml ggml-vector-index)
+set(GGML_CORE_TARGETS ggml-base ggml)
+if (GGML_VECTOR_INDEX)
+    list(APPEND GGML_CORE_TARGETS ggml-vector-index)
+endif()
+
+foreach (target ${GGML_CORE_TARGETS})
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
 endforeach()
@@ -577,7 +584,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
 endif()
 
 if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
-    foreach (target ggml-base ggml ggml-vector-index)
+    foreach (target ${GGML_CORE_TARGETS})
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
         target_compile_definitions(${target} PUBLIC  GGML_SHARED)

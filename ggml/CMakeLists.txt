@@ -187,6 +187,7 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 # ggml core
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
+option(GGML_VECTOR_INDEX                    "ggml: build vector index library"                ON)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 
 # 3rd party libs / backends
@@ -342,12 +343,20 @@ set(GGML_PUBLIC_HEADERS
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
-set_target_properties(ggml-vector-index PROPERTIES PUBLIC_HEADER include/ggml-vector-index.h)
+if (GGML_VECTOR_INDEX)
+    set_target_properties(ggml-vector-index PROPERTIES PUBLIC_HEADER include/ggml-vector-index.h)
+endif()
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
 #endif()
+
+set(GGML_INSTALL_TARGETS ggml ggml-base)
+if (GGML_VECTOR_INDEX)
+    list(APPEND GGML_INSTALL_TARGETS ggml-vector-index)
+endif()
+
 install(
-  TARGETS ggml ggml-base ggml-vector-index
+  TARGETS ${GGML_INSTALL_TARGETS}
   EXPORT ggml-targets)
 
 install(
@@ -363,6 +372,14 @@ if (GGML_STANDALONE)
 
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+    if (GGML_VECTOR_INDEX)
+        configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index.pc.in
+            ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc
+            @ONLY)
+
+        install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+    endif()
 endif()
 
 #

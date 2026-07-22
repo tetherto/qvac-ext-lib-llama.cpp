@@ -529,7 +529,7 @@ int main() {
         &cached_tail_id_b, cached_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_remove_logged(
         cached_tail, base_ids[0], cached_tail_delta_path.c_str()) == 1);
-    CHECK(ggml_vec_index_test_get_delta_tail_scan_count() == 2);
+    CHECK(ggml_vec_index_test_get_delta_tail_scan_count() == 0);
     CHECK(ggml_vec_index_test_get_state_crc_scan_count() == 0);
 
     auto * cached_tail_replayed = ggml_vec_index_load_with_delta(
@@ -601,6 +601,47 @@ int main() {
     std::filesystem::remove(stale_tail_snapshot_path);
     std::filesystem::remove(stale_tail_delta_path);
     std::filesystem::remove(stale_tail_delta_path + ".lock");
+
+    const std::string stale_compact_snapshot_path =
+        unique_temp_path("ggml-vector-index-stale-compact-base.tvim");
+    const std::string stale_compact_delta_path =
+        unique_temp_path("ggml-vector-index-stale-compact-log.tvid");
+    std::filesystem::remove(stale_compact_snapshot_path);
+    std::filesystem::remove(stale_compact_delta_path);
+    std::filesystem::remove(stale_compact_delta_path + ".lock");
+
+    auto * stale_compact_base = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(stale_compact_base != nullptr);
+    CHECK(ggml_vec_index_add(
+        stale_compact_base, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(stale_compact_base, stale_compact_snapshot_path.c_str()) ==
+          GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(stale_compact_base);
+
+    auto * stale_compactor = ggml_vec_index_load(stale_compact_snapshot_path.c_str());
+    auto * current_writer = ggml_vec_index_load(stale_compact_snapshot_path.c_str());
+    CHECK(stale_compactor != nullptr);
+    CHECK(current_writer != nullptr);
+    const uint64_t stale_compact_id = 804;
+    CHECK(ggml_vec_index_add_logged(
+        current_writer, extra_vector.data(), 1,
+        &stale_compact_id, stale_compact_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_compact_delta(
+        stale_compactor,
+        stale_compact_snapshot_path.c_str(),
+        stale_compact_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+
+    auto * stale_compact_replayed = ggml_vec_index_load_with_delta(
+        stale_compact_snapshot_path.c_str(), stale_compact_delta_path.c_str());
+    CHECK(stale_compact_replayed != nullptr);
+    CHECK(ggml_vec_index_len(stale_compact_replayed) == 3);
+    CHECK(ggml_vec_index_contains(stale_compact_replayed, stale_compact_id) == 1);
+    ggml_vec_index_free(stale_compact_replayed);
+    ggml_vec_index_free(current_writer);
+    ggml_vec_index_free(stale_compactor);
+    std::filesystem::remove(stale_compact_snapshot_path);
+    std::filesystem::remove(stale_compact_delta_path);
+    std::filesystem::remove(stale_compact_delta_path + ".lock");
 
     const std::string load_compact_snapshot_path =
         unique_temp_path("ggml-vector-index-load-compact-base.tvim");

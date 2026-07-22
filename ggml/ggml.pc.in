@@ -6,5 +6,5 @@ includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@
 Name: ggml
 Description: Tensor library for machine learning
 Version: @GGML_VERSION@
-Libs: -L${libdir} -lggml -lggml-base -lggml-vector-index
+Libs: -L${libdir} -lggml -lggml-base
 Cflags: -I${includedir}
