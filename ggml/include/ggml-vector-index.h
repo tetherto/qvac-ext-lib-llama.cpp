@@ -235,6 +235,9 @@ GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 // Mutating APIs return GGML_VEC_INDEX_E_INVALID_ARG on mmap-backed handles.
 // `ggml_vec_index_write` can snapshot mmap-backed handles, but callers must
 // write to a different path than the mapped source file.
+// This loader is snapshot-only: it does not replay .tvid delta logs. Use
+// `ggml_vec_index_load_with_delta` when loading a snapshot plus delta log;
+// that path materializes the resulting index in memory.
 // Requires a little-endian host; use `ggml_vec_index_load` on other hosts.
 // Returns 0 on success and stores the loaded handle in `out`.
 GGML_API int ggml_vec_index_load_mmap_ex(
@@ -310,11 +313,11 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 // flag bits; they also accept legacy v1 f32 snapshots. Legacy bit_width=8
 // snapshots migrate to q8, while all other legacy widths migrate to f32.
 //
-// Delta log (.tvid version 2, all little-endian):
+// Delta log (.tvid version 3, all little-endian):
 //
 //   file header:
 //     0   4   magic = "TVDL"
-//     4   1   version = 2
+//     4   1   version = 3
 //     5   1   bit_width (4, 8, or 32)
 //     6   2   reserved (zero)
 //     8   4   dim (uint32)
@@ -328,14 +331,18 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 //     16  4   CRC32C over record header bytes [0, 16), state token, and payload
 //     20  4   state token after applying this record
 //
-//   add payload:    N uint64 ids, then N*D float32 vectors
+//   add payload:
+//     - f32: N uint64 ids, then N*D float32 vectors
+//     - q8:  N uint64 ids, then N float32 scales, then N*D int8 codes
+//     - q4:  N uint64 ids, then N float32 scales, then
+//            N*ceil(D/2) packed unsigned nibbles
 //   remove payload: one uint64 id
 //
 // The base snapshot token binds the log to the snapshot state it extends.
 // Record state tokens let loading validate the final replay state and recognize
 // a compacted snapshot when a process crashed before replacing the old delta
 // log. Readers also accept legacy .tvid v1 logs, whose state field is a
-// full-index CRC32C.
+// full-index CRC32C, and v2 logs, whose add payloads always store f32 vectors.
 
 #ifdef __cplusplus
 }

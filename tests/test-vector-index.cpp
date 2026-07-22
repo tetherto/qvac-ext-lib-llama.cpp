@@ -153,6 +153,20 @@ void append_u64_le(std::vector<uint8_t> & bytes, uint64_t value) {
     }
 }
 
+uint64_t read_u64_le_at(const std::vector<uint8_t> & bytes, size_t offset) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value |= static_cast<uint64_t>(bytes[offset + static_cast<size_t>(i)]) << (8 * i);
+    }
+    return value;
+}
+
+void write_u32_le_at(std::vector<uint8_t> & bytes, size_t offset, uint32_t value) {
+    for (int i = 0; i < 4; ++i) {
+        bytes[offset + static_cast<size_t>(i)] = static_cast<uint8_t>(value >> (8 * i));
+    }
+}
+
 void append_f32_le(std::vector<uint8_t> & bytes, float value) {
     uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -185,6 +199,19 @@ uint32_t crc32c_update_u64(uint32_t crc, uint64_t value) {
         bytes[i] = static_cast<uint8_t>(value >> (8 * i));
     }
     return crc32c_update(crc, bytes, sizeof(bytes));
+}
+
+void refresh_delta_record_crc(std::vector<uint8_t> & bytes, size_t record_offset) {
+    const uint64_t payload_bytes = read_u64_le_at(bytes, record_offset + 8);
+    uint32_t crc = crc32c_update(0xffffffffu, bytes.data() + record_offset, 16);
+    crc = crc32c_update(crc, bytes.data() + record_offset + 20, 4);
+    if (payload_bytes != 0) {
+        crc = crc32c_update(
+            crc,
+            bytes.data() + record_offset + 24,
+            static_cast<size_t>(payload_bytes));
+    }
+    write_u32_le_at(bytes, record_offset + 16, crc ^ 0xffffffffu);
 }
 
 uint64_t rotl64(uint64_t value, int shift) {
@@ -1764,57 +1791,113 @@ int main() {
         CHECK(std::fesetround(saved_rounding_mode) == 0);
     }
 
-    // Delta replay keeps q8 storage q8 and reuses the normal q8 quantization path.
+    // Delta replay keeps quantized storage quantized. New v3 logs store native
+    // q4/q8 rows instead of f32 vectors, while v2 f32-payload logs remain readable.
     {
-        const std::string snapshot_path =
-            (std::filesystem::temp_directory_path() /
-             "ggml-vector-index-q8-delta-base.tvim").string();
-        const std::string delta_path =
-            (std::filesystem::temp_directory_path() /
-             "ggml-vector-index-q8-delta-log.tvid").string();
-        std::filesystem::remove(snapshot_path);
-        std::filesystem::remove(delta_path);
+        for (int bit_width : { 8, 4 }) {
+            const std::string suffix = std::to_string(bit_width);
+            const std::string snapshot_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-q" + suffix + "-delta-base.tvim")).string();
+            const std::string delta_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-q" + suffix + "-delta-log.tvid")).string();
+            const std::string corrupt_delta_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-q" + suffix + "-delta-corrupt.tvid")).string();
+            const std::string v2_delta_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-q" + suffix + "-delta-v2.tvid")).string();
+            std::filesystem::remove(snapshot_path);
+            std::filesystem::remove(delta_path);
+            std::filesystem::remove(corrupt_delta_path);
+            std::filesystem::remove(v2_delta_path);
 
-        const uint64_t base_id = (1ULL << 42) + 1ULL;
-        const uint64_t delta_id = (1ULL << 42) + 2ULL;
-        auto * q8_delta = ggml_vec_index_create(kDim, /*bit_width=*/8);
-        CHECK(q8_delta != nullptr);
-        CHECK(ggml_vec_index_add(
-            q8_delta, seeds[0].data(), 1, &base_id) == GGML_VEC_INDEX_OK);
-        CHECK(ggml_vec_index_write(q8_delta, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
-        CHECK(ggml_vec_index_add_logged(
-            q8_delta, seeds[3].data(), 1, &delta_id, delta_path.c_str()) ==
-            GGML_VEC_INDEX_OK);
+            const uint64_t base_id = (1ULL << 42) + static_cast<uint64_t>(bit_width);
+            const uint64_t delta_id = (1ULL << 42) + static_cast<uint64_t>(bit_width + 100);
+            auto * quant_delta = ggml_vec_index_create(kDim, bit_width);
+            CHECK(quant_delta != nullptr);
+            CHECK(ggml_vec_index_add(
+                quant_delta, seeds[0].data(), 1, &base_id) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_write(
+                quant_delta, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_add_logged(
+                quant_delta, seeds[3].data(), 1, &delta_id, delta_path.c_str()) ==
+                GGML_VEC_INDEX_OK);
 
-        auto * replayed_q8 = ggml_vec_index_load_with_delta(
-            snapshot_path.c_str(), delta_path.c_str());
-        CHECK(replayed_q8 != nullptr);
-        CHECK(ggml_vec_index_bit_width(replayed_q8) == 8);
-        CHECK(ggml_vec_index_len(replayed_q8) == 2);
+            std::vector<uint8_t> delta_bytes = read_file_bytes(delta_path);
+            CHECK(delta_bytes.size() >= 16 + 24);
+            CHECK(delta_bytes[4] == 3);
+            const size_t old_f32_payload = sizeof(uint64_t) + kDim * sizeof(uint32_t);
+            const size_t old_f32_total = 16 + 24 + old_f32_payload;
+            CHECK(delta_bytes.size() < old_f32_total);
 
-        std::array<float, 1> scores{};
-        std::array<uint64_t, 1> out_ids{};
-        CHECK(ggml_vec_index_search(
-            replayed_q8, seeds[3].data(), 1, /*k=*/1,
-            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
-        CHECK(out_ids[0] == delta_id);
-        CHECK(std::fabs(scores[0] - 1.0f) < 1e-5f);
+            auto * replayed_quant = ggml_vec_index_load_with_delta(
+                snapshot_path.c_str(), delta_path.c_str());
+            CHECK(replayed_quant != nullptr);
+            CHECK(ggml_vec_index_bit_width(replayed_quant) == bit_width);
+            CHECK(ggml_vec_index_len(replayed_quant) == 2);
+            CHECK(ggml_vec_index_contains(replayed_quant, delta_id) == 1);
 
-        CHECK(ggml_vec_index_compact_delta(
-            q8_delta, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_OK);
-        CHECK(std::filesystem::file_size(delta_path) == 16);
-        auto * compacted_q8 = ggml_vec_index_load_with_delta(
-            snapshot_path.c_str(), delta_path.c_str());
-        CHECK(compacted_q8 != nullptr);
-        CHECK(ggml_vec_index_bit_width(compacted_q8) == 8);
-        CHECK(ggml_vec_index_len(compacted_q8) == 2);
-        CHECK(ggml_vec_index_contains(compacted_q8, delta_id) == 1);
+            std::array<float, 1> scores{};
+            std::array<uint64_t, 1> out_ids{};
+            CHECK(ggml_vec_index_search(
+                replayed_quant, seeds[3].data(), 1, /*k=*/1,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == delta_id);
 
-        ggml_vec_index_free(compacted_q8);
-        ggml_vec_index_free(replayed_q8);
-        ggml_vec_index_free(q8_delta);
-        std::filesystem::remove(snapshot_path);
-        std::filesystem::remove(delta_path);
+            std::vector<uint8_t> corrupt_bytes = delta_bytes;
+            const size_t record_offset = 16;
+            const size_t payload_offset = record_offset + 24;
+            const size_t scale_offset = payload_offset + sizeof(uint64_t);
+            write_u32_le_at(corrupt_bytes, scale_offset, 0);
+            refresh_delta_record_crc(corrupt_bytes, record_offset);
+            write_file_bytes(corrupt_delta_path, corrupt_bytes);
+            auto * corrupt_loaded = ggml_vec_index_load_with_delta(
+                snapshot_path.c_str(), corrupt_delta_path.c_str());
+            CHECK(corrupt_loaded == nullptr);
+            ggml_vec_index_free(corrupt_loaded);
+
+            CHECK(ggml_vec_index_compact_delta(
+                quant_delta, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_OK);
+            CHECK(std::filesystem::file_size(delta_path) == 16);
+            auto * compacted_quant = ggml_vec_index_load_with_delta(
+                snapshot_path.c_str(), delta_path.c_str());
+            CHECK(compacted_quant != nullptr);
+            CHECK(ggml_vec_index_bit_width(compacted_quant) == bit_width);
+            CHECK(ggml_vec_index_contains(compacted_quant, delta_id) == 1);
+            ggml_vec_index_free(compacted_quant);
+
+            CHECK(ggml_vec_index_compact_delta(
+                quant_delta, snapshot_path.c_str(), v2_delta_path.c_str()) ==
+                GGML_VEC_INDEX_OK);
+            std::vector<uint8_t> empty_v2 = read_file_bytes(v2_delta_path);
+            CHECK(empty_v2.size() == 16);
+            empty_v2[4] = 2;
+            write_file_bytes(v2_delta_path, empty_v2);
+            const uint64_t v2_delta_id =
+                (1ULL << 42) + static_cast<uint64_t>(bit_width + 200);
+            CHECK(ggml_vec_index_add_logged(
+                quant_delta, seeds[1].data(), 1, &v2_delta_id, v2_delta_path.c_str()) ==
+                GGML_VEC_INDEX_OK);
+            CHECK(std::filesystem::file_size(v2_delta_path) == old_f32_total);
+            auto * replayed_v2 = ggml_vec_index_load_with_delta(
+                snapshot_path.c_str(), v2_delta_path.c_str());
+            CHECK(replayed_v2 != nullptr);
+            CHECK(ggml_vec_index_bit_width(replayed_v2) == bit_width);
+            CHECK(ggml_vec_index_contains(replayed_v2, v2_delta_id) == 1);
+
+            ggml_vec_index_free(replayed_v2);
+            ggml_vec_index_free(replayed_quant);
+            ggml_vec_index_free(quant_delta);
+            std::filesystem::remove(snapshot_path);
+            std::filesystem::remove(delta_path);
+            std::filesystem::remove(corrupt_delta_path);
+            std::filesystem::remove(v2_delta_path);
+            std::filesystem::remove(delta_path + ".lock");
+            std::filesystem::remove(v2_delta_path + ".lock");
+            std::filesystem::remove(corrupt_delta_path + ".lock");
+        }
     }
 
     // Header metadata is protected even when all payload sections are empty.

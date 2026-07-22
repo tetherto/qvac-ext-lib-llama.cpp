@@ -267,7 +267,7 @@ if (GGML_VECTOR_INDEX)
         ggml-vector-index.cpp)
 
     set(GGML_VECTOR_INDEX_AVX2_FLAG "")
-    if (GGML_SYSTEM_ARCH STREQUAL "x86")
+    if (GGML_AVX2 AND GGML_SYSTEM_ARCH STREQUAL "x86")
         if (MSVC)
             check_cxx_compiler_flag("/arch:AVX2" GGML_VECTOR_INDEX_SUPPORTS_AVX2)
             if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)

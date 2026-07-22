@@ -101,6 +101,7 @@ constexpr size_t   kTvimChecksumSize = 16;
 constexpr uint8_t  kTvidMagic[4]   = { 'T', 'V', 'D', 'L' };
 constexpr uint8_t  kTvidVersionV1  = 1;
 constexpr uint8_t  kTvidVersion    = 2;
+constexpr uint8_t  kTvidVersionV3  = 3;
 constexpr uint8_t  kTvidOpAdd      = 1;
 constexpr uint8_t  kTvidOpRemove   = 2;
 constexpr size_t   kTvidHeaderSize = 16;
@@ -1500,16 +1501,53 @@ enum class DeltaStateKind {
     state_token,
 };
 
-bool delta_state_kind_from_version(uint8_t version, DeltaStateKind & state_kind) {
+enum class DeltaLogFormat {
+    v1,
+    v2,
+    v3,
+};
+
+DeltaStateKind delta_state_kind_for_format(DeltaLogFormat format) {
+    return format == DeltaLogFormat::v1 ?
+        DeltaStateKind::legacy_crc :
+        DeltaStateKind::state_token;
+}
+
+uint8_t delta_log_version_for_format(DeltaLogFormat format) {
+    switch (format) {
+        case DeltaLogFormat::v1:
+            return kTvidVersionV1;
+        case DeltaLogFormat::v2:
+            return kTvidVersion;
+        case DeltaLogFormat::v3:
+            return kTvidVersionV3;
+    }
+    return kTvidVersionV3;
+}
+
+bool delta_log_format_from_version(uint8_t version, DeltaLogFormat & format) {
     if (version == kTvidVersionV1) {
-        state_kind = DeltaStateKind::legacy_crc;
+        format = DeltaLogFormat::v1;
         return true;
     }
     if (version == kTvidVersion) {
-        state_kind = DeltaStateKind::state_token;
+        format = DeltaLogFormat::v2;
+        return true;
+    }
+    if (version == kTvidVersionV3) {
+        format = DeltaLogFormat::v3;
         return true;
     }
     return false;
+}
+
+bool delta_state_kind_from_version(uint8_t version, DeltaStateKind & state_kind) {
+    DeltaLogFormat format = DeltaLogFormat::v3;
+    if (!delta_log_format_from_version(version, format)) {
+        return false;
+    }
+    state_kind = delta_state_kind_for_format(format);
+    return true;
 }
 
 uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_kind) {
@@ -1574,39 +1612,39 @@ void update_delta_tail_cache(
     idx.delta_tail_cache.stamp = stamp;
 }
 
-DeltaStateKind delta_state_kind_for_append(const char * path) {
+DeltaLogFormat delta_log_format_for_append(const char * path) {
     try {
         std::filesystem::path fs_path;
         if (!filesystem_path_from_utf8(path, fs_path) ||
             !std::filesystem::exists(fs_path) ||
             std::filesystem::file_size(fs_path) == 0) {
-            return DeltaStateKind::state_token;
+            return DeltaLogFormat::v3;
         }
         std::ifstream f(fs_path, std::ios::binary);
         if (!f.is_open()) {
-            return DeltaStateKind::state_token;
+            return DeltaLogFormat::v3;
         }
         uint8_t header[kTvidHeaderSize] = {};
         f.read(reinterpret_cast<char *>(header), sizeof(header));
-        DeltaStateKind state_kind = DeltaStateKind::state_token;
+        DeltaLogFormat format = DeltaLogFormat::v3;
         if (f &&
             std::memcmp(header, kTvidMagic, 4) == 0 &&
-            delta_state_kind_from_version(header[4], state_kind)) {
-            return state_kind;
+            delta_log_format_from_version(header[4], format)) {
+            return format;
         }
     } catch (...) {
     }
-    return DeltaStateKind::state_token;
+    return DeltaLogFormat::v3;
 }
 
 void fill_delta_header(
         const ggml_vec_index & idx,
-        DeltaStateKind state_kind,
+        DeltaLogFormat format,
         uint32_t base_crc,
         uint8_t * header) {
     std::memset(header, 0, kTvidHeaderSize);
     std::memcpy(header, kTvidMagic, 4);
-    header[4] = state_kind == DeltaStateKind::legacy_crc ? kTvidVersionV1 : kTvidVersion;
+    header[4] = delta_log_version_for_format(format);
     header[5] = static_cast<uint8_t>(idx.bit_width);
     put_u32_le(header + 8, static_cast<uint32_t>(idx.dim));
     put_u32_le(header + 12, base_crc);
@@ -1616,6 +1654,7 @@ bool validate_delta_header(
         const char * path,
         const ggml_vec_index & idx,
         uint64_t & size,
+        DeltaLogFormat & format,
         DeltaStateKind & state_kind,
         uint32_t & base_crc) {
     std::filesystem::path fs_path;
@@ -1624,12 +1663,14 @@ bool validate_delta_header(
     }
     if (!std::filesystem::exists(fs_path)) {
         size = 0;
+        format = DeltaLogFormat::v3;
         state_kind = DeltaStateKind::state_token;
         base_crc = current_delta_state(idx, state_kind);
         return true;
     }
     size = static_cast<uint64_t>(std::filesystem::file_size(fs_path));
     if (size == 0) {
+        format = DeltaLogFormat::v3;
         state_kind = DeltaStateKind::state_token;
         base_crc = current_delta_state(idx, state_kind);
         return true;
@@ -1648,13 +1689,14 @@ bool validate_delta_header(
         return false;
     }
     if (std::memcmp(header, kTvidMagic, 4) != 0 ||
-        !delta_state_kind_from_version(header[4], state_kind) ||
+        !delta_log_format_from_version(header[4], format) ||
         header[5] != static_cast<uint8_t>(idx.bit_width) ||
         header[6] != 0 ||
         header[7] != 0 ||
         get_u32_le(header + 8) != static_cast<uint32_t>(idx.dim)) {
         return false;
     }
+    state_kind = delta_state_kind_for_format(format);
     base_crc = get_u32_le(header + 12);
     return true;
 }
@@ -1786,8 +1828,9 @@ bool delta_log_ends_at_state(
 bool delta_log_matches_index_state(const char * path, const ggml_vec_index & idx) {
     uint64_t size = 0;
     uint32_t base_crc = 0;
+    DeltaLogFormat format = DeltaLogFormat::v3;
     DeltaStateKind state_kind = DeltaStateKind::state_token;
-    if (!validate_delta_header(path, idx, size, state_kind, base_crc)) {
+    if (!validate_delta_header(path, idx, size, format, state_kind, base_crc)) {
         return false;
     }
 
@@ -1813,7 +1856,7 @@ struct DeltaAppendResult {
 DeltaAppendResult append_delta_record(
         ggml_vec_index & idx,
         const char * delta_path,
-        DeltaStateKind state_kind,
+        DeltaLogFormat format,
         uint8_t op,
         uint32_t n,
         uint32_t base_crc_for_new_log,
@@ -1829,13 +1872,16 @@ DeltaAppendResult append_delta_record(
 
     uint64_t old_size = 0;
     uint32_t existing_base_crc = 0;
-    DeltaStateKind existing_state_kind = state_kind;
-    if (!validate_delta_header(delta_path, idx, old_size, existing_state_kind, existing_base_crc)) {
+    DeltaLogFormat existing_format = format;
+    DeltaStateKind existing_state_kind = delta_state_kind_for_format(format);
+    if (!validate_delta_header(
+            delta_path, idx, old_size, existing_format, existing_state_kind, existing_base_crc)) {
         return { GGML_VEC_INDEX_E_IO, false };
     }
     if (old_size != 0) {
-        state_kind = existing_state_kind;
+        format = existing_format;
     }
+    const DeltaStateKind state_kind = delta_state_kind_for_format(format);
     if (old_size != 0) {
         uint32_t tail_crc = 0;
         uint64_t complete_size = 0;
@@ -1898,7 +1944,7 @@ DeltaAppendResult append_delta_record(
 
     if (old_size == 0) {
         uint8_t header[kTvidHeaderSize] = {};
-        fill_delta_header(idx, state_kind, base_crc_for_new_log, header);
+        fill_delta_header(idx, format, base_crc_for_new_log, header);
         if (!write_bytes(f, header, sizeof(header))) {
             return fail_io();
         }
@@ -1960,7 +2006,7 @@ int write_empty_delta_log_unlocked(const ggml_vec_index & idx, const char * delt
         };
 
         uint8_t header[kTvidHeaderSize] = {};
-        fill_delta_header(idx, DeltaStateKind::state_token, index_state_token(idx), header);
+        fill_delta_header(idx, DeltaLogFormat::v3, index_state_token(idx), header);
         if (!write_bytes(temp.stream, header, sizeof(header)) ||
             !flush_and_sync(temp.stream)) {
             return fail_io();
@@ -2047,7 +2093,21 @@ int check_logged_add_duplicates(
     return GGML_VEC_INDEX_OK;
 }
 
-bool build_add_delta_payload(
+bool append_u64_payload(std::vector<uint8_t> & payload, uint64_t value) {
+    uint8_t bytes[8];
+    put_u64_le(bytes, value);
+    payload.insert(payload.end(), bytes, bytes + sizeof(bytes));
+    return true;
+}
+
+bool append_u32_payload(std::vector<uint8_t> & payload, uint32_t value) {
+    uint8_t bytes[4];
+    put_u32_le(bytes, value);
+    payload.insert(payload.end(), bytes, bytes + sizeof(bytes));
+    return true;
+}
+
+bool build_add_delta_payload_f32(
         const ggml_vec_index_t * idx,
         const float * vectors,
         int n,
@@ -2063,14 +2123,79 @@ bool build_add_delta_payload(
     payload.clear();
     payload.reserve(id_bytes + vector_count * sizeof(uint32_t));
     for (int i = 0; i < n; ++i) {
-        uint8_t bytes[8];
-        put_u64_le(bytes, ids[i]);
-        payload.insert(payload.end(), bytes, bytes + sizeof(bytes));
+        append_u64_payload(payload, ids[i]);
     }
     for (size_t i = 0; i < vector_count; ++i) {
-        uint8_t bytes[4];
-        put_u32_le(bytes, float_to_u32(vectors[i]));
-        payload.insert(payload.end(), bytes, bytes + sizeof(bytes));
+        append_u32_payload(payload, float_to_u32(vectors[i]));
+    }
+    return true;
+}
+
+bool build_add_delta_payload_from_slots(
+        const ggml_vec_index_t * idx,
+        size_t base_slot,
+        int n,
+        std::vector<uint8_t> & payload) {
+    const size_t n_sz = static_cast<size_t>(n);
+    const size_t dim_sz = static_cast<size_t>(idx->dim);
+    const size_t id_bytes = n_sz * sizeof(uint64_t);
+    uint64_t payload_size = 0;
+    if (is_q4(*idx)) {
+        uint64_t code_bytes = 0;
+        if (!checked_mul_u64(n_sz, q4_row_bytes(dim_sz), code_bytes) ||
+            !checked_add_u64(id_bytes, n_sz * sizeof(uint32_t), payload_size) ||
+            !checked_add_u64(payload_size, code_bytes, payload_size)) {
+            return false;
+        }
+    } else if (is_q8(*idx)) {
+        uint64_t code_bytes = 0;
+        if (!checked_mul_u64(n_sz, dim_sz, code_bytes) ||
+            !checked_add_u64(id_bytes, n_sz * sizeof(uint32_t), payload_size) ||
+            !checked_add_u64(payload_size, code_bytes, payload_size)) {
+            return false;
+        }
+    } else {
+        uint64_t vector_count = 0;
+        uint64_t vector_bytes = 0;
+        if (!checked_mul_u64(n_sz, dim_sz, vector_count) ||
+            !checked_mul_u64(vector_count, sizeof(uint32_t), vector_bytes) ||
+            !checked_add_u64(id_bytes, vector_bytes, payload_size)) {
+            return false;
+        }
+    }
+    if (payload_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+
+    payload.clear();
+    payload.reserve(static_cast<size_t>(payload_size));
+    for (int i = 0; i < n; ++i) {
+        append_u64_payload(payload, idx->slot_to_id[base_slot + static_cast<size_t>(i)]);
+    }
+
+    if (is_q4(*idx)) {
+        for (int i = 0; i < n; ++i) {
+            append_u32_payload(
+                payload,
+                float_to_u32(idx->q4_scale[base_slot + static_cast<size_t>(i)]));
+        }
+        const size_t row_bytes = q4_row_bytes(dim_sz);
+        const uint8_t * data = q4_data_ptr(*idx) + base_slot * row_bytes;
+        payload.insert(payload.end(), data, data + n_sz * row_bytes);
+    } else if (is_q8(*idx)) {
+        for (int i = 0; i < n; ++i) {
+            append_u32_payload(
+                payload,
+                float_to_u32(idx->q8_scale[base_slot + static_cast<size_t>(i)]));
+        }
+        const int8_t * data = q8_data_ptr(*idx) + base_slot * dim_sz;
+        const auto * bytes = reinterpret_cast<const uint8_t *>(data);
+        payload.insert(payload.end(), bytes, bytes + n_sz * dim_sz);
+    } else {
+        const float * data = f32_data_ptr(*idx) + base_slot * dim_sz;
+        for (size_t i = 0; i < n_sz * dim_sz; ++i) {
+            append_u32_payload(payload, float_to_u32(data[i]));
+        }
     }
     return true;
 }
@@ -2508,25 +2633,39 @@ int ggml_vec_index_add_logged(
             return duplicate_status;
         }
 
+        const DeltaLogFormat format = delta_log_format_for_append(delta_path);
+        const DeltaStateKind state_kind = delta_state_kind_for_format(format);
+        const uint32_t base_crc = current_delta_state(*idx, state_kind);
+
         std::vector<uint8_t> payload;
-        if (!build_add_delta_payload(idx, vectors, n, ids, payload)) {
+        if (format != DeltaLogFormat::v3 &&
+            !build_add_delta_payload_f32(idx, vectors, n, ids, payload)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
-        const DeltaStateKind state_kind = delta_state_kind_for_append(delta_path);
-        const uint32_t base_crc = current_delta_state(*idx, state_kind);
         base_slot = idx->slot_to_id.size();
         const int add_status = ggml_vec_index_add_unlocked(idx, vectors, n, ids, false);
         if (add_status != GGML_VEC_INDEX_OK) {
             return add_status;
         }
         added = true;
+        if (format == DeltaLogFormat::v3 &&
+            !build_add_delta_payload_from_slots(idx, base_slot, n, payload)) {
+            for (size_t slot = base_slot; slot < idx->slot_to_id.size(); ++slot) {
+                if (slot_is_active(*idx, slot)) {
+                    remove_state_hash(*idx, slot_state_hash(*idx, slot));
+                }
+            }
+            rollback_appended_slots_unlocked(idx, base_slot, ids, n);
+            added = false;
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
 
         const uint32_t added_state_crc = current_delta_state(*idx, state_kind);
         const DeltaAppendResult append_result = append_delta_record(
             *idx,
             delta_path,
-            state_kind,
+            format,
             kTvidOpAdd,
             static_cast<uint32_t>(n),
             base_crc,
@@ -2595,7 +2734,8 @@ int ggml_vec_index_remove_logged(
             return 0;
         }
         const std::vector<uint8_t> payload = build_remove_delta_payload(id);
-        const DeltaStateKind state_kind = delta_state_kind_for_append(delta_path);
+        const DeltaLogFormat format = delta_log_format_for_append(delta_path);
+        const DeltaStateKind state_kind = delta_state_kind_for_format(format);
         const uint32_t base_crc = current_delta_state(*idx, state_kind);
         const uint32_t post_remove_crc =
             state_kind == DeltaStateKind::legacy_crc ?
@@ -2604,7 +2744,7 @@ int ggml_vec_index_remove_logged(
         const DeltaAppendResult append_result = append_delta_record(
             *idx,
             delta_path,
-            state_kind,
+            format,
             kTvidOpRemove,
             1,
             base_crc,
@@ -4067,7 +4207,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
 
 namespace {
 
-bool expected_add_delta_payload_size(uint64_t n, uint64_t dim, uint64_t & size) {
+bool expected_add_delta_payload_size_f32(uint64_t n, uint64_t dim, uint64_t & size) {
     uint64_t id_bytes = 0;
     uint64_t values = 0;
     uint64_t vector_bytes = 0;
@@ -4078,6 +4218,38 @@ bool expected_add_delta_payload_size(uint64_t n, uint64_t dim, uint64_t & size) 
         return false;
     }
     return true;
+}
+
+bool expected_add_delta_payload_size_native(
+        uint64_t n,
+        uint64_t dim,
+        int bit_width,
+        uint64_t & size) {
+    uint64_t id_bytes = 0;
+    uint64_t scale_bytes = 0;
+    uint64_t code_bytes = 0;
+    if (!checked_mul_u64(n, sizeof(uint64_t), id_bytes) ||
+        !checked_mul_u64(n, sizeof(uint32_t), scale_bytes)) {
+        return false;
+    }
+    if (bit_width == 4) {
+        uint64_t row_bytes = 0;
+        if (!checked_add_u64(dim, 1, row_bytes)) {
+            return false;
+        }
+        row_bytes /= 2;
+        if (!checked_mul_u64(n, row_bytes, code_bytes)) {
+            return false;
+        }
+    } else if (bit_width == 8) {
+        if (!checked_mul_u64(n, dim, code_bytes)) {
+            return false;
+        }
+    } else {
+        return expected_add_delta_payload_size_f32(n, dim, size);
+    }
+    return checked_add_u64(id_bytes, scale_bytes, size) &&
+        checked_add_u64(size, code_bytes, size);
 }
 
 bool read_delta_payload(std::ifstream & f, uint64_t payload_bytes, std::vector<uint8_t> & payload) {
@@ -4097,7 +4269,139 @@ bool read_delta_payload(std::ifstream & f, uint64_t payload_bytes, std::vector<u
     return true;
 }
 
-bool replay_add_delta(
+int ggml_vec_index_add_encoded_unlocked(
+        ggml_vec_index_t * idx,
+        const uint64_t * ids,
+        int n,
+        const float * scales,
+        const uint8_t * q4_codes,
+        const int8_t * q8_codes,
+        bool finalize) {
+    size_t base_slot = 0;
+    bool resized = false;
+
+    auto rollback = [&]() noexcept {
+        if (idx == nullptr || !resized) {
+            return;
+        }
+        rollback_appended_slots_unlocked(idx, base_slot, ids, n);
+    };
+
+    try {
+        if (idx == nullptr || ids == nullptr || scales == nullptr || n < 0 ||
+            (!is_q4(*idx) && !is_q8(*idx)) ||
+            (is_q4(*idx) && q4_codes == nullptr) ||
+            (is_q8(*idx) && q8_codes == nullptr)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (idx->read_only_mmap) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (n == 0) {
+            return GGML_VEC_INDEX_OK;
+        }
+        const int duplicate_status = check_logged_add_duplicates(idx, n, ids);
+        if (duplicate_status != GGML_VEC_INDEX_OK) {
+            return duplicate_status;
+        }
+
+        base_slot = idx->slot_to_id.size();
+        const size_t dim_sz = static_cast<size_t>(idx->dim);
+        const size_t n_sz = static_cast<size_t>(n);
+        if (n_sz > kMaxIndexLen || active_count(*idx) > kMaxIndexLen - n_sz ||
+            n_sz > std::numeric_limits<size_t>::max() - base_slot) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        const size_t new_slots = base_slot + n_sz;
+        if (is_q4(*idx)) {
+            const size_t row_bytes = q4_row_bytes(dim_sz);
+            if (new_slots > std::numeric_limits<size_t>::max() / row_bytes) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
+            for (size_t slot = 0; slot < n_sz; ++slot) {
+                const float scale = scales[slot];
+                if (!std::isfinite(scale) || scale <= 0.0f) {
+                    return GGML_VEC_INDEX_E_INVALID_ARG;
+                }
+                const uint8_t * row = q4_codes + slot * row_bytes;
+                for (size_t i = 0; i < dim_sz; ++i) {
+                    const uint8_t byte = row[i / 2];
+                    const uint8_t nibble = (i & 1) == 0 ?
+                        static_cast<uint8_t>(byte & 0x0f) :
+                        static_cast<uint8_t>(byte >> 4);
+                    if (nibble == 0 ||
+                        !std::isfinite(static_cast<float>(q4_decode(nibble)) * scale)) {
+                        return GGML_VEC_INDEX_E_INVALID_ARG;
+                    }
+                }
+                if ((dim_sz & 1) != 0 && (row[row_bytes - 1] >> 4) != 8) {
+                    return GGML_VEC_INDEX_E_INVALID_ARG;
+                }
+            }
+            resized = true;
+            idx->q4_data.resize(new_slots * row_bytes);
+            idx->q4_scale.resize(new_slots);
+            std::memcpy(
+                idx->q4_data.data() + base_slot * row_bytes,
+                q4_codes,
+                n_sz * row_bytes);
+            std::memcpy(idx->q4_scale.data() + base_slot, scales, n_sz * sizeof(float));
+        } else {
+            if (dim_sz != 0 && new_slots > std::numeric_limits<size_t>::max() / dim_sz) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
+            for (size_t slot = 0; slot < n_sz; ++slot) {
+                const float scale = scales[slot];
+                if (!std::isfinite(scale) || scale <= 0.0f) {
+                    return GGML_VEC_INDEX_E_INVALID_ARG;
+                }
+                const int8_t * row = q8_codes + slot * dim_sz;
+                for (size_t i = 0; i < dim_sz; ++i) {
+                    if (row[i] == std::numeric_limits<int8_t>::min() ||
+                        !std::isfinite(static_cast<float>(row[i]) * scale)) {
+                        return GGML_VEC_INDEX_E_INVALID_ARG;
+                    }
+                }
+            }
+            resized = true;
+            idx->q8_data.resize(new_slots * dim_sz);
+            idx->q8_scale.resize(new_slots);
+            std::memcpy(
+                idx->q8_data.data() + base_slot * dim_sz,
+                q8_codes,
+                n_sz * dim_sz * sizeof(int8_t));
+            std::memcpy(idx->q8_scale.data() + base_slot, scales, n_sz * sizeof(float));
+        }
+
+        idx->slot_to_id.resize(new_slots);
+        idx->slot_active.resize(new_slots, 0);
+        test_maybe_throw_bad_alloc();
+        idx->id_to_slot.reserve(new_slots);
+        for (int i = 0; i < n; ++i) {
+            const size_t slot = base_slot + static_cast<size_t>(i);
+            idx->slot_to_id[slot] = ids[i];
+            idx->slot_active[slot] = 1;
+            idx->id_to_slot.emplace(ids[i], slot);
+        }
+        idx->n_active += n_sz;
+        for (size_t slot = base_slot; slot < new_slots; ++slot) {
+            add_state_hash(*idx, slot_state_hash(*idx, slot));
+        }
+        if (finalize) {
+            ++idx->generation;
+            invalidate_ivf(*idx);
+        }
+    } catch (const std::bad_alloc &) {
+        rollback();
+        return GGML_VEC_INDEX_E_OOM;
+    } catch (...) {
+        rollback();
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+    return GGML_VEC_INDEX_OK;
+}
+
+bool replay_add_delta_f32(
         ggml_vec_index_t * idx,
         uint32_t n,
         const std::vector<uint8_t> & payload) {
@@ -4105,7 +4409,7 @@ bool replay_add_delta(
         return false;
     }
     uint64_t expected_payload = 0;
-    if (!expected_add_delta_payload_size(n, static_cast<uint64_t>(idx->dim), expected_payload) ||
+    if (!expected_add_delta_payload_size_f32(n, static_cast<uint64_t>(idx->dim), expected_payload) ||
         expected_payload != payload.size()) {
         return false;
     }
@@ -4133,6 +4437,69 @@ bool replay_add_delta(
         vectors.data(),
         static_cast<int>(n),
         ids.data());
+    return status == GGML_VEC_INDEX_OK;
+}
+
+bool replay_add_delta_native(
+        ggml_vec_index_t * idx,
+        uint32_t n,
+        const std::vector<uint8_t> & payload) {
+    if (n == 0 || n > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    if (!is_quantized(*idx)) {
+        return replay_add_delta_f32(idx, n, payload);
+    }
+
+    const size_t n_sz = static_cast<size_t>(n);
+    const size_t dim_sz = static_cast<size_t>(idx->dim);
+    uint64_t expected_payload = 0;
+    if (!expected_add_delta_payload_size_native(
+            n,
+            static_cast<uint64_t>(idx->dim),
+            idx->bit_width,
+            expected_payload) ||
+        expected_payload != payload.size()) {
+        return false;
+    }
+
+    std::vector<uint64_t> ids(n_sz);
+    std::vector<float> scales(n_sz);
+    const uint8_t * ptr = payload.data();
+    for (size_t i = 0; i < n_sz; ++i) {
+        ids[i] = get_u64_le(ptr);
+        ptr += sizeof(uint64_t);
+    }
+    for (float & scale : scales) {
+        scale = u32_to_float(get_u32_le(ptr));
+        ptr += sizeof(uint32_t);
+    }
+
+    int status = GGML_VEC_INDEX_E_INVALID_ARG;
+    if (is_q4(*idx)) {
+        const size_t code_bytes = n_sz * q4_row_bytes(dim_sz);
+        std::vector<uint8_t> codes(ptr, ptr + code_bytes);
+        status = ggml_vec_index_add_encoded_unlocked(
+            idx,
+            ids.data(),
+            static_cast<int>(n),
+            scales.data(),
+            codes.data(),
+            nullptr,
+            true);
+    } else {
+        const size_t code_bytes = n_sz * dim_sz;
+        std::vector<int8_t> codes(code_bytes);
+        std::memcpy(codes.data(), ptr, code_bytes);
+        status = ggml_vec_index_add_encoded_unlocked(
+            idx,
+            ids.data(),
+            static_cast<int>(n),
+            scales.data(),
+            nullptr,
+            codes.data(),
+            true);
+    }
     return status == GGML_VEC_INDEX_OK;
 }
 
@@ -4166,16 +4533,18 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
     }
     uint8_t header[kTvidHeaderSize] = {};
     f.read(reinterpret_cast<char *>(header), sizeof(header));
+    DeltaLogFormat format = DeltaLogFormat::v3;
     DeltaStateKind state_kind = DeltaStateKind::state_token;
     if (!f ||
         std::memcmp(header, kTvidMagic, 4) != 0 ||
-        !delta_state_kind_from_version(header[4], state_kind) ||
+        !delta_log_format_from_version(header[4], format) ||
         header[5] != static_cast<uint8_t>(idx->bit_width) ||
         header[6] != 0 ||
         header[7] != 0 ||
         get_u32_le(header + 8) != static_cast<uint32_t>(idx->dim)) {
         return false;
     }
+    state_kind = delta_state_kind_for_format(format);
 
     const uint32_t base_crc = get_u32_le(header + 12);
     const uint32_t snapshot_crc = current_delta_state(*idx, state_kind);
@@ -4224,7 +4593,10 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
 
         if (apply_records) {
             if (op == kTvidOpAdd) {
-                if (!replay_add_delta(idx, n, payload)) {
+                const bool replayed = format == DeltaLogFormat::v3 ?
+                    replay_add_delta_native(idx, n, payload) :
+                    replay_add_delta_f32(idx, n, payload);
+                if (!replayed) {
                     return false;
                 }
             } else {
