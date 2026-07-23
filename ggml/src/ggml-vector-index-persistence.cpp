@@ -233,7 +233,7 @@ static bool write_u64_le_crc(std::FILE * f, uint64_t v, uint32_t & crc) {
 }
 
 bool is_supported_bit_width(int bit_width) {
-    return bit_width == 4 || bit_width == 8 || bit_width == 32;
+    return bit_width == 2 || bit_width == 4 || bit_width == 8 || bit_width == 32;
 }
 
 bool is_valid_id(uint64_t id) {
@@ -271,17 +271,20 @@ static bool expected_file_size(
         uint64_t dim,
         uint64_t qparam_bytes,
         uint64_t component_bytes,
+        uint64_t packed_row_bytes,
         uint64_t & size) {
     uint64_t qparams = 0;
     uint64_t components = 0;
     uint64_t ids = 0;
     uint64_t total = header_size;
     if (component_bytes == 0) {
-        uint64_t row_bytes = 0;
-        if (!checked_add_u64(dim, 1, row_bytes)) {
-            return false;
+        uint64_t row_bytes = packed_row_bytes;
+        if (row_bytes == 0) {
+            if (!checked_add_u64(dim, 1, row_bytes)) {
+                return false;
+            }
+            row_bytes /= 2;
         }
-        row_bytes /= 2;
         if (!checked_mul_u64(n, row_bytes, components)) {
             return false;
         }
@@ -613,7 +616,41 @@ uint32_t index_state_crc32c(const ggml_vec_index & idx) {
     crc = crc32c_update_u32(crc, static_cast<uint32_t>(idx.bit_width));
     crc = crc32c_update_u32(crc, static_cast<uint32_t>(storage_kind(idx)));
     crc = crc32c_update_u64(crc, static_cast<uint64_t>(active_count(idx)));
-    if (is_q4(idx)) {
+    if (is_turbovec_q2(idx)) {
+        const size_t row_bytes = turbovec_q2_row_bytes(static_cast<size_t>(idx.dim));
+        const size_t scale_count = turbovec_q2_scale_count(static_cast<size_t>(idx.dim));
+        const uint8_t * data = turbovec_q2_data_ptr(idx);
+        for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
+            if (slot_is_active(idx, slot)) {
+                const float * scales = idx.turbovec_q2_scale.data() + slot * scale_count;
+                for (size_t i = 0; i < scale_count; ++i) {
+                    crc = crc32c_update_u32(crc, float_to_u32(scales[i]));
+                }
+            }
+        }
+        for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
+            if (slot_is_active(idx, slot)) {
+                crc = crc32c_update(crc, data + slot * row_bytes, row_bytes);
+            }
+        }
+    } else if (is_turbovec_q4(idx)) {
+        const size_t row_bytes = turbovec_q4_row_bytes(static_cast<size_t>(idx.dim));
+        const size_t scale_count = turbovec_q4_scale_count(static_cast<size_t>(idx.dim));
+        const uint8_t * data = turbovec_q4_data_ptr(idx);
+        for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
+            if (slot_is_active(idx, slot)) {
+                const float * scales = idx.turbovec_q4_scale.data() + slot * scale_count;
+                for (size_t i = 0; i < scale_count; ++i) {
+                    crc = crc32c_update_u32(crc, float_to_u32(scales[i]));
+                }
+            }
+        }
+        for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
+            if (slot_is_active(idx, slot)) {
+                crc = crc32c_update(crc, data + slot * row_bytes, row_bytes);
+            }
+        }
+    } else if (is_q4(idx)) {
         const size_t row_bytes = q4_row_bytes(static_cast<size_t>(idx.dim));
         const uint8_t * data = q4_data_ptr(idx);
         for (size_t slot = 0; slot < idx.slot_to_id.size(); ++slot) {
@@ -681,7 +718,23 @@ uint64_t slot_state_hash(const ggml_vec_index & idx, size_t slot) {
 
     const size_t dim_sz = static_cast<size_t>(idx.dim);
     update_u64(idx.slot_to_id[slot]);
-    if (is_q4(idx)) {
+    if (is_turbovec_q2(idx)) {
+        const size_t row_bytes = turbovec_q2_row_bytes(dim_sz);
+        const size_t scale_count = turbovec_q2_scale_count(dim_sz);
+        const float * scales = idx.turbovec_q2_scale.data() + slot * scale_count;
+        for (size_t i = 0; i < scale_count; ++i) {
+            update_u32(float_to_u32(scales[i]));
+        }
+        update_bytes(turbovec_q2_data_ptr(idx) + slot * row_bytes, row_bytes);
+    } else if (is_turbovec_q4(idx)) {
+        const size_t row_bytes = turbovec_q4_row_bytes(dim_sz);
+        const size_t scale_count = turbovec_q4_scale_count(dim_sz);
+        const float * scales = idx.turbovec_q4_scale.data() + slot * scale_count;
+        for (size_t i = 0; i < scale_count; ++i) {
+            update_u32(float_to_u32(scales[i]));
+        }
+        update_bytes(turbovec_q4_data_ptr(idx) + slot * row_bytes, row_bytes);
+    } else if (is_q4(idx)) {
         update_u32(float_to_u32(idx.q4_scale[slot]));
         const size_t row_bytes = q4_row_bytes(dim_sz);
         update_bytes(q4_data_ptr(idx) + slot * row_bytes, row_bytes);
@@ -1459,7 +1512,6 @@ static bool inspect_delta_log_tail(
     uint8_t header[kTvidHeaderSize] = {};
     f.read(reinterpret_cast<char *>(header), sizeof(header));
     DeltaLogFormat format = DeltaLogFormat::v4;
-    DeltaStateKind state_kind = DeltaStateKind::state_token;
     if (!f ||
         std::memcmp(header, kTvidMagic, 4) != 0 ||
         !delta_log_format_from_version(header[4], format) ||
@@ -1469,7 +1521,6 @@ static bool inspect_delta_log_tail(
         get_u32_le(header + 8) != static_cast<uint32_t>(idx.dim)) {
         return false;
     }
-    state_kind = delta_state_kind_for_format(format);
     const size_t header_size = delta_header_size_for_format(format);
     if (file_size < header_size) {
         return false;
@@ -2025,6 +2076,10 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             return GGML_VEC_INDEX_E_INTERNAL;
         }
         if (!has_vector_storage(*idx) ||
+            (is_turbovec_q2(*idx) &&
+             idx->turbovec_q2_scale.size() != n_slots * turbovec_q2_scale_count(dim_sz)) ||
+            (is_turbovec_q4(*idx) &&
+             idx->turbovec_q4_scale.size() != n_slots * turbovec_q4_scale_count(dim_sz)) ||
             (is_q4(*idx) && idx->q4_scale.size() != n_slots) ||
             (is_q8(*idx) && idx->q8_scale.size() != n_slots)) {
             return GGML_VEC_INDEX_E_INTERNAL;
@@ -2058,8 +2113,17 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
         put_u32_le(header + 8, dim_le);
         put_u32_le(header + 12, n_le);
         put_u32_le(header + 16, is_quantized(*idx) ? kQParamScaleF32 : kQParamNone);
-        put_u32_le(header + 20, is_quantized(*idx) ? 4u : 0u);
-        put_u32_le(header + 24, is_q4(*idx) ? 0u : (is_q8(*idx) ? 1u : 4u));
+        put_u32_le(
+            header + 20,
+            is_turbovec_q2(*idx) ?
+                static_cast<uint32_t>(turbovec_q2_scale_count(dim_sz) * sizeof(float)) :
+                is_turbovec_q4(*idx) ?
+                static_cast<uint32_t>(turbovec_q4_scale_count(dim_sz) * sizeof(float)) :
+                (is_quantized(*idx) ? 4u : 0u));
+        put_u32_le(
+            header + 24,
+            (is_q4(*idx) || is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) ?
+                0u : (is_q8(*idx) ? 1u : 4u));
         put_u32_le(header + 28, 0);
 
         if (!write_bytes(f, header, sizeof(header))) {
@@ -2071,18 +2135,71 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
         uint32_t vectors_crc = 0xffffffffu;
         uint32_t ids_crc     = 0xffffffffu;
         if (is_quantized(*idx)) {
-            const std::vector<float> & scales = is_q4(*idx) ? idx->q4_scale : idx->q8_scale;
-            for (size_t slot = 0; slot < n_slots; ++slot) {
-                if (!slot_is_active(*idx, slot)) {
-                    continue;
+            if (is_turbovec_q2(*idx)) {
+                const size_t scale_count = turbovec_q2_scale_count(dim_sz);
+                for (size_t slot = 0; slot < n_slots; ++slot) {
+                    if (!slot_is_active(*idx, slot)) {
+                        continue;
+                    }
+                    const float * scales = idx->turbovec_q2_scale.data() + slot * scale_count;
+                    for (size_t i = 0; i < scale_count; ++i) {
+                        if (!write_u32_le_crc(f, float_to_u32(scales[i]), qparams_crc)) {
+                            return fail_io();
+                        }
+                    }
                 }
-                const float scale = scales[slot];
-                if (!write_u32_le_crc(f, float_to_u32(scale), qparams_crc)) {
-                    return fail_io();
+            } else if (is_turbovec_q4(*idx)) {
+                const size_t scale_count = turbovec_q4_scale_count(dim_sz);
+                for (size_t slot = 0; slot < n_slots; ++slot) {
+                    if (!slot_is_active(*idx, slot)) {
+                        continue;
+                    }
+                    const float * scales = idx->turbovec_q4_scale.data() + slot * scale_count;
+                    for (size_t i = 0; i < scale_count; ++i) {
+                        if (!write_u32_le_crc(f, float_to_u32(scales[i]), qparams_crc)) {
+                            return fail_io();
+                        }
+                    }
+                }
+            } else {
+                const std::vector<float> & scales = is_q4(*idx) ? idx->q4_scale : idx->q8_scale;
+                for (size_t slot = 0; slot < n_slots; ++slot) {
+                    if (!slot_is_active(*idx, slot)) {
+                        continue;
+                    }
+                    const float scale = scales[slot];
+                    if (!write_u32_le_crc(f, float_to_u32(scale), qparams_crc)) {
+                        return fail_io();
+                    }
                 }
             }
 
-            if (is_q4(*idx)) {
+            if (is_turbovec_q2(*idx)) {
+                const size_t row_bytes = turbovec_q2_row_bytes(dim_sz);
+                const uint8_t * data = turbovec_q2_data_ptr(*idx);
+                for (size_t slot = 0; slot < n_slots; ++slot) {
+                    if (!slot_is_active(*idx, slot)) {
+                        continue;
+                    }
+                    if (!write_bytes(f, data + slot * row_bytes, row_bytes)) {
+                        return fail_io();
+                    }
+                    vectors_crc = crc32c_update(vectors_crc, data + slot * row_bytes, row_bytes);
+                }
+            } else if (is_turbovec_q4(*idx)) {
+                const size_t row_bytes = turbovec_q4_row_bytes(dim_sz);
+                const uint8_t * data = turbovec_q4_data_ptr(*idx);
+                for (size_t slot = 0; slot < n_slots; ++slot) {
+                    if (!slot_is_active(*idx, slot)) {
+                        continue;
+                    }
+                    const uint8_t * row = data + slot * row_bytes;
+                    if (!write_bytes(f, row, row_bytes)) {
+                        return fail_io();
+                    }
+                    vectors_crc = crc32c_update(vectors_crc, row, row_bytes);
+                }
+            } else if (is_q4(*idx)) {
                 const size_t row_bytes = q4_row_bytes(dim_sz);
                 const uint8_t * data = q4_data_ptr(*idx);
                 for (size_t slot = 0; slot < n_slots; ++slot) {
@@ -2260,14 +2377,61 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         if (dim_le == 0 || dim_le > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
-        if (version == kTvimVersion &&
-            ((bit_width == 4 && (kind != kStorageQ4 || qparam_type != kQParamScaleF32 ||
-                                  qparam_bytes != 4 || comp_bytes != 0)) ||
-             (bit_width == 8 && (kind != kStorageQ8 || qparam_type != kQParamScaleF32 ||
-                                  qparam_bytes != 4 || comp_bytes != 1)) ||
-             (bit_width == 32 && (kind != kStorageF32 || qparam_type != kQParamNone ||
-                                   qparam_bytes != 0 || comp_bytes != 4)))) {
-            return load_fail(GGML_VEC_INDEX_E_IO);
+        const bool serialized_turbovec_q2 =
+            version == kTvimVersion && bit_width == 2 && kind == kStorageTurboVecQ2;
+        const bool serialized_turbovec_q4 =
+            version == kTvimVersion && bit_width == 4 && kind == kStorageTurboVecQ4;
+        uint32_t expected_turbovec_q2_qparam_bytes = 0;
+        uint32_t expected_turbovec_q4_qparam_bytes = 0;
+        if (serialized_turbovec_q2) {
+            const int dim_i = static_cast<int>(dim_le);
+            if (!turbovec_q2_supported_dim(dim_i)) {
+                return load_fail(GGML_VEC_INDEX_E_IO);
+            }
+            const size_t scale_bytes = turbovec_q2_scale_count(static_cast<size_t>(dim_i)) *
+                sizeof(float);
+            if (scale_bytes > std::numeric_limits<uint32_t>::max()) {
+                return load_fail(GGML_VEC_INDEX_E_IO);
+            }
+            expected_turbovec_q2_qparam_bytes = static_cast<uint32_t>(scale_bytes);
+        }
+        if (serialized_turbovec_q4) {
+            const int dim_i = static_cast<int>(dim_le);
+            if (!turbovec_q4_supported_dim(dim_i)) {
+                return load_fail(GGML_VEC_INDEX_E_IO);
+            }
+            const size_t scale_bytes = turbovec_q4_scale_count(static_cast<size_t>(dim_i)) *
+                sizeof(float);
+            if (scale_bytes > std::numeric_limits<uint32_t>::max()) {
+                return load_fail(GGML_VEC_INDEX_E_IO);
+            }
+            expected_turbovec_q4_qparam_bytes = static_cast<uint32_t>(scale_bytes);
+        }
+        if (version == kTvimVersion) {
+            const bool valid_layout =
+                (serialized_turbovec_q2 &&
+                 qparam_type == kQParamScaleF32 &&
+                 qparam_bytes == expected_turbovec_q2_qparam_bytes && comp_bytes == 0) ||
+                (bit_width == 4 && kind == kStorageQ4 &&
+                 qparam_type == kQParamScaleF32 && qparam_bytes == 4 && comp_bytes == 0) ||
+                (serialized_turbovec_q4 &&
+                 qparam_type == kQParamScaleF32 &&
+                 qparam_bytes == expected_turbovec_q4_qparam_bytes && comp_bytes == 0) ||
+                (bit_width == 8 && kind == kStorageQ8 &&
+                 qparam_type == kQParamScaleF32 && qparam_bytes == 4 && comp_bytes == 1) ||
+                (bit_width == 32 && kind == kStorageF32 &&
+                 qparam_type == kQParamNone && qparam_bytes == 0 && comp_bytes == 4);
+            if (!valid_layout) {
+                return load_fail(GGML_VEC_INDEX_E_IO);
+            }
+        }
+
+        uint64_t packed_row_bytes = 0;
+        if (serialized_turbovec_q2) {
+            packed_row_bytes = turbovec_q2_row_bytes(static_cast<size_t>(dim_le));
+        } else if (serialized_turbovec_q4 ||
+                   (version == kTvimVersion && bit_width == 4 && kind == kStorageQ4)) {
+            packed_row_bytes = q4_row_bytes(static_cast<size_t>(dim_le));
         }
 
         uint64_t expected_size = 0;
@@ -2277,6 +2441,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 dim_le,
                 qparam_bytes,
                 comp_bytes,
+                packed_row_bytes,
                 expected_size)) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
@@ -2304,7 +2469,11 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         const int dim = static_cast<int>(dim_le);
 
         std::unique_ptr<ggml_vec_index_t, decltype(&ggml_vec_index_free)> idx(
-            ggml_vec_index_create(dim, bit_width),
+            serialized_turbovec_q2 ?
+                ggml_vec_index_create_turbovec_q2(dim) :
+                serialized_turbovec_q4 ?
+                ggml_vec_index_create_turbovec_q4(dim) :
+                ggml_vec_index_create(dim, bit_width),
             ggml_vec_index_free);
         if (idx == nullptr) {
             return load_fail(GGML_VEC_INDEX_E_OOM);
@@ -2319,7 +2488,13 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         }
 
         test_maybe_throw_bad_alloc();
-        if (is_q4(*idx)) {
+        if (is_turbovec_q2(*idx)) {
+            idx->turbovec_q2_data.resize(n * turbovec_q2_row_bytes(dim_sz));
+            idx->turbovec_q2_scale.resize(n * turbovec_q2_scale_count(dim_sz));
+        } else if (is_turbovec_q4(*idx)) {
+            idx->turbovec_q4_data.resize(n * turbovec_q4_row_bytes(dim_sz));
+            idx->turbovec_q4_scale.resize(n * turbovec_q4_scale_count(dim_sz));
+        } else if (is_q4(*idx)) {
             idx->q4_data.resize(n * q4_row_bytes(dim_sz));
             idx->q4_scale.resize(n);
         } else if (is_q8(*idx)) {
@@ -2368,23 +2543,91 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 }
             }
         } else if (is_quantized(*idx)) {
-            std::vector<float> & scales = is_q4(*idx) ? idx->q4_scale : idx->q8_scale;
-            for (float & scale : scales) {
-                uint32_t bits = 0;
-                const bool read_ok = checksummed ?
-                    read_u32_le_crc(f, bits, qparams_crc) :
-                    read_u32_le(f, bits);
-                if (!read_ok) {
-                    return load_fail(GGML_VEC_INDEX_E_IO);
+            if (is_turbovec_q2(*idx)) {
+                for (float & scale : idx->turbovec_q2_scale) {
+                    uint32_t bits = 0;
+                    const bool read_ok = checksummed ?
+                        read_u32_le_crc(f, bits, qparams_crc) :
+                        read_u32_le(f, bits);
+                    if (!read_ok) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                    scale = u32_to_float(bits);
+                    if (!std::isfinite(scale) || scale < 0.0f) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
                 }
-                scale = u32_to_float(bits);
-                if (!std::isfinite(scale) || scale <= 0.0f) {
-                    return load_fail(GGML_VEC_INDEX_E_IO);
+            } else if (is_turbovec_q4(*idx)) {
+                for (float & scale : idx->turbovec_q4_scale) {
+                    uint32_t bits = 0;
+                    const bool read_ok = checksummed ?
+                        read_u32_le_crc(f, bits, qparams_crc) :
+                        read_u32_le(f, bits);
+                    if (!read_ok) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                    scale = u32_to_float(bits);
+                    if (!std::isfinite(scale) || scale < 0.0f) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                }
+            } else {
+                std::vector<float> & scales = is_q4(*idx) ? idx->q4_scale : idx->q8_scale;
+                for (float & scale : scales) {
+                    uint32_t bits = 0;
+                    const bool read_ok = checksummed ?
+                        read_u32_le_crc(f, bits, qparams_crc) :
+                        read_u32_le(f, bits);
+                    if (!read_ok) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                    scale = u32_to_float(bits);
+                    if (!std::isfinite(scale) || scale <= 0.0f) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
                 }
             }
 
             std::vector<uint8_t> * q4_data = is_q4(*idx) ? &idx->q4_data : nullptr;
-            if (is_q4(*idx)) {
+            if (is_turbovec_q2(*idx)) {
+                if (!idx->turbovec_q2_data.empty()) {
+                    if (idx->turbovec_q2_data.size() >
+                        static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                    f.read(
+                        reinterpret_cast<char *>(idx->turbovec_q2_data.data()),
+                        static_cast<std::streamsize>(idx->turbovec_q2_data.size()));
+                    if (!f) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                    if (checksummed) {
+                        vectors_crc = crc32c_update(
+                            vectors_crc,
+                            idx->turbovec_q2_data.data(),
+                            idx->turbovec_q2_data.size());
+                    }
+                }
+            } else if (is_turbovec_q4(*idx)) {
+                if (!idx->turbovec_q4_data.empty()) {
+                    if (idx->turbovec_q4_data.size() >
+                        static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                    f.read(
+                        reinterpret_cast<char *>(idx->turbovec_q4_data.data()),
+                        static_cast<std::streamsize>(idx->turbovec_q4_data.size()));
+                    if (!f) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                    if (checksummed) {
+                        vectors_crc = crc32c_update(
+                            vectors_crc,
+                            idx->turbovec_q4_data.data(),
+                            idx->turbovec_q4_data.size());
+                    }
+                }
+            } else if (is_q4(*idx)) {
                 if (!q4_data->empty()) {
                     if (q4_data->size() >
                         static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
@@ -2562,7 +2805,8 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
         if (dim_le == 0 || dim_le > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
-        if ((bit_width == 4 && (kind != kStorageQ4 || qparam_type != kQParamScaleF32 ||
+        if ((bit_width == 2) ||
+            (bit_width == 4 && (kind != kStorageQ4 || qparam_type != kQParamScaleF32 ||
                                 qparam_bytes != 4 || comp_bytes != 0)) ||
             (bit_width == 8 && (kind != kStorageQ8 || qparam_type != kQParamScaleF32 ||
                                 qparam_bytes != 4 || comp_bytes != 1)) ||
@@ -2578,6 +2822,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
                 dim_le,
                 qparam_bytes,
                 comp_bytes,
+                bit_width == 4 ? q4_row_bytes(static_cast<size_t>(dim_le)) : 0,
                 expected_size)) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }

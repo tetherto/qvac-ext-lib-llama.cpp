@@ -314,7 +314,7 @@ if (GGML_VECTOR_INDEX)
         VISIBILITY_INLINES_HIDDEN ON
     )
 
-    target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)
+    target_link_libraries(ggml-vector-index PRIVATE Threads::Threads ggml-base)
 endif()
 
 function(ggml_add_backend_library backend)

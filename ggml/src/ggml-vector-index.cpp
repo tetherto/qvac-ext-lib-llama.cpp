@@ -20,15 +20,25 @@ bool is_q8(const ggml_vec_index & idx) {
 }
 
 bool is_q4(const ggml_vec_index & idx) {
-    return idx.bit_width == 4;
+    return idx.bit_width == 4 && !idx.turbovec_q4;
+}
+
+bool is_turbovec_q2(const ggml_vec_index & idx) {
+    return idx.bit_width == 2 && idx.turbovec_q2;
+}
+
+bool is_turbovec_q4(const ggml_vec_index & idx) {
+    return idx.bit_width == 4 && idx.turbovec_q4;
 }
 
 bool is_quantized(const ggml_vec_index & idx) {
-    return is_q4(idx) || is_q8(idx);
+    return is_q4(idx) || is_q8(idx) || is_turbovec_q2(idx) || is_turbovec_q4(idx);
 }
 
 uint8_t storage_kind(const ggml_vec_index & idx) {
-    return is_q4(idx) ? kStorageQ4 : (is_q8(idx) ? kStorageQ8 : kStorageF32);
+    return is_turbovec_q2(idx) ? kStorageTurboVecQ2 :
+        is_turbovec_q4(idx) ? kStorageTurboVecQ4 :
+        (is_q4(idx) ? kStorageQ4 : (is_q8(idx) ? kStorageQ8 : kStorageF32));
 }
 
 size_t q4_row_bytes(size_t dim) {
@@ -40,6 +50,12 @@ size_t vector_bytes(const ggml_vec_index & idx) {
     const size_t dim_sz = static_cast<size_t>(idx.dim);
     if (is_q4(idx)) {
         return n * q4_row_bytes(dim_sz);
+    }
+    if (is_turbovec_q2(idx)) {
+        return n * turbovec_q2_row_bytes(dim_sz);
+    }
+    if (is_turbovec_q4(idx)) {
+        return n * turbovec_q4_row_bytes(dim_sz);
     }
     if (is_q8(idx)) {
         return n * dim_sz * sizeof(int8_t);
@@ -67,6 +83,14 @@ const uint8_t * q4_data_ptr(const ggml_vec_index & idx) {
     return idx.mapped_q4_data != nullptr ? idx.mapped_q4_data : idx.q4_data.data();
 }
 
+const uint8_t * turbovec_q4_data_ptr(const ggml_vec_index & idx) {
+    return idx.turbovec_q4_data.data();
+}
+
+const uint8_t * turbovec_q2_data_ptr(const ggml_vec_index & idx) {
+    return idx.turbovec_q2_data.data();
+}
+
 bool has_vector_storage(const ggml_vec_index & idx) {
     const size_t bytes = vector_bytes(idx);
     if (idx.read_only_mmap) {
@@ -75,6 +99,12 @@ bool has_vector_storage(const ggml_vec_index & idx) {
              idx.mapped_data != nullptr ||
              idx.mapped_q8_data != nullptr ||
              idx.mapped_q4_data != nullptr);
+    }
+    if (is_turbovec_q4(idx)) {
+        return idx.turbovec_q4_data.size() == bytes;
+    }
+    if (is_turbovec_q2(idx)) {
+        return idx.turbovec_q2_data.size() == bytes;
     }
     if (is_q4(idx)) {
         return idx.q4_data.size() == bytes;
@@ -222,7 +252,7 @@ ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width) {
         if (dim <= 0) {
             return nullptr;
         }
-        if (!is_supported_bit_width(bit_width)) {
+        if (!is_supported_bit_width(bit_width) || bit_width == 2) {
             return nullptr;
         }
         auto * idx = new (std::nothrow) ggml_vec_index();
@@ -231,6 +261,50 @@ ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width) {
         }
         idx->dim       = dim;
         idx->bit_width = bit_width;
+        idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
+        if (idx->filter_cookie == 0) {
+            idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
+        }
+        return idx;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim) {
+    try {
+        if (!turbovec_q2_supported_dim(dim)) {
+            return nullptr;
+        }
+        auto * idx = new (std::nothrow) ggml_vec_index();
+        if (idx == nullptr) {
+            return nullptr;
+        }
+        idx->dim = dim;
+        idx->bit_width = 2;
+        idx->turbovec_q2 = true;
+        idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
+        if (idx->filter_cookie == 0) {
+            idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
+        }
+        return idx;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim) {
+    try {
+        if (!turbovec_q4_supported_dim(dim)) {
+            return nullptr;
+        }
+        auto * idx = new (std::nothrow) ggml_vec_index();
+        if (idx == nullptr) {
+            return nullptr;
+        }
+        idx->dim = dim;
+        idx->bit_width = 4;
+        idx->turbovec_q4 = true;
         idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
         if (idx->filter_cookie == 0) {
             idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
@@ -261,7 +335,13 @@ void rollback_appended_slots_unlocked(
         idx->id_to_slot.erase(ids[i]);
     }
     const size_t dim_sz = static_cast<size_t>(idx->dim);
-    if (is_q4(*idx)) {
+    if (is_turbovec_q2(*idx)) {
+        idx->turbovec_q2_data.resize(base_slot * turbovec_q2_row_bytes(dim_sz));
+        idx->turbovec_q2_scale.resize(base_slot * turbovec_q2_scale_count(dim_sz));
+    } else if (is_turbovec_q4(*idx)) {
+        idx->turbovec_q4_data.resize(base_slot * turbovec_q4_row_bytes(dim_sz));
+        idx->turbovec_q4_scale.resize(base_slot * turbovec_q4_scale_count(dim_sz));
+    } else if (is_q4(*idx)) {
         idx->q4_data.resize(base_slot * q4_row_bytes(dim_sz));
         idx->q4_scale.resize(base_slot);
     } else if (is_q8(*idx)) {
@@ -345,7 +425,13 @@ static int ggml_vec_index_add_unlocked(
         }
 
         resized = true;
-        if (is_q4(*idx)) {
+        if (is_turbovec_q2(*idx)) {
+            idx->turbovec_q2_data.resize(new_slots * turbovec_q2_row_bytes(dim_sz));
+            idx->turbovec_q2_scale.resize(new_slots * turbovec_q2_scale_count(dim_sz));
+        } else if (is_turbovec_q4(*idx)) {
+            idx->turbovec_q4_data.resize(new_slots * turbovec_q4_row_bytes(dim_sz));
+            idx->turbovec_q4_scale.resize(new_slots * turbovec_q4_scale_count(dim_sz));
+        } else if (is_q4(*idx)) {
             idx->q4_data.resize(new_slots * q4_row_bytes(dim_sz));
             idx->q4_scale.resize(new_slots);
         } else if (is_q8(*idx)) {
@@ -362,7 +448,23 @@ static int ggml_vec_index_add_unlocked(
         for (int i = 0; i < n; ++i) {
             const size_t slot = base_slot + static_cast<size_t>(i);
             const float * src = vectors + static_cast<size_t>(i) * dim_sz;
-            if (is_q4(*idx)) {
+            if (is_turbovec_q2(*idx)) {
+                const size_t row_bytes = turbovec_q2_row_bytes(dim_sz);
+                const size_t scale_count = turbovec_q2_scale_count(dim_sz);
+                quantize_turbovec_q2_row(
+                    src,
+                    idx->turbovec_q2_data.data() + slot * row_bytes,
+                    idx->turbovec_q2_scale.data() + slot * scale_count,
+                    idx->dim);
+            } else if (is_turbovec_q4(*idx)) {
+                const size_t row_bytes = turbovec_q4_row_bytes(dim_sz);
+                const size_t scale_count = turbovec_q4_scale_count(dim_sz);
+                quantize_turbovec_q4_row(
+                    src,
+                    idx->turbovec_q4_data.data() + slot * row_bytes,
+                    idx->turbovec_q4_scale.data() + slot * scale_count,
+                    idx->dim);
+            } else if (is_q4(*idx)) {
                 quantize_q4_row(
                     src,
                     idx->q4_data.data() + slot * q4_row_bytes(dim_sz),
@@ -500,7 +602,55 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
         new_slot_active.assign(n_live, 1);
         new_id_to_slot.reserve(n_live);
 
-        if (is_q4(*idx)) {
+        if (is_turbovec_q2(*idx)) {
+            const size_t row_bytes = turbovec_q2_row_bytes(dim_sz);
+            const size_t scale_count = turbovec_q2_scale_count(dim_sz);
+            std::vector<uint8_t> new_data;
+            std::vector<float> new_scales;
+            new_data.resize(n_live * row_bytes);
+            new_scales.resize(n_live * scale_count);
+            size_t out_slot = 0;
+            for (size_t slot = 0; slot < idx->slot_to_id.size(); ++slot) {
+                if (!slot_is_active(*idx, slot)) {
+                    continue;
+                }
+                std::memcpy(
+                    new_data.data() + out_slot * row_bytes,
+                    idx->turbovec_q2_data.data() + slot * row_bytes,
+                    row_bytes);
+                std::memcpy(
+                    new_scales.data() + out_slot * scale_count,
+                    idx->turbovec_q2_scale.data() + slot * scale_count,
+                    scale_count * sizeof(float));
+                ++out_slot;
+            }
+            idx->turbovec_q2_data.swap(new_data);
+            idx->turbovec_q2_scale.swap(new_scales);
+        } else if (is_turbovec_q4(*idx)) {
+            const size_t row_bytes = turbovec_q4_row_bytes(dim_sz);
+            const size_t scale_count = turbovec_q4_scale_count(dim_sz);
+            std::vector<uint8_t> new_data;
+            std::vector<float> new_scales;
+            new_data.resize(n_live * row_bytes);
+            new_scales.resize(n_live * scale_count);
+            size_t out_slot = 0;
+            for (size_t slot = 0; slot < idx->slot_to_id.size(); ++slot) {
+                if (!slot_is_active(*idx, slot)) {
+                    continue;
+                }
+                std::memcpy(
+                    new_data.data() + out_slot * row_bytes,
+                    idx->turbovec_q4_data.data() + slot * row_bytes,
+                    row_bytes);
+                std::memcpy(
+                    new_scales.data() + out_slot * scale_count,
+                    idx->turbovec_q4_scale.data() + slot * scale_count,
+                    scale_count * sizeof(float));
+                ++out_slot;
+            }
+            idx->turbovec_q4_data.swap(new_data);
+            idx->turbovec_q4_scale.swap(new_scales);
+        } else if (is_q4(*idx)) {
             const size_t row_bytes = q4_row_bytes(dim_sz);
             std::vector<uint8_t> new_q4_data;
             std::vector<float> new_q4_scale;
@@ -600,6 +750,9 @@ int ggml_vec_index_add_logged(
         }
         lock = std::unique_lock<std::shared_mutex>(idx->mutex);
         if (idx->read_only_mmap) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (!validate_logged_add_args(idx, vectors, n, ids)) {
@@ -720,6 +873,9 @@ int ggml_vec_index_remove_logged(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (idx->read_only_mmap) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (idx->id_to_slot.count(id) == 0) {

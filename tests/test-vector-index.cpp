@@ -31,6 +31,9 @@ namespace {
 
 constexpr int kDim = 4;
 
+#include "turbovec-golden-q2.inc"
+#include "turbovec-golden-q4.inc"
+
 #define CHECK(cond)                                                            \
     do {                                                                       \
         if (!(cond)) {                                                         \
@@ -130,6 +133,91 @@ void write_file_bytes(const std::string & path, const std::vector<uint8_t> & byt
         f.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     }
     CHECK(static_cast<bool>(f));
+}
+
+uint32_t read_u32_le_from(const uint8_t * bytes) {
+    return static_cast<uint32_t>(bytes[0]) |
+        (static_cast<uint32_t>(bytes[1]) << 8) |
+        (static_cast<uint32_t>(bytes[2]) << 16) |
+        (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+std::vector<uint8_t> bytes_to_vector(const uint8_t * bytes, size_t len) {
+    return std::vector<uint8_t>(bytes, bytes + len);
+}
+
+bool any_score_differs(const float * lhs, const float * rhs, size_t n, float eps) {
+    for (size_t i = 0; i < n; ++i) {
+        if (std::fabs(lhs[i] - rhs[i]) > eps) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void check_rust_tv_shape(
+        const uint8_t * bytes,
+        size_t len,
+        int bit_width,
+        int dim,
+        int n,
+        int packed_bytes,
+        int calib_count) {
+    CHECK(len >= 14);
+    CHECK(bytes[0] == 'T' && bytes[1] == 'V' && bytes[2] == 'P' && bytes[3] == 'I');
+    CHECK(bytes[4] == 3);
+    CHECK(bytes[5] == static_cast<uint8_t>(bit_width));
+    CHECK(read_u32_le_from(bytes + 6) == static_cast<uint32_t>(dim));
+    CHECK(read_u32_le_from(bytes + 10) == static_cast<uint32_t>(n));
+    CHECK(14 + static_cast<size_t>(packed_bytes) + static_cast<size_t>(n) * 4 + 4 <= len);
+    const size_t calib_offset = 14 + static_cast<size_t>(packed_bytes) + static_cast<size_t>(n) * 4;
+    CHECK(read_u32_le_from(bytes + calib_offset) == static_cast<uint32_t>(calib_count));
+}
+
+void check_rust_persistence_guard(
+        ggml_vec_index_t * idx,
+        const char * suffix,
+        int bit_width,
+        int storage_kind,
+        int n,
+        const uint8_t * rust_tv,
+        size_t rust_tv_len,
+        const uint8_t * rust_codes,
+        size_t rust_codes_len) {
+    const std::string rust_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-rust-" + std::string(suffix) + ".tv")).string();
+    const std::string qvac_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-qvac-" + std::string(suffix) + ".tvim")).string();
+    std::filesystem::remove(rust_path);
+    std::filesystem::remove(qvac_path);
+
+    write_file_bytes(rust_path, bytes_to_vector(rust_tv, rust_tv_len));
+    auto * rust_loaded = ggml_vec_index_load(rust_path.c_str());
+    CHECK(rust_loaded == nullptr);
+
+    CHECK(ggml_vec_index_write(idx, qvac_path.c_str()) == GGML_VEC_INDEX_OK);
+    const std::vector<uint8_t> qvac = read_file_bytes(qvac_path);
+    CHECK(qvac.size() >= 32);
+    CHECK(qvac[0] == 'T' && qvac[1] == 'V' && qvac[2] == 'P' && qvac[3] == 'I');
+    CHECK(qvac[4] == 2);
+    CHECK(qvac[5] == static_cast<uint8_t>(bit_width));
+    CHECK(qvac[6] == static_cast<uint8_t>(storage_kind));
+
+    const size_t qparam_bytes = read_u32_le_from(qvac.data() + 20);
+    CHECK(qparam_bytes == sizeof(float));
+    const size_t vector_offset = 32 + static_cast<size_t>(n) * qparam_bytes;
+    CHECK(qvac.size() >= vector_offset + rust_codes_len);
+    const bool same_codes = std::equal(
+        rust_codes,
+        rust_codes + rust_codes_len,
+        qvac.data() + vector_offset);
+    CHECK(!same_codes);
+    CHECK(qvac != bytes_to_vector(rust_tv, rust_tv_len));
+
+    std::filesystem::remove(rust_path);
+    std::filesystem::remove(qvac_path);
 }
 
 void append_file_bytes(const std::string & path, const std::vector<uint8_t> & bytes) {
@@ -429,6 +517,259 @@ int main() {
     CHECK(ggml_vec_index_len(nullptr) == 0);
     CHECK(ggml_vec_index_dim(nullptr) == 0);
     CHECK(ggml_vec_index_bit_width(nullptr) == 0);
+    CHECK(ggml_vec_index_create(kDim, 2) == nullptr);
+    CHECK(ggml_vec_index_create_turbovec_q2(0) == nullptr);
+    CHECK(ggml_vec_index_create_turbovec_q2(kDim) == nullptr);
+    CHECK(ggml_vec_index_create_turbovec_q4(0) == nullptr);
+    CHECK(ggml_vec_index_create_turbovec_q4(kDim) == nullptr);
+
+    // TurboVec q2/q4 are distinct modes. This first milestone supports
+    // add/search/filter/IVF and regular snapshots; delta logs are format-gated.
+    {
+        constexpr int tv_dim = 128;
+        auto * tv = ggml_vec_index_create_turbovec_q2(tv_dim);
+        CHECK(tv != nullptr);
+        CHECK(ggml_vec_index_dim(tv) == tv_dim);
+        CHECK(ggml_vec_index_bit_width(tv) == 2);
+
+        std::vector<float> tv_vecs(static_cast<size_t>(tv_dim) * 3);
+        for (int i = 0; i < tv_dim; ++i) {
+            const float a = static_cast<float>(std::sin(0.07 * static_cast<double>(i + 1)));
+            const float b = static_cast<float>(std::cos(0.11 * static_cast<double>(i + 3)));
+            tv_vecs[static_cast<size_t>(i)] = a;
+            tv_vecs[static_cast<size_t>(tv_dim + i)] = -a;
+            tv_vecs[static_cast<size_t>(2 * tv_dim + i)] = b;
+        }
+        const std::array<uint64_t, 3> tv_ids = { 9201, 9202, 9203 };
+        CHECK(ggml_vec_index_add(tv, tv_vecs.data(), 3, tv_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_len(tv) == 3);
+
+        std::array<float, 3> tv_scores{};
+        std::array<uint64_t, 3> tv_out{};
+        CHECK(ggml_vec_index_search(
+            tv, tv_vecs.data(), 1, 3, tv_scores.data(), tv_out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(tv_out[0] == tv_ids[0]);
+
+        const std::array<uint64_t, 2> allowed = { tv_ids[1], tv_ids[2] };
+        CHECK(ggml_vec_index_search_filtered(
+            tv, tv_vecs.data(), 1, 1, allowed.data(), static_cast<int>(allowed.size()),
+            tv_scores.data(), tv_out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(tv_out[0] != tv_ids[0]);
+
+        CHECK(ggml_vec_index_build_ivf(tv, /*n_lists=*/2, /*n_iter=*/1) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_ivf(
+            tv, tv_vecs.data(), 1, 1, /*nprobe=*/2,
+            tv_scores.data(), tv_out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(tv_out[0] == tv_ids[0]);
+
+        const std::string tv_snapshot_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-turbovec-q2.tvim").string();
+        const std::string tv_delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-turbovec-q2.tvid").string();
+        std::filesystem::remove(tv_snapshot_path);
+        std::filesystem::remove(tv_delta_path);
+        std::filesystem::remove(tv_delta_path + ".lock");
+        CHECK(ggml_vec_index_write(tv, tv_snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * tv_loaded = ggml_vec_index_load(tv_snapshot_path.c_str());
+        CHECK(tv_loaded != nullptr);
+        CHECK(ggml_vec_index_dim(tv_loaded) == tv_dim);
+        CHECK(ggml_vec_index_bit_width(tv_loaded) == 2);
+        CHECK(ggml_vec_index_len(tv_loaded) == 3);
+        CHECK(ggml_vec_index_search(
+            tv_loaded, tv_vecs.data(), 1, 3, tv_scores.data(), tv_out.data()) ==
+            GGML_VEC_INDEX_OK);
+        CHECK(tv_out[0] == tv_ids[0]);
+        CHECK(ggml_vec_index_load_mmap(tv_snapshot_path.c_str()) == nullptr);
+        ggml_vec_index_free(tv_loaded);
+        CHECK(ggml_vec_index_add_logged(
+            tv, tv_vecs.data(), 1, &tv_ids[0], tv_delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove_logged(tv, tv_ids[0], tv_delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(!std::filesystem::exists(tv_delta_path));
+        std::filesystem::remove(tv_snapshot_path);
+        std::filesystem::remove(tv_delta_path + ".lock");
+        ggml_vec_index_free(tv);
+    }
+
+    // TurboVec q4 is a distinct mode. This first milestone supports
+    // add/search/filter/IVF and regular snapshots; delta logs are format-gated.
+    {
+        constexpr int tv_dim = 128;
+        auto * tv = ggml_vec_index_create_turbovec_q4(tv_dim);
+        CHECK(tv != nullptr);
+        CHECK(ggml_vec_index_dim(tv) == tv_dim);
+        CHECK(ggml_vec_index_bit_width(tv) == 4);
+
+        std::vector<float> tv_vecs(static_cast<size_t>(tv_dim) * 3);
+        for (int i = 0; i < tv_dim; ++i) {
+            const float a = static_cast<float>(std::sin(0.07 * static_cast<double>(i + 1)));
+            const float b = static_cast<float>(std::cos(0.11 * static_cast<double>(i + 3)));
+            tv_vecs[static_cast<size_t>(i)] = a;
+            tv_vecs[static_cast<size_t>(tv_dim + i)] = -a;
+            tv_vecs[static_cast<size_t>(2 * tv_dim + i)] = b;
+        }
+        const std::array<uint64_t, 3> tv_ids = { 9101, 9102, 9103 };
+        CHECK(ggml_vec_index_add(tv, tv_vecs.data(), 3, tv_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_len(tv) == 3);
+
+        std::array<float, 3> tv_scores{};
+        std::array<uint64_t, 3> tv_out{};
+        CHECK(ggml_vec_index_search(
+            tv, tv_vecs.data(), 1, 3, tv_scores.data(), tv_out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(tv_out[0] == tv_ids[0]);
+
+        const std::array<uint64_t, 2> allowed = { tv_ids[1], tv_ids[2] };
+        CHECK(ggml_vec_index_search_filtered(
+            tv, tv_vecs.data(), 1, 1, allowed.data(), static_cast<int>(allowed.size()),
+            tv_scores.data(), tv_out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(tv_out[0] != tv_ids[0]);
+
+        CHECK(ggml_vec_index_build_ivf(tv, /*n_lists=*/2, /*n_iter=*/1) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_ivf(
+            tv, tv_vecs.data(), 1, 1, /*nprobe=*/2,
+            tv_scores.data(), tv_out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(tv_out[0] == tv_ids[0]);
+
+        const std::string tv_snapshot_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-turbovec-q4.tvim").string();
+        const std::string tv_delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-turbovec-q4.tvid").string();
+        std::filesystem::remove(tv_snapshot_path);
+        std::filesystem::remove(tv_delta_path);
+        std::filesystem::remove(tv_delta_path + ".lock");
+        CHECK(ggml_vec_index_write(tv, tv_snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * tv_loaded = ggml_vec_index_load(tv_snapshot_path.c_str());
+        CHECK(tv_loaded != nullptr);
+        CHECK(ggml_vec_index_dim(tv_loaded) == tv_dim);
+        CHECK(ggml_vec_index_bit_width(tv_loaded) == 4);
+        CHECK(ggml_vec_index_len(tv_loaded) == 3);
+        CHECK(ggml_vec_index_search(
+            tv_loaded, tv_vecs.data(), 1, 3, tv_scores.data(), tv_out.data()) ==
+            GGML_VEC_INDEX_OK);
+        CHECK(tv_out[0] == tv_ids[0]);
+        CHECK(ggml_vec_index_load_mmap(tv_snapshot_path.c_str()) == nullptr);
+        ggml_vec_index_free(tv_loaded);
+        CHECK(ggml_vec_index_add_logged(
+            tv, tv_vecs.data(), 1, &tv_ids[0], tv_delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove_logged(tv, tv_ids[0], tv_delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(!std::filesystem::exists(tv_delta_path));
+        std::filesystem::remove(tv_snapshot_path);
+        std::filesystem::remove(tv_delta_path + ".lock");
+        ggml_vec_index_free(tv);
+    }
+
+    // Rust TurboVec q2 golden parity: generated by tests/turbovec-golden-gen.
+    {
+        auto * tv = ggml_vec_index_create_turbovec_q2(kTurboVecGoldenQ2Dim);
+        CHECK(tv != nullptr);
+        std::array<uint64_t, kTurboVecGoldenQ2NDb> ids{};
+        for (int i = 0; i < kTurboVecGoldenQ2NDb; ++i) {
+            ids[static_cast<size_t>(i)] = static_cast<uint64_t>(i);
+        }
+        CHECK(ggml_vec_index_add(
+            tv,
+            kTurboVecGoldenQ2Db,
+            kTurboVecGoldenQ2NDb,
+            ids.data()) == GGML_VEC_INDEX_OK);
+        std::array<float, kTurboVecGoldenQ2NQuery * kTurboVecGoldenQ2K> scores{};
+        std::array<uint64_t, kTurboVecGoldenQ2NQuery * kTurboVecGoldenQ2K> out{};
+        CHECK(ggml_vec_index_search(
+            tv,
+            kTurboVecGoldenQ2Queries,
+            kTurboVecGoldenQ2NQuery,
+            kTurboVecGoldenQ2K,
+            scores.data(),
+            out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(any_score_differs(
+            scores.data(),
+            kTurboVecGoldenQ2RustScores,
+            scores.size(),
+            1e-5f));
+        check_rust_tv_shape(
+            kTurboVecGoldenQ2RustTvBytes,
+            kTurboVecGoldenQ2RustTvBytesLen,
+            2,
+            kTurboVecGoldenQ2Dim,
+            kTurboVecGoldenQ2NDb,
+            kTurboVecGoldenQ2RustPackedBytes,
+            kTurboVecGoldenQ2RustCalibCount);
+        check_rust_persistence_guard(
+            tv,
+            "q2-golden",
+            2,
+            5,
+            kTurboVecGoldenQ2NDb,
+            kTurboVecGoldenQ2RustTvBytes,
+            kTurboVecGoldenQ2RustTvBytesLen,
+            kTurboVecGoldenQ2RustPackedCodes,
+            kTurboVecGoldenQ2RustPackedBytes);
+        for (int i = 0; i < kTurboVecGoldenQ2NQuery * kTurboVecGoldenQ2K; ++i) {
+            CHECK(out[static_cast<size_t>(i)] ==
+                static_cast<uint64_t>(kTurboVecGoldenQ2TopK[i]));
+        }
+        ggml_vec_index_free(tv);
+    }
+
+    // Rust TurboVec q4 golden parity: generated by tests/turbovec-golden-gen.
+    // This checks top-k ordering on a fixed dataset before tighter byte/score
+    // parity is attempted.
+    {
+        auto * tv = ggml_vec_index_create_turbovec_q4(kTurboVecGoldenDim);
+        CHECK(tv != nullptr);
+        std::array<uint64_t, kTurboVecGoldenNDb> ids{};
+        for (int i = 0; i < kTurboVecGoldenNDb; ++i) {
+            ids[static_cast<size_t>(i)] = static_cast<uint64_t>(i);
+        }
+        CHECK(ggml_vec_index_add(
+            tv,
+            kTurboVecGoldenDb,
+            kTurboVecGoldenNDb,
+            ids.data()) == GGML_VEC_INDEX_OK);
+        std::array<float, kTurboVecGoldenNQuery * kTurboVecGoldenK> scores{};
+        std::array<uint64_t, kTurboVecGoldenNQuery * kTurboVecGoldenK> out{};
+        CHECK(ggml_vec_index_search(
+            tv,
+            kTurboVecGoldenQueries,
+            kTurboVecGoldenNQuery,
+            kTurboVecGoldenK,
+            scores.data(),
+            out.data()) == GGML_VEC_INDEX_OK);
+        CHECK(any_score_differs(
+            scores.data(),
+            kTurboVecGoldenRustScores,
+            scores.size(),
+            1e-5f));
+        check_rust_tv_shape(
+            kTurboVecGoldenRustTvBytes,
+            kTurboVecGoldenRustTvBytesLen,
+            4,
+            kTurboVecGoldenDim,
+            kTurboVecGoldenNDb,
+            kTurboVecGoldenRustPackedBytes,
+            kTurboVecGoldenRustCalibCount);
+        check_rust_persistence_guard(
+            tv,
+            "q4-golden",
+            4,
+            4,
+            kTurboVecGoldenNDb,
+            kTurboVecGoldenRustTvBytes,
+            kTurboVecGoldenRustTvBytesLen,
+            kTurboVecGoldenRustPackedCodes,
+            kTurboVecGoldenRustPackedBytes);
+        for (int i = 0; i < kTurboVecGoldenNQuery * kTurboVecGoldenK; ++i) {
+            CHECK(out[static_cast<size_t>(i)] ==
+                static_cast<uint64_t>(kTurboVecGoldenTopK[i]));
+        }
+        ggml_vec_index_free(tv);
+    }
 
     auto * idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
     CHECK(idx != nullptr);

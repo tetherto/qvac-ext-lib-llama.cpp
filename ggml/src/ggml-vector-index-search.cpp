@@ -244,33 +244,64 @@ inline float dot_q4(
 
 inline float score_slot(
         const ggml_vec_index_t & idx,
-        const float * query,
+        const float * score_query,
         size_t slot,
-        double max_query) {
+        double max_query,
+        const uint8_t * turbovec_lut = nullptr,
+        float turbovec_lut_scale = 1.0f,
+        float turbovec_lut_bias = 0.0f) {
     const int dim = idx.dim;
-    return is_q4(idx) ?
+    return is_turbovec_q2(idx) ?
+        dot_turbovec_q2_lut_row(
+            turbovec_lut,
+            turbovec_lut_scale,
+            turbovec_lut_bias,
+            turbovec_q2_data_ptr(idx) + slot * turbovec_q2_row_bytes(static_cast<size_t>(dim)),
+            idx.turbovec_q2_scale.data() + slot * turbovec_q2_scale_count(static_cast<size_t>(dim)),
+            dim) :
+        is_turbovec_q4(idx) ?
+        dot_turbovec_q4_lut_row(
+            turbovec_lut,
+            turbovec_lut_scale,
+            turbovec_lut_bias,
+            turbovec_q4_data_ptr(idx) + slot * turbovec_q4_row_bytes(static_cast<size_t>(dim)),
+            idx.turbovec_q4_scale.data() + slot * turbovec_q4_scale_count(static_cast<size_t>(dim)),
+            dim) :
+        is_q4(idx) ?
         dot_q4(
-            query,
+            score_query,
             q4_data_ptr(idx) + slot * q4_row_bytes(static_cast<size_t>(dim)),
             idx.q4_scale[slot],
             dim,
             max_query) :
         is_q8(idx) ?
         dot_q8(
-            query,
+            score_query,
             q8_data_ptr(idx) + slot * static_cast<size_t>(dim),
             idx.q8_scale[slot],
             dim,
             max_query) :
         dot(
-            query,
+            score_query,
             f32_data_ptr(idx) + slot * static_cast<size_t>(dim),
             dim);
 }
 
 void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) {
     const int dim = idx.dim;
-    if (is_q4(idx)) {
+    if (is_turbovec_q2(idx)) {
+        decode_turbovec_q2_row(
+            turbovec_q2_data_ptr(idx) + slot * turbovec_q2_row_bytes(static_cast<size_t>(dim)),
+            idx.turbovec_q2_scale.data() + slot * turbovec_q2_scale_count(static_cast<size_t>(dim)),
+            dst,
+            dim);
+    } else if (is_turbovec_q4(idx)) {
+        decode_turbovec_q4_row(
+            turbovec_q4_data_ptr(idx) + slot * turbovec_q4_row_bytes(static_cast<size_t>(dim)),
+            idx.turbovec_q4_scale.data() + slot * turbovec_q4_scale_count(static_cast<size_t>(dim)),
+            dst,
+            dim);
+    } else if (is_q4(idx)) {
         const uint8_t * codes =
             q4_data_ptr(idx) + slot * q4_row_bytes(static_cast<size_t>(dim));
         const float scale = idx.q4_scale[slot];
@@ -332,12 +363,37 @@ void search_one(
         std::min(static_cast<size_t>(k), candidate_hint);
     heap.reserve(heap_capacity);
     const double max_query = is_quantized(idx) ? query_max_abs(query, idx.dim) : 0.0;
+    const float * score_query = query;
+    std::vector<float> rotated_query;
+    std::vector<uint8_t> turbovec_lut;
+    float turbovec_lut_scale = 1.0f;
+    float turbovec_lut_bias = 0.0f;
+    if (is_turbovec_q2(idx) || is_turbovec_q4(idx)) {
+        rotated_query.resize(static_cast<size_t>(idx.dim));
+        rotate_turbovec_query(query, rotated_query.data(), idx.dim);
+        score_query = rotated_query.data();
+        if (is_turbovec_q2(idx)) {
+            build_turbovec_q2_lut(score_query, idx.dim, turbovec_lut, turbovec_lut_scale, turbovec_lut_bias);
+        } else {
+            build_turbovec_q4_lut(score_query, idx.dim, turbovec_lut, turbovec_lut_scale, turbovec_lut_bias);
+        }
+    }
 
     auto visit_slot = [&](size_t slot) {
         if (!slot_is_active(idx, slot)) {
             return;
         }
-        const ScoreId candidate{ score_slot(idx, query, slot, max_query), idx.slot_to_id[slot] };
+        const ScoreId candidate{
+            score_slot(
+                idx,
+                score_query,
+                slot,
+                max_query,
+                turbovec_lut.data(),
+                turbovec_lut_scale,
+                turbovec_lut_bias),
+            idx.slot_to_id[slot]
+        };
         if (heap.size() < static_cast<size_t>(k)) {
             heap.push_back(candidate);
             std::push_heap(heap.begin(), heap.end(), MinHeapCmp());

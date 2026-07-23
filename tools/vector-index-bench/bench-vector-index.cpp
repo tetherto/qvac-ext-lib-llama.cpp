@@ -30,6 +30,9 @@ namespace {
         }                                                                      \
     } while (0)
 
+constexpr int kModeTurboVecQ2 = -2;
+constexpr int kModeTurboVecQ4 = -4;
+
 struct BenchConfig {
     int n_vec   = 2048;
     int dim     = 256;
@@ -60,6 +63,8 @@ struct QualityBenchResult {
     const char * name = "";
     QualityMetrics q8;
     QualityMetrics q4;
+    QualityMetrics tvq2;
+    QualityMetrics tvq4;
     std::vector<QualityMetrics> q4_calibrated;
 };
 
@@ -156,6 +161,16 @@ const char * q8_kernel_name() {
 
 const char * q4_kernel_name() {
     return quantized_kernel_name();
+}
+
+ggml_vec_index_t * create_index_mode(int mode, int dim) {
+    if (mode == kModeTurboVecQ2) {
+        return ggml_vec_index_create_turbovec_q2(dim);
+    }
+    if (mode == kModeTurboVecQ4) {
+        return ggml_vec_index_create_turbovec_q4(dim);
+    }
+    return ggml_vec_index_create(dim, mode);
 }
 
 std::vector<float> make_normalized_vectors(int n, int dim, uint32_t seed) {
@@ -597,12 +612,18 @@ QualityBenchResult run_quality_bench(
     ggml_vec_index_t * f32 = ggml_vec_index_create(cfg.dim, 32);
     ggml_vec_index_t * q8 = ggml_vec_index_create(cfg.dim, 8);
     ggml_vec_index_t * q4 = ggml_vec_index_create(cfg.dim, 4);
+    ggml_vec_index_t * tvq2 = ggml_vec_index_create_turbovec_q2(cfg.dim);
+    ggml_vec_index_t * tvq4 = ggml_vec_index_create_turbovec_q4(cfg.dim);
     CHECK(f32 != nullptr);
     CHECK(q8 != nullptr);
     CHECK(q4 != nullptr);
+    CHECK(tvq2 != nullptr);
+    CHECK(tvq4 != nullptr);
     CHECK(ggml_vec_index_add(f32, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_add(q8, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_add(q4, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add(tvq2, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add(tvq4, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
 
     const TimedSearch f32_res = run_search(
         f32, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
@@ -610,11 +631,17 @@ QualityBenchResult run_quality_bench(
         q8, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
     const TimedSearch q4_res = run_search(
         q4, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    const TimedSearch tvq2_res = run_search(
+        tvq2, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    const TimedSearch tvq4_res = run_search(
+        tvq4, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
 
     QualityBenchResult result;
     result.name = name;
     result.q8 = quality_against(f32_res, q8_res, vectors, queries, cfg.n_query, cfg.k, cfg.dim);
     result.q4 = quality_against(f32_res, q4_res, vectors, queries, cfg.n_query, cfg.k, cfg.dim);
+    result.tvq2 = quality_against(f32_res, tvq2_res, vectors, queries, cfg.n_query, cfg.k, cfg.dim);
+    result.tvq4 = quality_against(f32_res, tvq4_res, vectors, queries, cfg.n_query, cfg.k, cfg.dim);
     result.q4_calibrated.reserve(q4_calibration_modes.size());
     for (const Q4CalibrationMode & mode : q4_calibration_modes) {
         const Q4SimulatedIndex sim = build_simulated_q4(vectors, cfg.n_vec, cfg.dim, mode);
@@ -627,6 +654,8 @@ QualityBenchResult run_quality_bench(
     ggml_vec_index_free(f32);
     ggml_vec_index_free(q8);
     ggml_vec_index_free(q4);
+    ggml_vec_index_free(tvq2);
+    ggml_vec_index_free(tvq4);
     return result;
 }
 
@@ -658,7 +687,7 @@ DeleteBenchResult run_delete_bench(
         const BenchConfig & cfg) {
     CHECK(cfg.delete_stride > 0);
 
-    ggml_vec_index_t * idx = ggml_vec_index_create(cfg.dim, bit_width);
+    ggml_vec_index_t * idx = create_index_mode(bit_width, cfg.dim);
     CHECK(idx != nullptr);
     CHECK(ggml_vec_index_add(idx, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
 
@@ -705,7 +734,7 @@ DeltaBenchResult run_delta_bench(
     std::filesystem::remove(snapshot_path);
     std::filesystem::remove(delta_path);
 
-    ggml_vec_index_t * idx = ggml_vec_index_create(cfg.dim, bit_width);
+    ggml_vec_index_t * idx = create_index_mode(bit_width, cfg.dim);
     CHECK(idx != nullptr);
     CHECK(ggml_vec_index_add(idx, vectors.data(), base_n, ids.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_write(idx, snapshot_path.string().c_str()) == GGML_VEC_INDEX_OK);
@@ -781,12 +810,18 @@ int main() {
     ggml_vec_index_t * f32 = ggml_vec_index_create(cfg.dim, 32);
     ggml_vec_index_t * q8  = ggml_vec_index_create(cfg.dim, 8);
     ggml_vec_index_t * q4  = ggml_vec_index_create(cfg.dim, 4);
+    ggml_vec_index_t * tvq2 = ggml_vec_index_create_turbovec_q2(cfg.dim);
+    ggml_vec_index_t * tvq4 = ggml_vec_index_create_turbovec_q4(cfg.dim);
     CHECK(f32 != nullptr);
     CHECK(q8 != nullptr);
     CHECK(q4 != nullptr);
+    CHECK(tvq2 != nullptr);
+    CHECK(tvq4 != nullptr);
     CHECK(ggml_vec_index_add(f32, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_add(q8,  vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_add(q4,  vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add(tvq2, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add(tvq4, vectors.data(), cfg.n_vec, ids.data()) == GGML_VEC_INDEX_OK);
 
     const double f32_ivf_build_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
         CHECK(ggml_vec_index_build_ivf(f32, cfg.ivf_lists, cfg.ivf_iters) == GGML_VEC_INDEX_OK);
@@ -797,6 +832,12 @@ int main() {
     const double q4_ivf_build_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
         CHECK(ggml_vec_index_build_ivf(q4, cfg.ivf_lists, cfg.ivf_iters) == GGML_VEC_INDEX_OK);
     });
+    const double tvq2_ivf_build_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
+        CHECK(ggml_vec_index_build_ivf(tvq2, cfg.ivf_lists, cfg.ivf_iters) == GGML_VEC_INDEX_OK);
+    });
+    const double tvq4_ivf_build_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
+        CHECK(ggml_vec_index_build_ivf(tvq4, cfg.ivf_lists, cfg.ivf_iters) == GGML_VEC_INDEX_OK);
+    });
 
     const TimedSearch f32_res = run_search(
         f32, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
@@ -804,12 +845,20 @@ int main() {
         q8, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
     const TimedSearch q4_res = run_search(
         q4, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    const TimedSearch tvq2_res = run_search(
+        tvq2, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
+    const TimedSearch tvq4_res = run_search(
+        tvq4, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
     const TimedSearch f32_ivf_res = run_ivf_search(
         f32, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
     const TimedSearch q8_ivf_res = run_ivf_search(
         q8, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
     const TimedSearch q4_ivf_res = run_ivf_search(
         q4, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
+    const TimedSearch tvq2_ivf_res = run_ivf_search(
+        tvq2, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
+    const TimedSearch tvq4_ivf_res = run_ivf_search(
+        tvq4, queries, cfg.n_query, cfg.k, cfg.ivf_nprobe, cfg.warmups, cfg.repeats);
 
     const std::vector<int> filter_sizes = {
         32,
@@ -821,9 +870,13 @@ int main() {
     std::vector<TimedSearch> f32_filtered;
     std::vector<TimedSearch> q8_filtered;
     std::vector<TimedSearch> q4_filtered;
+    std::vector<TimedSearch> tvq2_filtered;
+    std::vector<TimedSearch> tvq4_filtered;
     std::vector<TimedSearch> f32_prepared_filtered;
     std::vector<TimedSearch> q8_prepared_filtered;
     std::vector<TimedSearch> q4_prepared_filtered;
+    std::vector<TimedSearch> tvq2_prepared_filtered;
+    std::vector<TimedSearch> tvq4_prepared_filtered;
     for (int requested : filter_sizes) {
         const int n_allowed = std::min(requested, cfg.n_vec);
         allowlists.push_back(make_allowlist(cfg.n_vec, n_allowed));
@@ -851,15 +904,37 @@ int main() {
             allowlists.back(),
             cfg.warmups,
             cfg.repeats));
+        tvq2_filtered.push_back(run_filtered_search(
+            tvq2,
+            queries,
+            cfg.n_query,
+            cfg.k,
+            allowlists.back(),
+            cfg.warmups,
+            cfg.repeats));
+        tvq4_filtered.push_back(run_filtered_search(
+            tvq4,
+            queries,
+            cfg.n_query,
+            cfg.k,
+            allowlists.back(),
+            cfg.warmups,
+            cfg.repeats));
         ggml_vec_index_filter_t * f32_filter = ggml_vec_index_filter_create(
             f32, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
         ggml_vec_index_filter_t * q8_filter = ggml_vec_index_filter_create(
             q8, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
         ggml_vec_index_filter_t * q4_filter = ggml_vec_index_filter_create(
             q4, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
+        ggml_vec_index_filter_t * tvq2_filter = ggml_vec_index_filter_create(
+            tvq2, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
+        ggml_vec_index_filter_t * tvq4_filter = ggml_vec_index_filter_create(
+            tvq4, allowlists.back().data(), static_cast<int>(allowlists.back().size()));
         CHECK(f32_filter != nullptr);
         CHECK(q8_filter != nullptr);
         CHECK(q4_filter != nullptr);
+        CHECK(tvq2_filter != nullptr);
+        CHECK(tvq4_filter != nullptr);
         f32_prepared_filtered.push_back(run_prepared_filtered_search(
             f32,
             f32_filter,
@@ -884,9 +959,27 @@ int main() {
             cfg.k,
             cfg.warmups,
             cfg.repeats));
+        tvq2_prepared_filtered.push_back(run_prepared_filtered_search(
+            tvq2,
+            tvq2_filter,
+            queries,
+            cfg.n_query,
+            cfg.k,
+            cfg.warmups,
+            cfg.repeats));
+        tvq4_prepared_filtered.push_back(run_prepared_filtered_search(
+            tvq4,
+            tvq4_filter,
+            queries,
+            cfg.n_query,
+            cfg.k,
+            cfg.warmups,
+            cfg.repeats));
         ggml_vec_index_filter_free(f32_filter);
         ggml_vec_index_filter_free(q8_filter);
         ggml_vec_index_filter_free(q4_filter);
+        ggml_vec_index_filter_free(tvq2_filter);
+        ggml_vec_index_filter_free(tvq4_filter);
     }
 
     const double f32_ivf_recall_at_k =
@@ -895,13 +988,21 @@ int main() {
         recall_against(f32_res, q8_ivf_res, cfg.n_query, cfg.k);
     const double q4_ivf_recall_at_k =
         recall_against(f32_res, q4_ivf_res, cfg.n_query, cfg.k);
+    const double tvq2_ivf_recall_at_k =
+        recall_against(f32_res, tvq2_ivf_res, cfg.n_query, cfg.k);
+    const double tvq4_ivf_recall_at_k =
+        recall_against(f32_res, tvq4_ivf_res, cfg.n_query, cfg.k);
 
     const auto f32_path = write_index_file(f32, "ggml-vector-index-bench-f32.tvim");
     const auto q8_path  = write_index_file(q8,  "ggml-vector-index-bench-q8.tvim");
     const auto q4_path  = write_index_file(q4,  "ggml-vector-index-bench-q4.tvim");
+    const auto tvq2_path = write_index_file(tvq2, "ggml-vector-index-bench-tvq2.tvim");
+    const auto tvq4_path = write_index_file(tvq4, "ggml-vector-index-bench-tvq4.tvim");
     const uintmax_t f32_file_size = std::filesystem::file_size(f32_path);
     const uintmax_t q8_file_size  = std::filesystem::file_size(q8_path);
     const uintmax_t q4_file_size  = std::filesystem::file_size(q4_path);
+    const uintmax_t tvq2_file_size = std::filesystem::file_size(tvq2_path);
+    const uintmax_t tvq4_file_size = std::filesystem::file_size(tvq4_path);
     const double f32_mmap_load_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
         ggml_vec_index_t * loaded = ggml_vec_index_load_mmap(f32_path.string().c_str());
         CHECK(loaded != nullptr);
@@ -917,9 +1018,21 @@ int main() {
         CHECK(loaded != nullptr);
         ggml_vec_index_free(loaded);
     });
+    const double tvq2_load_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
+        ggml_vec_index_t * loaded = ggml_vec_index_load(tvq2_path.string().c_str());
+        CHECK(loaded != nullptr);
+        ggml_vec_index_free(loaded);
+    });
+    const double tvq4_load_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
+        ggml_vec_index_t * loaded = ggml_vec_index_load(tvq4_path.string().c_str());
+        CHECK(loaded != nullptr);
+        ggml_vec_index_free(loaded);
+    });
     std::filesystem::remove(f32_path);
     std::filesystem::remove(q8_path);
     std::filesystem::remove(q4_path);
+    std::filesystem::remove(tvq2_path);
+    std::filesystem::remove(tvq4_path);
 
     const DeltaBenchResult f32_delta = run_delta_bench(
         32,
@@ -984,69 +1097,107 @@ int main() {
         static_cast<size_t>(cfg.n_vec) * ((static_cast<size_t>(cfg.dim) + 1) / 2) +
         static_cast<size_t>(cfg.n_vec) * sizeof(float) +
         static_cast<size_t>(cfg.n_vec) * sizeof(uint64_t);
+    const size_t tv_scale_bytes =
+        static_cast<size_t>(cfg.n_vec) * (static_cast<size_t>(cfg.dim) / 128) * sizeof(float);
+    const size_t tvq2_memory_bytes =
+        static_cast<size_t>(cfg.n_vec) * (static_cast<size_t>(cfg.dim) / 4) +
+        tv_scale_bytes +
+        static_cast<size_t>(cfg.n_vec) * sizeof(uint64_t);
+    const size_t tvq4_memory_bytes =
+        static_cast<size_t>(cfg.n_vec) * (static_cast<size_t>(cfg.dim) / 2) +
+        tv_scale_bytes +
+        static_cast<size_t>(cfg.n_vec) * sizeof(uint64_t);
 
     std::printf("bench-vector-index\n");
     std::printf("  q8 kernel=%s\n", q8_kernel_name());
     std::printf("  q4 kernel=%s\n", q4_kernel_name());
     std::printf("  n_vec=%d dim=%d n_query=%d k=%d warmups=%d repeats=%d\n",
         cfg.n_vec, cfg.dim, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
-    std::printf("  estimated memory: f32=%zu bytes q8=%zu bytes q4=%zu bytes q8/f32=%.3f q4/f32=%.3f\n",
-        f32_memory_bytes, q8_memory_bytes, q4_memory_bytes,
+    std::printf("  estimated memory: f32=%zu bytes q8=%zu bytes q4=%zu bytes tvq2=%zu bytes tvq4=%zu bytes q8/f32=%.3f q4/f32=%.3f tvq2/f32=%.3f tvq4/f32=%.3f\n",
+        f32_memory_bytes, q8_memory_bytes, q4_memory_bytes, tvq2_memory_bytes, tvq4_memory_bytes,
         static_cast<double>(q8_memory_bytes) / static_cast<double>(f32_memory_bytes),
-        static_cast<double>(q4_memory_bytes) / static_cast<double>(f32_memory_bytes));
-    std::printf("  file size:        f32=%llu bytes q8=%llu bytes q4=%llu bytes q8/f32=%.3f q4/f32=%.3f\n",
+        static_cast<double>(q4_memory_bytes) / static_cast<double>(f32_memory_bytes),
+        static_cast<double>(tvq2_memory_bytes) / static_cast<double>(f32_memory_bytes),
+        static_cast<double>(tvq4_memory_bytes) / static_cast<double>(f32_memory_bytes));
+    std::printf("  file size:        f32=%llu bytes q8=%llu bytes q4=%llu bytes tvq2=%llu bytes tvq4=%llu bytes q8/f32=%.3f q4/f32=%.3f tvq2/f32=%.3f tvq4/f32=%.3f\n",
         static_cast<unsigned long long>(f32_file_size),
         static_cast<unsigned long long>(q8_file_size),
         static_cast<unsigned long long>(q4_file_size),
+        static_cast<unsigned long long>(tvq2_file_size),
+        static_cast<unsigned long long>(tvq4_file_size),
         static_cast<double>(q8_file_size) / static_cast<double>(f32_file_size),
-        static_cast<double>(q4_file_size) / static_cast<double>(f32_file_size));
+        static_cast<double>(q4_file_size) / static_cast<double>(f32_file_size),
+        static_cast<double>(tvq2_file_size) / static_cast<double>(f32_file_size),
+        static_cast<double>(tvq4_file_size) / static_cast<double>(f32_file_size));
     std::printf("  mmap load:        f32=%.3f ms q8=%.3f ms q4=%.3f ms\n",
         f32_mmap_load_ms, q8_mmap_load_ms, q4_mmap_load_ms);
-    std::printf("  median latency:   f32=%.3f ms q8=%.3f ms q4=%.3f ms q8/f32=%.3f q4/f32=%.3f\n",
-        f32_res.ms, q8_res.ms, q4_res.ms, q8_res.ms / f32_res.ms, q4_res.ms / f32_res.ms);
+    std::printf("  snapshot load:    tvq2=%.3f ms tvq4=%.3f ms (mmap unsupported)\n",
+        tvq2_load_ms, tvq4_load_ms);
+    std::printf("  median latency:   f32=%.3f ms q8=%.3f ms q4=%.3f ms tvq2=%.3f ms tvq4=%.3f ms q8/f32=%.3f q4/f32=%.3f tvq2/f32=%.3f tvq4/f32=%.3f\n",
+        f32_res.ms, q8_res.ms, q4_res.ms, tvq2_res.ms, tvq4_res.ms,
+        q8_res.ms / f32_res.ms, q4_res.ms / f32_res.ms,
+        tvq2_res.ms / f32_res.ms, tvq4_res.ms / f32_res.ms);
     std::printf(
-        "  ivf build:        lists=%d iters=%d f32=%.3f ms q8=%.3f ms q4=%.3f ms\n",
+        "  ivf build:        lists=%d iters=%d f32=%.3f ms q8=%.3f ms q4=%.3f ms tvq2=%.3f ms tvq4=%.3f ms\n",
         cfg.ivf_lists,
         cfg.ivf_iters,
         f32_ivf_build_ms,
         q8_ivf_build_ms,
-        q4_ivf_build_ms);
+        q4_ivf_build_ms,
+        tvq2_ivf_build_ms,
+        tvq4_ivf_build_ms);
     std::printf(
-        "  ivf latency:      nprobe=%d f32=%.3f ms q8=%.3f ms q4=%.3f ms f32/full=%.3f q8/full=%.3f q4/full=%.3f\n",
+        "  ivf latency:      nprobe=%d f32=%.3f ms q8=%.3f ms q4=%.3f ms tvq2=%.3f ms tvq4=%.3f ms f32/full=%.3f q8/full=%.3f q4/full=%.3f tvq2/full=%.3f tvq4/full=%.3f\n",
         cfg.ivf_nprobe,
         f32_ivf_res.ms,
         q8_ivf_res.ms,
         q4_ivf_res.ms,
+        tvq2_ivf_res.ms,
+        tvq4_ivf_res.ms,
         f32_ivf_res.ms / f32_res.ms,
         q8_ivf_res.ms / q8_res.ms,
-        q4_ivf_res.ms / q4_res.ms);
+        q4_ivf_res.ms / q4_res.ms,
+        tvq2_ivf_res.ms / tvq2_res.ms,
+        tvq4_ivf_res.ms / tvq4_res.ms);
     std::printf(
-        "  ivf recall:       f32@%d=%.4f q8@%d=%.4f q4@%d=%.4f against exact f32\n",
+        "  ivf recall:       f32@%d=%.4f q8@%d=%.4f q4@%d=%.4f tvq2@%d=%.4f tvq4@%d=%.4f against exact f32\n",
         cfg.k,
         f32_ivf_recall_at_k,
         cfg.k,
         q8_ivf_recall_at_k,
         cfg.k,
-        q4_ivf_recall_at_k);
+        q4_ivf_recall_at_k,
+        cfg.k,
+        tvq2_ivf_recall_at_k,
+        cfg.k,
+        tvq4_ivf_recall_at_k);
     for (size_t i = 0; i < allowlists.size(); ++i) {
         std::printf(
-            "  filtered latency: allowed=%zu f32=%.3f ms q8=%.3f ms q4=%.3f ms f32/prepared=%.3f ms q8/prepared=%.3f ms q4/prepared=%.3f ms\n",
+            "  filtered latency: allowed=%zu f32=%.3f ms q8=%.3f ms q4=%.3f ms tvq2=%.3f ms tvq4=%.3f ms f32/prepared=%.3f ms q8/prepared=%.3f ms q4/prepared=%.3f ms tvq2/prepared=%.3f ms tvq4/prepared=%.3f ms\n",
             allowlists[i].size(),
             f32_filtered[i].ms,
             q8_filtered[i].ms,
             q4_filtered[i].ms,
+            tvq2_filtered[i].ms,
+            tvq4_filtered[i].ms,
             f32_prepared_filtered[i].ms,
             q8_prepared_filtered[i].ms,
-            q4_prepared_filtered[i].ms);
+            q4_prepared_filtered[i].ms,
+            tvq2_prepared_filtered[i].ms,
+            tvq4_prepared_filtered[i].ms);
         std::printf(
-            "  filtered ratio:   allowed=%zu f32/full=%.3f q8/full=%.3f q4/full=%.3f f32/prep_speedup=%.3f q8/prep_speedup=%.3f q4/prep_speedup=%.3f\n",
+            "  filtered ratio:   allowed=%zu f32/full=%.3f q8/full=%.3f q4/full=%.3f tvq2/full=%.3f tvq4/full=%.3f f32/prep_speedup=%.3f q8/prep_speedup=%.3f q4/prep_speedup=%.3f tvq2/prep_speedup=%.3f tvq4/prep_speedup=%.3f\n",
             allowlists[i].size(),
             f32_filtered[i].ms / f32_res.ms,
             q8_filtered[i].ms / q8_res.ms,
             q4_filtered[i].ms / q4_res.ms,
+            tvq2_filtered[i].ms / tvq2_res.ms,
+            tvq4_filtered[i].ms / tvq4_res.ms,
             f32_filtered[i].ms / f32_prepared_filtered[i].ms,
             q8_filtered[i].ms / q8_prepared_filtered[i].ms,
-            q4_filtered[i].ms / q4_prepared_filtered[i].ms);
+            q4_filtered[i].ms / q4_prepared_filtered[i].ms,
+            tvq2_filtered[i].ms / tvq2_prepared_filtered[i].ms,
+            tvq4_filtered[i].ms / tvq4_prepared_filtered[i].ms);
     }
     std::printf(
         "  delta load f32:    snapshot=%.3f ms replay=%.3f ms compact=%.3f ms post_compact=%.3f ms\n",
@@ -1115,14 +1266,20 @@ int main() {
         q4_delete.compacted_search_ms / q4_delete.tombstone_search_ms);
     for (const QualityBenchResult & quality : quality_suite) {
         std::printf(
-            "  quality %-19s q8_recall=%.4f q8_mean_drift=%.6f q8_max_drift=%.6f q4_recall=%.4f q4_mean_drift=%.6f q4_max_drift=%.6f\n",
+            "  quality %-19s q8_recall=%.4f q8_mean_drift=%.6f q8_max_drift=%.6f q4_recall=%.4f q4_mean_drift=%.6f q4_max_drift=%.6f tvq2_recall=%.4f tvq2_mean_drift=%.6f tvq2_max_drift=%.6f tvq4_recall=%.4f tvq4_mean_drift=%.6f tvq4_max_drift=%.6f\n",
             quality.name,
             quality.q8.recall_at_k,
             quality.q8.mean_abs_score_drift,
             quality.q8.max_abs_score_drift,
             quality.q4.recall_at_k,
             quality.q4.mean_abs_score_drift,
-            quality.q4.max_abs_score_drift);
+            quality.q4.max_abs_score_drift,
+            quality.tvq2.recall_at_k,
+            quality.tvq2.mean_abs_score_drift,
+            quality.tvq2.max_abs_score_drift,
+            quality.tvq4.recall_at_k,
+            quality.tvq4.mean_abs_score_drift,
+            quality.tvq4.max_abs_score_drift);
         for (size_t i = 0; i < q4_calibration_modes.size(); ++i) {
             const QualityMetrics & metrics = quality.q4_calibrated[i];
             std::printf(
@@ -1137,5 +1294,7 @@ int main() {
     ggml_vec_index_free(f32);
     ggml_vec_index_free(q8);
     ggml_vec_index_free(q4);
+    ggml_vec_index_free(tvq2);
+    ggml_vec_index_free(tvq4);
     return 0;
 }

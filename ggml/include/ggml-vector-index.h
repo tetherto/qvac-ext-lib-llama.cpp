@@ -3,8 +3,8 @@
 // ggml-vector-index: vector-index C API.
 //
 // This public C API supports full f32 storage (`bit_width=32`), q8 storage
-// (`bit_width=8`), and packed q4
-// storage (`bit_width=4`) with CPU search directly against quantized codes.
+// (`bit_width=8`), packed q4 storage (`bit_width=4`), and distinct TurboVec
+// q2/q4 modes with CPU search directly against quantized codes.
 // q8 and q4 use NEON when available. Supported x86 CMake builds compile AVX2
 // kernels separately and runtime-dispatch them from a non-AVX2 baseline.
 //
@@ -74,6 +74,24 @@ GGML_API const char * ggml_vec_index_error_to_string(int error);
 // `bit_width=8` store per-vector symmetric quantized codes with one f32 scale
 // per vector. `bit_width=32` stores full f32 vectors. Returns NULL on bad args.
 GGML_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
+
+// Creates a TurboQuant q2 vector index. This is distinct from the generic
+// q4/q8 modes created by `ggml_vec_index_create`: vectors are normalized,
+// rotated in 128-dimensional blocks, quantized with Lloyd-Max q2 codebooks, and
+// searched against rotated queries. This first implementation requires
+// `dim > 0 && dim % 128 == 0` and supports add/search/filter/IVF plus regular
+// snapshot write/load. mmap loading and logged mutations are reserved for later
+// format work.
+GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
+
+// Creates a TurboQuant q4 vector index. This is distinct from the generic
+// `bit_width=4` mode created by `ggml_vec_index_create`: vectors are normalized,
+// rotated in 128-dimensional blocks, quantized with Lloyd-Max q4 codebooks, and
+// searched against rotated queries. This first implementation requires
+// `dim > 0 && dim % 128 == 0` and supports add/search/filter/IVF plus regular
+// snapshot write/load. mmap loading and logged mutations are reserved for later
+// format work.
+GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
 
 GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 
@@ -292,22 +310,25 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 //   ------  -----  -------------------------------------------------------
 //   0       4      magic = "TVPI" (bytes 0x54, 0x56, 0x50, 0x49)
 //   4       1      version = 2
-//   5       1      bit_width (4, 8, or 32)
-//   6       1      storage kind (1 = f32, 2 = q8, 3 = q4)
+//   5       1      bit_width (2 for TurboVec q2, 4, 8, or 32)
+//   6       1      storage kind (1 = f32, 2 = q8, 3 = q4, 4 = TurboVec q4, 5 = TurboVec q2)
 //   7       1      flags (bit 0 = checksum trailer present)
 //   8       4      dim (uint32)
 //   12      4      n_vectors (uint32)
 //   16      4      qparam_type (0 = none, 1 = per-vector f32 scale)
 //   20      4      qparam_bytes_per_vector (0 or 4)
-//   24      4      bytes_per_component (0 for packed q4, 1 for q8, 4 for f32)
+//   24      4      bytes_per_component (0 for packed q4/TurboVec, 1 for q8, 4 for f32)
 //   28      4      reserved (zero)
 //   32      ...    qparams:
 //                    - f32: empty
 //                    - q4/q8: N float32 scales
+//                    - TurboVec q2/q4: N float32 score-correction scales
 //   ...     ...    vectors:
 //                    - f32: N*D float32 values, row-major
 //                    - q8:  N*D int8 codes, row-major
 //                    - q4:  N*ceil(D/2) packed unsigned nibbles, row-major
+//                    - TurboVec q4: N*(D/2) Lloyd-Max codes in bit-plane layout
+//                    - TurboVec q2: N*(D/4) Lloyd-Max codes in bit-plane layout
 //   ...     N*8    ids (uint64)
 //   ...     4      header CRC32C, when flag bit 0 is set
 //   ...     4      qparams CRC32C, when flag bit 0 is set

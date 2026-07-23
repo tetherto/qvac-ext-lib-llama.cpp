@@ -4,9 +4,9 @@
 provided ids with dense vectors, supports exact and approximate top-k search,
 and can persist indexes to disk.
 
-This experimental component is currently standalone. It is not enabled in
-default builds and is not wired into the llama runtime, server, or app paths.
-Consumers should enable it explicitly and link the vector-index target directly.
+This candidate component is currently standalone. It is not enabled in default
+builds and is not wired into the llama runtime, server, or app paths. Consumers
+should enable it explicitly and link the vector-index target directly.
 
 ## Build
 
@@ -35,6 +35,13 @@ Create an index with a fixed dimension and bit width:
 - `bit_width=32`: full f32 vectors.
 - `bit_width=8`: per-vector symmetric q8 storage with f32 scales.
 - `bit_width=4`: per-vector symmetric packed q4 storage with f32 scales.
+
+`ggml_vec_index_create_turbovec_q2` and `ggml_vec_index_create_turbovec_q4`
+create separate TurboQuant q2/q4 modes for dimensions that are multiples of
+128. They store Lloyd-Max q2/q4 codes in Rust-style bit-plane rows with one
+score-correction scale per vector and search against rotated query LUTs. Regular
+snapshot write/load is supported; mmap loading and logged mutations are reserved
+for a later format update.
 
 Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries
