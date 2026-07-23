@@ -147,6 +147,7 @@ endif()
 # Vector-index regression test: no model required, no llama runtime touched.
 if (TARGET ggml-vector-index)
     find_package(Threads REQUIRED)
+    include(${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index-sources.cmake)
 
     add_executable(test-vector-index test-vector-index.cpp)
     target_compile_features(test-vector-index PRIVATE cxx_std_17)
@@ -156,11 +157,29 @@ if (TARGET ggml-vector-index)
     endif()
     llama_test(test-vector-index)
 
-    add_library(test-vector-index-fault-hooks STATIC ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index.cpp)
+    add_library(test-vector-index-fault-hooks STATIC
+        ${GGML_VECTOR_INDEX_INTERNAL_HEADERS}
+        ${GGML_VECTOR_INDEX_IMPL_SOURCES})
     target_compile_features(test-vector-index-fault-hooks PRIVATE cxx_std_17)
     target_compile_definitions(test-vector-index-fault-hooks PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
     target_include_directories(test-vector-index-fault-hooks PUBLIC ${PROJECT_SOURCE_DIR}/ggml/include)
     target_link_libraries(test-vector-index-fault-hooks PRIVATE Threads::Threads)
+    get_target_property(GGML_VECTOR_INDEX_HAS_AVX2
+        ggml-vector-index
+        GGML_VECTOR_INDEX_HAS_AVX2)
+    if (GGML_VECTOR_INDEX_HAS_AVX2)
+        get_target_property(GGML_VECTOR_INDEX_AVX2_COMPILE_OPTION
+            ggml-vector-index
+            GGML_VECTOR_INDEX_AVX2_COMPILE_OPTION)
+        target_sources(test-vector-index-fault-hooks PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index-avx2.cpp)
+        target_compile_definitions(test-vector-index-fault-hooks PRIVATE GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        if (GGML_VECTOR_INDEX_AVX2_COMPILE_OPTION)
+            set_source_files_properties(
+                ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index-avx2.cpp
+                PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_COMPILE_OPTION}")
+        endif()
+    endif()
     if (NOT WIN32)
         target_link_libraries(test-vector-index-fault-hooks PRIVATE m)
     endif()

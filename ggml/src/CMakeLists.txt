@@ -262,12 +262,16 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
 endif()
 
 if (GGML_VECTOR_INDEX)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index-sources.cmake)
     set(GGML_VECTOR_INDEX_SOURCES
         ../include/ggml-vector-index.h
-        ggml-vector-index.cpp)
+        ${GGML_VECTOR_INDEX_INTERNAL_HEADERS}
+        ${GGML_VECTOR_INDEX_IMPL_SOURCES})
 
     set(GGML_VECTOR_INDEX_AVX2_FLAG "")
-    if (GGML_AVX2 AND GGML_SYSTEM_ARCH STREQUAL "x86")
+    # GGML_NATIVE applies architecture flags only to the CPU backend target.
+    # Build this AVX2 object separately and keep runtime dispatch in the baseline TU.
+    if ((GGML_AVX2 OR GGML_NATIVE) AND GGML_SYSTEM_ARCH STREQUAL "x86")
         if (MSVC)
             check_cxx_compiler_flag("/arch:AVX2" GGML_VECTOR_INDEX_SUPPORTS_AVX2)
             if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)
@@ -283,16 +287,18 @@ if (GGML_VECTOR_INDEX)
 
     if (GGML_VECTOR_INDEX_AVX2_FLAG)
         list(APPEND GGML_VECTOR_INDEX_SOURCES
-             ggml-vector-index-avx2.h
-             ggml-vector-index-avx2.cpp)
+             ${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index-avx2.h
+             ${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index-avx2.cpp)
         set_source_files_properties(
-            ggml-vector-index-avx2.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index-avx2.cpp
             PROPERTIES COMPILE_OPTIONS "${GGML_VECTOR_INDEX_AVX2_FLAG}")
     endif()
 
     add_library(ggml-vector-index ${GGML_VECTOR_INDEX_SOURCES})
     add_library(ggml::ggml-vector-index ALIAS ggml-vector-index)
     add_library(ggml::vector-index ALIAS ggml-vector-index)
+    set_property(TARGET ggml-vector-index PROPERTY
+        GGML_VECTOR_INDEX_AVX2_COMPILE_OPTION "${GGML_VECTOR_INDEX_AVX2_FLAG}")
 
     if (GGML_VECTOR_INDEX_AVX2_FLAG)
         target_compile_definitions(ggml-vector-index PRIVATE GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
@@ -304,6 +310,8 @@ if (GGML_VECTOR_INDEX)
     set_target_properties(ggml-vector-index PROPERTIES
         VERSION ${GGML_VERSION}
         SOVERSION ${GGML_VERSION_MAJOR}
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
     )
 
     target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)

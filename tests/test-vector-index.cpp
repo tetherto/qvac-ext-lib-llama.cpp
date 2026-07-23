@@ -302,6 +302,7 @@ int main() {
     CHECK(ggml_vec_index_dim(idx) == kDim);
     CHECK(ggml_vec_index_len(idx) == 0);
     CHECK(ggml_vec_index_bit_width(idx) == 32);
+    ggml_vec_index_prepare(idx);
 
     // Zero-row adds are valid no-ops and must not create delta artifacts.
     {
@@ -745,6 +746,58 @@ int main() {
         }
     }
 
+    // Equal scores retain the lowest ids when top-k eviction is required.
+    {
+        auto * tie_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(tie_idx != nullptr);
+        const std::array<uint64_t, 4> tie_ids = { 50, 10, 30, 20 };
+        std::vector<float> tie_vecs;
+        for (size_t i = 0; i < tie_ids.size(); ++i) {
+            tie_vecs.insert(tie_vecs.end(), seeds[0].begin(), seeds[0].end());
+        }
+        CHECK(ggml_vec_index_add(
+            tie_idx, tie_vecs.data(), static_cast<int>(tie_ids.size()), tie_ids.data()) ==
+            GGML_VEC_INDEX_OK);
+        std::array<float, 2> scores{};
+        std::array<uint64_t, 2> out_ids{};
+        CHECK(ggml_vec_index_search(
+            tie_idx, seeds[0].data(), 1, /*k=*/2,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == 10);
+        CHECK(out_ids[1] == 20);
+        CHECK(scores[0] == scores[1]);
+        ggml_vec_index_free(tie_idx);
+    }
+
+    // Tombstone-heavy exact search visits live slots without scanning deleted rows.
+    {
+        auto * tombstone_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(tombstone_idx != nullptr);
+        const std::array<uint64_t, 6> tombstone_ids = { 60, 50, 40, 30, 20, 10 };
+        std::vector<float> tombstone_vecs;
+        for (size_t i = 0; i < tombstone_ids.size(); ++i) {
+            tombstone_vecs.insert(
+                tombstone_vecs.end(), seeds[0].begin(), seeds[0].end());
+        }
+        CHECK(ggml_vec_index_add(
+            tombstone_idx,
+            tombstone_vecs.data(),
+            static_cast<int>(tombstone_ids.size()),
+            tombstone_ids.data()) == GGML_VEC_INDEX_OK);
+        for (size_t i = 0; i < 4; ++i) {
+            CHECK(ggml_vec_index_remove(tombstone_idx, tombstone_ids[i]) == 1);
+        }
+
+        std::array<float, 2> scores{};
+        std::array<uint64_t, 2> out_ids{};
+        CHECK(ggml_vec_index_search(
+            tombstone_idx, seeds[0].data(), 1, /*k=*/2,
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == 10);
+        CHECK(out_ids[1] == 20);
+        ggml_vec_index_free(tombstone_idx);
+    }
+
     // Filtered search only considers ids present in the allowlist. Missing
     // and duplicate filter ids do not produce duplicate result rows.
     {
@@ -1162,6 +1215,16 @@ int main() {
         CHECK(corrupt_delta_loaded == nullptr);
         ggml_vec_index_free(corrupt_delta_loaded);
 
+        std::vector<uint8_t> forged_intermediate_delta = read_file_bytes(delta_path);
+        const size_t first_record_offset = 16;
+        forged_intermediate_delta[first_record_offset + 20] ^= 1;
+        refresh_delta_record_crc(forged_intermediate_delta, first_record_offset);
+        write_file_bytes(corrupt_delta_path, forged_intermediate_delta);
+        auto * forged_intermediate_loaded = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), corrupt_delta_path.c_str());
+        CHECK(forged_intermediate_loaded == nullptr);
+        ggml_vec_index_free(forged_intermediate_loaded);
+
         auto * mismatch = ggml_vec_index_create(kDim, /*bit_width=*/32);
         CHECK(mismatch != nullptr);
         std::vector<float> mismatch_vecs;
@@ -1450,10 +1513,15 @@ int main() {
                                   ("ggml-vector-index-mmap-" + std::to_string(bit_width) + ".tvim");
             const auto mmap_copy_tmp = std::filesystem::temp_directory_path() /
                                        ("ggml-vector-index-mmap-copy-" + std::to_string(bit_width) + ".tvim");
+            const auto mmap_delta_tmp = std::filesystem::temp_directory_path() /
+                                        ("ggml-vector-index-mmap-delta-" + std::to_string(bit_width) + ".tvid");
             const std::string mmap_path = mmap_tmp.string();
             const std::string mmap_copy_path = mmap_copy_tmp.string();
+            const std::string mmap_delta_path = mmap_delta_tmp.string();
             std::filesystem::remove(mmap_path);
             std::filesystem::remove(mmap_copy_path);
+            std::filesystem::remove(mmap_delta_path);
+            std::filesystem::remove(mmap_delta_path + ".lock");
 
             auto * source = ggml_vec_index_create(kDim, bit_width);
             CHECK(source != nullptr);
@@ -1492,6 +1560,13 @@ int main() {
             CHECK(ggml_vec_index_remove(mapped, mmap_ids[0])
                   == GGML_VEC_INDEX_E_INVALID_ARG);
             CHECK(ggml_vec_index_compact(mapped) == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_compact_delta(
+                mapped, mmap_copy_path.c_str(), mmap_delta_path.c_str()) ==
+                GGML_VEC_INDEX_OK);
+            auto * compacted = ggml_vec_index_load_with_delta(
+                mmap_copy_path.c_str(), mmap_delta_path.c_str());
+            CHECK(compacted != nullptr);
+            CHECK(ggml_vec_index_len(compacted) == static_cast<int>(mmap_ids.size()));
             CHECK(ggml_vec_index_write(mapped, mmap_path.c_str())
                   == GGML_VEC_INDEX_E_INVALID_ARG);
             CHECK(ggml_vec_index_write(mapped, mmap_copy_path.c_str()) == GGML_VEC_INDEX_OK);
@@ -1500,11 +1575,14 @@ int main() {
             CHECK(ggml_vec_index_len(copied) == static_cast<int>(mmap_ids.size()));
 
             ggml_vec_index_free(copied);
+            ggml_vec_index_free(compacted);
             ggml_vec_index_free(mapped);
             ggml_vec_index_free(normal);
             ggml_vec_index_free(source);
             std::filesystem::remove(mmap_path);
             std::filesystem::remove(mmap_copy_path);
+            std::filesystem::remove(mmap_delta_path);
+            std::filesystem::remove(mmap_delta_path + ".lock");
         }
     }
 
@@ -1576,6 +1654,33 @@ int main() {
         CHECK(std::fabs(scores[0] - expected) <= std::fabs(expected) * 1e-5f);
 
         ggml_vec_index_free(overflow_idx);
+    }
+
+    // SIMD safety-boundary rounding must not expose non-finite scores.
+    {
+        constexpr int boundary_dim = 16;
+        const std::vector<float> boundary_vector(boundary_dim, 1.0f);
+        const std::vector<float> boundary_query(
+            boundary_dim, FLT_MAX / static_cast<float>(boundary_dim));
+        const uint64_t boundary_id = 123456791ULL;
+
+        for (int bit_width : { 8, 4 }) {
+            auto * boundary_idx = ggml_vec_index_create(boundary_dim, bit_width);
+            CHECK(boundary_idx != nullptr);
+            CHECK(ggml_vec_index_add(
+                boundary_idx, boundary_vector.data(), 1, &boundary_id) ==
+                GGML_VEC_INDEX_OK);
+
+            std::array<float, 1> scores{};
+            std::array<uint64_t, 1> out_ids{};
+            CHECK(ggml_vec_index_search(
+                boundary_idx, boundary_query.data(), 1, /*k=*/1,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == boundary_id);
+            CHECK(std::isfinite(scores[0]));
+
+            ggml_vec_index_free(boundary_idx);
+        }
     }
 
     // Large finite terms can overflow float intermediates even when the final

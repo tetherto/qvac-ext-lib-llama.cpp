@@ -187,7 +187,7 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 # ggml core
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
-option(GGML_VECTOR_INDEX                    "ggml: build vector index library"                ON)
+option(GGML_VECTOR_INDEX                    "ggml: build vector index library"                OFF)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 
 # 3rd party libs / backends

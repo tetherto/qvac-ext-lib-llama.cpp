@@ -226,9 +226,6 @@ if(NOT TARGET ggml::all)
             endif()
         endforeach()
     endif()
-    if(TARGET ggml::vector-index)
-        list(APPEND _ggml_all_targets ggml::vector-index)
-    endif()
     add_library(ggml::all INTERFACE IMPORTED)
     set_target_properties(ggml::all
         PROPERTIES

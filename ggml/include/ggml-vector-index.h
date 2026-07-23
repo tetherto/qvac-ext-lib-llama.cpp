@@ -127,13 +127,15 @@ GGML_API int ggml_vec_index_remove_logged(
 // Read-only.
 GGML_API int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id);
 
-// Placeholder for cache warming / codebook resolution after a bulk add.
-// Currently a no-op. Use `ggml_vec_index_build_ivf` to build ANN state.
+// Compatibility no-op. Existing callers do not need to call this; use
+// `ggml_vec_index_build_ivf` when ANN search preparation is needed.
 GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 
 // Builds an in-memory IVF-flat approximate nearest-neighbor structure. This is
 // not persisted in .tvim files; call again after loading if ANN search is
-// needed. Successful add/remove calls invalidate the IVF structure.
+// needed. This is allowed on mmap-loaded handles because it only builds
+// heap-owned search state. Successful add/remove calls invalidate the IVF
+// structure.
 // `n_lists` is capped to the current index length. `n_iter` controls centroid
 // refinement; 0 uses deterministic initial centroids only.
 GGML_API int ggml_vec_index_build_ivf(
@@ -158,7 +160,8 @@ GGML_API int ggml_vec_index_build_ivf(
 // `query[i] * (q_code * per_vector_scale)`, without expanding the stored
 // matrix back to f32. Callers that want cosine similarity must L2-normalize
 // their vectors before insert AND before query; the index does NOT normalize
-// internally. All query components must be finite.
+// internally. All query components must be finite. SIMD and scalar reduction
+// order can produce small score differences across CPU architectures.
 GGML_API int ggml_vec_index_search(
     const ggml_vec_index_t * idx,
     const float            * queries,
@@ -232,7 +235,9 @@ GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 
 // Loads a v2 .tvim snapshot with its vector section memory-mapped read-only.
 // IDs and quantization scales are copied into memory for lookup and scoring.
-// Mutating APIs return GGML_VEC_INDEX_E_INVALID_ARG on mmap-backed handles.
+// Data-mutating and logged mutation APIs return
+// GGML_VEC_INDEX_E_INVALID_ARG on mmap-backed handles.
+// Heap-only search preparation such as `ggml_vec_index_build_ivf` is allowed.
 // `ggml_vec_index_write` can snapshot mmap-backed handles, but callers must
 // write to a different path than the mapped source file.
 // This loader is snapshot-only: it does not replay .tvid delta logs. Use
@@ -339,10 +344,11 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 //   remove payload: one uint64 id
 //
 // The base snapshot token binds the log to the snapshot state it extends.
-// Record state tokens let loading validate the final replay state and recognize
-// a compacted snapshot when a process crashed before replacing the old delta
-// log. Readers also accept legacy .tvid v1 logs, whose state field is a
-// full-index CRC32C, and v2 logs, whose add payloads always store f32 vectors.
+// Record state tokens let loading validate each replayed record's post-state
+// and recognize a compacted snapshot when a process crashed before replacing
+// the old delta log. Readers also accept legacy .tvid v1 logs, whose state
+// field is a full-index CRC32C, and v2 logs, whose add payloads always store
+// f32 vectors.
 
 #ifdef __cplusplus
 }
