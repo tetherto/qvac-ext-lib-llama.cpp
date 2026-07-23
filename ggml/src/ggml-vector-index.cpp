@@ -306,6 +306,9 @@ static int ggml_vec_index_add_unlocked(
         if (n == 0) {
             return GGML_VEC_INDEX_OK;
         }
+        if (finalize && idx->delta_log_bound) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
 
         // Atomic add: detect duplicates first (against existing AND in-batch),
         // bail before mutating any state.
@@ -416,7 +419,10 @@ int ggml_vec_index_add(
     }
 }
 
-static int ggml_vec_index_remove_unlocked(ggml_vec_index_t * idx, uint64_t id) {
+static int ggml_vec_index_remove_unlocked(
+        ggml_vec_index_t * idx,
+        uint64_t id,
+        bool allow_delta_bound = false) {
     try {
         if (idx == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -435,6 +441,9 @@ static int ggml_vec_index_remove_unlocked(ggml_vec_index_t * idx, uint64_t id) {
         if (!slot_is_active(*idx, slot)) {
             idx->id_to_slot.erase(it);
             return 0;
+        }
+        if (idx->delta_log_bound && !allow_delta_bound) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         remove_state_hash(*idx, slot_state_hash(*idx, slot));
         idx->slot_active[slot] = 0;
@@ -471,6 +480,9 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
 
         const size_t n_slots = idx->slot_to_id.size();
         const size_t n_live = active_count(*idx);
+        if (idx->delta_log_bound) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (n_live == n_slots) {
             return GGML_VEC_INDEX_OK;
         }
@@ -603,11 +615,17 @@ int ggml_vec_index_add_logged(
         }
 
         const DeltaLogFormat format = delta_log_format_for_append(delta_path);
+        if (is_quantized(*idx) &&
+            (format == DeltaLogFormat::v1 || format == DeltaLogFormat::v2)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         const DeltaStateKind state_kind = delta_state_kind_for_format(format);
         const uint32_t base_crc = current_delta_state(*idx, state_kind);
+        const DeltaStateWide base_wide = current_delta_state_wide(*idx);
 
         std::vector<uint8_t> payload;
         if (format != DeltaLogFormat::v3 &&
+            format != DeltaLogFormat::v4 &&
             !build_add_delta_payload_f32(idx, vectors, n, ids, payload)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
@@ -618,7 +636,7 @@ int ggml_vec_index_add_logged(
             return add_status;
         }
         added = true;
-        if (format == DeltaLogFormat::v3 &&
+        if ((format == DeltaLogFormat::v3 || format == DeltaLogFormat::v4) &&
             !build_add_delta_payload_from_slots(idx, base_slot, n, payload)) {
             for (size_t slot = base_slot; slot < idx->slot_to_id.size(); ++slot) {
                 if (slot_is_active(*idx, slot)) {
@@ -631,6 +649,7 @@ int ggml_vec_index_add_logged(
         }
 
         const uint32_t added_state_crc = current_delta_state(*idx, state_kind);
+        const DeltaStateWide added_state_wide = current_delta_state_wide(*idx);
         const DeltaAppendResult append_result = append_delta_record(
             *idx,
             delta_path,
@@ -639,11 +658,14 @@ int ggml_vec_index_add_logged(
             static_cast<uint32_t>(n),
             base_crc,
             added_state_crc,
+            base_wide,
+            added_state_wide,
             payload);
         if (append_result.status != GGML_VEC_INDEX_OK) {
             if (append_result.record_complete) {
                 ++idx->generation;
                 invalidate_ivf(*idx);
+                idx->delta_log_bound = true;
                 added = false;
                 return GGML_VEC_INDEX_OK;
             } else {
@@ -659,6 +681,7 @@ int ggml_vec_index_add_logged(
         }
         ++idx->generation;
         invalidate_ivf(*idx);
+        idx->delta_log_bound = true;
         added = false;
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
@@ -706,10 +729,12 @@ int ggml_vec_index_remove_logged(
         const DeltaLogFormat format = delta_log_format_for_append(delta_path);
         const DeltaStateKind state_kind = delta_state_kind_for_format(format);
         const uint32_t base_crc = current_delta_state(*idx, state_kind);
+        const DeltaStateWide base_wide = current_delta_state_wide(*idx);
         const uint32_t post_remove_crc =
             state_kind == DeltaStateKind::legacy_crc ?
                 index_state_crc32c_after_remove(*idx, id) :
                 index_state_token_after_remove(*idx, id);
+        const DeltaStateWide post_remove_wide = index_state_wide_after_remove(*idx, id);
         const DeltaAppendResult append_result = append_delta_record(
             *idx,
             delta_path,
@@ -718,14 +743,26 @@ int ggml_vec_index_remove_logged(
             1,
             base_crc,
             post_remove_crc,
+            base_wide,
+            post_remove_wide,
             payload);
         if (append_result.status != GGML_VEC_INDEX_OK) {
             if (append_result.record_complete) {
-                return ggml_vec_index_remove_unlocked(idx, id);
+                const int remove_status = ggml_vec_index_remove_unlocked(
+                    idx, id, /*allow_delta_bound=*/true);
+                if (remove_status == 1) {
+                    idx->delta_log_bound = true;
+                }
+                return remove_status;
             }
             return append_result.status;
         }
-        return ggml_vec_index_remove_unlocked(idx, id);
+        const int remove_status = ggml_vec_index_remove_unlocked(
+            idx, id, /*allow_delta_bound=*/true);
+        if (remove_status == 1) {
+            idx->delta_log_bound = true;
+        }
+        return remove_status;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {

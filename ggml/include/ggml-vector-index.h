@@ -15,7 +15,9 @@
 // full duration of any `ggml_vec_index_search_prepared_filtered` call using
 // them; do not free a filter concurrently with a search that uses it.
 //
-// Endianness: persistence format is fixed little-endian.
+// Endianness: persistence format is fixed little-endian. Non-mmap loaders
+// decode little-endian fields into host values; mmap loading requires a
+// little-endian host because vector bytes are read in place.
 
 #include <stdint.h>
 
@@ -109,6 +111,10 @@ GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 // must reload with `ggml_vec_index_load_with_delta` before appending again.
 // If an append error occurs after a complete replayable record is observed,
 // the mutation is treated as committed and the API returns OK.
+// Once a handle participates in delta logging, use logged mutations for
+// content changes; plain add/remove/compact return GGML_VEC_INDEX_E_INVALID_ARG.
+// Adding q4/q8 entries to legacy v1/v2 f32-payload logs is rejected; compact
+// the snapshot+delta pair first so new quantized adds use native-code v4 logs.
 GGML_API int ggml_vec_index_add_logged(
     ggml_vec_index_t * idx,
     const float      * vectors,
@@ -131,11 +137,13 @@ GGML_API int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id);
 // `ggml_vec_index_build_ivf` when ANN search preparation is needed.
 GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 
-// Builds an in-memory IVF-flat approximate nearest-neighbor structure. This is
-// not persisted in .tvim files; call again after loading if ANN search is
-// needed. This is allowed on mmap-loaded handles because it only builds
-// heap-owned search state. Successful add/remove calls invalidate the IVF
-// structure.
+// Builds an in-memory IVF-flat approximate nearest-neighbor structure for the
+// same dot-product score used by exact search. IVF assigns vectors and queries
+// to arithmetic centroids with dot-product scoring; low nprobe values are a
+// recall/latency heuristic, not a metric-correct guarantee. This is not
+// persisted in .tvim files; call again after loading if ANN search is needed.
+// This is allowed on mmap-loaded handles because it only builds heap-owned
+// search state. Successful add/remove calls invalidate the IVF structure.
 // `n_lists` is capped to the current index length. `n_iter` controls centroid
 // refinement; 0 uses deterministic initial centroids only.
 GGML_API int ggml_vec_index_build_ivf(
@@ -208,7 +216,7 @@ GGML_API int ggml_vec_index_search_prepared_filtered(
 // after the most recent mutation. `nprobe` controls how many centroid lists are
 // searched; higher values improve recall and lower the latency win. `nprobe`
 // must be >= 1. If nprobe is greater than the number of built lists, all lists
-// are searched.
+// are searched, so candidate coverage matches exact search.
 GGML_API int ggml_vec_index_search_ivf(
     const ggml_vec_index_t * idx,
     const float            * queries,
@@ -318,23 +326,25 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 // flag bits; they also accept legacy v1 f32 snapshots. Legacy bit_width=8
 // snapshots migrate to q8, while all other legacy widths migrate to f32.
 //
-// Delta log (.tvid version 3, all little-endian):
+// Delta log (.tvid version 4, all little-endian):
 //
 //   file header:
 //     0   4   magic = "TVDL"
-//     4   1   version = 3
+//     4   1   version = 4
 //     5   1   bit_width (4, 8, or 32)
 //     6   2   reserved (zero)
 //     8   4   dim (uint32)
-//     12  4   base snapshot state token
+//     12  4   reserved (zero)
+//     16  32  base snapshot state identity
 //
 //   record header:
 //     0   1   op (1 = add, 2 = remove)
 //     1   3   reserved (zero)
 //     4   4   n (add count; remove uses 1)
 //     8   8   payload bytes
-//     16  4   CRC32C over record header bytes [0, 16), state token, and payload
-//     20  4   state token after applying this record
+//     16  4   CRC32C over record header bytes [0, 16), state identity, and payload
+//     20  4   reserved (zero)
+//     24  32  state identity after applying this record
 //
 //   add payload:
 //     - f32: N uint64 ids, then N*D float32 vectors
@@ -343,12 +353,14 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 //            N*ceil(D/2) packed unsigned nibbles
 //   remove payload: one uint64 id
 //
-// The base snapshot token binds the log to the snapshot state it extends.
-// Record state tokens let loading validate each replayed record's post-state
+// The base snapshot state identity binds the log to the snapshot state it
+// extends. It stores the active count plus the three maintained 64-bit state
+// hash aggregates, with sums maintained modulo 2^64. Record state identities
+// let loading validate each replayed record's post-state
 // and recognize a compacted snapshot when a process crashed before replacing
 // the old delta log. Readers also accept legacy .tvid v1 logs, whose state
-// field is a full-index CRC32C, and v2 logs, whose add payloads always store
-// f32 vectors.
+// field is a full-index CRC32C, v2 logs, whose add payloads always store f32
+// vectors, and v3 logs, whose state field is a 32-bit token.
 
 #ifdef __cplusplus
 }

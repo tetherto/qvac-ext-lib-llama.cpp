@@ -4,9 +4,9 @@
 provided ids with dense vectors, supports exact and approximate top-k search,
 and can persist indexes to disk.
 
-This component is currently standalone. It is not enabled in default builds and
-is not wired into the llama runtime, server, or app paths. Consumers should
-enable it explicitly and link the vector-index target directly.
+This experimental component is currently standalone. It is not enabled in
+default builds and is not wired into the llama runtime, server, or app paths.
+Consumers should enable it explicitly and link the vector-index target directly.
 
 ## Build
 
@@ -106,6 +106,11 @@ use `ggml_vec_index_build_ivf` when approximate-search preparation is needed.
 Call `ggml_vec_index_build_ivf` after loading an index and after successful
 add/remove mutations. IVF state is not persisted in `.tvim` snapshots. Higher
 `nprobe` values search more lists and generally improve recall at higher cost.
+IVF uses the same dot-product score as exact search, assigning vectors and
+queries to arithmetic centroids with dot-product scoring. Low `nprobe` values
+are a recall/latency heuristic; probing all built lists gives exact-search
+candidate coverage. For cosine-like IVF behavior, normalize vectors before
+insertion and normalize queries before search.
 
 ## Persistence
 
@@ -123,7 +128,16 @@ Delta logs are bound to the state of the snapshot they extend. Use one evolving
 writer handle for a given snapshot and delta path pair. If another handle or
 process writes to the same log, stale writers must reload from snapshot plus
 delta before appending again. Loading validates each replayed record against
-its stored post-state token.
+its stored post-state identity.
+
+After a handle has been loaded with a delta log or has used logged mutations,
+content changes must continue through `ggml_vec_index_add_logged`,
+`ggml_vec_index_remove_logged`, or `ggml_vec_index_compact_delta`. Plain
+add/remove/compact calls are rejected on delta-bound handles.
+
+Readers still accept legacy v1/v2 delta logs. New q4/q8 adds are not appended
+to those f32-payload log formats; compact first so subsequent quantized adds use
+native-code v4 records.
 
 ## mmap Loading
 
@@ -140,11 +154,15 @@ On mmap-backed handles:
 - `ggml_vec_index_write` is allowed only when writing to a path different from
   the mapped source file.
 - `ggml_vec_index_compact_delta` is allowed when writing the compacted snapshot
-  to a path different from the mapped source file; it rebuilds the state token
+  to a path different from the mapped source file; it rebuilds the state identity
   before replacing the delta log.
 
 The mmap loader is snapshot-only and does not replay `.tvid` delta logs. Use
 `ggml_vec_index_load_with_delta` when delta replay is needed.
+
+The persisted formats are little-endian. Regular load paths decode fields into
+host values; mmap loading requires a little-endian host because vector bytes are
+read directly from the mapped file.
 
 ## Threading
 

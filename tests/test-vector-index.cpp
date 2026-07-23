@@ -201,14 +201,38 @@ uint32_t crc32c_update_u64(uint32_t crc, uint64_t value) {
     return crc32c_update(crc, bytes, sizeof(bytes));
 }
 
+bool delta_log_is_v4(const std::vector<uint8_t> & bytes) {
+    return bytes.size() > 4 && bytes[4] == 4;
+}
+
+size_t delta_log_header_size(const std::vector<uint8_t> & bytes) {
+    return delta_log_is_v4(bytes) ? 48 : 16;
+}
+
+size_t delta_record_header_size(const std::vector<uint8_t> & bytes) {
+    return delta_log_is_v4(bytes) ? 56 : 24;
+}
+
+size_t delta_record_state_offset(const std::vector<uint8_t> & bytes, size_t record_offset) {
+    return record_offset + (delta_log_is_v4(bytes) ? 24 : 20);
+}
+
+size_t delta_record_payload_offset(const std::vector<uint8_t> & bytes, size_t record_offset) {
+    return record_offset + delta_record_header_size(bytes);
+}
+
 void refresh_delta_record_crc(std::vector<uint8_t> & bytes, size_t record_offset) {
     const uint64_t payload_bytes = read_u64_le_at(bytes, record_offset + 8);
     uint32_t crc = crc32c_update(0xffffffffu, bytes.data() + record_offset, 16);
-    crc = crc32c_update(crc, bytes.data() + record_offset + 20, 4);
+    if (delta_log_is_v4(bytes)) {
+        crc = crc32c_update(crc, bytes.data() + record_offset + 24, 32);
+    } else {
+        crc = crc32c_update(crc, bytes.data() + record_offset + 20, 4);
+    }
     if (payload_bytes != 0) {
         crc = crc32c_update(
             crc,
-            bytes.data() + record_offset + 24,
+            bytes.data() + delta_record_payload_offset(bytes, record_offset),
             static_cast<size_t>(payload_bytes));
     }
     write_u32_le_at(bytes, record_offset + 16, crc ^ 0xffffffffu);
@@ -218,17 +242,87 @@ uint64_t rotl64(uint64_t value, int shift) {
     return (value << shift) | (value >> (64 - shift));
 }
 
+uint32_t float_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
 uint64_t slot_state_hash_f32(uint64_t id, const std::vector<float> & vector) {
     uint32_t crc0 = 0xffffffffu;
     uint32_t crc1 = 0x82f63b78u;
     crc0 = crc32c_update_u64(crc0, id);
     crc1 = crc32c_update_u64(crc1, id ^ 0xa5a5a5a5a5a5a5a5ull);
     for (float value : vector) {
-        uint32_t bits = 0;
-        std::memcpy(&bits, &value, sizeof(bits));
+        const uint32_t bits = float_bits(value);
         crc0 = crc32c_update_u32(crc0, bits);
         crc1 = crc32c_update_u32(crc1, bits ^ 0xa5a5a5a5u);
     }
+    return (static_cast<uint64_t>(crc0 ^ 0xffffffffu) << 32) |
+        static_cast<uint64_t>(crc1 ^ 0xffffffffu);
+}
+
+void quantize_for_state_hash(
+        int bit_width,
+        const std::vector<float> & vector,
+        std::vector<uint8_t> & codes,
+        float & scale) {
+    float max_abs = 0.0f;
+    for (float value : vector) {
+        max_abs = std::max(max_abs, std::fabs(value));
+    }
+
+    if (bit_width == 8) {
+        codes.assign(vector.size(), 0);
+        if (max_abs == 0.0f) {
+            scale = 1.0f;
+            return;
+        }
+        scale = max_abs / 127.0f;
+        for (size_t i = 0; i < vector.size(); ++i) {
+            int q = round_nearest_even(vector[i] / scale);
+            q = std::max(-127, std::min(127, q));
+            codes[i] = static_cast<uint8_t>(static_cast<int8_t>(q));
+        }
+        return;
+    }
+
+    codes.assign((vector.size() + 1) / 2, 0x88);
+    if (max_abs == 0.0f) {
+        scale = 1.0f;
+        return;
+    }
+    scale = max_abs / 7.0f;
+    for (size_t i = 0; i < vector.size(); ++i) {
+        int q = round_nearest_even(vector[i] / scale);
+        q = std::max(-7, std::min(7, q));
+        const uint8_t code = static_cast<uint8_t>(q + 8);
+        uint8_t & byte = codes[i / 2];
+        if ((i & 1) == 0) {
+            byte = static_cast<uint8_t>((byte & 0xf0u) | code);
+        } else {
+            byte = static_cast<uint8_t>((byte & 0x0fu) | (code << 4));
+        }
+    }
+}
+
+uint64_t slot_state_hash_quantized(
+        int bit_width,
+        uint64_t id,
+        const std::vector<float> & vector) {
+    std::vector<uint8_t> codes;
+    float scale = 1.0f;
+    quantize_for_state_hash(bit_width, vector, codes, scale);
+
+    uint32_t crc0 = 0xffffffffu;
+    uint32_t crc1 = 0x82f63b78u;
+    crc0 = crc32c_update_u64(crc0, id);
+    crc1 = crc32c_update_u64(crc1, id ^ 0xa5a5a5a5a5a5a5a5ull);
+    const uint32_t scale_bits = float_bits(scale);
+    crc0 = crc32c_update_u32(crc0, scale_bits);
+    crc1 = crc32c_update_u32(crc1, scale_bits ^ 0xa5a5a5a5u);
+    crc0 = crc32c_update(crc0, codes.data(), codes.size());
+    crc1 = crc32c_update(crc1, codes.data(), codes.size());
     return (static_cast<uint64_t>(crc0 ^ 0xffffffffu) << 32) |
         static_cast<uint64_t>(crc1 ^ 0xffffffffu);
 }
@@ -239,11 +333,50 @@ uint32_t f32_state_token(
         uint64_t hash_xor,
         uint64_t hash_sum,
         uint64_t hash_sum_rot) {
+    const uint32_t bit_width = 32;
+    const uint32_t storage_kind = 1;
     uint32_t crc = 0xffffffffu;
     crc = crc32c_update_u32(crc, static_cast<uint32_t>(dim));
-    crc = crc32c_update_u32(crc, 32);
-    crc = crc32c_update_u32(crc, 1);
+    crc = crc32c_update_u32(crc, bit_width);
+    crc = crc32c_update_u32(crc, storage_kind);
     crc = crc32c_update_u64(crc, static_cast<uint64_t>(n_active));
+    crc = crc32c_update_u64(crc, hash_xor);
+    crc = crc32c_update_u64(crc, hash_sum);
+    crc = crc32c_update_u64(crc, hash_sum_rot);
+    return crc ^ 0xffffffffu;
+}
+
+uint32_t state_token_from_wide_log_header(const std::vector<uint8_t> & bytes, int dim) {
+    CHECK(delta_log_is_v4(bytes));
+    const int bit_width = static_cast<int>(bytes[5]);
+    const uint32_t storage_kind =
+        bit_width == 4 ? 3u : (bit_width == 8 ? 2u : 1u);
+    const size_t state_offset = 16;
+    uint32_t crc = 0xffffffffu;
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(dim));
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(bit_width));
+    crc = crc32c_update_u32(crc, storage_kind);
+    crc = crc32c_update_u64(crc, read_u64_le_at(bytes, state_offset + 0));
+    crc = crc32c_update_u64(crc, read_u64_le_at(bytes, state_offset + 8));
+    crc = crc32c_update_u64(crc, read_u64_le_at(bytes, state_offset + 16));
+    crc = crc32c_update_u64(crc, read_u64_le_at(bytes, state_offset + 24));
+    return crc ^ 0xffffffffu;
+}
+
+uint32_t state_token_from_wide_values(
+        int bit_width,
+        int dim,
+        uint64_t n_active,
+        uint64_t hash_xor,
+        uint64_t hash_sum,
+        uint64_t hash_sum_rot) {
+    const uint32_t storage_kind =
+        bit_width == 4 ? 3u : (bit_width == 8 ? 2u : 1u);
+    uint32_t crc = 0xffffffffu;
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(dim));
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(bit_width));
+    crc = crc32c_update_u32(crc, storage_kind);
+    crc = crc32c_update_u64(crc, n_active);
     crc = crc32c_update_u64(crc, hash_xor);
     crc = crc32c_update_u64(crc, hash_sum);
     crc = crc32c_update_u64(crc, hash_sum_rot);
@@ -1171,6 +1304,12 @@ int main() {
             snapshot_path.c_str(), missing_delta_path.c_str());
         CHECK(base_only != nullptr);
         CHECK(ggml_vec_index_len(base_only) == 2);
+        const uint64_t plain_delta_bound_id = (1ULL << 41) + 6ULL;
+        CHECK(ggml_vec_index_add(
+            base_only, seeds[2].data(), 1, &plain_delta_bound_id) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove(base_only, ids[0]) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_compact(base_only) == GGML_VEC_INDEX_E_INVALID_ARG);
         ggml_vec_index_free(base_only);
 
         const uint64_t reserved_delta_id = UINT64_MAX;
@@ -1208,7 +1347,8 @@ int main() {
         CHECK(out_ids[0] == delta_id);
 
         std::vector<uint8_t> corrupt_delta = read_file_bytes(delta_path);
-        corrupt_delta[16 + 20] ^= 1; // state CRC is covered by record CRC
+        const size_t first_record_offset = delta_log_header_size(corrupt_delta);
+        corrupt_delta[delta_record_state_offset(corrupt_delta, first_record_offset)] ^= 1;
         write_file_bytes(corrupt_delta_path, corrupt_delta);
         auto * corrupt_delta_loaded = ggml_vec_index_load_with_delta(
             snapshot_path.c_str(), corrupt_delta_path.c_str());
@@ -1216,9 +1356,11 @@ int main() {
         ggml_vec_index_free(corrupt_delta_loaded);
 
         std::vector<uint8_t> forged_intermediate_delta = read_file_bytes(delta_path);
-        const size_t first_record_offset = 16;
-        forged_intermediate_delta[first_record_offset + 20] ^= 1;
-        refresh_delta_record_crc(forged_intermediate_delta, first_record_offset);
+        const size_t forged_first_record_offset =
+            delta_log_header_size(forged_intermediate_delta);
+        forged_intermediate_delta[
+            delta_record_state_offset(forged_intermediate_delta, forged_first_record_offset)] ^= 1;
+        refresh_delta_record_crc(forged_intermediate_delta, forged_first_record_offset);
         write_file_bytes(corrupt_delta_path, forged_intermediate_delta);
         auto * forged_intermediate_loaded = ggml_vec_index_load_with_delta(
             snapshot_path.c_str(), corrupt_delta_path.c_str());
@@ -1311,7 +1453,7 @@ int main() {
 
         CHECK(ggml_vec_index_compact_delta(
             base, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_OK);
-        CHECK(std::filesystem::file_size(delta_path) == 16);
+        CHECK(std::filesystem::file_size(delta_path) == 48);
 
         auto * compacted = ggml_vec_index_load_with_delta(
             snapshot_path.c_str(), delta_path.c_str());
@@ -1355,7 +1497,7 @@ int main() {
         CHECK(ggml_vec_index_compact_delta(
             recompact_from_old_log, snapshot_path.c_str(), delta_path.c_str()) ==
             GGML_VEC_INDEX_OK);
-        CHECK(std::filesystem::file_size(delta_path) == 16);
+        CHECK(std::filesystem::file_size(delta_path) == 48);
         const uint64_t post_recompact_id = (1ULL << 41) + 11ULL;
         CHECK(ggml_vec_index_add_logged(
             recompact_from_old_log, seeds[3].data(), 1, &post_recompact_id, delta_path.c_str()) ==
@@ -1896,7 +2038,7 @@ int main() {
         CHECK(std::fesetround(saved_rounding_mode) == 0);
     }
 
-    // Delta replay keeps quantized storage quantized. New v3 logs store native
+    // Delta replay keeps quantized storage quantized. New v4 logs store native
     // q4/q8 rows instead of f32 vectors, while v2 f32-payload logs remain readable.
     {
         for (int bit_width : { 8, 4 }) {
@@ -1931,11 +2073,15 @@ int main() {
                 GGML_VEC_INDEX_OK);
 
             std::vector<uint8_t> delta_bytes = read_file_bytes(delta_path);
-            CHECK(delta_bytes.size() >= 16 + 24);
-            CHECK(delta_bytes[4] == 3);
+            CHECK(delta_bytes.size() >= 48 + 56);
+            CHECK(delta_bytes[4] == 4);
             const size_t old_f32_payload = sizeof(uint64_t) + kDim * sizeof(uint32_t);
-            const size_t old_f32_total = 16 + 24 + old_f32_payload;
-            CHECK(delta_bytes.size() < old_f32_total);
+            const size_t expected_native_payload =
+                sizeof(uint64_t) + sizeof(uint32_t) +
+                (bit_width == 4 ? (kDim + 1) / 2 : kDim);
+            CHECK(read_u64_le_at(delta_bytes, delta_log_header_size(delta_bytes) + 8) ==
+                  expected_native_payload);
+            CHECK(expected_native_payload < old_f32_payload);
 
             auto * replayed_quant = ggml_vec_index_load_with_delta(
                 snapshot_path.c_str(), delta_path.c_str());
@@ -1952,8 +2098,8 @@ int main() {
             CHECK(out_ids[0] == delta_id);
 
             std::vector<uint8_t> corrupt_bytes = delta_bytes;
-            const size_t record_offset = 16;
-            const size_t payload_offset = record_offset + 24;
+            const size_t record_offset = delta_log_header_size(corrupt_bytes);
+            const size_t payload_offset = delta_record_payload_offset(corrupt_bytes, record_offset);
             const size_t scale_offset = payload_offset + sizeof(uint64_t);
             write_u32_le_at(corrupt_bytes, scale_offset, 0);
             refresh_delta_record_crc(corrupt_bytes, record_offset);
@@ -1965,7 +2111,7 @@ int main() {
 
             CHECK(ggml_vec_index_compact_delta(
                 quant_delta, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_OK);
-            CHECK(std::filesystem::file_size(delta_path) == 16);
+            CHECK(std::filesystem::file_size(delta_path) == 48);
             auto * compacted_quant = ggml_vec_index_load_with_delta(
                 snapshot_path.c_str(), delta_path.c_str());
             CHECK(compacted_quant != nullptr);
@@ -1976,16 +2122,63 @@ int main() {
             CHECK(ggml_vec_index_compact_delta(
                 quant_delta, snapshot_path.c_str(), v2_delta_path.c_str()) ==
                 GGML_VEC_INDEX_OK);
-            std::vector<uint8_t> empty_v2 = read_file_bytes(v2_delta_path);
-            CHECK(empty_v2.size() == 16);
+            const std::vector<uint8_t> compacted_v4 = read_file_bytes(v2_delta_path);
+            CHECK(compacted_v4.size() == 48);
+            std::vector<uint8_t> empty_v2(16, 0);
+            std::memcpy(empty_v2.data(), compacted_v4.data(), 12);
             empty_v2[4] = 2;
+            write_u32_le_at(empty_v2, 12, state_token_from_wide_log_header(compacted_v4, kDim));
             write_file_bytes(v2_delta_path, empty_v2);
             const uint64_t v2_delta_id =
                 (1ULL << 42) + static_cast<uint64_t>(bit_width + 200);
             CHECK(ggml_vec_index_add_logged(
                 quant_delta, seeds[1].data(), 1, &v2_delta_id, v2_delta_path.c_str()) ==
-                GGML_VEC_INDEX_OK);
-            CHECK(std::filesystem::file_size(v2_delta_path) == old_f32_total);
+                GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_contains(quant_delta, v2_delta_id) == 0);
+
+            std::vector<uint8_t> v2_payload;
+            append_u64_le(v2_payload, v2_delta_id);
+            for (float value : seeds[1]) {
+                append_f32_le(v2_payload, value);
+            }
+            CHECK(v2_payload.size() == old_f32_payload);
+
+            uint64_t wide_n_active = read_u64_le_at(compacted_v4, 16);
+            uint64_t wide_hash_xor = read_u64_le_at(compacted_v4, 24);
+            uint64_t wide_hash_sum = read_u64_le_at(compacted_v4, 32);
+            uint64_t wide_hash_sum_rot = read_u64_le_at(compacted_v4, 40);
+            const uint64_t v2_hash =
+                slot_state_hash_quantized(bit_width, v2_delta_id, seeds[1]);
+            ++wide_n_active;
+            wide_hash_xor ^= v2_hash;
+            wide_hash_sum += v2_hash;
+            wide_hash_sum_rot += rotl64(v2_hash, 17);
+            const uint32_t v2_post_token = state_token_from_wide_values(
+                bit_width,
+                kDim,
+                wide_n_active,
+                wide_hash_xor,
+                wide_hash_sum,
+                wide_hash_sum_rot);
+
+            std::vector<uint8_t> v2_log = empty_v2;
+            const size_t v2_record_offset = v2_log.size();
+            v2_log.push_back(1); // add
+            v2_log.insert(v2_log.end(), { 0, 0, 0 });
+            append_u32_le(v2_log, 1);
+            append_u64_le(v2_log, v2_payload.size());
+            append_u32_le(v2_log, 0); // record CRC placeholder
+            append_u32_le(v2_log, v2_post_token);
+            v2_log.insert(v2_log.end(), v2_payload.begin(), v2_payload.end());
+            uint32_t v2_record_crc = crc32c_update(
+                0xffffffffu,
+                v2_log.data() + v2_record_offset,
+                16);
+            v2_record_crc = crc32c_update_u32(v2_record_crc, v2_post_token);
+            v2_record_crc = crc32c_update(v2_record_crc, v2_payload.data(), v2_payload.size());
+            write_u32_le_at(v2_log, v2_record_offset + 16, v2_record_crc ^ 0xffffffffu);
+            write_file_bytes(v2_delta_path, v2_log);
+
             auto * replayed_v2 = ggml_vec_index_load_with_delta(
                 snapshot_path.c_str(), v2_delta_path.c_str());
             CHECK(replayed_v2 != nullptr);

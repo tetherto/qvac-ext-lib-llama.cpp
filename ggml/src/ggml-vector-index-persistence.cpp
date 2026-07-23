@@ -727,6 +727,19 @@ static uint32_t index_state_token_from(
     return crc ^ 0xffffffffu;
 }
 
+static DeltaStateWide index_state_wide_from(
+        size_t n_active,
+        uint64_t hash_xor,
+        uint64_t hash_sum,
+        uint64_t hash_sum_rot) {
+    DeltaStateWide state;
+    state.n_active = static_cast<uint64_t>(n_active);
+    state.hash_xor = hash_xor;
+    state.hash_sum = hash_sum;
+    state.hash_sum_rot = hash_sum_rot;
+    return state;
+}
+
 uint32_t index_state_token(const ggml_vec_index & idx) {
     return index_state_token_from(
         idx,
@@ -744,6 +757,27 @@ uint32_t index_state_token_after_remove(const ggml_vec_index & idx, uint64_t id)
     const uint64_t hash = slot_state_hash(idx, it->second);
     return index_state_token_from(
         idx,
+        active_count(idx) - 1,
+        idx.state_hash_xor ^ hash,
+        idx.state_hash_sum - hash,
+        idx.state_hash_sum_rot - rotl64(hash, 17));
+}
+
+DeltaStateWide index_state_wide(const ggml_vec_index & idx) {
+    return index_state_wide_from(
+        active_count(idx),
+        idx.state_hash_xor,
+        idx.state_hash_sum,
+        idx.state_hash_sum_rot);
+}
+
+DeltaStateWide index_state_wide_after_remove(const ggml_vec_index & idx, uint64_t id) {
+    const auto it = idx.id_to_slot.find(id);
+    if (it == idx.id_to_slot.end()) {
+        return index_state_wide(idx);
+    }
+    const uint64_t hash = slot_state_hash(idx, it->second);
+    return index_state_wide_from(
         active_count(idx) - 1,
         idx.state_hash_xor ^ hash,
         idx.state_hash_sum - hash,
@@ -1096,9 +1130,13 @@ static bool open_append_file(const char * path, std::FILE ** out) {
 }
 
 DeltaStateKind delta_state_kind_for_format(DeltaLogFormat format) {
-    return format == DeltaLogFormat::v1 ?
-        DeltaStateKind::legacy_crc :
-        DeltaStateKind::state_token;
+    if (format == DeltaLogFormat::v1) {
+        return DeltaStateKind::legacy_crc;
+    }
+    if (format == DeltaLogFormat::v4) {
+        return DeltaStateKind::wide_state;
+    }
+    return DeltaStateKind::state_token;
 }
 
 static uint8_t delta_log_version_for_format(DeltaLogFormat format) {
@@ -1109,8 +1147,10 @@ static uint8_t delta_log_version_for_format(DeltaLogFormat format) {
             return kTvidVersion;
         case DeltaLogFormat::v3:
             return kTvidVersionV3;
+        case DeltaLogFormat::v4:
+            return kTvidVersionV4;
     }
-    return kTvidVersionV3;
+    return kTvidVersionV4;
 }
 
 static bool delta_log_format_from_version(uint8_t version, DeltaLogFormat & format) {
@@ -1124,6 +1164,10 @@ static bool delta_log_format_from_version(uint8_t version, DeltaLogFormat & form
     }
     if (version == kTvidVersionV3) {
         format = DeltaLogFormat::v3;
+        return true;
+    }
+    if (version == kTvidVersionV4) {
+        format = DeltaLogFormat::v4;
         return true;
     }
     return false;
@@ -1144,8 +1188,61 @@ uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_ki
         index_state_token(idx);
 }
 
+DeltaStateWide current_delta_state_wide(const ggml_vec_index & idx) {
+    return index_state_wide(idx);
+}
+
+static bool delta_state_wide_equal(const DeltaStateWide & a, const DeltaStateWide & b) {
+    return a.n_active == b.n_active &&
+        a.hash_xor == b.hash_xor &&
+        a.hash_sum == b.hash_sum &&
+        a.hash_sum_rot == b.hash_sum_rot;
+}
+
+static bool delta_state_matches(
+        DeltaStateKind state_kind,
+        uint32_t lhs_crc,
+        const DeltaStateWide & lhs_wide,
+        uint32_t rhs_crc,
+        const DeltaStateWide & rhs_wide) {
+    if (state_kind == DeltaStateKind::wide_state) {
+        return delta_state_wide_equal(lhs_wide, rhs_wide);
+    }
+    return lhs_crc == rhs_crc;
+}
+
+static void put_delta_state_wide(uint8_t * dst, const DeltaStateWide & state) {
+    put_u64_le(dst + 0, state.n_active);
+    put_u64_le(dst + 8, state.hash_xor);
+    put_u64_le(dst + 16, state.hash_sum);
+    put_u64_le(dst + 24, state.hash_sum_rot);
+}
+
+static DeltaStateWide get_delta_state_wide(const uint8_t * src) {
+    DeltaStateWide state;
+    state.n_active = get_u64_le(src + 0);
+    state.hash_xor = get_u64_le(src + 8);
+    state.hash_sum = get_u64_le(src + 16);
+    state.hash_sum_rot = get_u64_le(src + 24);
+    return state;
+}
+
+static size_t delta_header_size_for_format(DeltaLogFormat format) {
+    return format == DeltaLogFormat::v4 ? kTvidHeaderSizeV4 : kTvidHeaderSize;
+}
+
+static size_t delta_record_header_size_for_format(DeltaLogFormat format) {
+    return format == DeltaLogFormat::v4 ? kTvidRecordHeaderSizeV4 : kTvidRecordHeaderSize;
+}
+
 static int delta_state_kind_cache_value(DeltaStateKind state_kind) {
-    return state_kind == DeltaStateKind::legacy_crc ? 1 : 2;
+    if (state_kind == DeltaStateKind::legacy_crc) {
+        return 1;
+    }
+    if (state_kind == DeltaStateKind::state_token) {
+        return 2;
+    }
+    return 3;
 }
 
 void invalidate_delta_tail_cache(ggml_vec_index & idx) {
@@ -1158,6 +1255,7 @@ static bool get_cached_delta_tail(
         DeltaStateKind state_kind,
         uint64_t expected_size,
         uint32_t & tail_crc,
+        DeltaStateWide & tail_wide,
         uint64_t & complete_size) {
     if (!idx.delta_tail_cache.valid ||
         idx.delta_tail_cache.state_kind != delta_state_kind_cache_value(state_kind) ||
@@ -1175,6 +1273,7 @@ static bool get_cached_delta_tail(
     }
 
     tail_crc = idx.delta_tail_cache.tail_crc;
+    tail_wide = idx.delta_tail_cache.tail_wide;
     complete_size = idx.delta_tail_cache.complete_size;
     return true;
 }
@@ -1183,7 +1282,8 @@ static void update_delta_tail_cache(
         ggml_vec_index & idx,
         const char * path,
         DeltaStateKind state_kind,
-        uint32_t tail_crc) {
+        uint32_t tail_crc,
+        const DeltaStateWide & tail_wide) {
     std::string path_key;
     DeltaFileStamp stamp;
     if (!delta_log_path_key(path, path_key) ||
@@ -1196,6 +1296,7 @@ static void update_delta_tail_cache(
     idx.delta_tail_cache.path_key = path_key;
     idx.delta_tail_cache.state_kind = delta_state_kind_cache_value(state_kind);
     idx.delta_tail_cache.tail_crc = tail_crc;
+    idx.delta_tail_cache.tail_wide = tail_wide;
     idx.delta_tail_cache.complete_size = stamp.size;
     idx.delta_tail_cache.stamp = stamp;
 }
@@ -1206,15 +1307,15 @@ DeltaLogFormat delta_log_format_for_append(const char * path) {
         if (!filesystem_path_from_utf8(path, fs_path) ||
             !std::filesystem::exists(fs_path) ||
             std::filesystem::file_size(fs_path) == 0) {
-            return DeltaLogFormat::v3;
+            return DeltaLogFormat::v4;
         }
         std::ifstream f(fs_path, std::ios::binary);
         if (!f.is_open()) {
-            return DeltaLogFormat::v3;
+            return DeltaLogFormat::v4;
         }
         uint8_t header[kTvidHeaderSize] = {};
         f.read(reinterpret_cast<char *>(header), sizeof(header));
-        DeltaLogFormat format = DeltaLogFormat::v3;
+        DeltaLogFormat format = DeltaLogFormat::v4;
         if (f &&
             std::memcmp(header, kTvidMagic, 4) == 0 &&
             delta_log_format_from_version(header[4], format)) {
@@ -1222,20 +1323,25 @@ DeltaLogFormat delta_log_format_for_append(const char * path) {
         }
     } catch (...) {
     }
-    return DeltaLogFormat::v3;
+    return DeltaLogFormat::v4;
 }
 
 static void fill_delta_header(
         const ggml_vec_index & idx,
         DeltaLogFormat format,
         uint32_t base_crc,
+        const DeltaStateWide & base_wide,
         uint8_t * header) {
-    std::memset(header, 0, kTvidHeaderSize);
+    std::memset(header, 0, delta_header_size_for_format(format));
     std::memcpy(header, kTvidMagic, 4);
     header[4] = delta_log_version_for_format(format);
     header[5] = static_cast<uint8_t>(idx.bit_width);
     put_u32_le(header + 8, static_cast<uint32_t>(idx.dim));
-    put_u32_le(header + 12, base_crc);
+    if (format == DeltaLogFormat::v4) {
+        put_delta_state_wide(header + 16, base_wide);
+    } else {
+        put_u32_le(header + 12, base_crc);
+    }
 }
 
 static bool validate_delta_header(
@@ -1244,23 +1350,26 @@ static bool validate_delta_header(
         uint64_t & size,
         DeltaLogFormat & format,
         DeltaStateKind & state_kind,
-        uint32_t & base_crc) {
+        uint32_t & base_crc,
+        DeltaStateWide & base_wide) {
     std::filesystem::path fs_path;
     if (!filesystem_path_from_utf8(path, fs_path)) {
         return false;
     }
     if (!std::filesystem::exists(fs_path)) {
         size = 0;
-        format = DeltaLogFormat::v3;
-        state_kind = DeltaStateKind::state_token;
+        format = DeltaLogFormat::v4;
+        state_kind = DeltaStateKind::wide_state;
         base_crc = current_delta_state(idx, state_kind);
+        base_wide = current_delta_state_wide(idx);
         return true;
     }
     size = static_cast<uint64_t>(std::filesystem::file_size(fs_path));
     if (size == 0) {
-        format = DeltaLogFormat::v3;
-        state_kind = DeltaStateKind::state_token;
+        format = DeltaLogFormat::v4;
+        state_kind = DeltaStateKind::wide_state;
         base_crc = current_delta_state(idx, state_kind);
+        base_wide = current_delta_state_wide(idx);
         return true;
     }
     if (size < kTvidHeaderSize) {
@@ -1285,7 +1394,24 @@ static bool validate_delta_header(
         return false;
     }
     state_kind = delta_state_kind_for_format(format);
-    base_crc = get_u32_le(header + 12);
+    if (size < delta_header_size_for_format(format)) {
+        return false;
+    }
+    if (format == DeltaLogFormat::v4) {
+        uint8_t wide_state[kTvidWideStateSize] = {};
+        f.read(reinterpret_cast<char *>(wide_state), sizeof(wide_state));
+        if (!f) {
+            return false;
+        }
+        base_crc = 0;
+        base_wide = get_delta_state_wide(wide_state);
+        if (get_u32_le(header + 12) != 0) {
+            return false;
+        }
+    } else {
+        base_crc = get_u32_le(header + 12);
+        base_wide = {};
+    }
     return true;
 }
 
@@ -1311,6 +1437,7 @@ static bool inspect_delta_log_tail(
         const char * path,
         const ggml_vec_index & idx,
         uint32_t & last_state_crc,
+        DeltaStateWide & last_state_wide,
         uint64_t & complete_size) {
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
     g_test_delta_tail_scan_count.fetch_add(1);
@@ -1331,34 +1458,55 @@ static bool inspect_delta_log_tail(
 
     uint8_t header[kTvidHeaderSize] = {};
     f.read(reinterpret_cast<char *>(header), sizeof(header));
+    DeltaLogFormat format = DeltaLogFormat::v4;
     DeltaStateKind state_kind = DeltaStateKind::state_token;
     if (!f ||
         std::memcmp(header, kTvidMagic, 4) != 0 ||
-        !delta_state_kind_from_version(header[4], state_kind) ||
+        !delta_log_format_from_version(header[4], format) ||
         header[5] != static_cast<uint8_t>(idx.bit_width) ||
         header[6] != 0 ||
         header[7] != 0 ||
         get_u32_le(header + 8) != static_cast<uint32_t>(idx.dim)) {
         return false;
     }
+    state_kind = delta_state_kind_for_format(format);
+    const size_t header_size = delta_header_size_for_format(format);
+    if (file_size < header_size) {
+        return false;
+    }
 
-    last_state_crc = get_u32_le(header + 12);
-    complete_size = kTvidHeaderSize;
-    uint64_t offset = kTvidHeaderSize;
+    if (format == DeltaLogFormat::v4) {
+        uint8_t wide_state[kTvidWideStateSize] = {};
+        f.read(reinterpret_cast<char *>(wide_state), sizeof(wide_state));
+        if (!f || get_u32_le(header + 12) != 0) {
+            return false;
+        }
+        last_state_crc = 0;
+        last_state_wide = get_delta_state_wide(wide_state);
+    } else {
+        last_state_crc = get_u32_le(header + 12);
+        last_state_wide = {};
+    }
+    complete_size = header_size;
+    uint64_t offset = header_size;
     while (offset < file_size) {
-        uint8_t record[kTvidRecordHeaderSize] = {};
-        f.read(reinterpret_cast<char *>(record), sizeof(record));
-        if (f.gcount() != static_cast<std::streamsize>(sizeof(record))) {
+        uint8_t record[kTvidRecordHeaderSizeV4] = {};
+        const size_t record_size = delta_record_header_size_for_format(format);
+        f.read(reinterpret_cast<char *>(record), static_cast<std::streamsize>(record_size));
+        if (f.gcount() != static_cast<std::streamsize>(record_size)) {
             return true;
         }
-        offset += kTvidRecordHeaderSize;
+        offset += record_size;
 
         const uint8_t op = record[0];
         const uint64_t payload_bytes = get_u64_le(record + 8);
         const uint32_t expected_crc = get_u32_le(record + 16);
-        const uint32_t state_crc = get_u32_le(record + 20);
+        const uint32_t state_crc = format == DeltaLogFormat::v4 ? 0 : get_u32_le(record + 20);
+        const DeltaStateWide state_wide =
+            format == DeltaLogFormat::v4 ? get_delta_state_wide(record + 24) : DeltaStateWide{};
         if (record[1] != 0 || record[2] != 0 || record[3] != 0 ||
-            (op != kTvidOpAdd && op != kTvidOpRemove)) {
+            (op != kTvidOpAdd && op != kTvidOpRemove) ||
+            (format == DeltaLogFormat::v4 && get_u32_le(record + 20) != 0)) {
             return false;
         }
         if (payload_bytes > file_size - offset) {
@@ -1381,7 +1529,11 @@ static bool inspect_delta_log_tail(
         offset += payload_bytes;
 
         uint32_t crc = crc32c_update(0xffffffffu, record, 16);
-        crc = crc32c_update(crc, record + 20, 4);
+        if (format == DeltaLogFormat::v4) {
+            crc = crc32c_update(crc, record + 24, kTvidWideStateSize);
+        } else {
+            crc = crc32c_update(crc, record + 20, 4);
+        }
         if (!payload.empty()) {
             crc = crc32c_update(crc, payload.data(), payload.size());
         }
@@ -1389,6 +1541,7 @@ static bool inspect_delta_log_tail(
             return false;
         }
         last_state_crc = state_crc;
+        last_state_wide = state_wide;
         complete_size = offset;
     }
     return true;
@@ -1397,17 +1550,20 @@ static bool inspect_delta_log_tail(
 static bool delta_log_ends_at_state(
         const char * path,
         const ggml_vec_index & idx,
-        uint32_t state_crc) {
+        DeltaStateKind state_kind,
+        uint32_t state_crc,
+        const DeltaStateWide & state_wide) {
     try {
         std::filesystem::path fs_path;
         if (!filesystem_path_from_utf8(path, fs_path)) {
             return false;
         }
         uint32_t tail_crc = 0;
+        DeltaStateWide tail_wide;
         uint64_t complete_size = 0;
-        return inspect_delta_log_tail(path, idx, tail_crc, complete_size) &&
+        return inspect_delta_log_tail(path, idx, tail_crc, tail_wide, complete_size) &&
             complete_size == static_cast<uint64_t>(std::filesystem::file_size(fs_path)) &&
-            tail_crc == state_crc;
+            delta_state_matches(state_kind, tail_crc, tail_wide, state_crc, state_wide);
     } catch (...) {
         return false;
     }
@@ -1416,24 +1572,28 @@ static bool delta_log_ends_at_state(
 static bool delta_log_matches_index_state(const char * path, const ggml_vec_index & idx) {
     uint64_t size = 0;
     uint32_t base_crc = 0;
-    DeltaLogFormat format = DeltaLogFormat::v3;
-    DeltaStateKind state_kind = DeltaStateKind::state_token;
-    if (!validate_delta_header(path, idx, size, format, state_kind, base_crc)) {
+    DeltaStateWide base_wide;
+    DeltaLogFormat format = DeltaLogFormat::v4;
+    DeltaStateKind state_kind = DeltaStateKind::wide_state;
+    if (!validate_delta_header(path, idx, size, format, state_kind, base_crc, base_wide)) {
         return false;
     }
 
     const uint32_t current_crc = current_delta_state(idx, state_kind);
+    const DeltaStateWide current_wide = current_delta_state_wide(idx);
     if (size == 0) {
-        return base_crc == current_crc;
+        return delta_state_matches(state_kind, base_crc, base_wide, current_crc, current_wide);
     }
 
     uint32_t tail_crc = 0;
+    DeltaStateWide tail_wide;
     uint64_t complete_size = 0;
-    if (!get_cached_delta_tail(idx, path, state_kind, size, tail_crc, complete_size) &&
-        !inspect_delta_log_tail(path, idx, tail_crc, complete_size)) {
+    if (!get_cached_delta_tail(idx, path, state_kind, size, tail_crc, tail_wide, complete_size) &&
+        !inspect_delta_log_tail(path, idx, tail_crc, tail_wide, complete_size)) {
         return false;
     }
-    return complete_size == size && tail_crc == current_crc;
+    return complete_size == size &&
+        delta_state_matches(state_kind, tail_crc, tail_wide, current_crc, current_wide);
 }
 
 DeltaAppendResult append_delta_record(
@@ -1444,6 +1604,8 @@ DeltaAppendResult append_delta_record(
         uint32_t n,
         uint32_t base_crc_for_new_log,
         uint32_t state_crc,
+        const DeltaStateWide & base_wide_for_new_log,
+        const DeltaStateWide & state_wide,
         const std::vector<uint8_t> & payload) {
     if (delta_path == nullptr) {
         return { GGML_VEC_INDEX_E_INVALID_ARG, false };
@@ -1455,10 +1617,17 @@ DeltaAppendResult append_delta_record(
 
     uint64_t old_size = 0;
     uint32_t existing_base_crc = 0;
+    DeltaStateWide existing_base_wide;
     DeltaLogFormat existing_format = format;
     DeltaStateKind existing_state_kind = delta_state_kind_for_format(format);
     if (!validate_delta_header(
-            delta_path, idx, old_size, existing_format, existing_state_kind, existing_base_crc)) {
+            delta_path,
+            idx,
+            old_size,
+            existing_format,
+            existing_state_kind,
+            existing_base_crc,
+            existing_base_wide)) {
         return { GGML_VEC_INDEX_E_IO, false };
     }
     if (old_size != 0) {
@@ -1467,13 +1636,19 @@ DeltaAppendResult append_delta_record(
     const DeltaStateKind state_kind = delta_state_kind_for_format(format);
     if (old_size != 0) {
         uint32_t tail_crc = 0;
+        DeltaStateWide tail_wide;
         uint64_t complete_size = 0;
         if (!get_cached_delta_tail(
-                idx, delta_path, state_kind, old_size, tail_crc, complete_size) &&
-            !inspect_delta_log_tail(delta_path, idx, tail_crc, complete_size)) {
+                idx, delta_path, state_kind, old_size, tail_crc, tail_wide, complete_size) &&
+            !inspect_delta_log_tail(delta_path, idx, tail_crc, tail_wide, complete_size)) {
             return { GGML_VEC_INDEX_E_IO, false };
         }
-        if (tail_crc != base_crc_for_new_log) {
+        if (!delta_state_matches(
+                state_kind,
+                tail_crc,
+                tail_wide,
+                base_crc_for_new_log,
+                base_wide_for_new_log)) {
             return { GGML_VEC_INDEX_E_IO, false };
         }
         if (complete_size != old_size) {
@@ -1484,8 +1659,19 @@ DeltaAppendResult append_delta_record(
             invalidate_delta_tail_cache(idx);
         }
         if (idx.delta_log_rebase_pending &&
-            idx.delta_log_rebase_crc == base_crc_for_new_log &&
-            existing_base_crc != base_crc_for_new_log) {
+            idx.delta_log_rebase_state_kind == delta_state_kind_cache_value(state_kind) &&
+            delta_state_matches(
+                state_kind,
+                idx.delta_log_rebase_crc,
+                idx.delta_log_rebase_wide,
+                base_crc_for_new_log,
+                base_wide_for_new_log) &&
+            !delta_state_matches(
+                state_kind,
+                existing_base_crc,
+                existing_base_wide,
+                base_crc_for_new_log,
+                base_wide_for_new_log)) {
             // The snapshot already includes this log's records (e.g. crash after
             // compacting the snapshot but before replacing the old delta log).
             if (!truncate_file_to(delta_path, 0)) {
@@ -1495,6 +1681,8 @@ DeltaAppendResult append_delta_record(
             invalidate_delta_tail_cache(idx);
             idx.delta_log_rebase_pending = false;
             idx.delta_log_rebase_crc = 0;
+            idx.delta_log_rebase_wide = {};
+            idx.delta_log_rebase_state_kind = 0;
         }
     }
     test_wait_after_delta_validate();
@@ -1513,9 +1701,10 @@ DeltaAppendResult append_delta_record(
         close_file();
         const bool truncated = truncate_file_to(delta_path, old_size);
         const bool record_complete =
-            !truncated && delta_log_ends_at_state(delta_path, idx, state_crc);
+            !truncated && delta_log_ends_at_state(
+                delta_path, idx, state_kind, state_crc, state_wide);
         if (record_complete) {
-            update_delta_tail_cache(idx, delta_path, state_kind, state_crc);
+            update_delta_tail_cache(idx, delta_path, state_kind, state_crc, state_wide);
         } else if (truncated) {
             invalidate_delta_tail_cache(idx);
         }
@@ -1526,26 +1715,36 @@ DeltaAppendResult append_delta_record(
     };
 
     if (old_size == 0) {
-        uint8_t header[kTvidHeaderSize] = {};
-        fill_delta_header(idx, format, base_crc_for_new_log, header);
-        if (!write_bytes(f, header, sizeof(header))) {
+        uint8_t header[kTvidHeaderSizeV4] = {};
+        const size_t header_size = delta_header_size_for_format(format);
+        fill_delta_header(idx, format, base_crc_for_new_log, base_wide_for_new_log, header);
+        if (!write_bytes(f, header, header_size)) {
             return fail_io();
         }
     }
 
-    uint8_t record[kTvidRecordHeaderSize] = {};
+    uint8_t record[kTvidRecordHeaderSizeV4] = {};
+    const size_t record_size = delta_record_header_size_for_format(format);
     record[0] = op;
     put_u32_le(record + 4, n);
     put_u64_le(record + 8, static_cast<uint64_t>(payload.size()));
-    put_u32_le(record + 20, state_crc);
+    if (format == DeltaLogFormat::v4) {
+        put_delta_state_wide(record + 24, state_wide);
+    } else {
+        put_u32_le(record + 20, state_crc);
+    }
     uint32_t crc = crc32c_update(0xffffffffu, record, 16);
-    crc = crc32c_update(crc, record + 20, 4);
+    if (format == DeltaLogFormat::v4) {
+        crc = crc32c_update(crc, record + 24, kTvidWideStateSize);
+    } else {
+        crc = crc32c_update(crc, record + 20, 4);
+    }
     if (!payload.empty()) {
         crc = crc32c_update(crc, payload.data(), payload.size());
     }
     put_u32_le(record + 16, crc ^ 0xffffffffu);
 
-    if (!write_bytes(f, record, sizeof(record)) ||
+    if (!write_bytes(f, record, record_size) ||
         (!payload.empty() && !write_bytes(f, payload.data(), payload.size())) ||
         !flush_and_sync(f)) {
         return fail_io();
@@ -1555,9 +1754,10 @@ DeltaAppendResult append_delta_record(
     if (close_result != 0 || !fsync_parent_dir(delta_path)) {
         const bool truncated = truncate_file_to(delta_path, old_size);
         const bool record_complete =
-            !truncated && delta_log_ends_at_state(delta_path, idx, state_crc);
+            !truncated && delta_log_ends_at_state(
+                delta_path, idx, state_kind, state_crc, state_wide);
         if (record_complete) {
-            update_delta_tail_cache(idx, delta_path, state_kind, state_crc);
+            update_delta_tail_cache(idx, delta_path, state_kind, state_crc, state_wide);
         } else if (truncated) {
             invalidate_delta_tail_cache(idx);
         }
@@ -1566,7 +1766,7 @@ DeltaAppendResult append_delta_record(
             record_complete,
         };
     }
-    update_delta_tail_cache(idx, delta_path, state_kind, state_crc);
+    update_delta_tail_cache(idx, delta_path, state_kind, state_crc, state_wide);
     return { GGML_VEC_INDEX_OK, true };
 }
 
@@ -1588,9 +1788,10 @@ static int write_empty_delta_log_unlocked(const ggml_vec_index & idx, const char
             return GGML_VEC_INDEX_E_IO;
         };
 
-        uint8_t header[kTvidHeaderSize] = {};
-        fill_delta_header(idx, DeltaLogFormat::v3, index_state_token(idx), header);
-        if (!write_bytes(temp.stream, header, sizeof(header)) ||
+        uint8_t header[kTvidHeaderSizeV4] = {};
+        const DeltaStateWide state_wide = index_state_wide(idx);
+        fill_delta_header(idx, DeltaLogFormat::v4, 0, state_wide, header);
+        if (!write_bytes(temp.stream, header, kTvidHeaderSizeV4) ||
             !flush_and_sync(temp.stream)) {
             return fail_io();
         }
@@ -1634,7 +1835,7 @@ static bool snapshot_matches_index(const ggml_vec_index & idx, const char * snap
         loaded->dim == idx.dim &&
         loaded->bit_width == idx.bit_width &&
         active_count(*loaded) == active_count(idx) &&
-        index_state_token(*loaded) == index_state_token(idx);
+        delta_state_wide_equal(index_state_wide(*loaded), index_state_wide(idx));
 }
 
 bool validate_logged_add_args(
@@ -2526,7 +2727,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
             }
         }
 
-        // Mmap handles are read-only snapshot views. Delta state tokens are not
+        // Mmap handles are read-only snapshot views. Delta state identities are not
         // needed unless a mutable handle participates in delta-log operations.
         idx->read_only_mmap = true;
         idx->mapped_source_path = path;
@@ -2847,6 +3048,8 @@ bool replay_remove_delta(ggml_vec_index_t * idx, uint32_t n, const std::vector<u
     if (!is_valid_id(id)) {
         return false;
     }
+    // Writers only append remove records for live ids; a miss means the log no
+    // longer matches the snapshot lineage and should be treated as corruption.
     return ggml_vec_index_remove(idx, id) == 1;
 }
 
@@ -2869,8 +3072,8 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
     }
     uint8_t header[kTvidHeaderSize] = {};
     f.read(reinterpret_cast<char *>(header), sizeof(header));
-    DeltaLogFormat format = DeltaLogFormat::v3;
-    DeltaStateKind state_kind = DeltaStateKind::state_token;
+    DeltaLogFormat format = DeltaLogFormat::v4;
+    DeltaStateKind state_kind = DeltaStateKind::wide_state;
     if (!f ||
         std::memcmp(header, kTvidMagic, 4) != 0 ||
         !delta_log_format_from_version(header[4], format) ||
@@ -2881,31 +3084,53 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
         return false;
     }
     state_kind = delta_state_kind_for_format(format);
+    const size_t header_size = delta_header_size_for_format(format);
+    if (file_size < header_size) {
+        return false;
+    }
 
-    const uint32_t base_crc = get_u32_le(header + 12);
+    uint32_t base_crc = 0;
+    DeltaStateWide base_wide;
+    if (format == DeltaLogFormat::v4) {
+        uint8_t wide_state[kTvidWideStateSize] = {};
+        f.read(reinterpret_cast<char *>(wide_state), sizeof(wide_state));
+        if (!f || get_u32_le(header + 12) != 0) {
+            return false;
+        }
+        base_wide = get_delta_state_wide(wide_state);
+    } else {
+        base_crc = get_u32_le(header + 12);
+    }
     const uint32_t snapshot_crc = current_delta_state(*idx, state_kind);
-    const bool apply_records = snapshot_crc == base_crc;
+    const DeltaStateWide snapshot_wide = current_delta_state_wide(*idx);
+    const bool apply_records =
+        delta_state_matches(state_kind, snapshot_crc, snapshot_wide, base_crc, base_wide);
     uint32_t last_state_crc = base_crc;
+    DeltaStateWide last_state_wide = base_wide;
 
-    uint64_t offset = kTvidHeaderSize;
+    uint64_t offset = header_size;
     while (offset < file_size) {
-        uint8_t record[kTvidRecordHeaderSize] = {};
-        f.read(reinterpret_cast<char *>(record), sizeof(record));
+        uint8_t record[kTvidRecordHeaderSizeV4] = {};
+        const size_t record_size = delta_record_header_size_for_format(format);
+        f.read(reinterpret_cast<char *>(record), static_cast<std::streamsize>(record_size));
         if (f.gcount() == 0 && f.eof()) {
             break;
         }
-        if (f.gcount() != static_cast<std::streamsize>(sizeof(record))) {
+        if (f.gcount() != static_cast<std::streamsize>(record_size)) {
             break; // torn trailing record header
         }
-        offset += kTvidRecordHeaderSize;
+        offset += record_size;
 
         const uint8_t op = record[0];
         const uint32_t n = get_u32_le(record + 4);
         const uint64_t payload_bytes = get_u64_le(record + 8);
         const uint32_t expected_crc = get_u32_le(record + 16);
-        const uint32_t state_crc = get_u32_le(record + 20);
+        const uint32_t state_crc = format == DeltaLogFormat::v4 ? 0 : get_u32_le(record + 20);
+        const DeltaStateWide state_wide =
+            format == DeltaLogFormat::v4 ? get_delta_state_wide(record + 24) : DeltaStateWide{};
         if (record[1] != 0 || record[2] != 0 || record[3] != 0 ||
-            (op != kTvidOpAdd && op != kTvidOpRemove)) {
+            (op != kTvidOpAdd && op != kTvidOpRemove) ||
+            (format == DeltaLogFormat::v4 && get_u32_le(record + 20) != 0)) {
             return false;
         }
         if (payload_bytes > file_size - offset) {
@@ -2919,7 +3144,11 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
         offset += payload_bytes;
 
         uint32_t crc = crc32c_update(0xffffffffu, record, 16);
-        crc = crc32c_update(crc, record + 20, 4);
+        if (format == DeltaLogFormat::v4) {
+            crc = crc32c_update(crc, record + 24, kTvidWideStateSize);
+        } else {
+            crc = crc32c_update(crc, record + 20, 4);
+        }
         if (!payload.empty()) {
             crc = crc32c_update(crc, payload.data(), payload.size());
         }
@@ -2929,7 +3158,8 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
 
         if (apply_records) {
             if (op == kTvidOpAdd) {
-                const bool replayed = format == DeltaLogFormat::v3 ?
+                const bool replayed =
+                    (format == DeltaLogFormat::v3 || format == DeltaLogFormat::v4) ?
                     replay_add_delta_native(idx, n, payload) :
                     replay_add_delta_f32(idx, n, payload);
                 if (!replayed) {
@@ -2940,22 +3170,40 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
                     return false;
                 }
             }
-            if (state_kind == DeltaStateKind::state_token &&
-                index_state_token(*idx) != state_crc) {
+            if (!delta_state_matches(
+                    state_kind,
+                    current_delta_state(*idx, state_kind),
+                    current_delta_state_wide(*idx),
+                    state_crc,
+                    state_wide)) {
                 return false;
             }
         }
         last_state_crc = state_crc;
+        last_state_wide = state_wide;
     }
 
     if (apply_records) {
-        return current_delta_state(*idx, state_kind) == last_state_crc;
+        return delta_state_matches(
+            state_kind,
+            current_delta_state(*idx, state_kind),
+            current_delta_state_wide(*idx),
+            last_state_crc,
+            last_state_wide);
     }
-    if (snapshot_crc != last_state_crc) {
+    if (!delta_state_matches(
+            state_kind,
+            snapshot_crc,
+            snapshot_wide,
+            last_state_crc,
+            last_state_wide)) {
         return false;
     }
-    idx->delta_log_rebase_pending = base_crc != snapshot_crc;
+    idx->delta_log_rebase_pending = !delta_state_matches(
+        state_kind, base_crc, base_wide, snapshot_crc, snapshot_wide);
     idx->delta_log_rebase_crc = snapshot_crc;
+    idx->delta_log_rebase_wide = snapshot_wide;
+    idx->delta_log_rebase_state_kind = delta_state_kind_cache_value(state_kind);
     return true;
 }
 
@@ -2999,6 +3247,7 @@ ggml_vec_index_t * ggml_vec_index_load_with_delta(
         if (!replay_delta_log(idx.get(), delta_path)) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
+        idx->delta_log_bound = true;
         g_last_load_error = GGML_VEC_INDEX_OK;
         return idx.release();
     } catch (const std::bad_alloc &) {
@@ -3045,10 +3294,14 @@ int ggml_vec_index_compact_delta(
         update_delta_tail_cache(
             *idx,
             delta_path,
-            DeltaStateKind::state_token,
-            index_state_token(*idx));
+            DeltaStateKind::wide_state,
+            0,
+            index_state_wide(*idx));
         idx->delta_log_rebase_pending = false;
         idx->delta_log_rebase_crc = 0;
+        idx->delta_log_rebase_wide = {};
+        idx->delta_log_rebase_state_kind = 0;
+        idx->delta_log_bound = true;
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
@@ -3056,4 +3309,3 @@ int ggml_vec_index_compact_delta(
         return GGML_VEC_INDEX_E_INTERNAL;
     }
 }
-

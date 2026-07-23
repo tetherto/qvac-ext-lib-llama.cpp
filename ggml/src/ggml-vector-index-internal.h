@@ -61,10 +61,14 @@ inline constexpr uint8_t  kTvidMagic[4]   = { 'T', 'V', 'D', 'L' };
 inline constexpr uint8_t  kTvidVersionV1  = 1;
 inline constexpr uint8_t  kTvidVersion    = 2;
 inline constexpr uint8_t  kTvidVersionV3  = 3;
+inline constexpr uint8_t  kTvidVersionV4  = 4;
 inline constexpr uint8_t  kTvidOpAdd      = 1;
 inline constexpr uint8_t  kTvidOpRemove   = 2;
 inline constexpr size_t   kTvidHeaderSize = 16;
+inline constexpr size_t   kTvidHeaderSizeV4 = 48;
 inline constexpr size_t   kTvidRecordHeaderSize = 24;
+inline constexpr size_t   kTvidRecordHeaderSizeV4 = 56;
+inline constexpr size_t   kTvidWideStateSize = 32;
 inline constexpr size_t   kMaxIndexLen    = static_cast<size_t>(std::numeric_limits<int>::max());
 
 static_assert(sizeof(float) == sizeof(uint32_t), "ggml-vector-index requires float32");
@@ -98,11 +102,19 @@ struct DeltaFileStamp {
 #endif
 };
 
+struct DeltaStateWide {
+    uint64_t n_active = 0;
+    uint64_t hash_xor = 0;
+    uint64_t hash_sum = 0;
+    uint64_t hash_sum_rot = 0;
+};
+
 struct DeltaTailCache {
     bool valid = false;
     std::string path_key;
     int state_kind = 0;
     uint32_t tail_crc = 0;
+    DeltaStateWide tail_wide;
     uint64_t complete_size = 0;
     DeltaFileStamp stamp;
 };
@@ -133,8 +145,11 @@ struct ggml_vec_index {
     uint64_t generation = 0;
     uint64_t filter_cookie = 0;
     bool read_only_mmap = false;
+    bool delta_log_bound = false;
     bool delta_log_rebase_pending = false;
     uint32_t delta_log_rebase_crc = 0;
+    DeltaStateWide delta_log_rebase_wide;
+    int delta_log_rebase_state_kind = 0;
     uint64_t state_hash_xor = 0;
     uint64_t state_hash_sum = 0;
     uint64_t state_hash_sum_rot = 0;
@@ -176,12 +191,14 @@ struct ggml_vec_index_filter {
 enum class DeltaStateKind {
     legacy_crc,
     state_token,
+    wide_state,
 };
 
 enum class DeltaLogFormat {
     v1,
     v2,
     v3,
+    v4,
 };
 
 struct DeltaAppendResult {
@@ -257,10 +274,13 @@ void remove_state_hash(ggml_vec_index & idx, uint64_t hash);
 void rebuild_state_hash(ggml_vec_index & idx);
 uint32_t index_state_token(const ggml_vec_index & idx);
 uint32_t index_state_token_after_remove(const ggml_vec_index & idx, uint64_t id);
+DeltaStateWide index_state_wide(const ggml_vec_index & idx);
+DeltaStateWide index_state_wide_after_remove(const ggml_vec_index & idx, uint64_t id);
 
 DeltaStateKind delta_state_kind_for_format(DeltaLogFormat format);
 DeltaLogFormat delta_log_format_for_append(const char * path);
 uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_kind);
+DeltaStateWide current_delta_state_wide(const ggml_vec_index & idx);
 void invalidate_delta_tail_cache(ggml_vec_index & idx);
 bool validate_logged_add_args(
     const ggml_vec_index_t * idx,
@@ -291,4 +311,6 @@ DeltaAppendResult append_delta_record(
     uint32_t n,
     uint32_t base_crc_for_new_log,
     uint32_t state_crc,
+    const DeltaStateWide & base_wide_for_new_log,
+    const DeltaStateWide & state_wide,
     const std::vector<uint8_t> & payload);
