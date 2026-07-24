@@ -106,8 +106,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer(
-        ggml_metal_library_t lib, bool use_mm) {
-    const char * base = use_mm ? "kernel_lightning_indexer_mm" : "kernel_lightning_indexer";
+        ggml_metal_library_t lib, ggml_type type_k, int n_heads, bool use_mm) {
+    char base[256];
+    snprintf(base, sizeof(base), "kernel_lightning_indexer%s_%s_h%d",
+        use_mm ? "_mm" : "", ggml_type_name(type_k), n_heads);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
     if (!res.pipeline) {

@@ -1264,24 +1264,68 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
             return false;
         case GGML_OP_LIGHTNING_INDEXER:
-            return has_simdgroup_reduction &&
-                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F16 &&
-                   op->type == GGML_TYPE_F32 &&
-                   op->src[0]->ne[0] > 0 && op->src[0]->ne[0] <= max_dispatch_dim &&
-                   op->src[0]->ne[1] > 0 && op->src[0]->ne[1] <= max_dispatch_dim &&
-                   op->src[0]->ne[2] > 0 && op->src[0]->ne[2] <= max_dispatch_dim &&
-                   op->src[0]->ne[3] > 0 && op->src[0]->ne[3] <= max_dispatch_dim &&
-                   op->src[1]->ne[0] == op->src[0]->ne[0] && op->src[1]->ne[1] == 1 &&
-                   op->src[1]->ne[2] > 0 && op->src[1]->ne[2] <= max_dispatch_dim &&
-                   op->src[1]->ne[3] == op->src[0]->ne[3] &&
-                   op->src[2]->ne[0] == op->src[0]->ne[1] && op->src[2]->ne[1] == op->src[0]->ne[2] &&
-                   op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == op->src[0]->ne[3] &&
-                   op->src[3]->ne[0] == op->src[1]->ne[2] && op->src[3]->ne[1] == op->src[0]->ne[2] &&
-                   op->src[3]->ne[2] == 1 && op->src[3]->ne[3] > 0 &&
-                   op->src[2]->ne[3] % op->src[3]->ne[3] == 0 &&
-                   op->ne[0] == op->src[1]->ne[2] && op->ne[1] == op->src[0]->ne[2] &&
-                   op->ne[2] == 1 && op->ne[3] == op->src[0]->ne[3];
+            {
+                const struct ggml_tensor * q       = op->src[0];
+                const struct ggml_tensor * k       = op->src[1];
+                const struct ggml_tensor * weights = op->src[2];
+                const struct ggml_tensor * mask    = op->src[3];
+
+                size_t k_align;
+                switch (k->type) {
+                    case GGML_TYPE_F32:
+                        k_align = 16;
+                        break;
+                    case GGML_TYPE_F16:
+                        k_align = 8;
+                        break;
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q4_0:
+                        k_align = 2;
+                        break;
+                    default:
+                        return false;
+                }
+
+                const bool aligned =
+                    (uintptr_t) q->data       % sizeof(float) == 0 &&
+                    (uintptr_t) k->data       % k_align       == 0 &&
+                    (uintptr_t) weights->data % sizeof(float) == 0 &&
+                    (uintptr_t) mask->data    % sizeof(ggml_fp16_t) == 0 &&
+                    (uintptr_t) op->data      % sizeof(float) == 0 &&
+                    q->nb[1] % sizeof(float) == 0 && q->nb[2] % sizeof(float) == 0 && q->nb[3] % sizeof(float) == 0 &&
+                    k->nb[2] % k_align == 0 && k->nb[3] % k_align == 0 &&
+                    weights->nb[1] % sizeof(float) == 0 && weights->nb[3] % sizeof(float) == 0 &&
+                    mask->nb[1] % sizeof(ggml_fp16_t) == 0 && mask->nb[3] % sizeof(ggml_fp16_t) == 0 &&
+                    op->nb[1] % sizeof(float) == 0 && op->nb[3] % sizeof(float) == 0;
+
+                return has_simdgroup_reduction && aligned &&
+                       q->type == GGML_TYPE_F32 &&
+                       weights->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F16 &&
+                       op->type == GGML_TYPE_F32 &&
+                       q->ne[0] == 128 && (q->ne[1] == 32 || q->ne[1] == 64) &&
+                       q->ne[2] > 0 && q->ne[2] <= max_dispatch_dim &&
+                       q->ne[3] > 0 && q->ne[3] <= max_dispatch_dim &&
+                       k->ne[0] == q->ne[0] && k->ne[1] == 1 &&
+                       k->ne[2] > 0 && k->ne[2] <= max_dispatch_dim &&
+                       k->ne[3] == q->ne[3] &&
+                       weights->ne[0] == q->ne[1] && weights->ne[1] == q->ne[2] &&
+                       weights->ne[2] == 1 && weights->ne[3] == q->ne[3] &&
+                       mask->ne[0] == k->ne[2] && mask->ne[1] == q->ne[2] &&
+                       mask->ne[2] == 1 && mask->ne[3] > 0 &&
+                       weights->ne[3] % mask->ne[3] == 0 &&
+                       op->ne[0] == k->ne[2] && op->ne[1] == q->ne[2] &&
+                       op->ne[2] == 1 && op->ne[3] == q->ne[3] &&
+                       q->nb[0] == ggml_type_size(q->type) &&
+                       k->ne[0] % ggml_blck_size(k->type) == 0 &&
+                       k->nb[0] == ggml_type_size(k->type) &&
+                       k->nb[1] == ggml_row_size(k->type, k->ne[0]) &&
+                       weights->nb[0] == ggml_type_size(weights->type) &&
+                       mask->nb[0] == ggml_type_size(mask->type) &&
+                       op->nb[0] == ggml_type_size(op->type);
+            }
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->ne[1] > 0 && op->src[0]->ne[1] <= max_grid_id &&
                    op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&

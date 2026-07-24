@@ -2556,7 +2556,8 @@ typedef decltype(kernel_sum_rows_impl<float, float>) kernel_sum_rows_t;
 template [[host_name("kernel_sum_rows_f32_f32")]]   kernel kernel_sum_rows_t kernel_sum_rows_impl<float,  float>;
 template [[host_name("kernel_sum_rows_f32_f32_4")]] kernel kernel_sum_rows_t kernel_sum_rows_impl<float4, float>;
 
-kernel void kernel_lightning_indexer(
+template<short NH, typename k_t, short epb, void (*deq_k_t4)(device const k_t *, short, thread float4 &)>
+kernel void kernel_lightning_indexer_impl(
         constant ggml_metal_kargs_lightning_indexer & args,
         device const char * q,
         device const char * k,
@@ -2579,20 +2580,24 @@ kernel void kernel_lightning_indexer(
     }
 
     float sumf = 0.0f;
-    for (int64_t ih = tpitg.x; ih < args.n_heads; ih += ntg.x) {
-        volatile float qk = 0.0f;
-        for (int64_t ie = 0; ie < args.n_embd; ++ie) {
-            const device float * q_ptr = (device const float *) (
-                q + ie*args.q_nb0 + ih*args.q_nb1 + it*args.q_nb2 + is*args.q_nb3);
-            const device float * k_ptr = (device const float *) (
-                k + ie*args.k_nb0 + ik*args.k_nb2 + is*args.k_nb3);
-            qk = qk + (*q_ptr) * (*k_ptr);
+    device const k_t * k_row = (device const k_t *) (
+        k + ik*args.k_nb2 + is*args.k_nb3);
+    for (int64_t ih = tpitg.x; ih < NH; ih += ntg.x) {
+        float qk = 0.0f;
+        FOR_UNROLL (short ie = 0; ie < 128; ie += 4) {
+            float4 kv;
+            deq_k_t4(k_row + ie/epb, (ie%epb)/4, kv);
+
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                const device float * q_ptr = (device const float *) (
+                    q + (ie + i)*args.q_nb0 + ih*args.q_nb1 + it*args.q_nb2 + is*args.q_nb3);
+                qk += (*q_ptr) * kv[i];
+            }
         }
 
         const device float * w_ptr = (device const float *) (
             weights + ih*args.weights_nb0 + it*args.weights_nb1 + is*args.weights_nb3);
-        volatile float product = max(qk, 0.0f) * (*w_ptr);
-        sumf += product;
+        sumf += max(qk, 0.0f) * (*w_ptr);
     }
 
     sumf = simd_sum(sumf);
@@ -2614,7 +2619,8 @@ kernel void kernel_lightning_indexer(
     }
 }
 
-kernel void kernel_lightning_indexer_mm(
+template<short NH, typename k_t, short epb, void (*deq_k_t4)(device const k_t *, short, thread half4 &)>
+kernel void kernel_lightning_indexer_mm_impl(
         constant ggml_metal_kargs_lightning_indexer & args,
         device const char * q,
         device const char * k,
@@ -2626,7 +2632,6 @@ kernel void kernel_lightning_indexer_mm(
         ushort tiitg [[thread_index_in_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr int NE = 128;
-    constexpr int NH = 64;
     constexpr int NK = 32;
     constexpr int NB = 32;
 
@@ -2638,8 +2643,8 @@ kernel void kernel_lightning_indexer_mm(
     threadgroup half  * sk = sq + NH*NB;
     threadgroup float * sc = (threadgroup float *) shmem;
 
-    simdgroup_float8x8 mc[8];
-    FOR_UNROLL (short ih = 0; ih < 8; ++ih) {
+    simdgroup_float8x8 mc[NH/8];
+    FOR_UNROLL (short ih = 0; ih < NH/8; ++ih) {
         mc[ih] = make_filled_simdgroup_matrix<float, 8>(0.0f);
     }
 
@@ -2658,9 +2663,11 @@ kernel void kernel_lightning_indexer_mm(
             const int ik = i / (NB/4);
             const int ie = 4*(i % (NB/4));
             if (ik0 + ik < args.n_kv) {
-                const device float4 * k_ptr = (device const float4 *) (
-                    k + (ib + ie)*args.k_nb0 + (ik0 + ik)*args.k_nb2 + is*args.k_nb3);
-                *(threadgroup half4 *) (sk + ik*NB + ie) = half4(*k_ptr);
+                device const k_t * k_row = (device const k_t *) (
+                    k + (ik0 + ik)*args.k_nb2 + is*args.k_nb3);
+                half4 kv;
+                deq_k_t4(k_row + (ib + ie)/epb, ((ib + ie)%epb)/4, kv);
+                *(threadgroup half4 *) (sk + ik*NB + ie) = kv;
             } else {
                 *(threadgroup half4 *) (sk + ik*NB + ie) = half4(0.0f);
             }
@@ -2668,7 +2675,7 @@ kernel void kernel_lightning_indexer_mm(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        FOR_UNROLL (short ih = 0; ih < 8; ++ih) {
+        FOR_UNROLL (short ih = 0; ih < NH/8; ++ih) {
             FOR_UNROLL (short ie = 0; ie < NB; ie += 8) {
                 simdgroup_half8x8 mq;
                 simdgroup_half8x8 mk;
@@ -2682,16 +2689,16 @@ kernel void kernel_lightning_indexer_mm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    FOR_UNROLL (short ih = 0; ih < 8; ++ih) {
+    FOR_UNROLL (short ih = 0; ih < NH/8; ++ih) {
         simdgroup_store(mc[ih], sc + (8*ih)*NK + 8*sgitg, NK);
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int ik_local = tiitg % NK;
-    const int ih0 = (tiitg / NK) * 16;
+    const int ih0 = (tiitg / NK) * (NH/4);
     float sumf = 0.0f;
-    FOR_UNROLL (short ih = 0; ih < 16; ++ih) {
+    FOR_UNROLL (short ih = 0; ih < NH/4; ++ih) {
         const device float * w_ptr = (device const float *) (
             weights + (ih0 + ih)*args.weights_nb0 + it*args.weights_nb1 + is*args.weights_nb3);
         sumf += max(sc[(ih0 + ih)*NK + ik_local], 0.0f) * (*w_ptr);
@@ -2715,6 +2722,32 @@ kernel void kernel_lightning_indexer_mm(
         }
     }
 }
+
+typedef decltype(kernel_lightning_indexer_impl<64, float4, 4, dequantize_f32_t4>) kernel_lightning_indexer_t;
+typedef decltype(kernel_lightning_indexer_mm_impl<64, float4, 4, dequantize_f32_t4>) kernel_lightning_indexer_mm_t;
+
+#define template_lightning_indexer(type_name, k_t, epb, deq_k_t4, n_heads) \
+    template [[host_name("kernel_lightning_indexer_" #type_name "_h" #n_heads)]] \
+    kernel kernel_lightning_indexer_t \
+    kernel_lightning_indexer_impl<n_heads, k_t, epb, deq_k_t4>; \
+    template [[host_name("kernel_lightning_indexer_mm_" #type_name "_h" #n_heads)]] \
+    kernel kernel_lightning_indexer_mm_t \
+    kernel_lightning_indexer_mm_impl<n_heads, k_t, epb, deq_k_t4>;
+
+#define template_lightning_indexer_heads(type_name, k_t, epb, deq_k_t4) \
+    template_lightning_indexer(type_name, k_t, epb, deq_k_t4, 32) \
+    template_lightning_indexer(type_name, k_t, epb, deq_k_t4, 64)
+
+template_lightning_indexer_heads(f32,  float4,     4,  dequantize_f32_t4)
+template_lightning_indexer_heads(f16,  half4,      4,  dequantize_f16_t4)
+template_lightning_indexer_heads(q8_0, block_q8_0, 32, dequantize_q8_0_t4)
+template_lightning_indexer_heads(q5_1, block_q5_1, 32, dequantize_q5_1_t4)
+template_lightning_indexer_heads(q5_0, block_q5_0, 32, dequantize_q5_0_t4)
+template_lightning_indexer_heads(q4_1, block_q4_1, 32, dequantize_q4_1_t4)
+template_lightning_indexer_heads(q4_0, block_q4_0, 32, dequantize_q4_0_t4)
+
+#undef template_lightning_indexer_heads
+#undef template_lightning_indexer
 
 kernel void kernel_dsv4_hc_post(
         constant ggml_metal_kargs_dsv4_hc_post & args,

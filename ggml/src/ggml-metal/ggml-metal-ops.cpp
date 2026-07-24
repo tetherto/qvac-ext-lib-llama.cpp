@@ -2631,29 +2631,33 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(args.n_kv <= std::numeric_limits<int>::max());
     GGML_ASSERT(args.n_streams <= std::numeric_limits<int>::max());
 
+    ggml_metal_buffer_id bid_q       = ggml_metal_get_buffer_id(q);
+    ggml_metal_buffer_id bid_k       = ggml_metal_get_buffer_id(k);
+    ggml_metal_buffer_id bid_weights = ggml_metal_get_buffer_id(weights);
+    ggml_metal_buffer_id bid_mask    = ggml_metal_get_buffer_id(mask);
+    ggml_metal_buffer_id bid_dst     = ggml_metal_get_buffer_id(op);
+
     constexpr int mm_nk = 32;
-    constexpr size_t mm_smem = 64*mm_nk*sizeof(float);
+    const size_t mm_smem = q->ne[1]*mm_nk*sizeof(float);
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    const bool q_vector_aligned =
+        bid_q.offs % 16 == 0 &&
+        q->nb[1] % 16 == 0 && q->nb[2] % 16 == 0 && q->nb[3] % 16 == 0;
     const bool use_mm =
         props_dev->has_simdgroup_mm &&
-        q->ne[0] == 128 && q->ne[1] == 64 &&
-        k->ne[0] == 128 && weights->ne[0] == 64 &&
-        q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) &&
-        q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 &&
-        weights->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F16 &&
-        op->type == GGML_TYPE_F32 &&
+        q_vector_aligned &&
         mm_smem <= props_dev->max_theadgroup_memory_size;
 
-    auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer(lib, use_mm);
+    auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer(lib, k->type, q->ne[1], use_mm);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),       1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(k),       2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 3);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask),    4);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),      5);
+    ggml_metal_encoder_set_buffer  (enc, bid_q,       1);
+    ggml_metal_encoder_set_buffer  (enc, bid_k,       2);
+    ggml_metal_encoder_set_buffer  (enc, bid_weights, 3);
+    ggml_metal_encoder_set_buffer  (enc, bid_mask,    4);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst,     5);
 
     if (use_mm) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, mm_smem, 0);
