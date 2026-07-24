@@ -40,6 +40,12 @@ std::atomic<bool> g_test_truncate_fail{ false };
 std::atomic<bool> g_test_parent_fsync_fail{ false };
 std::atomic<int> g_test_delta_append_wait_target{ 0 };
 std::atomic<int> g_test_delta_append_waiters{ 0 };
+std::atomic<int> g_test_delta_lock_attempts{ 0 };
+std::atomic<int> g_test_delta_append_active_waiters{ 0 };
+std::atomic<int> g_test_delta_append_max_active_waiters{ 0 };
+std::atomic<bool> g_test_delta_append_hold{ false };
+std::atomic<bool> g_test_delta_append_release{ false };
+std::atomic<int> g_test_sidecar_lock_probe{ -1 };
 std::atomic<int> g_test_load_with_delta_pause_ms{ 0 };
 std::atomic<int> g_test_load_with_delta_waiters{ 0 };
 std::atomic<int64_t> g_test_delta_tail_scan_count{ 0 };
@@ -75,11 +81,26 @@ void test_wait_after_delta_validate() {
     }
 
     g_test_delta_append_waiters.fetch_add(1);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-    while (g_test_delta_append_waiters.load() < target &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const int active = g_test_delta_append_active_waiters.fetch_add(1) + 1;
+    int observed_max = g_test_delta_append_max_active_waiters.load();
+    while (active > observed_max &&
+           !g_test_delta_append_max_active_waiters.compare_exchange_weak(
+               observed_max, active)) {
     }
+    if (g_test_delta_append_hold.load()) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!g_test_delta_append_release.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    } else {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (g_test_delta_append_waiters.load() < target &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    g_test_delta_append_active_waiters.fetch_sub(1);
 }
 
 void test_wait_after_load_with_delta_snapshot() {
@@ -567,11 +588,34 @@ void ggml_vec_index_test_set_parent_fsync_fail(int fail) {
 
 void ggml_vec_index_test_set_delta_append_wait_target(int target) {
     g_test_delta_append_waiters.store(0);
+    g_test_delta_lock_attempts.store(0);
+    g_test_delta_append_active_waiters.store(0);
+    g_test_delta_append_max_active_waiters.store(0);
+    g_test_delta_append_hold.store(false);
+    g_test_delta_append_release.store(false);
+    g_test_sidecar_lock_probe.store(-1);
     g_test_delta_append_wait_target.store(target);
 }
 
 int ggml_vec_index_test_get_delta_append_waiters(void) {
     return g_test_delta_append_waiters.load();
+}
+
+void ggml_vec_index_test_set_delta_append_hold(int hold) {
+    g_test_delta_append_release.store(false);
+    g_test_delta_append_hold.store(hold != 0);
+}
+
+void ggml_vec_index_test_release_delta_append(void) {
+    g_test_delta_append_release.store(true);
+}
+
+int ggml_vec_index_test_get_sidecar_lock_probe(void) {
+    return g_test_sidecar_lock_probe.load();
+}
+
+int ggml_vec_index_test_get_delta_append_max_active_waiters(void) {
+    return g_test_delta_append_max_active_waiters.load();
 }
 
 void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms) {
@@ -1068,9 +1112,8 @@ static std::shared_ptr<std::mutex> delta_log_process_mutex_for(const std::string
     static std::mutex registry_mutex;
     static std::unordered_map<std::string, std::weak_ptr<std::mutex>> registry;
 
-    // POSIX advisory locks are process-owned, so same-process threads need an
-    // in-memory companion lock. Key it by file identity so hardlink aliases
-    // serialize on the same lock.
+    // Keep a same-process companion lock keyed by file identity so hardlink
+    // aliases serialize on every supported locking implementation.
     std::lock_guard<std::mutex> guard(registry_mutex);
     const auto found = registry.find(key);
     if (found != registry.end()) {
@@ -1098,108 +1141,78 @@ class DeltaLogLock {
 public:
     explicit DeltaLogLock(const char * path) {
         std::filesystem::path fs_path;
-        if (!filesystem_path_from_utf8(path, fs_path)) {
-            return;
-        }
-        std::error_code exists_ec;
-        const bool data_exists = std::filesystem::exists(fs_path, exists_ec);
-        if (exists_ec) {
-            return;
-        }
-        std::filesystem::path open_path = fs_path;
         std::filesystem::path sidecar_lock_path;
-        if (!data_exists) {
-            if (!delta_lock_path(path, sidecar_lock_path)) {
-                return;
-            }
-            open_path = sidecar_lock_path;
-            process_mutex = delta_log_process_mutex_for(
-                std::string("path:") + sidecar_lock_path.u8string());
-            process_lock = std::unique_lock<std::mutex>(*process_mutex);
+        if (!filesystem_path_from_utf8(path, fs_path) ||
+            !delta_lock_path(path, sidecar_lock_path)) {
+            return;
         }
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        const int test_lock_attempt = g_test_delta_lock_attempts.fetch_add(1) + 1;
+#endif
+        sidecar_process_mutex = delta_log_process_mutex_for(
+            std::string("path:") + sidecar_lock_path.u8string());
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        if (g_test_delta_append_hold.load() && test_lock_attempt == 2) {
+            const bool acquired = sidecar_process_mutex->try_lock();
+            g_test_sidecar_lock_probe.store(acquired ? 0 : 1);
+            if (acquired) {
+                sidecar_process_mutex->unlock();
+            }
+        }
+#endif
+        sidecar_process_lock = std::unique_lock<std::mutex>(*sidecar_process_mutex);
 #ifdef _WIN32
-        file = CreateFileW(
-            open_path.wstring().c_str(),
+        sidecar_file = CreateFileW(
+            sidecar_lock_path.wstring().c_str(),
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
             nullptr);
-        if (file == INVALID_HANDLE_VALUE) {
+        if (sidecar_file == INVALID_HANDLE_VALUE) {
             return;
         }
-        BY_HANDLE_FILE_INFORMATION info = {};
-        if (GetFileInformationByHandle(file, &info) == 0) {
-            CloseHandle(file);
-            file = INVALID_HANDLE_VALUE;
-            return;
-        }
-        const uint64_t file_index =
-            (static_cast<uint64_t>(info.nFileIndexHigh) << 32) |
-            static_cast<uint64_t>(info.nFileIndexLow);
-        if (data_exists) {
-            process_mutex = delta_log_process_mutex_for(
-                std::string("win:") +
-                std::to_string(info.dwVolumeSerialNumber) + ":" +
-                std::to_string(file_index));
-            process_lock = std::unique_lock<std::mutex>(*process_mutex);
-        }
-        lock_overlapped.Offset = MAXDWORD;
-        lock_overlapped.OffsetHigh = 0x7fffffffu;
-        if (LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &lock_overlapped) == 0) {
-            CloseHandle(file);
-            file = INVALID_HANDLE_VALUE;
+        sidecar_lock_overlapped.Offset = MAXDWORD;
+        sidecar_lock_overlapped.OffsetHigh = 0x7fffffffu;
+        if (LockFileEx(
+                sidecar_file,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &sidecar_lock_overlapped) == 0) {
             return;
         }
 #else
-        fd = ::open(open_path.c_str(), data_exists ? O_RDWR : (O_CREAT | O_RDWR), 0666);
-        if (fd < 0) {
+        sidecar_fd = ::open(sidecar_lock_path.c_str(), O_CREAT | O_RDWR, 0666);
+        if (sidecar_fd < 0) {
             return;
         }
-        struct stat st;
-        if (::fstat(fd, &st) != 0) {
-            ::close(fd);
-            fd = -1;
-            return;
-        }
-        if (data_exists) {
-            process_mutex = delta_log_process_mutex_for(
-                std::string("posix:") +
-                std::to_string(static_cast<uint64_t>(st.st_dev)) + ":" +
-                std::to_string(static_cast<uint64_t>(st.st_ino)));
-            process_lock = std::unique_lock<std::mutex>(*process_mutex);
-        }
-        struct flock lock = {};
-        lock.l_type = F_WRLCK;
-        lock.l_whence = SEEK_SET;
-        while (::fcntl(fd, F_SETLKW, &lock) != 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            ::close(fd);
-            fd = -1;
+        if (!lock_fd(sidecar_fd)) {
             return;
         }
 #endif
+
+        std::error_code exists_ec;
+        const bool data_exists = std::filesystem::exists(fs_path, exists_ec);
+        if (exists_ec) {
+            return;
+        }
+        if (data_exists && !lock_data_file(fs_path)) {
+            return;
+        }
         locked = true;
     }
 
     ~DeltaLogLock() {
-        if (!locked) {
-            return;
-        }
 #ifdef _WIN32
-        UnlockFileEx(file, 0, 1, 0, &lock_overlapped);
-        CloseHandle(file);
-        file = INVALID_HANDLE_VALUE;
+        close_file(data_file, data_lock_overlapped);
+        close_file(sidecar_file, sidecar_lock_overlapped);
 #else
-        struct flock lock = {};
-        lock.l_type = F_UNLCK;
-        lock.l_whence = SEEK_SET;
-        (void) ::fcntl(fd, F_SETLK, &lock);
-        ::close(fd);
-        fd = -1;
+        close_fd(data_fd);
+        close_fd(sidecar_fd);
 #endif
     }
 
@@ -1208,14 +1221,100 @@ public:
     }
 
 private:
-    std::shared_ptr<std::mutex> process_mutex;
-    std::unique_lock<std::mutex> process_lock;
+#ifdef _WIN32
+    bool lock_data_file(const std::filesystem::path & path) {
+        data_file = CreateFileW(
+            path.wstring().c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (data_file == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        BY_HANDLE_FILE_INFORMATION info = {};
+        if (GetFileInformationByHandle(data_file, &info) == 0) {
+            return false;
+        }
+        const uint64_t file_index =
+            (static_cast<uint64_t>(info.nFileIndexHigh) << 32) |
+            static_cast<uint64_t>(info.nFileIndexLow);
+        data_process_mutex = delta_log_process_mutex_for(
+            std::string("win:") +
+            std::to_string(info.dwVolumeSerialNumber) + ":" +
+            std::to_string(file_index));
+        data_process_lock = std::unique_lock<std::mutex>(*data_process_mutex);
+        data_lock_overlapped.Offset = MAXDWORD;
+        data_lock_overlapped.OffsetHigh = 0x7fffffffu;
+        return LockFileEx(
+            data_file,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &data_lock_overlapped) != 0;
+    }
+
+    static void close_file(HANDLE & file, OVERLAPPED & overlapped) {
+        if (file == INVALID_HANDLE_VALUE) {
+            return;
+        }
+        (void) UnlockFileEx(file, 0, 1, 0, &overlapped);
+        CloseHandle(file);
+        file = INVALID_HANDLE_VALUE;
+    }
+#else
+    static bool lock_fd(int fd) {
+        while (::flock(fd, LOCK_EX) != 0) {
+            if (errno != EINTR) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool lock_data_file(const std::filesystem::path & path) {
+        data_fd = ::open(path.c_str(), O_RDWR);
+        if (data_fd < 0) {
+            return false;
+        }
+        struct stat st;
+        if (::fstat(data_fd, &st) != 0) {
+            return false;
+        }
+        data_process_mutex = delta_log_process_mutex_for(
+            std::string("posix:") +
+            std::to_string(static_cast<uint64_t>(st.st_dev)) + ":" +
+            std::to_string(static_cast<uint64_t>(st.st_ino)));
+        data_process_lock = std::unique_lock<std::mutex>(*data_process_mutex);
+        return lock_fd(data_fd);
+    }
+
+    static void close_fd(int & fd) {
+        if (fd < 0) {
+            return;
+        }
+        (void) ::flock(fd, LOCK_UN);
+        (void) ::close(fd);
+        fd = -1;
+    }
+#endif
+
+    std::shared_ptr<std::mutex> sidecar_process_mutex;
+    std::shared_ptr<std::mutex> data_process_mutex;
+    std::unique_lock<std::mutex> sidecar_process_lock;
+    std::unique_lock<std::mutex> data_process_lock;
     bool locked = false;
 #ifdef _WIN32
-    HANDLE file = INVALID_HANDLE_VALUE;
-    OVERLAPPED lock_overlapped = {};
+    HANDLE sidecar_file = INVALID_HANDLE_VALUE;
+    HANDLE data_file = INVALID_HANDLE_VALUE;
+    OVERLAPPED sidecar_lock_overlapped = {};
+    OVERLAPPED data_lock_overlapped = {};
 #else
-    int fd = -1;
+    int sidecar_fd = -1;
+    int data_fd = -1;
 #endif
 };
 
@@ -1948,12 +2047,11 @@ DeltaAppendResult append_delta_record(
             idx.delta_log_rebase_state_kind = 0;
         }
     }
-    test_wait_after_delta_validate();
-
     std::FILE * f = nullptr;
     if (!open_append_file(delta_path, &f)) {
         return { GGML_VEC_INDEX_E_IO, false };
     }
+    test_wait_after_delta_validate();
     auto close_file = [&]() {
         if (f != nullptr) {
             std::fclose(f);

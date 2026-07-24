@@ -18,6 +18,10 @@ extern "C" void ggml_vec_index_test_set_truncate_fail(int fail);
 extern "C" void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 extern "C" void ggml_vec_index_test_set_delta_append_wait_target(int target);
 extern "C" int ggml_vec_index_test_get_delta_append_waiters(void);
+extern "C" void ggml_vec_index_test_set_delta_append_hold(int hold);
+extern "C" void ggml_vec_index_test_release_delta_append(void);
+extern "C" int ggml_vec_index_test_get_sidecar_lock_probe(void);
+extern "C" int ggml_vec_index_test_get_delta_append_max_active_waiters(void);
 extern "C" void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
 extern "C" void ggml_vec_index_test_reset_delta_tail_scan_count(void);
 extern "C" int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
@@ -797,27 +801,43 @@ int main() {
     CHECK(shared_b != nullptr);
     const uint64_t shared_id_a = 501;
     const uint64_t shared_id_b = 502;
-    std::atomic<bool> start_shared_appends{ false };
     int status_a = GGML_VEC_INDEX_E_INTERNAL;
     int status_b = GGML_VEC_INDEX_E_INTERNAL;
     ggml_vec_index_test_set_delta_append_wait_target(2);
+    ggml_vec_index_test_set_delta_append_hold(1);
     std::thread thread_a([&]() {
-        while (!start_shared_appends.load()) {
-            std::this_thread::yield();
-        }
         status_a = ggml_vec_index_add_logged(
             shared_a, logged_vector.data(), 1, &shared_id_a, shared_delta_path.c_str());
     });
+    const auto first_append_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (ggml_vec_index_test_get_delta_append_waiters() < 1 &&
+           std::chrono::steady_clock::now() < first_append_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool first_append_waiting =
+        ggml_vec_index_test_get_delta_append_waiters() == 1;
+    if (!first_append_waiting) {
+        ggml_vec_index_test_release_delta_append();
+        thread_a.join();
+        CHECK(first_append_waiting);
+    }
     std::thread thread_b([&]() {
-        while (!start_shared_appends.load()) {
-            std::this_thread::yield();
-        }
         status_b = ggml_vec_index_add_logged(
             shared_b, extra_vector.data(), 1, &shared_id_b, shared_delta_path.c_str());
     });
-    start_shared_appends.store(true);
+    const auto sidecar_probe_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (ggml_vec_index_test_get_sidecar_lock_probe() < 0 &&
+           std::chrono::steady_clock::now() < sidecar_probe_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const int sidecar_lock_probe = ggml_vec_index_test_get_sidecar_lock_probe();
+    ggml_vec_index_test_release_delta_append();
     thread_a.join();
     thread_b.join();
+    CHECK(sidecar_lock_probe == 1);
+    CHECK(ggml_vec_index_test_get_delta_append_max_active_waiters() == 1);
     reset_fault_hooks();
 
     CHECK((status_a == GGML_VEC_INDEX_OK && status_b == GGML_VEC_INDEX_E_IO) ||

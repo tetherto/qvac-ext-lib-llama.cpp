@@ -33,6 +33,7 @@
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -232,6 +233,10 @@ void ggml_vec_index_test_set_truncate_fail(int fail);
 void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 void ggml_vec_index_test_set_delta_append_wait_target(int target);
 int ggml_vec_index_test_get_delta_append_waiters(void);
+void ggml_vec_index_test_set_delta_append_hold(int hold);
+void ggml_vec_index_test_release_delta_append(void);
+int ggml_vec_index_test_get_sidecar_lock_probe(void);
+int ggml_vec_index_test_get_delta_append_max_active_waiters(void);
 void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
 void ggml_vec_index_test_reset_delta_tail_scan_count(void);
 int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);

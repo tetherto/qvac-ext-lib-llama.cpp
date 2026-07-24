@@ -12,7 +12,8 @@ on:
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
-      '**/*.cpp'
+      '**/*.cpp',
+      '**/*.inc'
     ]
 
 concurrency:
@@ -87,3 +88,9 @@ jobs:
         run: |
           cd build
           ctest -L main -E tokenizer --verbose --timeout 900
+
+      - name: Test vector index (undefined)
+        if: ${{ matrix.sanitizer == 'UNDEFINED' }}
+        run: |
+          cd build
+          ctest -R '^test-vector-index(-faults)?$' --verbose --timeout 900
