@@ -949,6 +949,8 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_dequant_mul_mat_mat_q8_0_bk64_f16acc;
+    vk_pipeline pipeline_dequant_mul_mat_mat_q8_0_bk64_f32acc;
 
     // QJL (Stage 2) correction pass applied after mul_mm.comp for standalone
     // MUL_MAT on TBQ3_0/TBQ4_0 when n > mul_mat_vec_max_cols. Indexed as
@@ -4534,6 +4536,13 @@ struct CompileTask {
     uint32_t required_subgroup_size;
 };
 
+static bool ggml_vk_is_gfx1151(const vk_device & device) {
+    const std::string device_name = device->properties.deviceName.data();
+    return device->vendor_id == VK_VENDOR_ID_AMD &&
+           device->driver_id == vk::DriverId::eMesaRadv &&
+           device_name.find("GFX1151") != std::string::npos;
+}
+
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -4610,12 +4619,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmqid, m_warptile_mmqid, s_warptile_mmqid,
                           l_warptile_mmqid_int, m_warptile_mmqid_int, s_warptile_mmqid_int,
                           l_warptile_mmqid_int_k, m_warptile_mmqid_int_k, s_warptile_mmqid_int_k;
+    std::vector<uint32_t> q8_0_bk64_warptile;
     std::array<uint32_t, 3> l_wg_denoms, m_wg_denoms, s_wg_denoms,
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
                             l_mmqid_wg_denoms, m_mmqid_wg_denoms, s_mmqid_wg_denoms;
+    std::array<uint32_t, 3> q8_0_bk64_wg_denoms {};
 
     uint32_t l_align, m_align, s_align;
+    uint32_t q8_0_bk64_align {};
 
     vk_pipeline wait_pipeline;
     CompileTask claimed_task {};
@@ -4771,6 +4783,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_align = 128;
         m_align =  64;
         s_align =  32;
+
+        // GFX1151 q8_0 prefill candidate for tall attention/output projections.
+        // This keeps the same shader and math as the normal coopmat path, but
+        // doubles K tile depth to reduce q8_0 dequant/load loop overhead.
+        q8_0_bk64_warptile = { 256, 128, 128, 64, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+        q8_0_bk64_wg_denoms = { 128, 128, 1 };
+        q8_0_bk64_align = 128;
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
@@ -5379,6 +5398,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_PQ3_0_64,  pipeline_dequant_mul_mat_mat[GGML_TYPE_PQ3_0_64],  matmul_pq3_0_64_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_TBQ4_0_64, pipeline_dequant_mul_mat_mat[GGML_TYPE_TBQ4_0_64], matmul_tbq4_0_64_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_PQ4_0_64,  pipeline_dequant_mul_mat_mat[GGML_TYPE_PQ4_0_64],  matmul_pq4_0_64_f32,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+
+        if (ggml_vk_is_gfx1151(device) &&
+                ggml_vk_matmul_shmem_support(device, q8_0_bk64_warptile, false, GGML_TYPE_Q8_0)) {
+            if (device->coopmat_acc_f16_support) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_0_bk64_f16acc, "matmul_q8_0_f32_f16acc_bk64", matmul_q8_0_f32_f16acc_cm1_len, matmul_q8_0_f32_f16acc_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants), q8_0_bk64_wg_denoms, ggml_vk_mul_mm_spec(q8_0_bk64_warptile, true), q8_0_bk64_align, false, true);
+            }
+            if (device->coopmat_acc_f32_support) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_0_bk64_f32acc, "matmul_q8_0_f32_bk64", matmul_q8_0_f32_cm1_len, matmul_q8_0_f32_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants), q8_0_bk64_wg_denoms, ggml_vk_mul_mm_spec(q8_0_bk64_warptile, true), q8_0_bk64_align, false, true);
+            }
+        }
 
         CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_K], matmul_q2_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_TQ2_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_TQ2_0], matmul_tq2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -10569,6 +10598,23 @@ static void ggml_vk_matmul_tiling(ggml_backend_vk_context *ctx, vk_context& subc
     }
 }
 
+static vk_pipeline ggml_vk_get_q8_0_bk64_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline mmp, uint32_t m, uint32_t n, uint32_t k, uint32_t batch, bool aligned) {
+    if (!aligned || !ctx->device->coopmat_support || ctx->device->coopmat2 || !ggml_vk_is_gfx1151(ctx->device)) {
+        return nullptr;
+    }
+    if (m < 512 || n < 128 || k < 1024 || batch < 1) {
+        return nullptr;
+    }
+
+    if (mmp == ctx->device->pipeline_dequant_mul_mat_mat[GGML_TYPE_Q8_0].f16acc) {
+        return ctx->device->pipeline_dequant_mul_mat_mat_q8_0_bk64_f16acc;
+    }
+    if (mmp == ctx->device->pipeline_dequant_mul_mat_mat[GGML_TYPE_Q8_0].f32acc) {
+        return ctx->device->pipeline_dequant_mul_mat_mat_q8_0_bk64_f32acc;
+    }
+    return nullptr;
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -10657,6 +10703,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+    if (!quantize_y && !qx_needs_dequant && src0->type == GGML_TYPE_Q8_0 && effective_src1_type == GGML_TYPE_F32) {
+        vk_pipeline hot_pipeline = ggml_vk_get_q8_0_bk64_pipeline(ctx, mmp, ne01, ne11, ne10, ne12*ne13, aligned);
+        if (hot_pipeline != nullptr) {
+            pipeline = hot_pipeline;
+        }
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
