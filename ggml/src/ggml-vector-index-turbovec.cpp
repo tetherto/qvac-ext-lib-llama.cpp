@@ -2,8 +2,6 @@
 
 #include "ggml-vector-index-internal.h"
 
-#include "ggml-tbq-quants.h"
-
 #if defined(__APPLE__) && defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 #endif
@@ -643,9 +641,10 @@ static const TurboVecCodebook & turbovec_codebook(int bits, int dim) {
     return it->second;
 }
 
-static uint8_t turbovec_q2_quantize_val(float value, const float * boundaries) {
+static uint8_t turbovec_quantize_val(float value, const float * boundaries, int bits) {
     uint8_t code = 0;
-    for (int i = 0; i < 3; ++i) {
+    const int n_boundaries = (1 << bits) - 1;
+    for (int i = 0; i < n_boundaries; ++i) {
         if (value > boundaries[i]) {
             ++code;
         }
@@ -967,7 +966,7 @@ size_t turbovec_q2_row_bytes(size_t dim) {
 }
 
 size_t turbovec_q2_scale_count(size_t dim) {
-    GGML_UNUSED(dim);
+    (void) dim;
     return 1;
 }
 
@@ -976,7 +975,7 @@ size_t turbovec_q4_row_bytes(size_t dim) {
 }
 
 size_t turbovec_q4_scale_count(size_t dim) {
-    GGML_UNUSED(dim);
+    (void) dim;
     return 1;
 }
 
@@ -1311,9 +1310,8 @@ void quantize_turbovec_batch(
             const float calibrated =
                 (rotated_row[coordinate] + tqplus_shift[coordinate]) *
                 tqplus_scale[coordinate];
-            const uint8_t code = bits == 2 ?
-                turbovec_q2_quantize_val(calibrated, codebook.boundaries.data()) :
-                tq4_quantize_val(calibrated, codebook.boundaries.data());
+            const uint8_t code =
+                turbovec_quantize_val(calibrated, codebook.boundaries.data(), bits);
             turbovec_set_bitplane_code(packed_row, column, bits, dim, code);
             const float inverse_calibration_scale =
                 1.0f / tqplus_scale[coordinate];
