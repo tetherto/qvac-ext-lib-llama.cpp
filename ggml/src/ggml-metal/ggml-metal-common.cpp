@@ -263,6 +263,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             case GGML_OP_LIGHTNING_INDEXER:
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
+            case GGML_OP_DSV4_HC_POST:
             case GGML_OP_ROPE:
             case GGML_OP_NORM:
             case GGML_OP_RMS_NORM:

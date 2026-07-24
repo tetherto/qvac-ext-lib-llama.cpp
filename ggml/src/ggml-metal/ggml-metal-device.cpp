@@ -90,6 +90,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
         case GGML_OP_LIGHTNING_INDEXER: op_str = "lightning_indexer"; break;
         case GGML_OP_DSV4_HC_COMB:      op_str = "dsv4_hc_comb";      break;
         case GGML_OP_DSV4_HC_PRE:       op_str = "dsv4_hc_pre";       break;
+        case GGML_OP_DSV4_HC_POST:      op_str = "dsv4_hc_post";      break;
         default: GGML_ABORT("fatal error");
     };
 
@@ -116,6 +117,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_post(
+        ggml_metal_library_t lib, bool use_vec4) {
+    const char * base = use_vec4 ? "kernel_dsv4_hc_post_4" : "kernel_dsv4_hc_post";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
     }
 
     return res;

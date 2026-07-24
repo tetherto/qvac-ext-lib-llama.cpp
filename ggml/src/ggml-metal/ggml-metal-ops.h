@@ -70,6 +70,7 @@ int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc_comb      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc_pre       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_hc_post      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
