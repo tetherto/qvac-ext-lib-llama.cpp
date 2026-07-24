@@ -290,6 +290,18 @@ typedef struct {
     uint64_t dst_nb2;
 } ggml_metal_kargs_dsv4_hc_comb;
 
+typedef struct {
+    int64_t  ne;
+    int64_t  n_embd;
+    int64_t  hc;
+    uint64_t x_nb0;
+    uint64_t x_nb1;
+    uint64_t x_nb2;
+    uint64_t weights_nb0;
+    uint64_t weights_nb1;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+} ggml_metal_kargs_dsv4_hc_pre;
 
 typedef struct {
     int32_t  ne00;

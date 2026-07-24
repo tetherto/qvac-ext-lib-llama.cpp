@@ -2804,6 +2804,32 @@ kernel void kernel_dsv4_hc_comb(
     }
 }
 
+kernel void kernel_dsv4_hc_pre(
+        constant ggml_metal_kargs_dsv4_hc_pre & args,
+        device const char * x,
+        device const char * weights,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.ne) {
+        return;
+    }
+
+    const int64_t i  = gid % args.n_embd;
+    const int64_t it = gid / args.n_embd;
+
+    volatile float sum = 0.0f;
+    for (int64_t ih = 0; ih < args.hc; ++ih) {
+        const device float * x_ptr = (device const float *) (
+            x + i*args.x_nb0 + ih*args.x_nb1 + it*args.x_nb2);
+        const device float * weights_ptr = (device const float *) (
+            weights + ih*args.weights_nb0 + it*args.weights_nb1);
+        sum = sum + (*x_ptr) * (*weights_ptr);
+    }
+
+    device float * dst_ptr = (device float *) (
+        dst + i*args.dst_nb0 + it*args.dst_nb1);
+    *dst_ptr = sum;
+}
 
 template<typename T>
 kernel void kernel_cumsum_blk(
