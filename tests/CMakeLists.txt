@@ -210,14 +210,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
-    llama_test(
-        test-recurrent-state-rollback
-        LABEL main
-        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
+    # WebGPU excludes QWEN35 in arch_supported() (test-llama-archs.cpp)
+    if (NOT GGML_WEBGPU)
+        llama_test(
+            test-recurrent-state-rollback
+            LABEL main
+            ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+        )
+        set_tests_properties(test-recurrent-state-rollback PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endif()
 
     llama_test(
         test-recurrent-state-rollback
