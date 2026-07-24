@@ -7,6 +7,7 @@
 
 #include <Metal/Metal.h>
 
+#include <limits.h>
 #include <stdatomic.h>
 
 #ifndef TARGET_OS_VISION
@@ -1134,6 +1135,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
+    const int64_t max_dispatch_dim     = INT_MAX;
 
     if (!has_simdgroup_reduction) {
         return false;
@@ -1260,6 +1262,25 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 }
             }
             return false;
+        case GGML_OP_LIGHTNING_INDEXER:
+            return has_simdgroup_reduction &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F16 &&
+                   op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] > 0 && op->src[0]->ne[0] <= max_dispatch_dim &&
+                   op->src[0]->ne[1] > 0 && op->src[0]->ne[1] <= max_dispatch_dim &&
+                   op->src[0]->ne[2] > 0 && op->src[0]->ne[2] <= max_dispatch_dim &&
+                   op->src[0]->ne[3] > 0 && op->src[0]->ne[3] <= max_dispatch_dim &&
+                   op->src[1]->ne[0] == op->src[0]->ne[0] && op->src[1]->ne[1] == 1 &&
+                   op->src[1]->ne[2] > 0 && op->src[1]->ne[2] <= max_dispatch_dim &&
+                   op->src[1]->ne[3] == op->src[0]->ne[3] &&
+                   op->src[2]->ne[0] == op->src[0]->ne[1] && op->src[2]->ne[1] == op->src[0]->ne[2] &&
+                   op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == op->src[0]->ne[3] &&
+                   op->src[3]->ne[0] == op->src[1]->ne[2] && op->src[3]->ne[1] == op->src[0]->ne[2] &&
+                   op->src[3]->ne[2] == 1 && op->src[3]->ne[3] > 0 &&
+                   op->src[2]->ne[3] % op->src[3]->ne[3] == 0 &&
+                   op->ne[0] == op->src[1]->ne[2] && op->ne[1] == op->src[0]->ne[2] &&
+                   op->ne[2] == 1 && op->ne[3] == op->src[0]->ne[3];
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;

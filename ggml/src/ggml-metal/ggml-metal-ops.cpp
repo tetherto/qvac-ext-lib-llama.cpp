@@ -278,6 +278,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_add_id(ctx, idx);
             } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
+            } break;
         case GGML_OP_REPEAT:
             {
                 n_fuse = ggml_metal_op_repeat(ctx, idx);
@@ -2569,6 +2573,97 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q       = op->src[0];
+    const ggml_tensor * k       = op->src[1];
+    const ggml_tensor * weights = op->src[2];
+    const ggml_tensor * mask    = op->src[3];
+
+    ggml_metal_kargs_lightning_indexer args = {
+        /*.n_embd         =*/ q->ne[0],
+        /*.n_heads        =*/ q->ne[1],
+        /*.n_tokens       =*/ q->ne[2],
+        /*.n_kv           =*/ k->ne[2],
+        /*.n_streams      =*/ q->ne[3],
+        /*.n_mask_streams =*/ mask->ne[3],
+        /*.q_nb0          =*/ q->nb[0],
+        /*.q_nb1          =*/ q->nb[1],
+        /*.q_nb2          =*/ q->nb[2],
+        /*.q_nb3          =*/ q->nb[3],
+        /*.k_nb0          =*/ k->nb[0],
+        /*.k_nb2          =*/ k->nb[2],
+        /*.k_nb3          =*/ k->nb[3],
+        /*.weights_nb0   =*/ weights->nb[0],
+        /*.weights_nb1   =*/ weights->nb[1],
+        /*.weights_nb3   =*/ weights->nb[3],
+        /*.mask_nb0       =*/ mask->nb[0],
+        /*.mask_nb1       =*/ mask->nb[1],
+        /*.mask_nb3       =*/ mask->nb[3],
+        /*.dst_nb0        =*/ op->nb[0],
+        /*.dst_nb1        =*/ op->nb[1],
+        /*.dst_nb3        =*/ op->nb[3],
+    };
+
+    GGML_ASSERT(args.n_embd <= std::numeric_limits<int>::max());
+    GGML_ASSERT(args.n_heads <= std::numeric_limits<int>::max());
+    GGML_ASSERT(args.n_tokens <= std::numeric_limits<int>::max());
+    GGML_ASSERT(args.n_kv <= std::numeric_limits<int>::max());
+    GGML_ASSERT(args.n_streams <= std::numeric_limits<int>::max());
+
+    constexpr int mm_nk = 32;
+    constexpr size_t mm_smem = 64*mm_nk*sizeof(float);
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    const bool use_mm =
+        props_dev->has_simdgroup_mm &&
+        q->ne[0] == 128 && q->ne[1] == 64 &&
+        k->ne[0] == 128 && weights->ne[0] == 64 &&
+        q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) &&
+        q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 &&
+        weights->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F16 &&
+        op->type == GGML_TYPE_F32 &&
+        mm_smem <= props_dev->max_theadgroup_memory_size;
+
+    auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer(lib, use_mm);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),       1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(k),       2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask),    4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),      5);
+
+    if (use_mm) {
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, mm_smem, 0);
+        ggml_metal_encoder_dispatch_threadgroups(
+            enc, (args.n_kv + mm_nk - 1)/mm_nk, args.n_tokens, args.n_streams, 32, 4, 1);
+    } else {
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float), 0);
+
+        int nth = 32;
+        while (nth < args.n_heads && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+            nth *= 2;
+        }
+        nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        nth = std::min(nth, (int) args.n_heads);
+
+        ggml_metal_encoder_dispatch_threadgroups(
+            enc, args.n_kv, args.n_tokens, args.n_streams, nth, 1, 1);
+    }
+
+    return 1;
+}
+
 
     return 1;
 }

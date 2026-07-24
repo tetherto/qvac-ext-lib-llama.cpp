@@ -86,7 +86,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
 
     const char * op_str = "undefined";
     switch (op) {
-        case GGML_OP_ADD_ID: op_str = "add_id"; break;
+        case GGML_OP_ADD_ID:            op_str = "add_id";            break;
+        case GGML_OP_LIGHTNING_INDEXER: op_str = "lightning_indexer"; break;
         default: GGML_ABORT("fatal error");
     };
 
@@ -96,6 +97,23 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer(
+        ggml_metal_library_t lib, bool use_mm) {
+    const char * base = use_mm ? "kernel_lightning_indexer_mm" : "kernel_lightning_indexer";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    return res;
+}
+
     }
 
     return res;

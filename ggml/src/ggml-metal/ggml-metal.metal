@@ -2556,6 +2556,167 @@ typedef decltype(kernel_sum_rows_impl<float, float>) kernel_sum_rows_t;
 template [[host_name("kernel_sum_rows_f32_f32")]]   kernel kernel_sum_rows_t kernel_sum_rows_impl<float,  float>;
 template [[host_name("kernel_sum_rows_f32_f32_4")]] kernel kernel_sum_rows_t kernel_sum_rows_impl<float4, float>;
 
+kernel void kernel_lightning_indexer(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * weights,
+        device const char * mask,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort  sgitg [[simdgroup_index_in_threadgroup]],
+        ushort  tiisg [[thread_index_in_simdgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const int64_t ik = tgpig.x;
+    const int64_t it = tgpig.y;
+    const int64_t is = tgpig.z;
+
+    threadgroup float * shmem_f = (threadgroup float *) shmem;
+    if (sgitg == 0) {
+        shmem_f[tiisg] = 0.0f;
+    }
+
+    float sumf = 0.0f;
+    for (int64_t ih = tpitg.x; ih < args.n_heads; ih += ntg.x) {
+        volatile float qk = 0.0f;
+        for (int64_t ie = 0; ie < args.n_embd; ++ie) {
+            const device float * q_ptr = (device const float *) (
+                q + ie*args.q_nb0 + ih*args.q_nb1 + it*args.q_nb2 + is*args.q_nb3);
+            const device float * k_ptr = (device const float *) (
+                k + ie*args.k_nb0 + ik*args.k_nb2 + is*args.k_nb3);
+            qk = qk + (*q_ptr) * (*k_ptr);
+        }
+
+        const device float * w_ptr = (device const float *) (
+            weights + ih*args.weights_nb0 + it*args.weights_nb1 + is*args.weights_nb3);
+        volatile float product = max(qk, 0.0f) * (*w_ptr);
+        sumf += product;
+    }
+
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem_f[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = shmem_f[tiisg];
+    sumf = simd_sum(sumf);
+
+    if (tpitg.x == 0) {
+        const int64_t im = is % args.n_mask_streams;
+        const device half * mask_ptr = (device const half *) (
+            mask + ik*args.mask_nb0 + it*args.mask_nb1 + im*args.mask_nb3);
+        device float * dst_ptr = (device float *) (
+            dst + ik*args.dst_nb0 + it*args.dst_nb1 + is*args.dst_nb3);
+        *dst_ptr = sumf + float(*mask_ptr);
+    }
+}
+
+kernel void kernel_lightning_indexer_mm(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * weights,
+        device const char * mask,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int NE = 128;
+    constexpr int NH = 64;
+    constexpr int NK = 32;
+    constexpr int NB = 32;
+
+    const int64_t it = tgpig.y;
+    const int64_t is = tgpig.z;
+    const int64_t ik0 = tgpig.x * NK;
+
+    threadgroup half  * sq = (threadgroup half *) shmem;
+    threadgroup half  * sk = sq + NH*NB;
+    threadgroup float * sc = (threadgroup float *) shmem;
+
+    simdgroup_float8x8 mc[8];
+    FOR_UNROLL (short ih = 0; ih < 8; ++ih) {
+        mc[ih] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    FOR_UNROLL (short ib = 0; ib < NE; ib += NB) {
+        // The matrix path intentionally narrows F32 Q and dequantized K to F16, matching the CUDA WMMA
+        // and Vulkan cooperative-matrix paths. Values outside the finite F16 range overflow during conversion.
+        for (int i = tiitg; i < NH*NB/4; i += 4*N_SIMDWIDTH) {
+            const int ih = i / (NB/4);
+            const int ie = 4*(i % (NB/4));
+            const device float4 * q_ptr = (device const float4 *) (
+                q + (ib + ie)*args.q_nb0 + ih*args.q_nb1 + it*args.q_nb2 + is*args.q_nb3);
+            *(threadgroup half4 *) (sq + ih*NB + ie) = half4(*q_ptr);
+        }
+
+        for (int i = tiitg; i < NK*NB/4; i += 4*N_SIMDWIDTH) {
+            const int ik = i / (NB/4);
+            const int ie = 4*(i % (NB/4));
+            if (ik0 + ik < args.n_kv) {
+                const device float4 * k_ptr = (device const float4 *) (
+                    k + (ib + ie)*args.k_nb0 + (ik0 + ik)*args.k_nb2 + is*args.k_nb3);
+                *(threadgroup half4 *) (sk + ik*NB + ie) = half4(*k_ptr);
+            } else {
+                *(threadgroup half4 *) (sk + ik*NB + ie) = half4(0.0f);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short ih = 0; ih < 8; ++ih) {
+            FOR_UNROLL (short ie = 0; ie < NB; ie += 8) {
+                simdgroup_half8x8 mq;
+                simdgroup_half8x8 mk;
+
+                simdgroup_load(mq, sq + (8*ih)*NB + ie, NB);
+                simdgroup_load(mk, sk + (8*sgitg)*NB + ie, NB, 0, true);
+                simdgroup_multiply_accumulate(mc[ih], mq, mk, mc[ih]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    FOR_UNROLL (short ih = 0; ih < 8; ++ih) {
+        simdgroup_store(mc[ih], sc + (8*ih)*NK + 8*sgitg, NK);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int ik_local = tiitg % NK;
+    const int ih0 = (tiitg / NK) * 16;
+    float sumf = 0.0f;
+    FOR_UNROLL (short ih = 0; ih < 16; ++ih) {
+        const device float * w_ptr = (device const float *) (
+            weights + (ih0 + ih)*args.weights_nb0 + it*args.weights_nb1 + is*args.weights_nb3);
+        sumf += max(sc[(ih0 + ih)*NK + ik_local], 0.0f) * (*w_ptr);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sc[(tiitg / NK)*NK + ik_local] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiitg < NK) {
+        const int64_t ik = ik0 + ik_local;
+        if (ik < args.n_kv) {
+            sumf = sc[ik_local] + sc[NK + ik_local] + sc[2*NK + ik_local] + sc[3*NK + ik_local];
+
+            const int64_t im = is % args.n_mask_streams;
+            const device half * mask_ptr = (device const half *) (
+                mask + ik*args.mask_nb0 + it*args.mask_nb1 + im*args.mask_nb3);
+            device float * dst_ptr = (device float *) (
+                dst + ik*args.dst_nb0 + it*args.dst_nb1 + is*args.dst_nb3);
+            *dst_ptr = sumf + float(*mask_ptr);
+        }
+    }
+}
+
+
 template<typename T>
 kernel void kernel_cumsum_blk(
         constant ggml_metal_kargs_cumsum_blk & args,
