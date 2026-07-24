@@ -78,10 +78,11 @@ GGML_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
 // Creates a TurboQuant q2 vector index. This is distinct from the generic
 // q4/q8 modes created by `ggml_vec_index_create`: vectors are normalized,
 // rotated, quantized with Lloyd-Max q2 codebooks, and searched against rotated
-// queries. This implementation requires `0 < dim <= 65536 && dim % 8 == 0` and
-// supports add/search/filter/IVF plus regular snapshot write/load. TurboVec
-// materializes a dense `dim x dim` rotation matrix on first use, so very large
-// accepted dimensions may return GGML_VEC_INDEX_E_OOM from add/search.
+// queries. This implementation requires a 64-bit target,
+// `0 < dim <= 65536 && dim % 8 == 0`, and supports add/search/filter/IVF plus
+// regular snapshot write/load. TurboVec materializes a dense `dim x dim`
+// rotation matrix on first use, so very large accepted dimensions may return
+// GGML_VEC_INDEX_E_OOM from add/search.
 // `ggml_vec_index_prepare` is best-effort and does not report allocation status.
 // mmap loading and logged mutations are reserved for later format work.
 GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
@@ -89,10 +90,11 @@ GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
 // Creates a TurboQuant q4 vector index. This is distinct from the generic
 // `bit_width=4` mode created by `ggml_vec_index_create`: vectors are normalized,
 // rotated, quantized with Lloyd-Max q4 codebooks, and searched against rotated
-// queries. This implementation requires `0 < dim <= 65536 && dim % 8 == 0` and
-// supports add/search/filter/IVF plus regular snapshot write/load. TurboVec
-// materializes a dense `dim x dim` rotation matrix on first use, so very large
-// accepted dimensions may return GGML_VEC_INDEX_E_OOM from add/search.
+// queries. This implementation requires a 64-bit target,
+// `0 < dim <= 65536 && dim % 8 == 0`, and supports add/search/filter/IVF plus
+// regular snapshot write/load. TurboVec materializes a dense `dim x dim`
+// rotation matrix on first use, so very large accepted dimensions may return
+// GGML_VEC_INDEX_E_OOM from add/search.
 // `ggml_vec_index_prepare` is best-effort and does not report allocation status.
 // mmap loading and logged mutations are reserved for later format work.
 GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
@@ -129,13 +131,16 @@ GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 // snapshot with `ggml_vec_index_load_with_delta`.
 //
 // Delta logs are state-bound and single-writer per snapshot lineage. Use one
-// evolving writer handle for a given {snapshot, delta_path} pair. If another
-// handle or process appends to the same log, stale writers are rejected and
-// must reload with `ggml_vec_index_load_with_delta` before appending again.
+// evolving writer handle for a given {snapshot, delta_path} pair. Once bound,
+// logged mutations and compaction with a different delta path return
+// GGML_VEC_INDEX_E_INVALID_ARG. If another handle or process appends to the
+// same log, stale writers are rejected and must reload with
+// `ggml_vec_index_load_with_delta` before appending again.
 // If an append error occurs after a complete replayable record is observed,
 // the mutation is treated as committed and the API returns OK.
 // Once a handle participates in delta logging, use logged mutations for
-// content changes; plain add/remove/compact return GGML_VEC_INDEX_E_INVALID_ARG.
+// content changes; plain add/remove/compact/write return
+// GGML_VEC_INDEX_E_INVALID_ARG.
 // Adding q4/q8 entries to legacy v1/v2 f32-payload logs is rejected; compact
 // the snapshot+delta pair first so new quantized adds use native-code v4 logs.
 GGML_API int ggml_vec_index_add_logged(
@@ -252,6 +257,8 @@ GGML_API int ggml_vec_index_search_ivf(
     uint64_t               * out_ids);
 
 // Persistence. Writers use .tvim v2 for f32/q4/q8 and v3 for TurboVec.
+// Delta-bound handles must use `ggml_vec_index_compact_delta`; ordinary
+// snapshot writes return GGML_VEC_INDEX_E_INVALID_ARG.
 GGML_API int ggml_vec_index_write(
     ggml_vec_index_t * idx,
     const char       * path);
@@ -272,7 +279,8 @@ GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 // GGML_VEC_INDEX_E_INVALID_ARG on mmap-backed handles.
 // Heap-only search preparation such as `ggml_vec_index_build_ivf` is allowed.
 // `ggml_vec_index_write` can snapshot mmap-backed handles, but callers must
-// write to a different path than the mapped source file.
+// write to a different path than the mapped source file and the handle must
+// not be delta-bound.
 // This loader is snapshot-only: it does not replay .tvid delta logs. Use
 // `ggml_vec_index_load_with_delta` when loading a snapshot plus delta log;
 // that path materializes the resulting index in memory.

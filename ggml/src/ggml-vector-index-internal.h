@@ -153,6 +153,7 @@ struct ggml_vec_index {
     uint64_t filter_cookie = 0;
     bool read_only_mmap = false;
     bool delta_log_bound = false;
+    std::string bound_delta_log_path_key;
     bool delta_log_rebase_pending = false;
     uint32_t delta_log_rebase_crc = 0;
     DeltaStateWide delta_log_rebase_wide;
@@ -223,19 +224,26 @@ struct DeltaAppendResult {
     bool record_complete = false;
 };
 
+#ifdef GGML_VEC_INDEX_EXPORT_TESTS
+#define GGML_VEC_INDEX_TEST_API GGML_API
+#else
+#define GGML_VEC_INDEX_TEST_API
+#endif
+
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
-void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
-void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
-void ggml_vec_index_test_set_truncate_fail(int fail);
-void ggml_vec_index_test_set_parent_fsync_fail(int fail);
-void ggml_vec_index_test_set_delta_append_wait_target(int target);
-void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
-void ggml_vec_index_test_reset_delta_tail_scan_count(void);
-int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
-void ggml_vec_index_test_reset_state_crc_scan_count(void);
-int64_t ggml_vec_index_test_get_state_crc_scan_count(void);
-int ggml_vec_index_test_get_load_with_delta_waiters(void);
+GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
+GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
+GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_truncate_fail(int fail);
+GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_parent_fsync_fail(int fail);
+GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_delta_append_wait_target(int target);
+GGML_VEC_INDEX_TEST_API int ggml_vec_index_test_get_delta_append_waiters(void);
+GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
+GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_reset_delta_tail_scan_count(void);
+GGML_VEC_INDEX_TEST_API int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
+GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_reset_state_crc_scan_count(void);
+GGML_VEC_INDEX_TEST_API int64_t ggml_vec_index_test_get_state_crc_scan_count(void);
+GGML_VEC_INDEX_TEST_API int ggml_vec_index_test_get_load_with_delta_waiters(void);
 }
 #endif
 
@@ -261,6 +269,7 @@ bool checked_add_u64(uint64_t a, uint64_t b, uint64_t & out);
 bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t & out);
 bool filesystem_path_from_utf8(const char * path, std::filesystem::path & out);
 bool filesystem_paths_equal(const char * lhs, const char * rhs);
+bool delta_log_path_key(const char * path, std::string & out);
 
 void invalidate_ivf(ggml_vec_index & idx);
 bool is_q8(const ggml_vec_index & idx);
@@ -288,12 +297,10 @@ void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale);
 void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale);
 bool turbovec_q2_supported_dim(int dim);
 bool turbovec_q4_supported_dim(int dim);
-#ifdef GGML_VEC_INDEX_EXPORT_TESTS
-#define GGML_VEC_INDEX_TEST_API GGML_API
-#else
-#define GGML_VEC_INDEX_TEST_API
-#endif
+void turbovec_retain_rotation(int dim);
+void turbovec_release_rotation(int dim) noexcept;
 GGML_VEC_INDEX_TEST_API uint64_t turbovec_rotation_hash_for_test(int dim);
+GGML_VEC_INDEX_TEST_API size_t turbovec_rotation_cache_bytes_for_test(void);
 GGML_VEC_INDEX_TEST_API uint64_t turbovec_query_rotation_hash_for_test(
     const float * queries,
     int n_queries,
@@ -312,6 +319,8 @@ GGML_VEC_INDEX_TEST_API uint64_t turbovec_blocked_hash_for_test(const ggml_vec_i
 GGML_VEC_INDEX_TEST_API void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
 GGML_VEC_INDEX_TEST_API int turbovec_avx2_available_for_test();
 GGML_VEC_INDEX_TEST_API int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
+GGML_VEC_INDEX_TEST_API void turbovec_reset_block_score_call_count_for_test(void);
+GGML_VEC_INDEX_TEST_API int64_t turbovec_block_score_call_count_for_test(void);
 #undef GGML_VEC_INDEX_TEST_API
 void prepare_turbovec(int bits, int dim);
 void rotate_turbovec_query(const float * src, float * dst, int dim);
@@ -402,7 +411,7 @@ DeltaStateKind delta_state_kind_for_format(DeltaLogFormat format);
 DeltaLogFormat delta_log_format_for_append(const char * path);
 uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_kind);
 DeltaStateWide current_delta_state_wide(const ggml_vec_index & idx);
-void invalidate_delta_tail_cache(ggml_vec_index & idx);
+void invalidate_delta_tail_cache(ggml_vec_index & idx) noexcept;
 bool validate_logged_add_args(
     const ggml_vec_index_t * idx,
     const float * vectors,

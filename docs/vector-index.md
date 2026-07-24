@@ -37,12 +37,13 @@ Create an index with a fixed dimension and bit width:
 - `bit_width=4`: per-vector symmetric packed q4 storage with f32 scales.
 
 `ggml_vec_index_create_turbovec_q2` and `ggml_vec_index_create_turbovec_q4`
-create separate TurboQuant q2/q4 modes for positive dimensions up to 65536 that
-are multiples of 8. They store Lloyd-Max q2/q4 codes in Rust-style bit-plane
-rows with one score-correction scale per vector. Vectors and queries use a
-deterministic dense full-dimension Gaussian QR rotation before LUT scoring. The
-rotation is materialized as a dense `dim x dim` matrix on first use; very large
-accepted dimensions are format-valid, but add/search can return
+create separate TurboQuant q2/q4 modes on 64-bit targets for positive
+dimensions up to 65536 that are multiples of 8. They store Lloyd-Max q2/q4
+codes in Rust-style bit-plane rows with one score-correction scale per vector.
+Vectors and queries use a deterministic dense full-dimension Gaussian QR
+rotation before LUT scoring. The rotation is materialized as a dense `dim x dim`
+matrix on first use; very large accepted dimensions are format-valid, but
+add/search can return
 `GGML_VEC_INDEX_E_OOM` if the rotation state cannot be allocated.
 `ggml_vec_index_prepare` is best-effort and does not report allocation status.
 The first non-empty add fits TQ+ per-coordinate calibration when it contains at least
@@ -154,13 +155,15 @@ vectors when interchange is needed.
 Delta logs are bound to the state of the snapshot they extend. Use one evolving
 writer handle for a given snapshot and delta path pair. If another handle or
 process writes to the same log, stale writers must reload from snapshot plus
-delta before appending again. Loading validates each replayed record against
-its stored post-state identity.
+delta before appending again. A bound handle rejects logged mutations or
+compaction with a different delta path. Loading validates each replayed record
+against its stored post-state identity.
 
 After a handle has been loaded with a delta log or has used logged mutations,
 content changes must continue through `ggml_vec_index_add_logged`,
 `ggml_vec_index_remove_logged`, or `ggml_vec_index_compact_delta`. Plain
-add/remove/compact calls are rejected on delta-bound handles.
+add/remove/compact calls and ordinary snapshot writes are rejected on
+delta-bound handles.
 
 Readers still accept legacy v1/v2 delta logs. New q4/q8 adds are not appended
 to those f32-payload log formats; compact first so subsequent quantized adds use
@@ -179,7 +182,7 @@ On mmap-backed handles:
 - Index-content mutations such as add, remove, compact, and logged mutations
   return `GGML_VEC_INDEX_E_INVALID_ARG`.
 - `ggml_vec_index_write` is allowed only when writing to a path different from
-  the mapped source file.
+  the mapped source file and the handle is not delta-bound.
 - `ggml_vec_index_compact_delta` is allowed when writing the compacted snapshot
   to a path different from the mapped source file; it rebuilds the state identity
   before replacing the delta log.

@@ -9,6 +9,12 @@
 #define GGML_VEC_INDEX_USE_NEON 0
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
+#define GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT 1
+#else
+#define GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT 0
+#endif
+
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
 #include "ggml-vector-index-avx2.h"
 #if defined(_MSC_VER)
@@ -21,6 +27,8 @@
 // ---------------------------------------------------------------------------
 
 namespace {
+
+static std::atomic<int64_t> g_turbovec_block_score_calls{ 0 };
 
 inline float float_score_from_double(double score) {
     if (score > static_cast<double>(FLT_MAX)) {
@@ -424,78 +432,95 @@ void search_one(
             idx.turbovec_blocked_n_blocks * n_byte_groups * 32;
         if (idx.turbovec_blocked_data.size() == expected_blocked_bytes &&
             idx.turbovec_blocked_n_blocks == (n_slots + 31) / 32) {
-            turbovec_scores.assign(n_slots, -std::numeric_limits<float>::infinity());
             std::vector<uint8_t> allowed_blocks;
+            size_t allowed_block_count = idx.turbovec_blocked_n_blocks;
             if (allowed_slots != nullptr || active_count(idx) != n_slots) {
                 allowed_blocks.assign(idx.turbovec_blocked_n_blocks, 0);
+                allowed_block_count = 0;
                 if (allowed_slots != nullptr) {
                     for (size_t slot : *allowed_slots) {
                         if (slot < n_slots && slot_is_active(idx, slot)) {
-                            allowed_blocks[slot / 32] = 1;
+                            uint8_t & block_allowed = allowed_blocks[slot / 32];
+                            if (block_allowed == 0) {
+                                block_allowed = 1;
+                                ++allowed_block_count;
+                            }
                         }
                     }
                 } else {
                     for (size_t slot = 0; slot < n_slots; ++slot) {
                         if (slot_is_active(idx, slot)) {
-                            allowed_blocks[slot / 32] = 1;
+                            uint8_t & block_allowed = allowed_blocks[slot / 32];
+                            if (block_allowed == 0) {
+                                block_allowed = 1;
+                                ++allowed_block_count;
+                            }
                         }
                     }
                 }
             }
+            const size_t blocked_lane_count = allowed_block_count * 32;
+            const bool sparse_candidates =
+                !allowed_blocks.empty() &&
+                candidate_hint < (blocked_lane_count + 3) / 4;
+            if (!sparse_candidates) {
+                turbovec_scores.assign(n_slots, -std::numeric_limits<float>::infinity());
 
-            const float * vector_scales = is_turbovec_q2(idx) ?
-                idx.turbovec_q2_scale.data() :
-                idx.turbovec_q4_scale.data();
-            std::array<float, 32> block_scores{};
-#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON
-            static const bool has_turbovec_avx2 = cpu_has_avx2_fma();
+                const float * vector_scales = is_turbovec_q2(idx) ?
+                    idx.turbovec_q2_scale.data() :
+                    idx.turbovec_q4_scale.data();
+                std::array<float, 32> block_scores{};
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
+                static const bool has_turbovec_avx2 = cpu_has_avx2_fma();
 #endif
-            for (size_t block = 0; block < idx.turbovec_blocked_n_blocks; ++block) {
-                if (!allowed_blocks.empty() && allowed_blocks[block] == 0) {
-                    continue;
-                }
-#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON
-                if (has_turbovec_avx2) {
-                    ggml_vec_index_detail::score_turbovec_lut_block_avx2(
-                        turbovec_lut.data(),
-                        turbovec_lut_scale,
-                        turbovec_lut_bias,
-                        idx.turbovec_blocked_data.data(),
-                        vector_scales,
-                        block,
-                        n_byte_groups,
-                        n_slots,
-                        block_scores.data());
-                } else
-#endif
-                {
-                    score_turbovec_lut_block(
-                        turbovec_lut.data(),
-                        turbovec_lut_scale,
-                        turbovec_lut_bias,
-                        idx.turbovec_blocked_data.data(),
-                        vector_scales,
-                        block,
-                        n_slots,
-                        bits,
-                        idx.dim,
-                        block_scores.data());
-                }
-                const size_t base_slot = block * 32;
-                const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
-                for (size_t lane = 0; lane < count; ++lane) {
-                    float score = block_scores[lane];
-                    if (!std::isfinite(score)) {
-                        score = score_slot(
-                            idx,
-                            score_query,
-                            base_slot + lane,
-                            max_query,
+                for (size_t block = 0; block < idx.turbovec_blocked_n_blocks; ++block) {
+                    if (!allowed_blocks.empty() && allowed_blocks[block] == 0) {
+                        continue;
+                    }
+                    g_turbovec_block_score_calls.fetch_add(1, std::memory_order_relaxed);
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
+                    if (has_turbovec_avx2) {
+                        ggml_vec_index_detail::score_turbovec_lut_block_avx2(
                             turbovec_lut.data(),
                             turbovec_lut_scale,
-                            turbovec_lut_bias);
+                            turbovec_lut_bias,
+                            idx.turbovec_blocked_data.data(),
+                            vector_scales,
+                            block,
+                            n_byte_groups,
+                            n_slots,
+                            block_scores.data());
+                    } else
+#endif
+                    {
+                        score_turbovec_lut_block(
+                            turbovec_lut.data(),
+                            turbovec_lut_scale,
+                            turbovec_lut_bias,
+                            idx.turbovec_blocked_data.data(),
+                            vector_scales,
+                            block,
+                            n_slots,
+                            bits,
+                            idx.dim,
+                            block_scores.data());
                     }
-                    turbovec_scores[base_slot + lane] = score;
+                    const size_t base_slot = block * 32;
+                    const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
+                    for (size_t lane = 0; lane < count; ++lane) {
+                        float score = block_scores[lane];
+                        if (!std::isfinite(score)) {
+                            score = score_slot(
+                                idx,
+                                score_query,
+                                base_slot + lane,
+                                max_query,
+                                turbovec_lut.data(),
+                                turbovec_lut_scale,
+                                turbovec_lut_bias);
+                        }
+                        turbovec_scores[base_slot + lane] = score;
+                    }
                 }
             }
         }
@@ -584,8 +609,16 @@ std::vector<size_t> allowed_slots_for_ids(
 
 } // namespace
 
+void turbovec_reset_block_score_call_count_for_test(void) {
+    g_turbovec_block_score_calls.store(0, std::memory_order_relaxed);
+}
+
+int64_t turbovec_block_score_call_count_for_test(void) {
+    return g_turbovec_block_score_calls.load(std::memory_order_relaxed);
+}
+
 int turbovec_avx2_available_for_test() {
-#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
     return cpu_has_avx2_fma() ? 1 : 0;
 #else
     return 0;
@@ -596,7 +629,7 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim) {
     if ((bits != 2 && bits != 4) || dim <= 0 || dim % (8 / bits) != 0) {
         return 0;
     }
-#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
     if (!cpu_has_avx2_fma()) {
         return 1;
     }

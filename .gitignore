@@ -60,6 +60,7 @@
 /.cargo-turbovec-inspect/
 /ggml/build*/
 /results/
+/tests/turbovec-golden-gen/*.tmp.tv
 
 # Deprecated
 

@@ -27,6 +27,12 @@ struct TurboVecCodebook {
     std::vector<float> centroids;
 };
 
+struct TurboVecRotationCacheEntry {
+    size_t ref_count = 0;
+    std::weak_ptr<const std::vector<float>> weak;
+    std::shared_ptr<const std::vector<float>> strong;
+};
+
 struct ChaCha8 {
     uint32_t key[8] = {};
     uint64_t counter = 0;
@@ -281,19 +287,37 @@ static std::vector<float> make_turbovec_rotation(int dim) {
     return result;
 }
 
-static const std::vector<float> & turbovec_rotation(int dim) {
+static std::mutex & turbovec_rotation_cache_mutex() {
     static std::mutex mutex;
-    static std::unordered_map<int, std::vector<float>> cache;
-    std::lock_guard<std::mutex> lock(mutex);
+    return mutex;
+}
+
+static std::unordered_map<int, TurboVecRotationCacheEntry> & turbovec_rotation_cache() {
+    static std::unordered_map<int, TurboVecRotationCacheEntry> cache;
+    return cache;
+}
+
+static std::shared_ptr<const std::vector<float>> turbovec_rotation(int dim) {
+    std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
+    auto & cache = turbovec_rotation_cache();
     auto it = cache.find(dim);
     if (it == cache.end()) {
-        it = cache.emplace(dim, make_turbovec_rotation(dim)).first;
+        it = cache.emplace(dim, TurboVecRotationCacheEntry{}).first;
     }
-    return it->second;
+    std::shared_ptr<const std::vector<float>> rotation =
+        it->second.strong != nullptr ? it->second.strong : it->second.weak.lock();
+    if (rotation == nullptr) {
+        rotation = std::make_shared<const std::vector<float>>(make_turbovec_rotation(dim));
+        it->second.weak = rotation;
+        if (it->second.ref_count != 0) {
+            it->second.strong = rotation;
+        }
+    }
+    return rotation;
 }
 
 static void apply_turbovec_rotation(const float * src, float * dst, int dim, bool transpose) {
-    const std::vector<float> & rotation = turbovec_rotation(dim);
+    const std::shared_ptr<const std::vector<float>> rotation = turbovec_rotation(dim);
     const size_t dim_sz = static_cast<size_t>(dim);
     for (int row = 0; row < dim; ++row) {
         float sum = 0.0f;
@@ -301,7 +325,7 @@ static void apply_turbovec_rotation(const float * src, float * dst, int dim, boo
             const size_t matrix_index = transpose ?
                 static_cast<size_t>(column) * dim_sz + static_cast<size_t>(row) :
                 static_cast<size_t>(row) * dim_sz + static_cast<size_t>(column);
-            sum = std::fma(rotation[matrix_index], src[static_cast<size_t>(column)], sum);
+            sum = std::fma((*rotation)[matrix_index], src[static_cast<size_t>(column)], sum);
         }
         dst[static_cast<size_t>(row)] = sum;
     }
@@ -309,7 +333,7 @@ static void apply_turbovec_rotation(const float * src, float * dst, int dim, boo
 
 static void apply_turbovec_rotation_batch(const float * src, float * dst, int n, int dim) {
 #if defined(__APPLE__) && defined(GGML_USE_ACCELERATE)
-    const std::vector<float> & rotation = turbovec_rotation(dim);
+    const std::shared_ptr<const std::vector<float>> rotation = turbovec_rotation(dim);
     cblas_sgemm(
         CblasRowMajor,
         CblasNoTrans,
@@ -320,7 +344,7 @@ static void apply_turbovec_rotation_batch(const float * src, float * dst, int n,
         1.0f,
         src,
         dim,
-        rotation.data(),
+        rotation->data(),
         dim,
         0.0f,
         dst,
@@ -813,11 +837,56 @@ static float horizontal_sum_local(float32x4_t v) {
 } // namespace
 
 bool turbovec_q2_supported_dim(int dim) {
-    return dim > 0 && dim <= kTurboVecMaxDim && dim % kTurboVecDimMultiple == 0;
+    return sizeof(size_t) >= 8 &&
+        dim > 0 && dim <= kTurboVecMaxDim && dim % kTurboVecDimMultiple == 0;
 }
 
 bool turbovec_q4_supported_dim(int dim) {
-    return dim > 0 && dim <= kTurboVecMaxDim && dim % kTurboVecDimMultiple == 0;
+    return sizeof(size_t) >= 8 &&
+        dim > 0 && dim <= kTurboVecMaxDim && dim % kTurboVecDimMultiple == 0;
+}
+
+void turbovec_retain_rotation(int dim) {
+    std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
+    TurboVecRotationCacheEntry & entry = turbovec_rotation_cache()[dim];
+    ++entry.ref_count;
+    if (entry.strong == nullptr) {
+        entry.strong = entry.weak.lock();
+    }
+}
+
+void turbovec_release_rotation(int dim) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
+        auto & cache = turbovec_rotation_cache();
+        const auto it = cache.find(dim);
+        if (it == cache.end() || it->second.ref_count == 0) {
+            return;
+        }
+        --it->second.ref_count;
+        if (it->second.ref_count == 0) {
+            it->second.strong.reset();
+            if (it->second.weak.expired()) {
+                cache.erase(it);
+            }
+        }
+    } catch (...) {
+    }
+}
+
+size_t turbovec_rotation_cache_bytes_for_test(void) {
+    try {
+        std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
+        size_t bytes = 0;
+        for (const auto & entry : turbovec_rotation_cache()) {
+            if (entry.second.strong != nullptr) {
+                bytes += entry.second.strong->size() * sizeof(float);
+            }
+        }
+        return bytes;
+    } catch (...) {
+        return 0;
+    }
 }
 
 uint64_t turbovec_rotation_hash_for_test(int dim) {
@@ -825,7 +894,8 @@ uint64_t turbovec_rotation_hash_for_test(int dim) {
         return 0;
     }
     uint64_t hash = UINT64_C(0xcbf29ce484222325);
-    for (float value : turbovec_rotation(dim)) {
+    const std::shared_ptr<const std::vector<float>> rotation = turbovec_rotation(dim);
+    for (float value : *rotation) {
         uint32_t bits = 0;
         std::memcpy(&bits, &value, sizeof(bits));
         for (int byte = 0; byte < 4; ++byte) {

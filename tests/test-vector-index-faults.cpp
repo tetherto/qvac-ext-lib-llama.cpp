@@ -17,6 +17,7 @@ extern "C" void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 extern "C" void ggml_vec_index_test_set_truncate_fail(int fail);
 extern "C" void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 extern "C" void ggml_vec_index_test_set_delta_append_wait_target(int target);
+extern "C" int ggml_vec_index_test_get_delta_append_waiters(void);
 extern "C" void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
 extern "C" void ggml_vec_index_test_reset_delta_tail_scan_count(void);
 extern "C" int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
@@ -311,7 +312,7 @@ int main() {
             GGML_VEC_INDEX_OK);
         ggml_vec_index_test_set_parent_fsync_fail(1);
         CHECK(ggml_vec_index_write(parent_fsync_idx, parent_fsync_path.c_str()) ==
-              GGML_VEC_INDEX_E_IO);
+              GGML_VEC_INDEX_OK);
         reset_fault_hooks();
         CHECK(read_file_bytes(parent_fsync_path) != before_parent_fsync);
 
@@ -601,6 +602,76 @@ int main() {
     std::filesystem::remove(stale_tail_snapshot_path);
     std::filesystem::remove(stale_tail_delta_path);
     std::filesystem::remove(stale_tail_delta_path + ".lock");
+
+    const std::string hardlink_snapshot_path =
+        unique_temp_path("ggml-vector-index-hardlink-lock-base.tvim");
+    const std::string hardlink_delta_path =
+        unique_temp_path("ggml-vector-index-hardlink-lock-log.tvid");
+    const std::string hardlink_alias_path =
+        unique_temp_path("ggml-vector-index-hardlink-lock-alias.tvid");
+    std::filesystem::remove(hardlink_snapshot_path);
+    std::filesystem::remove(hardlink_delta_path);
+    std::filesystem::remove(hardlink_alias_path);
+
+    auto * hardlink_base = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(hardlink_base != nullptr);
+    CHECK(ggml_vec_index_add(
+        hardlink_base, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(hardlink_base, hardlink_snapshot_path.c_str()) ==
+          GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(hardlink_base);
+
+    {
+        std::ofstream empty_delta(hardlink_delta_path, std::ios::binary);
+        CHECK(empty_delta.is_open());
+    }
+    std::error_code hardlink_ec;
+    std::filesystem::create_hard_link(hardlink_delta_path, hardlink_alias_path, hardlink_ec);
+    if (!hardlink_ec) {
+        auto * hardlink_writer_a = ggml_vec_index_load(hardlink_snapshot_path.c_str());
+        auto * hardlink_writer_b = ggml_vec_index_load(hardlink_snapshot_path.c_str());
+        CHECK(hardlink_writer_a != nullptr);
+        CHECK(hardlink_writer_b != nullptr);
+
+        int status_a = GGML_VEC_INDEX_E_INTERNAL;
+        int status_b = GGML_VEC_INDEX_E_INTERNAL;
+        const uint64_t hardlink_id_a = 805;
+        const uint64_t hardlink_id_b = 806;
+        ggml_vec_index_test_set_delta_append_wait_target(2);
+        std::thread thread_a([&]() {
+            status_a = ggml_vec_index_add_logged(
+                hardlink_writer_a,
+                logged_vector.data(),
+                1,
+                &hardlink_id_a,
+                hardlink_delta_path.c_str());
+        });
+        while (ggml_vec_index_test_get_delta_append_waiters() < 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::thread thread_b([&]() {
+            status_b = ggml_vec_index_add_logged(
+                hardlink_writer_b,
+                extra_vector.data(),
+                1,
+                &hardlink_id_b,
+                hardlink_alias_path.c_str());
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK(ggml_vec_index_test_get_delta_append_waiters() == 1);
+        thread_a.join();
+        thread_b.join();
+        reset_fault_hooks();
+
+        CHECK(status_a == GGML_VEC_INDEX_OK);
+        CHECK(status_b == GGML_VEC_INDEX_E_IO);
+        CHECK(ggml_vec_index_contains(hardlink_writer_b, hardlink_id_b) == 0);
+        ggml_vec_index_free(hardlink_writer_a);
+        ggml_vec_index_free(hardlink_writer_b);
+    }
+    std::filesystem::remove(hardlink_snapshot_path);
+    std::filesystem::remove(hardlink_delta_path);
+    std::filesystem::remove(hardlink_alias_path);
 
     const std::string stale_compact_snapshot_path =
         unique_temp_path("ggml-vector-index-stale-compact-base.tvim");

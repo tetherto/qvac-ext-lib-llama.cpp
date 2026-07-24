@@ -13,6 +13,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <system_error>
 #include <unordered_set>
 #include <vector>
 
@@ -117,6 +118,30 @@ double median_time_ms(int warmups, int repeats, Fn fn) {
     }
     std::sort(times.begin(), times.end());
     return times[times.size() / 2];
+}
+
+std::filesystem::path make_temp_dir() {
+    const auto base = std::filesystem::temp_directory_path();
+    std::random_device rd;
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        const std::string name =
+            "ggml-vector-index-bench-" +
+            std::to_string(static_cast<unsigned long long>(now)) + "-" +
+            std::to_string(static_cast<unsigned long long>(rd()));
+        std::error_code ec;
+        const auto path = base / name;
+        if (std::filesystem::create_directory(path, ec)) {
+            return path;
+        }
+    }
+    CHECK(false);
+    return base / "ggml-vector-index-bench";
+}
+
+void remove_delta_artifacts(const std::filesystem::path & delta_path) {
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_path.string() + ".lock");
 }
 
 bool x86_cpu_has_avx2() {
@@ -504,8 +529,11 @@ TimedSearch run_simulated_q4_search(
     return result;
 }
 
-std::filesystem::path write_index_file(ggml_vec_index_t * idx, const char * name) {
-    const auto path = std::filesystem::temp_directory_path() / name;
+std::filesystem::path write_index_file(
+        ggml_vec_index_t * idx,
+        const std::filesystem::path & temp_dir,
+        const char * name) {
+    const auto path = temp_dir / name;
     CHECK(ggml_vec_index_write(idx, path.string().c_str()) == GGML_VEC_INDEX_OK);
     return path;
 }
@@ -723,16 +751,15 @@ DeltaBenchResult run_delta_bench(
         const std::vector<float> & vectors,
         const std::vector<uint64_t> & ids,
         const BenchConfig & cfg,
+        const std::filesystem::path & temp_dir,
         const char * snapshot_name,
         const char * delta_name) {
     CHECK(cfg.delta_ops > 0 && cfg.delta_ops * 2 < cfg.n_vec);
     const int base_n = cfg.n_vec - cfg.delta_ops;
-    const std::filesystem::path snapshot_path =
-        std::filesystem::temp_directory_path() / snapshot_name;
-    const std::filesystem::path delta_path =
-        std::filesystem::temp_directory_path() / delta_name;
+    const std::filesystem::path snapshot_path = temp_dir / snapshot_name;
+    const std::filesystem::path delta_path = temp_dir / delta_name;
     std::filesystem::remove(snapshot_path);
-    std::filesystem::remove(delta_path);
+    remove_delta_artifacts(delta_path);
 
     ggml_vec_index_t * idx = create_index_mode(bit_width, cfg.dim);
     CHECK(idx != nullptr);
@@ -791,7 +818,7 @@ DeltaBenchResult run_delta_bench(
 
     ggml_vec_index_free(idx);
     std::filesystem::remove(snapshot_path);
-    std::filesystem::remove(delta_path);
+    remove_delta_artifacts(delta_path);
     return result;
 }
 
@@ -799,6 +826,7 @@ DeltaBenchResult run_delta_bench(
 
 int main() {
     const BenchConfig cfg;
+    const std::filesystem::path temp_dir = make_temp_dir();
 
     std::vector<float> vectors = make_normalized_vectors(cfg.n_vec, cfg.dim, 0xdeadbeef);
     std::vector<float> queries = make_normalized_vectors(cfg.n_query, cfg.dim, 0xc001d00d);
@@ -993,11 +1021,11 @@ int main() {
     const double tvq4_ivf_recall_at_k =
         recall_against(f32_res, tvq4_ivf_res, cfg.n_query, cfg.k);
 
-    const auto f32_path = write_index_file(f32, "ggml-vector-index-bench-f32.tvim");
-    const auto q8_path  = write_index_file(q8,  "ggml-vector-index-bench-q8.tvim");
-    const auto q4_path  = write_index_file(q4,  "ggml-vector-index-bench-q4.tvim");
-    const auto tvq2_path = write_index_file(tvq2, "ggml-vector-index-bench-tvq2.tvim");
-    const auto tvq4_path = write_index_file(tvq4, "ggml-vector-index-bench-tvq4.tvim");
+    const auto f32_path = write_index_file(f32, temp_dir, "ggml-vector-index-bench-f32.tvim");
+    const auto q8_path  = write_index_file(q8,  temp_dir, "ggml-vector-index-bench-q8.tvim");
+    const auto q4_path  = write_index_file(q4,  temp_dir, "ggml-vector-index-bench-q4.tvim");
+    const auto tvq2_path = write_index_file(tvq2, temp_dir, "ggml-vector-index-bench-tvq2.tvim");
+    const auto tvq4_path = write_index_file(tvq4, temp_dir, "ggml-vector-index-bench-tvq4.tvim");
     const uintmax_t f32_file_size = std::filesystem::file_size(f32_path);
     const uintmax_t q8_file_size  = std::filesystem::file_size(q8_path);
     const uintmax_t q4_file_size  = std::filesystem::file_size(q4_path);
@@ -1039,6 +1067,7 @@ int main() {
         vectors,
         ids,
         cfg,
+        temp_dir,
         "ggml-vector-index-bench-delta-f32.tvim",
         "ggml-vector-index-bench-delta-f32.tvid");
     const DeltaBenchResult q8_delta = run_delta_bench(
@@ -1046,6 +1075,7 @@ int main() {
         vectors,
         ids,
         cfg,
+        temp_dir,
         "ggml-vector-index-bench-delta-q8.tvim",
         "ggml-vector-index-bench-delta-q8.tvid");
     const DeltaBenchResult q4_delta = run_delta_bench(
@@ -1053,6 +1083,7 @@ int main() {
         vectors,
         ids,
         cfg,
+        temp_dir,
         "ggml-vector-index-bench-delta-q4.tvim",
         "ggml-vector-index-bench-delta-q4.tvid");
     const DeleteBenchResult f32_delete = run_delete_bench(32, vectors, ids, queries, cfg);
@@ -1304,5 +1335,7 @@ int main() {
     ggml_vec_index_free(q4);
     ggml_vec_index_free(tvq2);
     ggml_vec_index_free(tvq4);
+    std::error_code cleanup_ec;
+    std::filesystem::remove_all(temp_dir, cleanup_ec);
     return 0;
 }

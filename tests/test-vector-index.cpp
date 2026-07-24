@@ -35,6 +35,7 @@
 #endif
 
 uint64_t turbovec_rotation_hash_for_test(int dim);
+size_t turbovec_rotation_cache_bytes_for_test(void);
 uint64_t turbovec_query_rotation_hash_for_test(
     const float * queries,
     int n_queries,
@@ -53,6 +54,8 @@ uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
 void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
 int turbovec_avx2_available_for_test();
 int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
+void turbovec_reset_block_score_call_count_for_test(void);
+int64_t turbovec_block_score_call_count_for_test(void);
 
 namespace {
 
@@ -386,6 +389,12 @@ uint64_t read_u64_le_at(const std::vector<uint8_t> & bytes, size_t offset) {
 
 void write_u32_le_at(std::vector<uint8_t> & bytes, size_t offset, uint32_t value) {
     for (int i = 0; i < 4; ++i) {
+        bytes[offset + static_cast<size_t>(i)] = static_cast<uint8_t>(value >> (8 * i));
+    }
+}
+
+void write_u64_le_at(std::vector<uint8_t> & bytes, size_t offset, uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
         bytes[offset + static_cast<size_t>(i)] = static_cast<uint8_t>(value >> (8 * i));
     }
 }
@@ -926,6 +935,19 @@ int main() {
     CHECK(max_dim_q4 != nullptr);
     ggml_vec_index_free(max_dim_q4);
 
+    {
+        constexpr int tv_cache_dim = 64;
+        CHECK(turbovec_rotation_cache_bytes_for_test() == 0);
+        auto * tv_cache = ggml_vec_index_create_turbovec_q2(tv_cache_dim);
+        CHECK(tv_cache != nullptr);
+        ggml_vec_index_prepare(tv_cache);
+        CHECK(turbovec_rotation_cache_bytes_for_test() >=
+              static_cast<size_t>(tv_cache_dim) * static_cast<size_t>(tv_cache_dim) *
+                  sizeof(float));
+        ggml_vec_index_free(tv_cache);
+        CHECK(turbovec_rotation_cache_bytes_for_test() == 0);
+    }
+
     // The early TurboVec prototype wrote incompatible v2 snapshots. They must
     // not be silently decoded as the v3 Rust-compatible layout.
     {
@@ -1075,6 +1097,63 @@ int main() {
         CHECK(turbovec_avx2_lut_block_matches_scalar_for_test(bit_width, 256) == 1);
     }
 
+    // Sparse filters should not score whole TurboVec blocks when only a few
+    // lanes from those blocks are candidates.
+    {
+        constexpr int tv_dim = 128;
+        constexpr int n_vecs = 96;
+        for (const int bit_width : { 2, 4 }) {
+            auto * tv = bit_width == 2 ?
+                ggml_vec_index_create_turbovec_q2(tv_dim) :
+                ggml_vec_index_create_turbovec_q4(tv_dim);
+            CHECK(tv != nullptr);
+            std::vector<float> tv_vecs(static_cast<size_t>(tv_dim) * n_vecs);
+            std::vector<uint64_t> tv_ids(static_cast<size_t>(n_vecs));
+            for (int row = 0; row < n_vecs; ++row) {
+                tv_ids[static_cast<size_t>(row)] =
+                    static_cast<uint64_t>(9700 + bit_width * 100 + row);
+                for (int col = 0; col < tv_dim; ++col) {
+                    const double x = static_cast<double>(row + 1);
+                    const double y = static_cast<double>(col + 5);
+                    tv_vecs[static_cast<size_t>(row) * tv_dim + static_cast<size_t>(col)] =
+                        static_cast<float>(
+                            0.44 * std::sin(0.017 * x * y + 0.13) +
+                            0.38 * std::cos(0.029 * (x + 2.0) * (y + 1.0)) +
+                            0.18 * std::sin(0.061 * (x + y)));
+                }
+            }
+            CHECK(ggml_vec_index_add(tv, tv_vecs.data(), n_vecs, tv_ids.data()) ==
+                  GGML_VEC_INDEX_OK);
+            CHECK(turbovec_blocked_hash_for_test(tv) != 0);
+
+            const std::array<uint64_t, 2> allowed = {
+                tv_ids[5],
+                tv_ids[63],
+            };
+            std::array<float, 4> scores{};
+            std::array<uint64_t, 4> out{};
+            turbovec_reset_block_score_call_count_for_test();
+            CHECK(ggml_vec_index_search_filtered(
+                tv,
+                tv_vecs.data(),
+                1,
+                2,
+                allowed.data(),
+                static_cast<int>(allowed.size()),
+                scores.data(),
+                out.data()) == GGML_VEC_INDEX_OK);
+            CHECK(turbovec_block_score_call_count_for_test() == 0);
+
+            turbovec_reset_block_score_call_count_for_test();
+            CHECK(ggml_vec_index_search(
+                tv, tv_vecs.data(), 1, 4, scores.data(), out.data()) ==
+                GGML_VEC_INDEX_OK);
+            CHECK(turbovec_block_score_call_count_for_test() ==
+                  static_cast<int64_t>((static_cast<size_t>(n_vecs) + 31) / 32));
+            ggml_vec_index_free(tv);
+        }
+    }
+
     // TurboVec q2/q4 are distinct modes. This first milestone supports
     // add/search/filter/IVF and regular snapshots; delta logs are format-gated.
     {
@@ -1120,8 +1199,12 @@ int main() {
         const std::string tv_delta_path =
             (std::filesystem::temp_directory_path() /
              "ggml-vector-index-turbovec-q2.tvid").string();
+        const std::string tv_unchecksummed_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-turbovec-q2-unchecksummed.tvim").string();
         std::filesystem::remove(tv_snapshot_path);
         std::filesystem::remove(tv_delta_path);
+        std::filesystem::remove(tv_unchecksummed_path);
         std::filesystem::remove(tv_delta_path + ".lock");
         CHECK(ggml_vec_index_write(tv, tv_snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
         auto * tv_loaded = ggml_vec_index_load(tv_snapshot_path.c_str());
@@ -1136,6 +1219,16 @@ int main() {
         CHECK(tv_out[0] == tv_ids[0]);
         CHECK(ggml_vec_index_load_mmap(tv_snapshot_path.c_str()) == nullptr);
         ggml_vec_index_free(tv_loaded);
+        std::vector<uint8_t> unchecksummed_tv = read_file_bytes(tv_snapshot_path);
+        CHECK(unchecksummed_tv.size() > 16);
+        CHECK(unchecksummed_tv[4] == 3);
+        CHECK((unchecksummed_tv[7] & 1) != 0);
+        unchecksummed_tv[7] = 0;
+        unchecksummed_tv.resize(unchecksummed_tv.size() - 16);
+        write_file_bytes(tv_unchecksummed_path, unchecksummed_tv);
+        auto * unchecksummed_loaded = ggml_vec_index_load(tv_unchecksummed_path.c_str());
+        CHECK(unchecksummed_loaded == nullptr);
+        ggml_vec_index_free(unchecksummed_loaded);
         ggml_vec_index_t * tv_delta_loaded = nullptr;
         CHECK(ggml_vec_index_load_with_delta_ex(
             tv_snapshot_path.c_str(), tv_delta_path.c_str(), &tv_delta_loaded) ==
@@ -1173,6 +1266,7 @@ int main() {
             GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(!std::filesystem::exists(tv_delta_path));
         std::filesystem::remove(tv_snapshot_path);
+        std::filesystem::remove(tv_unchecksummed_path);
         std::filesystem::remove(tv_delta_path + ".lock");
         ggml_vec_index_free(tv);
     }
@@ -2231,11 +2325,16 @@ int main() {
         const std::string corrupt_delta_path =
             (std::filesystem::temp_directory_path() /
              "ggml-vector-index-delta-corrupt.tvid").string();
+        const std::string alternate_delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-delta-alternate.tvid").string();
         std::filesystem::remove(snapshot_path);
         std::filesystem::remove(delta_path);
         std::filesystem::remove(missing_delta_path);
         std::filesystem::remove(mismatched_snapshot_path);
         std::filesystem::remove(corrupt_delta_path);
+        std::filesystem::remove(alternate_delta_path);
+        std::filesystem::remove(alternate_delta_path + ".lock");
 
         auto * base = ggml_vec_index_create(kDim, /*bit_width=*/32);
         CHECK(base != nullptr);
@@ -2275,6 +2374,19 @@ int main() {
         CHECK(ggml_vec_index_add_logged(
             base, seeds[2].data(), 1, &delta_id, delta_path.c_str()) ==
             GGML_VEC_INDEX_E_DUPLICATE);
+        CHECK(ggml_vec_index_write(base, mismatched_snapshot_path.c_str()) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(!std::filesystem::exists(mismatched_snapshot_path));
+        const uint64_t alternate_delta_id = (1ULL << 41) + 8ULL;
+        CHECK(ggml_vec_index_add_logged(
+            base, seeds[3].data(), 1, &alternate_delta_id, alternate_delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_contains(base, alternate_delta_id) == 0);
+        CHECK(!std::filesystem::exists(alternate_delta_path));
+        CHECK(ggml_vec_index_compact_delta(
+            base, mismatched_snapshot_path.c_str(), alternate_delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(!std::filesystem::exists(mismatched_snapshot_path));
 
         auto * replayed = ggml_vec_index_load_with_delta(
             snapshot_path.c_str(), delta_path.c_str());
@@ -2283,6 +2395,13 @@ int main() {
         CHECK(ggml_vec_index_contains(replayed, ids[0]) == 0);
         CHECK(ggml_vec_index_contains(replayed, ids[1]) == 1);
         CHECK(ggml_vec_index_contains(replayed, delta_id) == 1);
+        CHECK(ggml_vec_index_add_logged(
+            replayed,
+            seeds[3].data(),
+            1,
+            &alternate_delta_id,
+            alternate_delta_path.c_str()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_contains(replayed, alternate_delta_id) == 0);
 
         std::array<float, 2> scores{};
         std::array<uint64_t, 2> out_ids{};
@@ -2299,6 +2418,21 @@ int main() {
             snapshot_path.c_str(), corrupt_delta_path.c_str());
         CHECK(corrupt_delta_loaded == nullptr);
         ggml_vec_index_free(corrupt_delta_loaded);
+
+        std::vector<uint8_t> corrupt_payload_size_delta = read_file_bytes(delta_path);
+        const size_t corrupt_payload_size_record_offset =
+            delta_log_header_size(corrupt_payload_size_delta);
+        const uint64_t declared_payload_size =
+            read_u64_le_at(corrupt_payload_size_delta, corrupt_payload_size_record_offset + 8);
+        write_u64_le_at(
+            corrupt_payload_size_delta,
+            corrupt_payload_size_record_offset + 8,
+            declared_payload_size + 1);
+        write_file_bytes(corrupt_delta_path, corrupt_payload_size_delta);
+        auto * corrupt_payload_size_loaded = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), corrupt_delta_path.c_str());
+        CHECK(corrupt_payload_size_loaded == nullptr);
+        ggml_vec_index_free(corrupt_payload_size_loaded);
 
         std::vector<uint8_t> forged_intermediate_delta = read_file_bytes(delta_path);
         const size_t forged_first_record_offset =
@@ -2380,6 +2514,17 @@ int main() {
             snapshot_path.c_str(), missing_remove_delta_path.c_str());
         CHECK(missing_remove_loaded == nullptr);
         ggml_vec_index_free(missing_remove_loaded);
+        auto * missing_remove_writer = ggml_vec_index_load(snapshot_path.c_str());
+        CHECK(missing_remove_writer != nullptr);
+        const uint64_t after_missing_remove_id = (1ULL << 41) + 124ULL;
+        CHECK(ggml_vec_index_add_logged(
+            missing_remove_writer,
+            seeds[2].data(),
+            1,
+            &after_missing_remove_id,
+            missing_remove_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+        CHECK(ggml_vec_index_contains(missing_remove_writer, after_missing_remove_id) == 0);
+        ggml_vec_index_free(missing_remove_writer);
         std::filesystem::remove(missing_remove_delta_path);
         std::filesystem::remove(missing_remove_delta_path + ".lock");
 
@@ -2488,6 +2633,8 @@ int main() {
         std::filesystem::remove(delta_path);
         std::filesystem::remove(mismatched_snapshot_path);
         std::filesystem::remove(corrupt_delta_path);
+        std::filesystem::remove(alternate_delta_path);
+        std::filesystem::remove(alternate_delta_path + ".lock");
     }
 
     // Delta replay supports tombstone delete followed by re-adding the same ID.
@@ -2635,6 +2782,17 @@ int main() {
                 CHECK(std::fabs(mmap_scores[i] - normal_scores[i]) <= 1e-6f);
             }
 
+            std::filesystem::resize_file(mmap_path, 0);
+            std::array<float, 4> truncated_scores{};
+            std::array<uint64_t, 4> truncated_ids{};
+            CHECK(ggml_vec_index_search(
+                mapped, query.data(), 1, /*k=*/4,
+                truncated_scores.data(), truncated_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(truncated_ids[i] == normal_ids[i]);
+                CHECK(std::fabs(truncated_scores[i] - normal_scores[i]) <= 1e-6f);
+            }
+
             CHECK(ggml_vec_index_build_ivf(mapped, /*n_lists=*/2, /*n_iter=*/2)
                   == GGML_VEC_INDEX_OK);
             CHECK(ggml_vec_index_search_ivf(
@@ -2647,6 +2805,7 @@ int main() {
             CHECK(ggml_vec_index_remove(mapped, mmap_ids[0])
                   == GGML_VEC_INDEX_E_INVALID_ARG);
             CHECK(ggml_vec_index_compact(mapped) == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_write(mapped, mmap_copy_path.c_str()) == GGML_VEC_INDEX_OK);
             CHECK(ggml_vec_index_compact_delta(
                 mapped, mmap_copy_path.c_str(), mmap_delta_path.c_str()) ==
                 GGML_VEC_INDEX_OK);
@@ -2656,7 +2815,8 @@ int main() {
             CHECK(ggml_vec_index_len(compacted) == static_cast<int>(mmap_ids.size()));
             CHECK(ggml_vec_index_write(mapped, mmap_path.c_str())
                   == GGML_VEC_INDEX_E_INVALID_ARG);
-            CHECK(ggml_vec_index_write(mapped, mmap_copy_path.c_str()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_write(mapped, mmap_copy_path.c_str())
+                  == GGML_VEC_INDEX_E_INVALID_ARG);
             auto * copied = ggml_vec_index_load(mmap_copy_path.c_str());
             CHECK(copied != nullptr);
             CHECK(ggml_vec_index_len(copied) == static_cast<int>(mmap_ids.size()));
@@ -3064,8 +3224,10 @@ int main() {
             CHECK(ggml_vec_index_contains(compacted_quant, delta_id) == 1);
             ggml_vec_index_free(compacted_quant);
 
+            auto * v2_writer = ggml_vec_index_load(snapshot_path.c_str());
+            CHECK(v2_writer != nullptr);
             CHECK(ggml_vec_index_compact_delta(
-                quant_delta, snapshot_path.c_str(), v2_delta_path.c_str()) ==
+                v2_writer, snapshot_path.c_str(), v2_delta_path.c_str()) ==
                 GGML_VEC_INDEX_OK);
             const std::vector<uint8_t> compacted_v4 = read_file_bytes(v2_delta_path);
             CHECK(compacted_v4.size() == 48);
@@ -3077,9 +3239,9 @@ int main() {
             const uint64_t v2_delta_id =
                 (1ULL << 42) + static_cast<uint64_t>(bit_width + 200);
             CHECK(ggml_vec_index_add_logged(
-                quant_delta, seeds[1].data(), 1, &v2_delta_id, v2_delta_path.c_str()) ==
+                v2_writer, seeds[1].data(), 1, &v2_delta_id, v2_delta_path.c_str()) ==
                 GGML_VEC_INDEX_E_INVALID_ARG);
-            CHECK(ggml_vec_index_contains(quant_delta, v2_delta_id) == 0);
+            CHECK(ggml_vec_index_contains(v2_writer, v2_delta_id) == 0);
 
             std::vector<uint8_t> v2_payload;
             append_u64_le(v2_payload, v2_delta_id);
@@ -3131,6 +3293,7 @@ int main() {
             CHECK(ggml_vec_index_contains(replayed_v2, v2_delta_id) == 1);
 
             ggml_vec_index_free(replayed_v2);
+            ggml_vec_index_free(v2_writer);
             ggml_vec_index_free(replayed_quant);
             ggml_vec_index_free(quant_delta);
             std::filesystem::remove(snapshot_path);

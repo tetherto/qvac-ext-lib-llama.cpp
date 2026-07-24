@@ -108,6 +108,7 @@ jobs:
         run: |
           cmake -B build \
             -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_RPC=ON
           time cmake --build build --config Release -j $(nproc)
 
