@@ -2716,6 +2716,90 @@ kernel void kernel_lightning_indexer_mm(
     }
 }
 
+kernel void kernel_dsv4_hc_post(
+        constant ggml_metal_kargs_dsv4_hc_post & args,
+        device const char * x,
+        device const char * residual,
+        device const char * post,
+        device const char * comb,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.ne) {
+        return;
+    }
+
+    const int64_t i  = gid % args.n_embd;
+    const int64_t d  = (gid / args.n_embd) % args.hc;
+    const int64_t it = gid / (args.n_embd * args.hc);
+
+    const device float * x_ptr = (device const float *) (
+        x + i*args.x_nb0 + it*args.x_nb1);
+    const device float * post_ptr = (device const float *) (
+        post + d*args.post_nb0 + it*args.post_nb1);
+    volatile float sum = (*x_ptr) * (*post_ptr);
+
+    for (int64_t s = 0; s < args.hc; ++s) {
+        const device float * residual_ptr = (device const float *) (
+            residual + i*args.residual_nb0 + s*args.residual_nb1 + it*args.residual_nb2);
+        const device float * comb_ptr = (device const float *) (
+            comb + d*args.comb_nb0 + s*args.comb_nb1 + it*args.comb_nb2);
+        volatile float product = (*residual_ptr) * (*comb_ptr);
+        sum = sum + product;
+    }
+
+    device float * dst_ptr = (device float *) (
+        dst + i*args.dst_nb0 + d*args.dst_nb1 + it*args.dst_nb2);
+    *dst_ptr = sum;
+}
+
+kernel void kernel_dsv4_hc_post_4(
+        constant ggml_metal_kargs_dsv4_hc_post & args,
+        device const char * x,
+        device const char * residual,
+        device const char * post,
+        device const char * comb,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.ne/4) {
+        return;
+    }
+
+    const int64_t ne4 = args.n_embd/4;
+    const int64_t i4 = gid % ne4;
+    const int64_t d  = (gid / ne4) % args.hc;
+    const int64_t it = gid / (ne4 * args.hc);
+
+    const device float * post_ptr = (device const float *) (
+        post + d*args.post_nb0 + it*args.post_nb1);
+    float4 xv;
+    for (int64_t c = 0; c < 4; ++c) {
+        const device float * x_ptr = (device const float *) (
+            x + (4*i4 + c)*args.x_nb0 + it*args.x_nb1);
+        xv[c] = *x_ptr;
+    }
+    volatile float4 sum = xv * (*post_ptr);
+
+    for (int64_t s = 0; s < args.hc; ++s) {
+        const device float * comb_ptr = (device const float *) (
+            comb + d*args.comb_nb0 + s*args.comb_nb1 + it*args.comb_nb2);
+        float4 rv;
+        for (int64_t c = 0; c < 4; ++c) {
+            const device float * residual_ptr = (device const float *) (
+                residual + (4*i4 + c)*args.residual_nb0 +
+                s*args.residual_nb1 + it*args.residual_nb2);
+            rv[c] = *residual_ptr;
+        }
+        volatile float4 product = rv * (*comb_ptr);
+        sum = sum + product;
+    }
+
+    for (int64_t c = 0; c < 4; ++c) {
+        device float * dst_ptr = (device float *) (
+            dst + (4*i4 + c)*args.dst_nb0 + d*args.dst_nb1 + it*args.dst_nb2);
+        *dst_ptr = sum[c];
+    }
+}
+
 kernel void kernel_dsv4_hc_comb(
         constant ggml_metal_kargs_dsv4_hc_comb & args,
         device const char * mixes,

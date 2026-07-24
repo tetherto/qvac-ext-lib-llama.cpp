@@ -278,6 +278,26 @@ typedef struct {
 } ggml_metal_kargs_lightning_indexer;
 
 typedef struct {
+    int64_t  ne;
+    int64_t  n_embd;
+    int64_t  hc;
+    int64_t  n_tokens;
+    uint64_t x_nb0;
+    uint64_t x_nb1;
+    uint64_t residual_nb0;
+    uint64_t residual_nb1;
+    uint64_t residual_nb2;
+    uint64_t post_nb0;
+    uint64_t post_nb1;
+    uint64_t comb_nb0;
+    uint64_t comb_nb1;
+    uint64_t comb_nb2;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+} ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
     int64_t  n_tokens;
     uint32_t n_iter;
     float    eps;
