@@ -1007,6 +1007,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32_cm2;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
+    vk_pipeline pipeline_dsv4_hc_post_f32;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
@@ -1872,6 +1873,31 @@ struct vk_op_dsv4_hc_pre_push_constants {
 };
 static_assert(sizeof(vk_op_dsv4_hc_pre_push_constants) <= 128);
 
+struct vk_op_dsv4_hc_post_push_constants {
+    uint32_t ne;
+    uint32_t n_embd;
+    uint32_t hc;
+    uint32_t n_tokens;
+    uint32_t x_nb0;
+    uint32_t x_nb1;
+    uint32_t x_offset;
+    uint32_t residual_nb0;
+    uint32_t residual_nb1;
+    uint32_t residual_nb2;
+    uint32_t residual_offset;
+    uint32_t post_nb0;
+    uint32_t post_nb1;
+    uint32_t post_offset;
+    uint32_t comb_nb0;
+    uint32_t comb_nb1;
+    uint32_t comb_nb2;
+    uint32_t comb_offset;
+    uint32_t dst_nb0;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
+    uint32_t dst_offset;
+};
+static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 
 struct vk_op_diag_mask_push_constants {
     uint32_t ncols;
@@ -6552,6 +6578,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {DSV4_HC_COMB_WG_SIZE, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32, "dsv4_hc_pre_f32", dsv4_hc_pre_f32_len, dsv4_hc_pre_f32_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32, "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_set_f32, "set_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 0}, 1);
@@ -13045,6 +13072,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_dsv4_hc_pre_f32;
         }
         return nullptr;
+    case GGML_OP_DSV4_HC_POST:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 &&
+            dst->src[3]->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_dsv4_hc_post_f32;
+        }
+        return nullptr;
     case GGML_OP_CONCAT: {
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
@@ -14789,6 +14822,56 @@ static void ggml_vk_dsv4_hc_pre(
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, weights_buf, dst_buf }, pc, elements);
+}
+
+static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * x, const ggml_tensor * residual, const ggml_tensor * post, const ggml_tensor * comb, ggml_tensor * dst) {
+    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_post_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    const uint32_t type_size = ggml_type_size(dst->type);
+    const vk_op_dsv4_hc_post_push_constants pc = {
+        (uint32_t) ggml_nelements(dst),
+        (uint32_t) dst->ne[0],
+        (uint32_t) dst->ne[1],
+        (uint32_t) dst->ne[2],
+        (uint32_t) (x->nb[0] / type_size),
+        (uint32_t) (x->nb[1] / type_size),
+        (uint32_t) (get_misalign_bytes(ctx, x) / type_size),
+        (uint32_t) (residual->nb[0] / type_size),
+        (uint32_t) (residual->nb[1] / type_size),
+        (uint32_t) (residual->nb[2] / type_size),
+        (uint32_t) (get_misalign_bytes(ctx, residual) / type_size),
+        (uint32_t) (post->nb[0] / type_size),
+        (uint32_t) (post->nb[1] / type_size),
+        (uint32_t) (get_misalign_bytes(ctx, post) / type_size),
+        (uint32_t) (comb->nb[0] / type_size),
+        (uint32_t) (comb->nb[1] / type_size),
+        (uint32_t) (comb->nb[2] / type_size),
+        (uint32_t) (get_misalign_bytes(ctx, comb) / type_size),
+        (uint32_t) (dst->nb[0] / type_size),
+        (uint32_t) (dst->nb[1] / type_size),
+        (uint32_t) (dst->nb[2] / type_size),
+        (uint32_t) (get_misalign_bytes(ctx, dst) / type_size),
+    };
+
+    vk_subbuffer x_buf        = ggml_vk_tensor_subbuffer(ctx, x, true);
+    vk_subbuffer residual_buf = ggml_vk_tensor_subbuffer(ctx, residual, true);
+    vk_subbuffer post_buf     = ggml_vk_tensor_subbuffer(ctx, post, true);
+    vk_subbuffer comb_buf     = ggml_vk_tensor_subbuffer(ctx, comb, true);
+    vk_subbuffer dst_buf      = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    uint32_t ne = ggml_nelements(dst);
+    std::array<uint32_t, 3> elements;
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, residual_buf, post_buf, comb_buf, dst_buf }, pc, elements);
 }
 
 static void ggml_vk_op_f32_wkv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_rwkv_wkv6_push_constants&& pc, int version) {
@@ -17894,6 +17977,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_DSV4_HC_PRE:
         ggml_vk_dsv4_hc_pre(ctx, compute_ctx, src0, src1, node);
         break;
+    case GGML_OP_DSV4_HC_POST:
+        ggml_vk_dsv4_hc_post(ctx, compute_ctx, src0, src1, src2, src3, node);
         break;
     case GGML_OP_CONCAT:
         ggml_vk_concat(ctx, compute_ctx, src0, src1, node);
@@ -21098,6 +21183,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
                    op->ne[0] == op->src[0]->ne[0] && op->ne[1] == op->src[0]->ne[2] &&
                    op->ne[2] == 1 && op->ne[3] == 1;
+        case GGML_OP_DSV4_HC_POST:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[0] == op->src[0]->ne[0] && op->src[1]->ne[2] == op->src[0]->ne[1] && op->src[1]->ne[3] == 1 &&
+                   op->src[2]->ne[0] == op->src[1]->ne[1] && op->src[2]->ne[1] == op->src[0]->ne[1] && op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                   op->src[3]->ne[0] == op->src[1]->ne[1] && op->src[3]->ne[1] == op->src[1]->ne[1] && op->src[3]->ne[2] == op->src[0]->ne[1] && op->src[3]->ne[3] == 1 &&
+                   op->ne[0] == op->src[0]->ne[0] && op->ne[1] == op->src[1]->ne[1] && op->ne[2] == op->src[0]->ne[1] && op->ne[3] == 1;
         case GGML_OP_SILU_BACK:
         case GGML_OP_GELU_BACK:
         case GGML_OP_GEGLU_BACK:
@@ -21963,6 +22056,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                 ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_i32(tensor, 1));
         } else if (tensor->op == GGML_OP_DSV4_HC_PRE) {
             tensor_clone = ggml_dsv4_hc_pre(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_DSV4_HC_POST) {
+            tensor_clone = ggml_dsv4_hc_post(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_SUB) {
             tensor_clone = ggml_sub(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL) {
