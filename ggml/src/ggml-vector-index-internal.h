@@ -288,12 +288,17 @@ void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale);
 void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale);
 bool turbovec_q2_supported_dim(int dim);
 bool turbovec_q4_supported_dim(int dim);
-GGML_API uint64_t turbovec_rotation_hash_for_test(int dim);
-GGML_API uint64_t turbovec_query_rotation_hash_for_test(
+#ifdef GGML_VEC_INDEX_EXPORT_TESTS
+#define GGML_VEC_INDEX_TEST_API GGML_API
+#else
+#define GGML_VEC_INDEX_TEST_API
+#endif
+GGML_VEC_INDEX_TEST_API uint64_t turbovec_rotation_hash_for_test(int dim);
+GGML_VEC_INDEX_TEST_API uint64_t turbovec_query_rotation_hash_for_test(
     const float * queries,
     int n_queries,
     int dim);
-GGML_API uint64_t turbovec_lut_hash_for_test(
+GGML_VEC_INDEX_TEST_API uint64_t turbovec_lut_hash_for_test(
     const float * query,
     const float * tqplus_shift,
     const float * tqplus_scale,
@@ -302,11 +307,12 @@ GGML_API uint64_t turbovec_lut_hash_for_test(
     int dim,
     uint32_t * lut_scale_bits,
     uint32_t * lut_bias_bits);
-GGML_API uint64_t turbovec_codebook_hash_for_test(int bits, int dim);
-GGML_API uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
-GGML_API void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
-GGML_API int turbovec_avx2_available_for_test();
-GGML_API int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
+GGML_VEC_INDEX_TEST_API uint64_t turbovec_codebook_hash_for_test(int bits, int dim);
+GGML_VEC_INDEX_TEST_API uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
+GGML_VEC_INDEX_TEST_API void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
+GGML_VEC_INDEX_TEST_API int turbovec_avx2_available_for_test();
+GGML_VEC_INDEX_TEST_API int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
+#undef GGML_VEC_INDEX_TEST_API
 void prepare_turbovec(int bits, int dim);
 void rotate_turbovec_query(const float * src, float * dst, int dim);
 void rotate_turbovec_queries(

@@ -1693,6 +1693,11 @@ DeltaAppendResult append_delta_record(
     if (old_size != 0) {
         format = existing_format;
     }
+    if (op == kTvidOpAdd &&
+        is_quantized(idx) &&
+        (format == DeltaLogFormat::v1 || format == DeltaLogFormat::v2)) {
+        return { GGML_VEC_INDEX_E_INVALID_ARG, false };
+    }
     const DeltaStateKind state_kind = delta_state_kind_for_format(format);
     if (old_size != 0) {
         uint32_t tail_crc = 0;
