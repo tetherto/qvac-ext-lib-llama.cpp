@@ -1005,6 +1005,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32;
     vk_pipeline pipeline_lightning_indexer_f32_cm1;
     vk_pipeline pipeline_lightning_indexer_f32_cm2;
+    vk_pipeline pipeline_dsv4_hc_comb_f32;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
@@ -1833,6 +1834,25 @@ static bool ggml_vk_lightning_indexer_cm2_compatible(
     return false;
 #endif
 }
+
+struct vk_op_dsv4_hc_comb_push_constants {
+    uint32_t n_tokens;
+    uint32_t n_iter;
+    float eps;
+    uint32_t mixes_nb0;
+    uint32_t mixes_nb1;
+    uint32_t mixes_offset;
+    uint32_t scale_nb0;
+    uint32_t scale_offset;
+    uint32_t base_nb0;
+    uint32_t base_offset;
+    uint32_t dst_nb0;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
+    uint32_t dst_offset;
+};
+static_assert(sizeof(vk_op_dsv4_hc_comb_push_constants) <= 128);
+static constexpr uint32_t DSV4_HC_COMB_WG_SIZE = 64;
 
 
 struct vk_op_diag_mask_push_constants {
@@ -6512,6 +6532,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #endif
     }
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {DSV4_HC_COMB_WG_SIZE, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_set_f32, "set_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 0}, 1);
@@ -12994,6 +13015,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_lightning_indexer_f32;
         }
         return nullptr;
+    case GGML_OP_DSV4_HC_COMB:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_dsv4_hc_comb_f32;
+        }
+        return nullptr;
     case GGML_OP_CONCAT: {
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
@@ -14656,6 +14683,44 @@ static void ggml_vk_lightning_indexer(
                   (uint32_t) k->ne[2],
         (uint32_t) q->ne[2],
         (uint32_t) q->ne[3],
+    });
+}
+
+static void ggml_vk_dsv4_hc_comb(
+        ggml_backend_vk_context * ctx,
+        vk_context & subctx,
+        const ggml_tensor * mixes,
+        const ggml_tensor * scale,
+        const ggml_tensor * base,
+        ggml_tensor * dst) {
+    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_comb_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    const vk_op_dsv4_hc_comb_push_constants pc = {
+        (uint32_t) mixes->ne[1],
+        (uint32_t) ggml_get_op_params_i32(dst, 1),
+        ggml_get_op_params_f32(dst, 0),
+        (uint32_t) (mixes->nb[0] / sizeof(float)),
+        (uint32_t) (mixes->nb[1] / sizeof(float)),
+        (uint32_t) (get_misalign_bytes(ctx, mixes) / sizeof(float)),
+        (uint32_t) (scale->nb[0] / sizeof(float)),
+        (uint32_t) (get_misalign_bytes(ctx, scale) / sizeof(float)),
+        (uint32_t) (base->nb[0] / sizeof(float)),
+        (uint32_t) (get_misalign_bytes(ctx, base) / sizeof(float)),
+        (uint32_t) (dst->nb[0] / sizeof(float)),
+        (uint32_t) (dst->nb[1] / sizeof(float)),
+        (uint32_t) (dst->nb[2] / sizeof(float)),
+        (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(float)),
+    };
+
+    vk_subbuffer mixes_buf = ggml_vk_tensor_subbuffer(ctx, mixes, true);
+    vk_subbuffer scale_buf = ggml_vk_tensor_subbuffer(ctx, scale, true);
+    vk_subbuffer base_buf  = ggml_vk_tensor_subbuffer(ctx, base, true);
+    vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { mixes_buf, scale_buf, base_buf, dst_buf }, pc, {
+        (uint32_t) mixes->ne[1], 1, 1,
     });
 }
 
@@ -17755,6 +17820,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_LIGHTNING_INDEXER:
         ggml_vk_lightning_indexer(ctx, compute_ctx, src0, src1, src2, src3, node);
+        break;
+    case GGML_OP_DSV4_HC_COMB:
+        ggml_vk_dsv4_hc_comb(ctx, compute_ctx, src0, src1, src2, node);
         break;
         break;
     case GGML_OP_CONCAT:
@@ -20939,6 +21007,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->ne[0] <= device->properties.limits.maxComputeWorkGroupCount[0] &&
                    op->ne[1] <= device->properties.limits.maxComputeWorkGroupCount[1] &&
                    op->ne[3] <= device->properties.limits.maxComputeWorkGroupCount[2];
+        case GGML_OP_DSV4_HC_COMB: {
+            const uint64_t groups_x = CEIL_DIV((uint64_t) op->src[0]->ne[1], DSV4_HC_COMB_WG_SIZE);
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] == 24 && op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[0] >= 3 && op->src[1]->ne[1] == 1 &&
+                   op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                   op->src[2]->ne[0] == 24 && op->src[2]->ne[1] == 1 &&
+                   op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                   op->ne[0] == 4 && op->ne[1] == 4 && op->ne[2] == op->src[0]->ne[1] && op->ne[3] == 1 &&
+                   ggml_get_op_params_i32(op, 1) > 0 &&
+                   groups_x <= device->properties.limits.maxComputeWorkGroupCount[0];
+        }
         case GGML_OP_SILU_BACK:
         case GGML_OP_GELU_BACK:
         case GGML_OP_GEGLU_BACK:
@@ -21798,6 +21879,10 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_mul_mat_id_back_b(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], b_like);
         } else if (tensor->op == GGML_OP_LIGHTNING_INDEXER) {
             tensor_clone = ggml_lightning_indexer(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
+        } else if (tensor->op == GGML_OP_DSV4_HC_COMB) {
+            tensor_clone = ggml_dsv4_hc_comb(
+                ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_i32(tensor, 1));
         } else if (tensor->op == GGML_OP_SUB) {
             tensor_clone = ggml_sub(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL) {

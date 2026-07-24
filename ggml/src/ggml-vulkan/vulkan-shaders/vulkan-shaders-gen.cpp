@@ -1132,6 +1132,7 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
     string_to_spv("lightning_indexer_f32", "lightning_indexer_cm2.comp", {}, true, false, true);
 #endif
+    string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("div_f32", "div.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("repeat_i32", "repeat.comp", {{"A_TYPE", "int32_t"}, {"D_TYPE", "int32_t"}});
