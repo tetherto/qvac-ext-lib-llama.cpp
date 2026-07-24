@@ -3,9 +3,15 @@
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_buffer_reference : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_NV_cooperative_matrix2 : enable
+
+#include "dequant_funcs_cm2.glsl"
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -41,13 +47,12 @@ layout(push_constant) uniform parameter {
 } p;
 
 layout(binding = 0) readonly buffer QBuf { float data_q[]; };
-layout(binding = 1) readonly buffer KBuf { float data_k[]; };
+layout(binding = 1) readonly buffer KBuf { A_TYPE data_a[]; };
 layout(binding = 2) readonly buffer WBuf { float data_w[]; };
 layout(binding = 3) readonly buffer MBuf { float16_t data_m[]; };
 layout(binding = 4) writeonly buffer DstBuf { float data_dst[]; };
 
 const uint N_EMBD = 128;
-const uint N_HEAD = 64;
 const uint KV_TILE = 64;
 
 float add_reduce(const in float x, const in float y) {
@@ -93,6 +98,9 @@ void main() {
 
     layout_q = setTensorLayoutDimensionNV(layout_q, N_HEAD, N_EMBD);
     layout_q = setTensorLayoutStrideNV(layout_q, p.q_nb1, p.q_nb0);
+#if QUANT_K > 1
+    layout_k = setTensorLayoutBlockSizeNV(layout_k, 1, QUANT_K);
+#endif
     layout_k = setTensorLayoutDimensionNV(layout_k, p.n_kv, N_EMBD);
     layout_k = setTensorLayoutStrideNV(layout_k, p.k_nb2, p.k_nb0);
 
@@ -108,12 +116,20 @@ void main() {
     }
 
     coopmat<float16_t, gl_ScopeWorkgroup, N_EMBD, KV_TILE, gl_MatrixUseB> mat_k;
+#if defined(DATA_A_F32)
     {
         coopmat<float, gl_ScopeWorkgroup, N_EMBD, KV_TILE, gl_MatrixUseAccumulator> k_f32;
-        coopMatLoadTensorNV(k_f32, data_k, k_base,
+        coopMatLoadTensorNV(k_f32, data_a, k_base,
             sliceTensorLayoutNV(layout_k, kv_base, KV_TILE, 0, N_EMBD), transpose);
         mat_k = coopmat<float16_t, gl_ScopeWorkgroup, N_EMBD, KV_TILE, gl_MatrixUseB>(k_f32);
     }
+#elif defined(DATA_A_F16)
+    coopMatLoadTensorNV(mat_k, data_a, k_base,
+        sliceTensorLayoutNV(layout_k, kv_base, KV_TILE, 0, N_EMBD), transpose);
+#else
+    coopMatLoadTensorNV(mat_k, data_a, k_base,
+        sliceTensorLayoutNV(layout_k, kv_base, KV_TILE, 0, N_EMBD), transpose, dequantFuncA);
+#endif
     coopmat<float, gl_ScopeWorkgroup, N_HEAD, KV_TILE, gl_MatrixUseAccumulator> mat_scores =
         coopmat<float, gl_ScopeWorkgroup, N_HEAD, KV_TILE, gl_MatrixUseAccumulator>(0.0);
     mat_scores = coopMatMulAdd(mat_q, mat_k, mat_scores);
