@@ -77,20 +77,22 @@ GGML_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
 
 // Creates a TurboQuant q2 vector index. This is distinct from the generic
 // q4/q8 modes created by `ggml_vec_index_create`: vectors are normalized,
-// rotated in 128-dimensional blocks, quantized with Lloyd-Max q2 codebooks, and
-// searched against rotated queries. This first implementation requires
-// `dim > 0 && dim % 128 == 0` and supports add/search/filter/IVF plus regular
-// snapshot write/load. mmap loading and logged mutations are reserved for later
-// format work.
+// rotated, quantized with Lloyd-Max q2 codebooks, and searched against rotated
+// queries. This implementation requires `0 < dim <= 65536 && dim % 8 == 0` and
+// supports add/search/filter/IVF plus regular snapshot write/load. TurboVec
+// materializes a dense `dim x dim` rotation matrix on first use, so very large
+// accepted dimensions may return GGML_VEC_INDEX_E_OOM from add/search/prepare.
+// mmap loading and logged mutations are reserved for later format work.
 GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
 
 // Creates a TurboQuant q4 vector index. This is distinct from the generic
 // `bit_width=4` mode created by `ggml_vec_index_create`: vectors are normalized,
-// rotated in 128-dimensional blocks, quantized with Lloyd-Max q4 codebooks, and
-// searched against rotated queries. This first implementation requires
-// `dim > 0 && dim % 128 == 0` and supports add/search/filter/IVF plus regular
-// snapshot write/load. mmap loading and logged mutations are reserved for later
-// format work.
+// rotated, quantized with Lloyd-Max q4 codebooks, and searched against rotated
+// queries. This implementation requires `0 < dim <= 65536 && dim % 8 == 0` and
+// supports add/search/filter/IVF plus regular snapshot write/load. TurboVec
+// materializes a dense `dim x dim` rotation matrix on first use, so very large
+// accepted dimensions may return GGML_VEC_INDEX_E_OOM from add/search/prepare.
+// mmap loading and logged mutations are reserved for later format work.
 GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
 
 GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
@@ -101,8 +103,9 @@ GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 // associating each with the corresponding `ids[i]` (caller-owned external id).
 // Returns 0 on success. Returns GGML_VEC_INDEX_E_DUPLICATE if any id already
 // exists in the index; in that case the index is unchanged (atomic add).
-// All vector components must be finite. UINT64_MAX is reserved for search
-// result padding and is not a valid id. Live index length is capped at INT_MAX.
+// All vector components must be finite. TurboVec q2/q4 also require
+// `abs(component) < 1e16`. UINT64_MAX is reserved for search result padding and
+// is not a valid id. Live index length is capped at INT_MAX.
 GGML_API int ggml_vec_index_add(
     ggml_vec_index_t * idx,
     const float      * vectors,
@@ -151,8 +154,9 @@ GGML_API int ggml_vec_index_remove_logged(
 // Read-only.
 GGML_API int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id);
 
-// Compatibility no-op. Existing callers do not need to call this; use
-// `ggml_vec_index_build_ivf` when ANN search preparation is needed.
+// Optional cache warmup. TurboVec q2/q4 precompute rotation and codebook state;
+// other storage modes ignore this call. Existing callers do not need to call
+// this; use `ggml_vec_index_build_ivf` when ANN search preparation is needed.
 GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 
 // Builds an in-memory IVF-flat approximate nearest-neighbor structure for the
@@ -186,8 +190,9 @@ GGML_API int ggml_vec_index_build_ivf(
 // `query[i] * (q_code * per_vector_scale)`, without expanding the stored
 // matrix back to f32. Callers that want cosine similarity must L2-normalize
 // their vectors before insert AND before query; the index does NOT normalize
-// internally. All query components must be finite. SIMD and scalar reduction
-// order can produce small score differences across CPU architectures.
+// internally. All query components must be finite; TurboVec q2/q4 also require
+// `abs(component) < 1e16`. SIMD and scalar reduction order can produce small
+// score differences across CPU architectures.
 GGML_API int ggml_vec_index_search(
     const ggml_vec_index_t * idx,
     const float            * queries,

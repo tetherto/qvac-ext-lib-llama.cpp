@@ -4,11 +4,11 @@
 
 #include "ggml-tbq-quants.h"
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 #endif
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
 #include <arm_neon.h>
 #define GGML_VEC_INDEX_TV_USE_NEON 1
 #else
@@ -17,11 +17,11 @@
 
 namespace {
 
-constexpr int kTurboVecQ4BlockDim = 128;
-constexpr int kTurboVecQ4BlockBytes = kTurboVecQ4BlockDim / 2;
-constexpr int kTurboVecQ2BlockBytes = kTurboVecQ4BlockDim / 4;
+constexpr int kTurboVecDimMultiple = 8;
 constexpr int kTurboVecScoreBlock = 32;
+#if GGML_VEC_INDEX_TV_USE_NEON
 constexpr int kTurboVecFlushEvery = 256;
+#endif
 constexpr uint64_t kTurboVecRotationSeed = 42;
 
 struct TurboVecCodebook {
@@ -298,21 +298,20 @@ static void apply_turbovec_rotation(const float * src, float * dst, int dim, boo
     const std::vector<float> & rotation = turbovec_rotation(dim);
     const size_t dim_sz = static_cast<size_t>(dim);
     for (int row = 0; row < dim; ++row) {
-        double sum = 0.0;
+        float sum = 0.0f;
         for (int column = 0; column < dim; ++column) {
             const size_t matrix_index = transpose ?
                 static_cast<size_t>(column) * dim_sz + static_cast<size_t>(row) :
                 static_cast<size_t>(row) * dim_sz + static_cast<size_t>(column);
-            sum += static_cast<double>(rotation[matrix_index]) *
-                static_cast<double>(src[static_cast<size_t>(column)]);
+            sum = std::fma(rotation[matrix_index], src[static_cast<size_t>(column)], sum);
         }
-        dst[static_cast<size_t>(row)] = static_cast<float>(sum);
+        dst[static_cast<size_t>(row)] = sum;
     }
 }
 
 static void apply_turbovec_rotation_batch(const float * src, float * dst, int n, int dim) {
+#if defined(__APPLE__) && defined(GGML_USE_ACCELERATE)
     const std::vector<float> & rotation = turbovec_rotation(dim);
-#if defined(__APPLE__)
     cblas_sgemm(
         CblasRowMajor,
         CblasNoTrans,
@@ -339,7 +338,7 @@ static void apply_turbovec_rotation_batch(const float * src, float * dst, int n,
 #endif
 }
 
-static float vector_norm(const float * values, int dim) {
+static double vector_norm(const float * values, int dim) {
 #if GGML_VEC_INDEX_TV_USE_NEON
     const int chunks = dim / 4;
     float32x4_t acc = vdupq_n_f32(0.0f);
@@ -357,7 +356,15 @@ static float vector_norm(const float * values, int dim) {
         sum += values[i] * values[i];
     }
 #endif
-    return std::sqrt(sum);
+    if (std::isfinite(sum)) {
+        return static_cast<double>(std::sqrt(sum));
+    }
+    double sum_f64 = 0.0;
+    for (int i = 0; i < dim; ++i) {
+        const double value = static_cast<double>(values[i]);
+        sum_f64 += value * value;
+    }
+    return std::sqrt(sum_f64);
 }
 
 static float float_score_from_double_local(double score) {
@@ -807,11 +814,11 @@ static float horizontal_sum_local(float32x4_t v) {
 } // namespace
 
 bool turbovec_q2_supported_dim(int dim) {
-    return dim > 0 && dim % kTurboVecQ4BlockDim == 0;
+    return dim > 0 && dim <= kTurboVecMaxDim && dim % kTurboVecDimMultiple == 0;
 }
 
 bool turbovec_q4_supported_dim(int dim) {
-    return dim > 0 && dim % kTurboVecQ4BlockDim == 0;
+    return dim > 0 && dim <= kTurboVecMaxDim && dim % kTurboVecDimMultiple == 0;
 }
 
 uint64_t turbovec_rotation_hash_for_test(int dim) {
@@ -915,12 +922,23 @@ uint64_t turbovec_codebook_hash_for_test(int bits, int dim) {
     return hash;
 }
 
+void prepare_turbovec(int bits, int dim) {
+    if ((bits != 2 && bits != 4) || !turbovec_q4_supported_dim(dim)) {
+        return;
+    }
+    (void) turbovec_rotation(dim);
+    (void) turbovec_codebook(bits, dim);
+}
+
 uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx) {
     if (idx == nullptr) {
         return 0;
     }
     try {
         std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        if (idx->turbovec_blocked_data.empty()) {
+            return 0;
+        }
         uint64_t hash = UINT64_C(0xcbf29ce484222325);
         for (uint8_t value : idx->turbovec_blocked_data) {
             hash ^= value;
@@ -932,9 +950,20 @@ uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx) {
     }
 }
 
+void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        idx->turbovec_blocked_data.clear();
+        idx->turbovec_blocked_n_blocks = 0;
+    } catch (...) {
+    }
+}
+
 size_t turbovec_q2_row_bytes(size_t dim) {
-    return (dim / static_cast<size_t>(kTurboVecQ4BlockDim)) *
-        static_cast<size_t>(kTurboVecQ2BlockBytes);
+    return dim / 4;
 }
 
 size_t turbovec_q2_scale_count(size_t dim) {
@@ -943,13 +972,75 @@ size_t turbovec_q2_scale_count(size_t dim) {
 }
 
 size_t turbovec_q4_row_bytes(size_t dim) {
-    return (dim / static_cast<size_t>(kTurboVecQ4BlockDim)) *
-        static_cast<size_t>(kTurboVecQ4BlockBytes);
+    return dim / 2;
 }
 
 size_t turbovec_q4_scale_count(size_t dim) {
     GGML_UNUSED(dim);
     return 1;
+}
+
+static void repack_turbovec_code_block(
+        const uint8_t * packed_codes,
+        size_t n_vectors,
+        int bits,
+        int dim,
+        size_t block,
+        std::vector<uint8_t> & blocked_codes) {
+    const size_t dim_sz = static_cast<size_t>(dim);
+    const size_t codes_per_byte = static_cast<size_t>(8 / bits);
+    const size_t n_byte_groups = dim_sz / codes_per_byte;
+    const size_t row_bytes = static_cast<size_t>(bits) * (dim_sz / 8);
+    const size_t base_vector = block * kTurboVecScoreBlock;
+    const size_t block_offset =
+        block * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
+    std::fill_n(
+        blocked_codes.data() + block_offset,
+        n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
+        0);
+    for (size_t group = 0; group < n_byte_groups; ++group) {
+        const size_t output_offset =
+            (block * n_byte_groups + group) * kTurboVecScoreBlock;
+#if defined(__x86_64__) || defined(_M_X64)
+        static constexpr size_t perm[16] = {
+            0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15,
+        };
+        for (size_t j = 0; j < 16; ++j) {
+            const size_t vector_a = base_vector + perm[j];
+            const size_t vector_b = vector_a + 16;
+            const uint8_t byte_a = vector_a < n_vectors ?
+                turbovec_group_code_byte(
+                    packed_codes + vector_a * row_bytes,
+                    static_cast<int>(group),
+                    bits,
+                    dim) :
+                0;
+            const uint8_t byte_b = vector_b < n_vectors ?
+                turbovec_group_code_byte(
+                    packed_codes + vector_b * row_bytes,
+                    static_cast<int>(group),
+                    bits,
+                    dim) :
+                0;
+            blocked_codes[output_offset + j] =
+                static_cast<uint8_t>((byte_a >> 4) | ((byte_b >> 4) << 4));
+            blocked_codes[output_offset + 16 + j] =
+                static_cast<uint8_t>((byte_a & 0x0f) | ((byte_b & 0x0f) << 4));
+        }
+#else
+        for (size_t lane = 0; lane < kTurboVecScoreBlock; ++lane) {
+            const size_t vector = base_vector + lane;
+            if (vector < n_vectors) {
+                blocked_codes[output_offset + lane] =
+                    turbovec_group_code_byte(
+                        packed_codes + vector * row_bytes,
+                        static_cast<int>(group),
+                        bits,
+                        dim);
+            }
+        }
+#endif
+    }
 }
 
 void repack_turbovec_codes(
@@ -962,57 +1053,42 @@ void repack_turbovec_codes(
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t codes_per_byte = static_cast<size_t>(8 / bits);
     const size_t n_byte_groups = dim_sz / codes_per_byte;
-    const size_t row_bytes = static_cast<size_t>(bits) * (dim_sz / 8);
     n_blocks = (n_vectors + kTurboVecScoreBlock - 1) / kTurboVecScoreBlock;
     blocked_codes.assign(
         n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
         0);
 
     for (size_t block = 0; block < n_blocks; ++block) {
-        const size_t base_vector = block * kTurboVecScoreBlock;
-        for (size_t group = 0; group < n_byte_groups; ++group) {
-            const size_t output_offset =
-                (block * n_byte_groups + group) * kTurboVecScoreBlock;
-#if defined(__x86_64__) || defined(_M_X64)
-            static constexpr size_t perm[16] = {
-                0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15,
-            };
-            for (size_t j = 0; j < 16; ++j) {
-                const size_t vector_a = base_vector + perm[j];
-                const size_t vector_b = vector_a + 16;
-                const uint8_t byte_a = vector_a < n_vectors ?
-                    turbovec_group_code_byte(
-                        packed_codes + vector_a * row_bytes,
-                        static_cast<int>(group),
-                        bits,
-                        dim) :
-                    0;
-                const uint8_t byte_b = vector_b < n_vectors ?
-                    turbovec_group_code_byte(
-                        packed_codes + vector_b * row_bytes,
-                        static_cast<int>(group),
-                        bits,
-                        dim) :
-                    0;
-                blocked_codes[output_offset + j] =
-                    static_cast<uint8_t>((byte_a >> 4) | ((byte_b >> 4) << 4));
-                blocked_codes[output_offset + 16 + j] =
-                    static_cast<uint8_t>((byte_a & 0x0f) | ((byte_b & 0x0f) << 4));
-            }
-#else
-            for (size_t lane = 0; lane < kTurboVecScoreBlock; ++lane) {
-                const size_t vector = base_vector + lane;
-                if (vector < n_vectors) {
-                    blocked_codes[output_offset + lane] =
-                        turbovec_group_code_byte(
-                            packed_codes + vector * row_bytes,
-                            static_cast<int>(group),
-                            bits,
-                            dim);
-                }
-            }
-#endif
-        }
+        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes);
+    }
+}
+
+void repack_turbovec_codes_from_slot(
+        const uint8_t * packed_codes,
+        size_t n_vectors,
+        int bits,
+        int dim,
+        size_t first_slot,
+        std::vector<uint8_t> & blocked_codes,
+        size_t & n_blocks) {
+    const size_t dim_sz = static_cast<size_t>(dim);
+    const size_t codes_per_byte = static_cast<size_t>(8 / bits);
+    const size_t n_byte_groups = dim_sz / codes_per_byte;
+    const size_t old_expected_size =
+        n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock);
+    if (first_slot == 0 || first_slot > n_vectors ||
+        blocked_codes.size() != old_expected_size) {
+        repack_turbovec_codes(packed_codes, n_vectors, bits, dim, blocked_codes, n_blocks);
+        return;
+    }
+
+    const size_t first_block = first_slot / kTurboVecScoreBlock;
+    n_blocks = (n_vectors + kTurboVecScoreBlock - 1) / kTurboVecScoreBlock;
+    blocked_codes.resize(
+        n_blocks * n_byte_groups * static_cast<size_t>(kTurboVecScoreBlock),
+        0);
+    for (size_t block = first_block; block < n_blocks; ++block) {
+        repack_turbovec_code_block(packed_codes, n_vectors, bits, dim, block, blocked_codes);
     }
 }
 
@@ -1166,14 +1242,16 @@ void quantize_turbovec_batch(
     const size_t row_bytes = static_cast<size_t>(bits) * (dim_sz / 8);
     const TurboVecCodebook & codebook = turbovec_codebook(bits, dim);
 
-    std::vector<float> norms(n_sz);
+    std::vector<double> norms(n_sz);
     std::vector<float> unit(n_sz * dim_sz);
     for (int row = 0; row < n; ++row) {
         const float * input = src + static_cast<size_t>(row) * dim_sz;
         float * unit_row = unit.data() + static_cast<size_t>(row) * dim_sz;
-        const float norm = vector_norm(input, dim);
+        const double norm = vector_norm(input, dim);
         norms[static_cast<size_t>(row)] = norm;
-        const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+        const float inv_norm =
+            norm > 1e-10 && norm <= static_cast<double>(FLT_MAX) ?
+                1.0f / static_cast<float>(norm) : 0.0f;
         for (int column = 0; column < dim; ++column) {
             unit_row[static_cast<size_t>(column)] =
                 input[static_cast<size_t>(column)] * inv_norm;
@@ -1245,9 +1323,19 @@ void quantize_turbovec_batch(
                 static_cast<double>(tqplus_shift[coordinate]);
             inner += static_cast<double>(rotated_row[coordinate]) * centroid_original;
         }
-        scales[static_cast<size_t>(row)] =
-            norms[static_cast<size_t>(row)] /
-            static_cast<float>(std::max(inner, 1e-10));
+        const double denom = std::max(inner, 1e-10);
+        const float scale =
+            static_cast<float>(norms[static_cast<size_t>(row)]) /
+            static_cast<float>(denom);
+        if (std::isfinite(scale)) {
+            scales[static_cast<size_t>(row)] = scale;
+        } else {
+            const double scale_f64 = norms[static_cast<size_t>(row)] / denom;
+            if (!std::isfinite(scale_f64) || scale_f64 > static_cast<double>(FLT_MAX)) {
+                throw std::invalid_argument("invalid TurboVec vector scale");
+            }
+            scales[static_cast<size_t>(row)] = static_cast<float>(scale_f64);
+        }
     }
 }
 

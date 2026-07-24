@@ -428,7 +428,11 @@ static int ggml_vec_index_add_unlocked(
         if (dim_sz != 0 && new_slots > std::numeric_limits<size_t>::max() / dim_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (!all_finite(vectors, n_sz * dim_sz)) {
+        const size_t value_count = n_sz * dim_sz;
+        const bool valid_values = is_turbovec_q2(*idx) || is_turbovec_q4(*idx) ?
+            all_finite_abs_less_than(vectors, value_count, kTurboVecMaxInputMagnitude) :
+            all_finite(vectors, value_count);
+        if (!valid_values) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
@@ -453,8 +457,6 @@ static int ggml_vec_index_add_unlocked(
         test_maybe_throw_bad_alloc();
         idx->id_to_slot.reserve(new_slots);
 
-        std::vector<uint8_t> new_turbovec_blocked_data;
-        size_t new_turbovec_blocked_n_blocks = 0;
         if (is_turbovec_q2(*idx)) {
             quantize_turbovec_batch(
                 vectors,
@@ -465,13 +467,6 @@ static int ggml_vec_index_add_unlocked(
                 idx->dim,
                 idx->turbovec_tqplus_shift,
                 idx->turbovec_tqplus_scale);
-            repack_turbovec_codes(
-                idx->turbovec_q2_data.data(),
-                new_slots,
-                2,
-                idx->dim,
-                new_turbovec_blocked_data,
-                new_turbovec_blocked_n_blocks);
         } else if (is_turbovec_q4(*idx)) {
             quantize_turbovec_batch(
                 vectors,
@@ -482,13 +477,6 @@ static int ggml_vec_index_add_unlocked(
                 idx->dim,
                 idx->turbovec_tqplus_shift,
                 idx->turbovec_tqplus_scale);
-            repack_turbovec_codes(
-                idx->turbovec_q4_data.data(),
-                new_slots,
-                4,
-                idx->dim,
-                new_turbovec_blocked_data,
-                new_turbovec_blocked_n_blocks);
         }
 
         for (int i = 0; i < n; ++i) {
@@ -520,12 +508,27 @@ static int ggml_vec_index_add_unlocked(
             idx->id_to_slot.emplace(ids[i], slot);
         }
         idx->n_active += n_sz;
+        if (is_turbovec_q2(*idx)) {
+            repack_turbovec_codes_from_slot(
+                idx->turbovec_q2_data.data(),
+                new_slots,
+                2,
+                idx->dim,
+                base_slot,
+                idx->turbovec_blocked_data,
+                idx->turbovec_blocked_n_blocks);
+        } else if (is_turbovec_q4(*idx)) {
+            repack_turbovec_codes_from_slot(
+                idx->turbovec_q4_data.data(),
+                new_slots,
+                4,
+                idx->dim,
+                base_slot,
+                idx->turbovec_blocked_data,
+                idx->turbovec_blocked_n_blocks);
+        }
         for (size_t slot = base_slot; slot < new_slots; ++slot) {
             add_state_hash(*idx, slot_state_hash(*idx, slot));
-        }
-        if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
-            idx->turbovec_blocked_data.swap(new_turbovec_blocked_data);
-            idx->turbovec_blocked_n_blocks = new_turbovec_blocked_n_blocks;
         }
         if (finalize) {
             ++idx->generation;
@@ -534,6 +537,9 @@ static int ggml_vec_index_add_unlocked(
     } catch (const std::bad_alloc &) {
         rollback();
         return GGML_VEC_INDEX_E_OOM;
+    } catch (const std::invalid_argument &) {
+        rollback();
+        return GGML_VEC_INDEX_E_INVALID_ARG;
     } catch (...) {
         rollback();
         return GGML_VEC_INDEX_E_INTERNAL;
@@ -998,7 +1004,20 @@ int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id) {
     }
 }
 
-void ggml_vec_index_prepare(ggml_vec_index_t * /*idx*/) {}
+void ggml_vec_index_prepare(ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        if (is_turbovec_q2(*idx)) {
+            prepare_turbovec(2, idx->dim);
+        } else if (is_turbovec_q4(*idx)) {
+            prepare_turbovec(4, idx->dim);
+        }
+    } catch (...) {
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Stats

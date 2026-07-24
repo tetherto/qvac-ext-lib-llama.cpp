@@ -23,6 +23,7 @@
 #include <new>
 #include <queue>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -74,6 +75,8 @@ inline constexpr size_t   kTvidRecordHeaderSize = 24;
 inline constexpr size_t   kTvidRecordHeaderSizeV4 = 56;
 inline constexpr size_t   kTvidWideStateSize = 32;
 inline constexpr size_t   kMaxIndexLen    = static_cast<size_t>(std::numeric_limits<int>::max());
+inline constexpr int      kTurboVecMaxDim = 65536;
+inline constexpr float    kTurboVecMaxInputMagnitude = 1e16f;
 
 static_assert(sizeof(float) == sizeof(uint32_t), "ggml-vector-index requires float32");
 
@@ -244,6 +247,7 @@ void test_wait_after_load_with_delta_snapshot();
 bool is_supported_bit_width(int bit_width);
 bool is_valid_id(uint64_t id);
 bool all_finite(const float * values, size_t n);
+bool all_finite_abs_less_than(const float * values, size_t n, float max_abs);
 uint32_t float_to_u32(float value);
 float u32_to_float(uint32_t value);
 void put_u32_le(uint8_t * dst, uint32_t v);
@@ -300,6 +304,10 @@ GGML_API uint64_t turbovec_lut_hash_for_test(
     uint32_t * lut_bias_bits);
 GGML_API uint64_t turbovec_codebook_hash_for_test(int bits, int dim);
 GGML_API uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
+GGML_API void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
+GGML_API int turbovec_avx2_available_for_test();
+GGML_API int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
+void prepare_turbovec(int bits, int dim);
 void rotate_turbovec_query(const float * src, float * dst, int dim);
 void rotate_turbovec_queries(
     const float * src,
@@ -346,6 +354,14 @@ void repack_turbovec_codes(
     size_t n_vectors,
     int bits,
     int dim,
+    std::vector<uint8_t> & blocked_codes,
+    size_t & n_blocks);
+void repack_turbovec_codes_from_slot(
+    const uint8_t * packed_codes,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    size_t first_slot,
     std::vector<uint8_t> & blocked_codes,
     size_t & n_blocks);
 void score_turbovec_lut_block(

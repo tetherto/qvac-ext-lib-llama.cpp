@@ -37,16 +37,20 @@ Create an index with a fixed dimension and bit width:
 - `bit_width=4`: per-vector symmetric packed q4 storage with f32 scales.
 
 `ggml_vec_index_create_turbovec_q2` and `ggml_vec_index_create_turbovec_q4`
-create separate TurboQuant q2/q4 modes for dimensions that are multiples of
-128. They store Lloyd-Max q2/q4 codes in Rust-style bit-plane rows with one
-score-correction scale per vector. Vectors and queries use a deterministic dense
-Gaussian QR rotation before LUT scoring. The first non-empty add fits TQ+
-per-coordinate calibration when it contains at least 1000 vectors, then reuses
-that calibration for later adds. TurboVec snapshots use `.tvim` v3 to persist
-the calibration. Regular snapshot write/load is supported; mmap loading and
-logged mutations are reserved for a later format update. Search also keeps a
-32-vector blocked copy of the packed codes in memory for NEON/AVX2 LUT scoring;
-this cache is rebuilt after adds, compaction, and snapshot loading.
+create separate TurboQuant q2/q4 modes for positive dimensions up to 65536 that
+are multiples of 8. They store Lloyd-Max q2/q4 codes in Rust-style bit-plane
+rows with one score-correction scale per vector. Vectors and queries use a
+deterministic dense full-dimension Gaussian QR rotation before LUT scoring. The
+rotation is materialized as a dense `dim x dim` matrix on first use; very large
+accepted dimensions are format-valid, but add/search/prepare can return
+`GGML_VEC_INDEX_E_OOM` if the rotation state cannot be allocated. The
+first non-empty add fits TQ+ per-coordinate calibration when it contains at least
+1000 vectors, then reuses that calibration for later adds. TurboVec snapshots
+use `.tvim` v3 to persist the calibration. Regular snapshot write/load is
+supported; mmap loading and logged mutations are reserved for a later format
+update. Search also keeps a 32-vector blocked copy of the packed codes in memory
+for NEON/AVX2 LUT scoring; this cache is updated after adds and rebuilt after
+compaction and snapshot loading.
 
 Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries
@@ -112,7 +116,8 @@ IVF-flat search builds heap-owned approximate-nearest-neighbor state:
 - `ggml_vec_index_build_ivf`
 - `ggml_vec_index_search_ivf`
 
-`ggml_vec_index_prepare` remains as a compatibility no-op. New callers should
+`ggml_vec_index_prepare` is an optional cache warmup for TurboVec q2/q4
+rotation and codebook state; other storage modes ignore it. New callers should
 use `ggml_vec_index_build_ivf` when approximate-search preparation is needed.
 
 Call `ggml_vec_index_build_ivf` after loading an index and after successful
@@ -135,6 +140,15 @@ Snapshots use the `.tvim` format. Delta logs use `.tvid`.
 - `ggml_vec_index_load_with_delta` loads a snapshot and replays a delta log.
 - `ggml_vec_index_compact_delta` writes a new snapshot and replaces the delta
   log with an empty matching log.
+
+TurboVec `.tvim` snapshots are llama.cpp vector-index containers, not Rust
+`turbovec` `.tv` or Rust `IdMapIndex` `.tvim` files. The formats share the
+`TVPI` magic in current fixtures, but their headers and payload layout differ:
+llama.cpp uses a 32-byte vector-index header with storage kind, qparam,
+calibration-byte, id, and checksum sections, while Rust `TurboQuantIndex` `.tv`
+uses its own compact header and has no external-id section. `ggml_vec_index_load`
+intentionally rejects Rust TurboVec files; rebuild the llama.cpp index from
+vectors when interchange is needed.
 
 Delta logs are bound to the state of the snapshot they extend. Use one evolving
 writer handle for a given snapshot and delta path pair. If another handle or

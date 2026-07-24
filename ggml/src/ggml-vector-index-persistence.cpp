@@ -249,6 +249,15 @@ bool all_finite(const float * values, size_t n) {
     return true;
 }
 
+bool all_finite_abs_less_than(const float * values, size_t n, float max_abs) {
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(values[i]) || std::fabs(values[i]) >= max_abs) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t & out) {
     if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a) {
         return false;
@@ -2411,6 +2420,9 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             modern_version && bit_width == 2 && kind == kStorageTurboVecQ2;
         const bool serialized_turbovec_q4 =
             modern_version && bit_width == 4 && kind == kStorageTurboVecQ4;
+        if (version != kTvimVersionV3 && (serialized_turbovec_q2 || serialized_turbovec_q4)) {
+            return load_fail(GGML_VEC_INDEX_E_BAD_VERSION);
+        }
         uint32_t expected_turbovec_q2_qparam_bytes = 0;
         uint32_t expected_turbovec_q4_qparam_bytes = 0;
         if (serialized_turbovec_q2) {
@@ -2810,12 +2822,6 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             }
         }
 
-        if (version == kTvimVersion &&
-            (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) &&
-            n != 0) {
-            idx->turbovec_tqplus_shift.assign(dim_sz, 0.0f);
-            idx->turbovec_tqplus_scale.assign(dim_sz, 1.0f);
-        }
         if (is_turbovec_q2(*idx)) {
             repack_turbovec_codes(
                 idx->turbovec_q2_data.data(),
@@ -3578,6 +3584,9 @@ ggml_vec_index_t * ggml_vec_index_load_with_delta(
         if (idx == nullptr) {
             return load_fail(load_status_from_last_error());
         }
+        if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
+            return load_fail(GGML_VEC_INDEX_E_INVALID_ARG);
+        }
         test_wait_after_load_with_delta_snapshot();
         if (!replay_delta_log(idx.get(), delta_path)) {
             return load_fail(GGML_VEC_INDEX_E_IO);
@@ -3606,6 +3615,9 @@ int ggml_vec_index_compact_delta(
         std::unique_lock<std::shared_mutex> lock(idx->mutex);
         if (idx->read_only_mmap) {
             rebuild_state_hash(*idx);
+        }
+        if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         DeltaLogLock delta_lock(delta_path);
         if (!delta_lock.ok()) {

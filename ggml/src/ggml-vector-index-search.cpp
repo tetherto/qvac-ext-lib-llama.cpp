@@ -485,10 +485,20 @@ void search_one(
                 }
                 const size_t base_slot = block * 32;
                 const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
-                std::copy_n(
-                    block_scores.data(),
-                    count,
-                    turbovec_scores.data() + base_slot);
+                for (size_t lane = 0; lane < count; ++lane) {
+                    float score = block_scores[lane];
+                    if (!std::isfinite(score)) {
+                        score = score_slot(
+                            idx,
+                            score_query,
+                            base_slot + lane,
+                            max_query,
+                            turbovec_lut.data(),
+                            turbovec_lut_scale,
+                            turbovec_lut_bias);
+                    }
+                    turbovec_scores[base_slot + lane] = score;
+                }
             }
         }
     }
@@ -575,6 +585,86 @@ std::vector<size_t> allowed_slots_for_ids(
 }
 
 } // namespace
+
+int turbovec_avx2_available_for_test() {
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON
+    return cpu_has_avx2_fma() ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim) {
+    if ((bits != 2 && bits != 4) || dim <= 0 || dim % (8 / bits) != 0) {
+        return 0;
+    }
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON
+    if (!cpu_has_avx2_fma()) {
+        return 1;
+    }
+    constexpr size_t block_size = 32;
+    const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
+    constexpr size_t n_vectors = block_size + 17;
+    constexpr size_t n_blocks = 2;
+    std::vector<uint8_t> lut(n_byte_groups * block_size);
+    std::vector<uint8_t> blocked_codes(n_blocks * n_byte_groups * block_size);
+    std::vector<float> vector_scales(n_vectors);
+    for (size_t i = 0; i < lut.size(); ++i) {
+        lut[i] = static_cast<uint8_t>((i * 19 + static_cast<size_t>(bits) * 7) & 0x7f);
+    }
+    for (size_t i = 0; i < blocked_codes.size(); ++i) {
+        blocked_codes[i] = static_cast<uint8_t>((i * 23 + static_cast<size_t>(dim) * 3) & 0xff);
+    }
+    for (size_t i = 0; i < vector_scales.size(); ++i) {
+        vector_scales[i] = 0.5f + 0.003f * static_cast<float>((i * 11) % 97);
+    }
+
+    constexpr float lut_scale = 0.03125f;
+    constexpr float lut_bias = -1.25f;
+    std::array<float, block_size> scalar_scores{};
+    std::array<float, block_size> avx2_scores{};
+    const float tolerance = 0.002f * static_cast<float>(std::max(dim, 1));
+    for (size_t block = 0; block < n_blocks; ++block) {
+        score_turbovec_lut_block(
+            lut.data(),
+            lut_scale,
+            lut_bias,
+            blocked_codes.data(),
+            vector_scales.data(),
+            block,
+            n_vectors,
+            bits,
+            dim,
+            scalar_scores.data());
+        ggml_vec_index_detail::score_turbovec_lut_block_avx2(
+            lut.data(),
+            lut_scale,
+            lut_bias,
+            blocked_codes.data(),
+            vector_scales.data(),
+            block,
+            n_byte_groups,
+            n_vectors,
+            avx2_scores.data());
+        for (size_t lane = 0; lane < block_size; ++lane) {
+            const float scalar_score = scalar_scores[lane];
+            const float avx2_score = avx2_scores[lane];
+            if (std::isfinite(scalar_score) != std::isfinite(avx2_score)) {
+                return 0;
+            }
+            if (std::isfinite(scalar_score) &&
+                std::fabs(scalar_score - avx2_score) > tolerance) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+#else
+    (void) bits;
+    (void) dim;
+    return 1;
+#endif
+}
 
 static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists, int n_iter) {
     try {
@@ -710,7 +800,11 @@ static int ggml_vec_index_search_impl(
             n_q_sz > std::numeric_limits<size_t>::max() / k_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (!all_finite(queries, n_q_sz * dim_sz)) {
+        const size_t value_count = n_q_sz * dim_sz;
+        const bool valid_queries = is_turbovec_q2(*idx) || is_turbovec_q4(*idx) ?
+            all_finite_abs_less_than(queries, value_count, kTurboVecMaxInputMagnitude) :
+            all_finite(queries, value_count);
+        if (!valid_queries) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
@@ -863,7 +957,11 @@ int ggml_vec_index_search_ivf(
             n_q_sz > std::numeric_limits<size_t>::max() / k_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (!all_finite(queries, n_q_sz * dim_sz)) {
+        const size_t value_count = n_q_sz * dim_sz;
+        const bool valid_queries = is_turbovec_q2(*idx) || is_turbovec_q4(*idx) ?
+            all_finite_abs_less_than(queries, value_count, kTurboVecMaxInputMagnitude) :
+            all_finite(queries, value_count);
+        if (!valid_queries) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (idx->ivf_generation != idx->generation ||
