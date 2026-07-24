@@ -1119,13 +1119,27 @@ void process_shaders() {
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
-    string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", {});
+    for (const auto & tname : {"f32", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"}) {
+        const std::string type(tname);
+        const std::map<std::string, std::string> type_dict = {
+            {"DATA_A_" + to_uppercase(type), "1"},
+            {"FLOAT_TYPE", "float"},
+            {"FLOAT_TYPEV2", "vec2"},
+            {"LOAD_VEC_A", "1"},
+        };
+        string_to_spv("lightning_indexer_" + type, "lightning_indexer.comp", type_dict);
+        for (const auto & n_head : {"32", "64"}) {
+            const auto head_dict = merge_maps(type_dict, {{"N_HEAD", n_head}});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    string_to_spv("lightning_indexer_f32", "lightning_indexer_cm1.comp", {}, true, true);
+            string_to_spv("lightning_indexer_" + type + "_h" + n_head,
+                "lightning_indexer_cm1.comp", head_dict, true, true);
 #endif
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
-    string_to_spv("lightning_indexer_f32", "lightning_indexer_cm2.comp", {}, true, false, true);
+            string_to_spv("lightning_indexer_" + type + "_h" + n_head,
+                "lightning_indexer_cm2.comp", head_dict, true, false, true);
 #endif
+        }
+    }
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32", "dsv4_hc_pre.comp", {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
