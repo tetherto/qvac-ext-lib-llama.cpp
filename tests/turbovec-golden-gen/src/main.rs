@@ -2,6 +2,8 @@ use std::fs;
 use std::io::{self, Write};
 
 use turbovec::codebook;
+use turbovec::pack;
+use turbovec::rotation;
 use turbovec::TurboQuantIndex;
 
 const DIM: usize = 128;
@@ -56,11 +58,208 @@ fn read_u32_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes.try_into().unwrap())
 }
 
+fn hash_f32_le(values: &[f32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for value in values {
+        for byte in value.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn hash_bytes(values: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in values {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn build_query_lut(query: &[f32], centroids: &[f32], bits: usize) -> (Vec<u8>, f32, f32) {
+    let codes_per_byte = 8 / bits;
+    let codes_per_nibble = codes_per_byte / 2;
+    let n_byte_groups = DIM / codes_per_byte;
+    let code_mask = (1u16 << bits) - 1;
+    let mut lut = vec![0u8; n_byte_groups * 32];
+    let mut values = vec![0.0f32; n_byte_groups * 32];
+    let mut mins = vec![0.0f32; n_byte_groups * 2];
+    let mut max_span = 0.0f32;
+    let mut bias = 0.0f32;
+    for group in 0..n_byte_groups {
+        let dim_start = group * codes_per_byte;
+        let mut lo_min = f32::MAX;
+        let mut lo_max = f32::MIN;
+        let mut hi_min = f32::MAX;
+        let mut hi_max = f32::MIN;
+        for nibble in 0u16..16 {
+            let mut lo = 0.0f32;
+            let mut hi = 0.0f32;
+            for coordinate in 0..codes_per_nibble {
+                let shift = (codes_per_nibble - 1 - coordinate) * bits;
+                let code = ((nibble >> shift) & code_mask) as usize;
+                lo += query[dim_start + coordinate] * centroids[code];
+                hi += query[dim_start + codes_per_nibble + coordinate] * centroids[code];
+            }
+            values[group * 32 + nibble as usize] = lo;
+            values[group * 32 + 16 + nibble as usize] = hi;
+            lo_min = lo_min.min(lo);
+            lo_max = lo_max.max(lo);
+            hi_min = hi_min.min(hi);
+            hi_max = hi_max.max(hi);
+        }
+        mins[group * 2] = lo_min;
+        mins[group * 2 + 1] = hi_min;
+        bias += lo_min + hi_min;
+        max_span = max_span.max(lo_max - lo_min).max(hi_max - hi_min);
+    }
+    let scale = if max_span > 1e-10 { max_span / 127.0 } else { 1.0 };
+    let inverse_scale = 1.0 / scale;
+    for group in 0..n_byte_groups {
+        for entry in 0..16 {
+            let lo = group * 32 + entry;
+            let hi = lo + 16;
+            lut[lo] = ((values[lo] - mins[group * 2]) * inverse_scale)
+                .round()
+                .clamp(0.0, 127.0) as u8;
+            lut[hi] = ((values[hi] - mins[group * 2 + 1]) * inverse_scale)
+                .round()
+                .clamp(0.0, 127.0) as u8;
+        }
+    }
+    (lut, scale, bias)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let bits = args.get(1).map(|s| s.parse::<usize>().unwrap()).unwrap_or(4);
     assert!(bits == 2 || bits == 4);
     let prefix = if bits == 2 { "kTurboVecGoldenQ2" } else { "kTurboVecGolden" };
+    if args.iter().any(|arg| arg == "--rotation-hash-only") {
+        let rotation = rotation::make_rotation_matrix(DIM);
+        println!("0x{:016x}", hash_f32_le(&rotation));
+        return;
+    }
+    if args.iter().any(|arg| arg == "--tqplus-hashes") {
+        const N_TQPLUS: usize = 1000;
+        let mut db = vec![0.0f32; N_TQPLUS * DIM];
+        for row in 0..N_TQPLUS {
+            for col in 0..DIM {
+                db[row * DIM + col] = fill_value(row, col, 0.47);
+            }
+        }
+        let mut index = TurboQuantIndex::new(DIM, bits).unwrap();
+        index.add(&db);
+        index.prepare();
+        let mut queries = vec![0.0f32; N_QUERY * DIM];
+        for row in 0..N_QUERY {
+            for col in 0..DIM {
+                queries[row * DIM + col] = fill_value(row * 2, col, 0.29);
+            }
+        }
+        let rotation = rotation::make_rotation_matrix(DIM);
+        let mut rotated_queries = vec![0.0f32; N_QUERY * DIM];
+        {
+            let q_ref =
+                faer::mat::from_row_major_slice::<f32, _, _>(&queries, N_QUERY, DIM);
+            let r_ref =
+                faer::mat::from_row_major_slice::<f32, _, _>(&rotation, DIM, DIM);
+            let out_mut = faer::mat::from_row_major_slice_mut::<f32, _, _>(
+                &mut rotated_queries,
+                N_QUERY,
+                DIM,
+            );
+            faer::linalg::matmul::matmul(
+                out_mut,
+                q_ref,
+                r_ref.transpose(),
+                None,
+                1.0_f32,
+                faer::Parallelism::Rayon(0),
+            );
+        }
+        let results = index.search(&queries, K);
+        let tv_path = std::env::current_dir()
+            .unwrap()
+            .join(format!("tests/turbovec-golden-gen/turbovec-q{}-tqplus.tmp.tv", bits));
+        index.write(&tv_path).unwrap();
+        let tv_bytes = fs::read(&tv_path).unwrap();
+        fs::remove_file(&tv_path).unwrap();
+        let packed_offset = 14;
+        let packed_len = N_TQPLUS * bits * (DIM / 8);
+        let scales_offset = packed_offset + packed_len;
+        let calib_count_offset = scales_offset + N_TQPLUS * 4;
+        let calib_count =
+            read_u32_le(&tv_bytes[calib_count_offset..calib_count_offset + 4]) as usize;
+        assert_eq!(calib_count, DIM);
+        let shift_offset = calib_count_offset + 4;
+        let tq_scale_offset = shift_offset + DIM * 4;
+        let (blocked_codes, _) = pack::repack(
+            &tv_bytes[packed_offset..packed_offset + packed_len],
+            N_TQPLUS,
+            bits,
+            DIM,
+        );
+        let shifts: Vec<f32> = tv_bytes[shift_offset..shift_offset + DIM * 4]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        let tq_scales: Vec<f32> = tv_bytes[tq_scale_offset..tq_scale_offset + DIM * 4]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        let mut calibrated_query = vec![0.0f32; DIM];
+        let mut bias_correction = 0.0f64;
+        for coordinate in 0..DIM {
+            calibrated_query[coordinate] =
+                rotated_queries[coordinate] / tq_scales[coordinate];
+            bias_correction -=
+                (rotated_queries[coordinate] as f64) * (shifts[coordinate] as f64);
+        }
+        let (_, centroids) = codebook::codebook(bits, DIM);
+        let (query_lut, query_lut_scale, mut query_lut_bias) =
+            build_query_lut(&calibrated_query, &centroids, bits);
+        let base_lut_bias = query_lut_bias;
+        let bias_correction_f32 = bias_correction as f32;
+        query_lut_bias += bias_correction_f32;
+        println!(
+            "bits={} codes=0x{:016x} blocked=0x{:016x} scales=0x{:016x} shift=0x{:016x} tqscale=0x{:016x} qrot=0x{:016x}",
+            bits,
+            hash_bytes(&tv_bytes[packed_offset..packed_offset + packed_len]),
+            hash_bytes(&blocked_codes),
+            hash_bytes(&tv_bytes[scales_offset..scales_offset + N_TQPLUS * 4]),
+            hash_bytes(&tv_bytes[shift_offset..shift_offset + DIM * 4]),
+            hash_bytes(&tv_bytes[tq_scale_offset..tq_scale_offset + DIM * 4]),
+            hash_f32_le(&rotated_queries),
+        );
+        println!(
+            "lut=0x{:016x} lut_scale={:08x} lut_bias={:08x} lut_base_bias={:08x} bias_correction={:08x} centroids=0x{:016x}",
+            hash_bytes(&query_lut),
+            query_lut_scale.to_bits(),
+            query_lut_bias.to_bits(),
+            base_lut_bias.to_bits(),
+            bias_correction_f32.to_bits(),
+            hash_f32_le(&centroids),
+        );
+        print!("scores:");
+        for score in &results.scores {
+            print!(" {:.9e}", score);
+        }
+        println!();
+        print!("score_bits:");
+        for score in &results.scores {
+            print!(" {:08x}", score.to_bits());
+        }
+        println!();
+        print!("indices:");
+        for index in &results.indices {
+            print!(" {}", index);
+        }
+        println!();
+        return;
+    }
 
     let mut db = vec![0.0f32; N_DB * DIM];
     let mut queries = vec![0.0f32; N_QUERY * DIM];
@@ -82,6 +281,8 @@ fn main() {
     index.prepare();
     let results = index.search(&queries, K);
     let (_, centroids) = codebook::codebook(bits, DIM);
+    let rotation = rotation::make_rotation_matrix(DIM);
+    let rotation_hash = hash_f32_le(&rotation);
     let tv_path = std::env::current_dir()
         .unwrap()
         .join(format!("tests/turbovec-golden-gen/turbovec-q{}.tmp.tv", bits));
@@ -123,6 +324,9 @@ fn main() {
     println!("static constexpr int {}RustScaleCount = {};", prefix, scales_len);
     println!("static constexpr int {}RustCalibCount = {};", prefix, calib_count);
     println!("static constexpr int {}RustTvBytesLen = {};", prefix, tv_bytes.len());
+    println!(
+        "static constexpr uint64_t {}RustRotationHash = UINT64_C(0x{:016x});",
+        prefix, rotation_hash);
     print_f32_array(&format!("{}Db", prefix), &db);
     print_f32_array(&format!("{}Queries", prefix), &queries);
     print_f32_array(&format!("{}RustScores", prefix), &results.scores);

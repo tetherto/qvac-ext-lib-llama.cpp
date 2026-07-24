@@ -338,9 +338,17 @@ void rollback_appended_slots_unlocked(
     if (is_turbovec_q2(*idx)) {
         idx->turbovec_q2_data.resize(base_slot * turbovec_q2_row_bytes(dim_sz));
         idx->turbovec_q2_scale.resize(base_slot * turbovec_q2_scale_count(dim_sz));
+        if (base_slot == 0) {
+            idx->turbovec_tqplus_shift.clear();
+            idx->turbovec_tqplus_scale.clear();
+        }
     } else if (is_turbovec_q4(*idx)) {
         idx->turbovec_q4_data.resize(base_slot * turbovec_q4_row_bytes(dim_sz));
         idx->turbovec_q4_scale.resize(base_slot * turbovec_q4_scale_count(dim_sz));
+        if (base_slot == 0) {
+            idx->turbovec_tqplus_shift.clear();
+            idx->turbovec_tqplus_scale.clear();
+        }
     } else if (is_q4(*idx)) {
         idx->q4_data.resize(base_slot * q4_row_bytes(dim_sz));
         idx->q4_scale.resize(base_slot);
@@ -445,25 +453,49 @@ static int ggml_vec_index_add_unlocked(
         test_maybe_throw_bad_alloc();
         idx->id_to_slot.reserve(new_slots);
 
+        std::vector<uint8_t> new_turbovec_blocked_data;
+        size_t new_turbovec_blocked_n_blocks = 0;
+        if (is_turbovec_q2(*idx)) {
+            quantize_turbovec_batch(
+                vectors,
+                n,
+                2,
+                idx->turbovec_q2_data.data() + base_slot * turbovec_q2_row_bytes(dim_sz),
+                idx->turbovec_q2_scale.data() + base_slot,
+                idx->dim,
+                idx->turbovec_tqplus_shift,
+                idx->turbovec_tqplus_scale);
+            repack_turbovec_codes(
+                idx->turbovec_q2_data.data(),
+                new_slots,
+                2,
+                idx->dim,
+                new_turbovec_blocked_data,
+                new_turbovec_blocked_n_blocks);
+        } else if (is_turbovec_q4(*idx)) {
+            quantize_turbovec_batch(
+                vectors,
+                n,
+                4,
+                idx->turbovec_q4_data.data() + base_slot * turbovec_q4_row_bytes(dim_sz),
+                idx->turbovec_q4_scale.data() + base_slot,
+                idx->dim,
+                idx->turbovec_tqplus_shift,
+                idx->turbovec_tqplus_scale);
+            repack_turbovec_codes(
+                idx->turbovec_q4_data.data(),
+                new_slots,
+                4,
+                idx->dim,
+                new_turbovec_blocked_data,
+                new_turbovec_blocked_n_blocks);
+        }
+
         for (int i = 0; i < n; ++i) {
             const size_t slot = base_slot + static_cast<size_t>(i);
             const float * src = vectors + static_cast<size_t>(i) * dim_sz;
-            if (is_turbovec_q2(*idx)) {
-                const size_t row_bytes = turbovec_q2_row_bytes(dim_sz);
-                const size_t scale_count = turbovec_q2_scale_count(dim_sz);
-                quantize_turbovec_q2_row(
-                    src,
-                    idx->turbovec_q2_data.data() + slot * row_bytes,
-                    idx->turbovec_q2_scale.data() + slot * scale_count,
-                    idx->dim);
-            } else if (is_turbovec_q4(*idx)) {
-                const size_t row_bytes = turbovec_q4_row_bytes(dim_sz);
-                const size_t scale_count = turbovec_q4_scale_count(dim_sz);
-                quantize_turbovec_q4_row(
-                    src,
-                    idx->turbovec_q4_data.data() + slot * row_bytes,
-                    idx->turbovec_q4_scale.data() + slot * scale_count,
-                    idx->dim);
+            if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
+                (void) src;
             } else if (is_q4(*idx)) {
                 quantize_q4_row(
                     src,
@@ -490,6 +522,10 @@ static int ggml_vec_index_add_unlocked(
         idx->n_active += n_sz;
         for (size_t slot = base_slot; slot < new_slots; ++slot) {
             add_state_hash(*idx, slot_state_hash(*idx, slot));
+        }
+        if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
+            idx->turbovec_blocked_data.swap(new_turbovec_blocked_data);
+            idx->turbovec_blocked_n_blocks = new_turbovec_blocked_n_blocks;
         }
         if (finalize) {
             ++idx->generation;
@@ -601,6 +637,8 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
         new_slot_to_id.reserve(n_live);
         new_slot_active.assign(n_live, 1);
         new_id_to_slot.reserve(n_live);
+        std::vector<uint8_t> new_turbovec_blocked_data;
+        size_t new_turbovec_blocked_n_blocks = 0;
 
         if (is_turbovec_q2(*idx)) {
             const size_t row_bytes = turbovec_q2_row_bytes(dim_sz);
@@ -622,10 +660,21 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
                     new_scales.data() + out_slot * scale_count,
                     idx->turbovec_q2_scale.data() + slot * scale_count,
                     scale_count * sizeof(float));
+                new_slot_to_id.push_back(idx->slot_to_id[slot]);
+                new_id_to_slot.emplace(idx->slot_to_id[slot], out_slot);
                 ++out_slot;
             }
+            repack_turbovec_codes(
+                new_data.data(),
+                n_live,
+                2,
+                idx->dim,
+                new_turbovec_blocked_data,
+                new_turbovec_blocked_n_blocks);
             idx->turbovec_q2_data.swap(new_data);
             idx->turbovec_q2_scale.swap(new_scales);
+            idx->turbovec_blocked_data.swap(new_turbovec_blocked_data);
+            idx->turbovec_blocked_n_blocks = new_turbovec_blocked_n_blocks;
         } else if (is_turbovec_q4(*idx)) {
             const size_t row_bytes = turbovec_q4_row_bytes(dim_sz);
             const size_t scale_count = turbovec_q4_scale_count(dim_sz);
@@ -646,10 +695,21 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
                     new_scales.data() + out_slot * scale_count,
                     idx->turbovec_q4_scale.data() + slot * scale_count,
                     scale_count * sizeof(float));
+                new_slot_to_id.push_back(idx->slot_to_id[slot]);
+                new_id_to_slot.emplace(idx->slot_to_id[slot], out_slot);
                 ++out_slot;
             }
+            repack_turbovec_codes(
+                new_data.data(),
+                n_live,
+                4,
+                idx->dim,
+                new_turbovec_blocked_data,
+                new_turbovec_blocked_n_blocks);
             idx->turbovec_q4_data.swap(new_data);
             idx->turbovec_q4_scale.swap(new_scales);
+            idx->turbovec_blocked_data.swap(new_turbovec_blocked_data);
+            idx->turbovec_blocked_n_blocks = new_turbovec_blocked_n_blocks;
         } else if (is_q4(*idx)) {
             const size_t row_bytes = q4_row_bytes(dim_sz);
             std::vector<uint8_t> new_q4_data;

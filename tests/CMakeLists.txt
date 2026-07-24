@@ -164,6 +164,10 @@ if (TARGET ggml-vector-index)
     target_compile_definitions(test-vector-index-fault-hooks PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
     target_include_directories(test-vector-index-fault-hooks PUBLIC ${PROJECT_SOURCE_DIR}/ggml/include)
     target_link_libraries(test-vector-index-fault-hooks PRIVATE Threads::Threads ggml-base)
+    if (APPLE)
+        target_compile_definitions(test-vector-index-fault-hooks PRIVATE ACCELERATE_NEW_LAPACK)
+        target_link_libraries(test-vector-index-fault-hooks PRIVATE "-framework Accelerate")
+    endif()
     get_target_property(GGML_VECTOR_INDEX_HAS_AVX2
         ggml-vector-index
         GGML_VECTOR_INDEX_HAS_AVX2)

@@ -3,6 +3,7 @@
 #include "ggml-vector-index.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cerrno>
@@ -48,6 +49,7 @@
 inline constexpr uint8_t  kTvimMagic[4]   = { 'T', 'V', 'P', 'I' };
 inline constexpr uint8_t  kTvimVersionV1  = 1;
 inline constexpr uint8_t  kTvimVersion    = 2;
+inline constexpr uint8_t  kTvimVersionV3  = 3;
 inline constexpr uint8_t  kStorageF32     = 1;
 inline constexpr uint8_t  kStorageQ8      = 2;
 inline constexpr uint8_t  kStorageQ4      = 3;
@@ -175,6 +177,10 @@ struct ggml_vec_index {
     bool turbovec_q4 = false;
     std::vector<uint8_t> turbovec_q4_data;
     std::vector<float>   turbovec_q4_scale;
+    std::vector<float>   turbovec_tqplus_shift;
+    std::vector<float>   turbovec_tqplus_scale;
+    std::vector<uint8_t> turbovec_blocked_data;
+    size_t turbovec_blocked_n_blocks = 0;
 
     std::vector<uint64_t> slot_to_id;
     std::vector<uint8_t>  slot_active;
@@ -278,19 +284,81 @@ void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale);
 void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale);
 bool turbovec_q2_supported_dim(int dim);
 bool turbovec_q4_supported_dim(int dim);
+GGML_API uint64_t turbovec_rotation_hash_for_test(int dim);
+GGML_API uint64_t turbovec_query_rotation_hash_for_test(
+    const float * queries,
+    int n_queries,
+    int dim);
+GGML_API uint64_t turbovec_lut_hash_for_test(
+    const float * query,
+    const float * tqplus_shift,
+    const float * tqplus_scale,
+    int bits,
+    int n_queries,
+    int dim,
+    uint32_t * lut_scale_bits,
+    uint32_t * lut_bias_bits);
+GGML_API uint64_t turbovec_codebook_hash_for_test(int bits, int dim);
+GGML_API uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
 void rotate_turbovec_query(const float * src, float * dst, int dim);
+void rotate_turbovec_queries(
+    const float * src,
+    float * dst,
+    int n_queries,
+    int dim);
 void quantize_turbovec_q2_row(const float * src, uint8_t * dst, float * scales, int dim);
+void quantize_turbovec_batch(
+    const float * src,
+    int n,
+    int bits,
+    uint8_t * dst,
+    float * scales,
+    int dim,
+    std::vector<float> & tqplus_shift,
+    std::vector<float> & tqplus_scale);
 void decode_turbovec_q2_row(const uint8_t * codes, const float * scales, float * dst, int dim);
+void decode_turbovec_q2_row_calibrated(
+    const uint8_t * codes,
+    const float * scales,
+    const float * tqplus_shift,
+    const float * tqplus_scale,
+    float * dst,
+    int dim);
 void build_turbovec_q2_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias);
 float dot_turbovec_q2_lut_row(const uint8_t * lut, float lut_scale, float lut_bias, const uint8_t * codes, const float * scales, int dim);
 float dot_turbovec_q2_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim);
 float dot_turbovec_q2_row(const float * query, const uint8_t * codes, const float * scales, int dim);
 void quantize_turbovec_q4_row(const float * src, uint8_t * dst, float * scales, int dim);
 void decode_turbovec_q4_row(const uint8_t * codes, const float * scales, float * dst, int dim);
+void decode_turbovec_q4_row_calibrated(
+    const uint8_t * codes,
+    const float * scales,
+    const float * tqplus_shift,
+    const float * tqplus_scale,
+    float * dst,
+    int dim);
 void build_turbovec_q4_lut(const float * rotated_query, int dim, std::vector<uint8_t> & lut, float & scale, float & bias);
 float dot_turbovec_q4_lut_row(const uint8_t * lut, float lut_scale, float lut_bias, const uint8_t * codes, const float * scales, int dim);
 float dot_turbovec_q4_rotated_row(const float * rotated_query, const uint8_t * codes, const float * scales, int dim);
 float dot_turbovec_q4_row(const float * query, const uint8_t * codes, const float * scales, int dim);
+void repack_turbovec_codes(
+    const uint8_t * packed_codes,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    std::vector<uint8_t> & blocked_codes,
+    size_t & n_blocks);
+void score_turbovec_lut_block(
+    const uint8_t * lut,
+    float lut_scale,
+    float lut_bias,
+    const uint8_t * blocked_codes,
+    const float * vector_scales,
+    size_t block_index,
+    size_t n_vectors,
+    int bits,
+    int dim,
+    float * out_scores);
 void rollback_appended_slots_unlocked(
     ggml_vec_index_t * idx,
     size_t base_slot,

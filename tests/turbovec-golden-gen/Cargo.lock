@@ -990,6 +990,7 @@ dependencies = [
 name = "turbovec-golden-gen"
 version = "0.1.0"
 dependencies = [
+ "faer",
  "turbovec",
 ]
 

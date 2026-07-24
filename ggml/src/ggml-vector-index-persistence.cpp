@@ -2080,8 +2080,17 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
              idx->turbovec_q2_scale.size() != n_slots * turbovec_q2_scale_count(dim_sz)) ||
             (is_turbovec_q4(*idx) &&
              idx->turbovec_q4_scale.size() != n_slots * turbovec_q4_scale_count(dim_sz)) ||
+            ((is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) &&
+             ((!idx->turbovec_tqplus_shift.empty() &&
+               idx->turbovec_tqplus_shift.size() != dim_sz) ||
+              idx->turbovec_tqplus_shift.size() != idx->turbovec_tqplus_scale.size())) ||
             (is_q4(*idx) && idx->q4_scale.size() != n_slots) ||
             (is_q8(*idx) && idx->q8_scale.size() != n_slots)) {
+            return GGML_VEC_INDEX_E_INTERNAL;
+        }
+        if ((is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) &&
+            !idx->turbovec_tqplus_shift.empty() &&
+            dim_sz > std::numeric_limits<uint32_t>::max() / (2 * sizeof(float))) {
             return GGML_VEC_INDEX_E_INTERNAL;
         }
 
@@ -2104,7 +2113,11 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
         // Header: 32 bytes. Layout matches the comment block in the header file.
         uint8_t header[kTvimHeaderSize] = {};
         std::memcpy(header, kTvimMagic, 4);
-        header[4] = kTvimVersion;
+        const bool is_turbovec = is_turbovec_q2(*idx) || is_turbovec_q4(*idx);
+        const uint8_t snapshot_version = is_turbovec ? kTvimVersionV3 : kTvimVersion;
+        const uint32_t calibration_bytes = idx->turbovec_tqplus_shift.empty() ?
+            0u : static_cast<uint32_t>(2 * dim_sz * sizeof(float));
+        header[4] = snapshot_version;
         header[5] = static_cast<uint8_t>(idx->bit_width);
         header[6] = storage_kind(*idx);
         header[7] = kFlagCRC32C;
@@ -2124,7 +2137,7 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
             header + 24,
             (is_q4(*idx) || is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) ?
                 0u : (is_q8(*idx) ? 1u : 4u));
-        put_u32_le(header + 28, 0);
+        put_u32_le(header + 28, calibration_bytes);
 
         if (!write_bytes(f, header, sizeof(header))) {
             return fail_io();
@@ -2169,6 +2182,19 @@ static int ggml_vec_index_write_unlocked(ggml_vec_index_t * idx, const char * pa
                     }
                     const float scale = scales[slot];
                     if (!write_u32_le_crc(f, float_to_u32(scale), qparams_crc)) {
+                        return fail_io();
+                    }
+                }
+            }
+
+            if (is_turbovec) {
+                for (float value : idx->turbovec_tqplus_shift) {
+                    if (!write_u32_le_crc(f, float_to_u32(value), qparams_crc)) {
+                        return fail_io();
+                    }
+                }
+                for (float value : idx->turbovec_tqplus_scale) {
+                    if (!write_u32_le_crc(f, float_to_u32(value), qparams_crc)) {
                         return fail_io();
                     }
                 }
@@ -2335,10 +2361,12 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         }
 
         const uint8_t version = header[4];
-        if (version != kTvimVersionV1 && version != kTvimVersion) {
+        const bool modern_version =
+            version == kTvimVersion || version == kTvimVersionV3;
+        if (version != kTvimVersionV1 && !modern_version) {
             return load_fail(GGML_VEC_INDEX_E_BAD_VERSION);
         }
-        if (version == kTvimVersion) {
+        if (modern_version) {
             f.read(
                 reinterpret_cast<char *>(header + kTvimV1HeaderSize),
                 kTvimHeaderSize - kTvimV1HeaderSize);
@@ -2349,17 +2377,17 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             }
         }
 
-        const uint8_t flags = version == kTvimVersion ? header[7] : 0;
+        const uint8_t flags = modern_version ? header[7] : 0;
         if ((version == kTvimVersionV1 && (header[6] != 0 || header[7] != 0)) ||
-            (version == kTvimVersion &&
-             ((flags & ~kFlagCRC32C) != 0 || get_u32_le(header + 28) != 0))) {
+            (modern_version && (flags & ~kFlagCRC32C) != 0) ||
+            (version == kTvimVersion && get_u32_le(header + 28) != 0)) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
 
         const int serialized_bit_width = static_cast<int>(header[5]);
         if ((version == kTvimVersionV1 &&
              (serialized_bit_width <= 0 || serialized_bit_width > 32)) ||
-            (version == kTvimVersion && !is_supported_bit_width(serialized_bit_width))) {
+            (modern_version && !is_supported_bit_width(serialized_bit_width))) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
         const int bit_width =
@@ -2369,18 +2397,20 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         const uint32_t dim_le = get_u32_le(header + 8);
         const uint32_t n_le   = get_u32_le(header + 12);
         const uint32_t qparam_type =
-            version == kTvimVersion ? get_u32_le(header + 16) : kQParamNone;
+            modern_version ? get_u32_le(header + 16) : kQParamNone;
         const uint32_t qparam_bytes =
-            version == kTvimVersion ? get_u32_le(header + 20) : 0;
+            modern_version ? get_u32_le(header + 20) : 0;
         const uint32_t comp_bytes =
-            version == kTvimVersion ? get_u32_le(header + 24) : 4;
+            modern_version ? get_u32_le(header + 24) : 4;
+        const uint32_t calibration_bytes =
+            version == kTvimVersionV3 ? get_u32_le(header + 28) : 0;
         if (dim_le == 0 || dim_le > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
         const bool serialized_turbovec_q2 =
-            version == kTvimVersion && bit_width == 2 && kind == kStorageTurboVecQ2;
+            modern_version && bit_width == 2 && kind == kStorageTurboVecQ2;
         const bool serialized_turbovec_q4 =
-            version == kTvimVersion && bit_width == 4 && kind == kStorageTurboVecQ4;
+            modern_version && bit_width == 4 && kind == kStorageTurboVecQ4;
         uint32_t expected_turbovec_q2_qparam_bytes = 0;
         uint32_t expected_turbovec_q4_qparam_bytes = 0;
         if (serialized_turbovec_q2) {
@@ -2407,7 +2437,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             }
             expected_turbovec_q4_qparam_bytes = static_cast<uint32_t>(scale_bytes);
         }
-        if (version == kTvimVersion) {
+        if (modern_version) {
             const bool valid_layout =
                 (serialized_turbovec_q2 &&
                  qparam_type == kQParamScaleF32 &&
@@ -2425,24 +2455,35 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
         }
+        const uint64_t expected_calibration_bytes =
+            static_cast<uint64_t>(dim_le) * 2 * sizeof(float);
+        if (version == kTvimVersionV3 &&
+            (!(serialized_turbovec_q2 || serialized_turbovec_q4) ||
+             (calibration_bytes != expected_calibration_bytes &&
+              !(n_le == 0 && calibration_bytes == 0)))) {
+            return load_fail(GGML_VEC_INDEX_E_IO);
+        }
 
         uint64_t packed_row_bytes = 0;
         if (serialized_turbovec_q2) {
             packed_row_bytes = turbovec_q2_row_bytes(static_cast<size_t>(dim_le));
         } else if (serialized_turbovec_q4 ||
-                   (version == kTvimVersion && bit_width == 4 && kind == kStorageQ4)) {
+                   (modern_version && bit_width == 4 && kind == kStorageQ4)) {
             packed_row_bytes = q4_row_bytes(static_cast<size_t>(dim_le));
         }
 
         uint64_t expected_size = 0;
         if (!expected_file_size(
-                version == kTvimVersion ? kTvimHeaderSize : kTvimV1HeaderSize,
+                modern_version ? kTvimHeaderSize : kTvimV1HeaderSize,
                 n_le,
                 dim_le,
                 qparam_bytes,
                 comp_bytes,
                 packed_row_bytes,
                 expected_size)) {
+            return load_fail(GGML_VEC_INDEX_E_IO);
+        }
+        if (!checked_add_u64(expected_size, calibration_bytes, expected_size)) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
         if ((flags & kFlagCRC32C) != 0 &&
@@ -2460,7 +2501,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         }
         f.seekg(
             static_cast<std::streamoff>(
-                version == kTvimVersion ? kTvimHeaderSize : kTvimV1HeaderSize),
+                modern_version ? kTvimHeaderSize : kTvimV1HeaderSize),
             std::ios::beg);
         if (!f) {
             return load_fail(GGML_VEC_INDEX_E_IO);
@@ -2585,6 +2626,31 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                     if (!std::isfinite(scale) || scale <= 0.0f) {
                         return load_fail(GGML_VEC_INDEX_E_IO);
                     }
+                }
+            }
+
+            if (version == kTvimVersionV3 && calibration_bytes != 0) {
+                idx->turbovec_tqplus_shift.resize(dim_sz);
+                idx->turbovec_tqplus_scale.resize(dim_sz);
+                auto read_calibration = [&](std::vector<float> & values, bool require_positive) {
+                    for (float & value : values) {
+                        uint32_t bits = 0;
+                        const bool read_ok = checksummed ?
+                            read_u32_le_crc(f, bits, qparams_crc) :
+                            read_u32_le(f, bits);
+                        if (!read_ok) {
+                            return false;
+                        }
+                        value = u32_to_float(bits);
+                        if (!std::isfinite(value) || (require_positive && value <= 0.0f)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                if (!read_calibration(idx->turbovec_tqplus_shift, false) ||
+                    !read_calibration(idx->turbovec_tqplus_scale, true)) {
+                    return load_fail(GGML_VEC_INDEX_E_IO);
                 }
             }
 
@@ -2742,6 +2808,30 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 // Duplicate id in persisted file: corrupted.
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
+        }
+
+        if (version == kTvimVersion &&
+            (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) &&
+            n != 0) {
+            idx->turbovec_tqplus_shift.assign(dim_sz, 0.0f);
+            idx->turbovec_tqplus_scale.assign(dim_sz, 1.0f);
+        }
+        if (is_turbovec_q2(*idx)) {
+            repack_turbovec_codes(
+                idx->turbovec_q2_data.data(),
+                n,
+                2,
+                dim,
+                idx->turbovec_blocked_data,
+                idx->turbovec_blocked_n_blocks);
+        } else if (is_turbovec_q4(*idx)) {
+            repack_turbovec_codes(
+                idx->turbovec_q4_data.data(),
+                n,
+                4,
+                dim,
+                idx->turbovec_blocked_data,
+                idx->turbovec_blocked_n_blocks);
         }
 
         rebuild_state_hash(*idx);

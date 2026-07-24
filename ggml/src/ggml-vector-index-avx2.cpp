@@ -1,7 +1,9 @@
 #include "ggml-vector-index-avx2.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <immintrin.h>
+#include <limits>
 
 namespace ggml_vec_index_detail {
 namespace {
@@ -74,6 +76,105 @@ float dot_q4_avx2(const float * query, const uint8_t * codes, float scale, int d
         acc += query[i] * value;
     }
     return acc;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,fma")))
+#endif
+void score_turbovec_lut_block_avx2(
+        const uint8_t * lut,
+        float lut_scale,
+        float lut_bias,
+        const uint8_t * blocked_codes,
+        const float * vector_scales,
+        size_t block_index,
+        size_t n_byte_groups,
+        size_t n_vectors,
+        float * out_scores) {
+    constexpr size_t block_size = 32;
+    constexpr size_t flush_every = 256;
+    const size_t base_vector = block_index * block_size;
+    const size_t block_offset = block_index * n_byte_groups * block_size;
+    const size_t valid_lanes = std::min(block_size, n_vectors - base_vector);
+    const __m256i nibble_mask = _mm256_set1_epi8(0x0f);
+    const __m256 scale = _mm256_set1_ps(lut_scale);
+    __m256 float_accum[4] = {
+        _mm256_set1_ps(lut_bias),
+        _mm256_set1_ps(lut_bias),
+        _mm256_set1_ps(lut_bias),
+        _mm256_set1_ps(lut_bias),
+    };
+
+    const size_t n_batches = (n_byte_groups + flush_every - 1) / flush_every;
+    for (size_t batch = 0; batch < n_batches; ++batch) {
+        const size_t group_begin = batch * flush_every;
+        const size_t group_end = std::min(group_begin + flush_every, n_byte_groups);
+        __m256i accum[4] = {
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+        };
+        for (size_t group = group_begin; group < group_end; ++group) {
+            const __m256i codes = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(
+                    blocked_codes + block_offset + group * block_size));
+            const __m256i low = _mm256_and_si256(codes, nibble_mask);
+            const __m256i high = _mm256_and_si256(
+                _mm256_srli_epi16(codes, 4),
+                nibble_mask);
+            const __m256i table = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(lut + group * block_size));
+            const __m256i low_values = _mm256_shuffle_epi8(table, low);
+            const __m256i high_values = _mm256_shuffle_epi8(table, high);
+            accum[0] = _mm256_add_epi16(accum[0], low_values);
+            accum[1] = _mm256_add_epi16(accum[1], _mm256_srli_epi16(low_values, 8));
+            accum[2] = _mm256_add_epi16(accum[2], high_values);
+            accum[3] = _mm256_add_epi16(accum[3], _mm256_srli_epi16(high_values, 8));
+        }
+
+        accum[0] = _mm256_sub_epi16(
+            accum[0],
+            _mm256_slli_epi16(accum[1], 8));
+        accum[2] = _mm256_sub_epi16(
+            accum[2],
+            _mm256_slli_epi16(accum[3], 8));
+        const __m256i decoded0 = _mm256_add_epi16(
+            _mm256_permute2x128_si256(accum[0], accum[1], 0x21),
+            _mm256_blend_epi32(accum[0], accum[1], 0xf0));
+        const __m256i decoded1 = _mm256_add_epi16(
+            _mm256_permute2x128_si256(accum[2], accum[3], 0x21),
+            _mm256_blend_epi32(accum[2], accum[3], 0xf0));
+        const __m256 values[4] = {
+            _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(decoded0))),
+            _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(decoded0, 1))),
+            _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(decoded1))),
+            _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(decoded1, 1))),
+        };
+        for (int i = 0; i < 4; ++i) {
+            float_accum[i] = _mm256_fmadd_ps(scale, values[i], float_accum[i]);
+        }
+    }
+
+    if (valid_lanes == block_size) {
+        for (int i = 0; i < 4; ++i) {
+            const __m256 vector_scale =
+                _mm256_loadu_ps(vector_scales + base_vector + static_cast<size_t>(i) * 8);
+            _mm256_storeu_ps(
+                out_scores + static_cast<size_t>(i) * 8,
+                _mm256_mul_ps(float_accum[i], vector_scale));
+        }
+    } else {
+        alignas(32) float decoded[block_size];
+        for (int i = 0; i < 4; ++i) {
+            _mm256_store_ps(decoded + static_cast<size_t>(i) * 8, float_accum[i]);
+        }
+        for (size_t lane = 0; lane < block_size; ++lane) {
+            out_scores[lane] = lane < valid_lanes ?
+                decoded[lane] * vector_scales[base_vector + lane] :
+                -std::numeric_limits<float>::infinity();
+        }
+    }
 }
 
 } // namespace ggml_vec_index_detail

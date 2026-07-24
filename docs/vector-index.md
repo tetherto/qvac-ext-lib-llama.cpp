@@ -39,9 +39,14 @@ Create an index with a fixed dimension and bit width:
 `ggml_vec_index_create_turbovec_q2` and `ggml_vec_index_create_turbovec_q4`
 create separate TurboQuant q2/q4 modes for dimensions that are multiples of
 128. They store Lloyd-Max q2/q4 codes in Rust-style bit-plane rows with one
-score-correction scale per vector and search against rotated query LUTs. Regular
-snapshot write/load is supported; mmap loading and logged mutations are reserved
-for a later format update.
+score-correction scale per vector. Vectors and queries use a deterministic dense
+Gaussian QR rotation before LUT scoring. The first non-empty add fits TQ+
+per-coordinate calibration when it contains at least 1000 vectors, then reuses
+that calibration for later adds. TurboVec snapshots use `.tvim` v3 to persist
+the calibration. Regular snapshot write/load is supported; mmap loading and
+logged mutations are reserved for a later format update. Search also keeps a
+32-vector blocked copy of the packed codes in memory for NEON/AVX2 LUT scoring;
+this cache is rebuilt after adds, compaction, and snapshot loading.
 
 Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries

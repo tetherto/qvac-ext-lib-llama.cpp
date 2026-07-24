@@ -9,6 +9,7 @@ static constexpr int kTurboVecGoldenRustPackedBytes = 512;
 static constexpr int kTurboVecGoldenRustScaleCount = 8;
 static constexpr int kTurboVecGoldenRustCalibCount = 128;
 static constexpr int kTurboVecGoldenRustTvBytesLen = 1586;
+static constexpr uint64_t kTurboVecGoldenRustRotationHash = UINT64_C(0xae24e88b434e0e2e);
 static const float kTurboVecGoldenDb[] = {
     6.351269037e-2f, 6.287096441e-2f, 6.102651358e-2f, 5.808888748e-2f, 5.419625342e-2f, 4.951152205e-2f, 4.421781749e-2f, 3.851345181e-2f,
     3.260646388e-2f, 2.670892142e-2f, 2.103113197e-2f, 1.577588916e-2f, 1.113297325e-2f, 7.273976225e-3f, 4.347652663e-3f, 2.475887537e-3f,

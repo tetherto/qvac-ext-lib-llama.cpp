@@ -244,12 +244,12 @@ GGML_API int ggml_vec_index_search_ivf(
     float                  * out_scores,
     uint64_t               * out_ids);
 
-// Persistence. Format is .tvim version 2; see bottom of this header.
+// Persistence. Writers use .tvim v2 for f32/q4/q8 and v3 for TurboVec.
 GGML_API int ggml_vec_index_write(
     ggml_vec_index_t * idx,
     const char       * path);
 
-// Loads v2 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
+// Loads v2/v3 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
 // are quantized to q8; all other legacy bit widths migrate to f32/32-bit.
 // Returns 0 on success and stores the loaded handle in `out`.
 GGML_API int ggml_vec_index_load_ex(
@@ -304,12 +304,12 @@ GGML_API int ggml_vec_index_len(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_dim(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 
-// File format (.tvim version 2, all little-endian):
+// File format (.tvim versions 2 and 3, all little-endian):
 //
 //   offset  size   field
 //   ------  -----  -------------------------------------------------------
 //   0       4      magic = "TVPI" (bytes 0x54, 0x56, 0x50, 0x49)
-//   4       1      version = 2
+//   4       1      version (2 for f32/q4/q8, 3 for TurboVec)
 //   5       1      bit_width (2 for TurboVec q2, 4, 8, or 32)
 //   6       1      storage kind (1 = f32, 2 = q8, 3 = q4, 4 = TurboVec q4, 5 = TurboVec q2)
 //   7       1      flags (bit 0 = checksum trailer present)
@@ -318,11 +318,12 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 //   16      4      qparam_type (0 = none, 1 = per-vector f32 scale)
 //   20      4      qparam_bytes_per_vector (0 or 4)
 //   24      4      bytes_per_component (0 for packed q4/TurboVec, 1 for q8, 4 for f32)
-//   28      4      reserved (zero)
+//   28      4      TQ+ calibration bytes (v3; zero in v2)
 //   32      ...    qparams:
 //                    - f32: empty
 //                    - q4/q8: N float32 scales
 //                    - TurboVec q2/q4: N float32 score-correction scales
+//   ...     ...    TQ+ calibration (v3): D float32 shifts, then D float32 scales
 //   ...     ...    vectors:
 //                    - f32: N*D float32 values, row-major
 //                    - q8:  N*D int8 codes, row-major
@@ -340,10 +341,11 @@ GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 // q4 uses scale = max(abs(v)) / 7, code = round(v / scale) clamped to [-7, 7],
 // stored as unsigned nibble `code + 8` (0 is invalid). Zero vectors use
 // scale = 1 and all-zero dequantized codes. Each CRC32C covers exactly its
-// corresponding serialized section; the header CRC covers bytes [0, 32), and
+// corresponding serialized section; the qparams CRC also covers v3 calibration,
+// the header CRC covers bytes [0, 32), and
 // the CRC32C of an empty section is zero.
 // Legacy v2 files with flags=0 and no checksum trailer remain readable.
-// Writers emit checksummed v2 files. Readers reject unknown versions and v2
+// Writers emit checksummed v2/v3 files. Readers reject unknown versions and
 // flag bits; they also accept legacy v1 f32 snapshots. Legacy bit_width=8
 // snapshots migrate to q8, while all other legacy widths migrate to f32.
 //

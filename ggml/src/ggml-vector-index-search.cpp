@@ -190,6 +190,20 @@ bool cpu_has_avx2() {
 #endif
 }
 
+bool cpu_has_avx2_fma() {
+#if defined(_MSC_VER)
+    int regs[4] = {};
+    __cpuidex(regs, 1, 0);
+    constexpr int kFma = 1 << 12;
+    return cpu_has_avx2() && (regs[2] & kFma) != 0;
+#elif defined(__GNUC__) || defined(__clang__)
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
+    return false;
+#endif
+}
+
 #endif
 
 inline float dot_q8(
@@ -290,15 +304,19 @@ inline float score_slot(
 void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) {
     const int dim = idx.dim;
     if (is_turbovec_q2(idx)) {
-        decode_turbovec_q2_row(
+        decode_turbovec_q2_row_calibrated(
             turbovec_q2_data_ptr(idx) + slot * turbovec_q2_row_bytes(static_cast<size_t>(dim)),
             idx.turbovec_q2_scale.data() + slot * turbovec_q2_scale_count(static_cast<size_t>(dim)),
+            idx.turbovec_tqplus_shift.empty() ? nullptr : idx.turbovec_tqplus_shift.data(),
+            idx.turbovec_tqplus_scale.empty() ? nullptr : idx.turbovec_tqplus_scale.data(),
             dst,
             dim);
     } else if (is_turbovec_q4(idx)) {
-        decode_turbovec_q4_row(
+        decode_turbovec_q4_row_calibrated(
             turbovec_q4_data_ptr(idx) + slot * turbovec_q4_row_bytes(static_cast<size_t>(dim)),
             idx.turbovec_q4_scale.data() + slot * turbovec_q4_scale_count(static_cast<size_t>(dim)),
+            idx.turbovec_tqplus_shift.empty() ? nullptr : idx.turbovec_tqplus_shift.data(),
+            idx.turbovec_tqplus_scale.empty() ? nullptr : idx.turbovec_tqplus_scale.data(),
             dst,
             dim);
     } else if (is_q4(idx)) {
@@ -349,7 +367,8 @@ void search_one(
     uint64_t               * out_ids,
     std::vector<ScoreId>   & heap,
     std::vector<ScoreId>   & drained,
-    const std::vector<size_t> * allowed_slots = nullptr) {
+    const std::vector<size_t> * allowed_slots = nullptr,
+    const float * pre_rotated_turbovec_query = nullptr) {
 
     const size_t n_slots = idx.slot_to_id.size();
 
@@ -365,17 +384,112 @@ void search_one(
     const double max_query = is_quantized(idx) ? query_max_abs(query, idx.dim) : 0.0;
     const float * score_query = query;
     std::vector<float> rotated_query;
+    std::vector<float> calibrated_query;
     std::vector<uint8_t> turbovec_lut;
+    std::vector<float> turbovec_scores;
     float turbovec_lut_scale = 1.0f;
     float turbovec_lut_bias = 0.0f;
     if (is_turbovec_q2(idx) || is_turbovec_q4(idx)) {
-        rotated_query.resize(static_cast<size_t>(idx.dim));
-        rotate_turbovec_query(query, rotated_query.data(), idx.dim);
-        score_query = rotated_query.data();
+        if (pre_rotated_turbovec_query != nullptr) {
+            score_query = pre_rotated_turbovec_query;
+        } else {
+            rotated_query.resize(static_cast<size_t>(idx.dim));
+            rotate_turbovec_query(query, rotated_query.data(), idx.dim);
+            score_query = rotated_query.data();
+        }
+        if (!idx.turbovec_tqplus_shift.empty()) {
+            calibrated_query.resize(static_cast<size_t>(idx.dim));
+            double bias_correction = 0.0;
+            for (int coordinate = 0; coordinate < idx.dim; ++coordinate) {
+                const size_t i = static_cast<size_t>(coordinate);
+                calibrated_query[i] =
+                    score_query[i] / idx.turbovec_tqplus_scale[i];
+                bias_correction -=
+                    static_cast<double>(score_query[i]) *
+                    static_cast<double>(idx.turbovec_tqplus_shift[i]);
+            }
+            score_query = calibrated_query.data();
+            turbovec_lut_bias = static_cast<float>(bias_correction);
+        }
+        const float tqplus_bias = turbovec_lut_bias;
         if (is_turbovec_q2(idx)) {
             build_turbovec_q2_lut(score_query, idx.dim, turbovec_lut, turbovec_lut_scale, turbovec_lut_bias);
         } else {
             build_turbovec_q4_lut(score_query, idx.dim, turbovec_lut, turbovec_lut_scale, turbovec_lut_bias);
+        }
+        turbovec_lut_bias += tqplus_bias;
+
+        const int bits = is_turbovec_q2(idx) ? 2 : 4;
+        const size_t n_byte_groups =
+            static_cast<size_t>(idx.dim) / static_cast<size_t>(8 / bits);
+        const size_t expected_blocked_bytes =
+            idx.turbovec_blocked_n_blocks * n_byte_groups * 32;
+        if (idx.turbovec_blocked_data.size() == expected_blocked_bytes &&
+            idx.turbovec_blocked_n_blocks == (n_slots + 31) / 32) {
+            turbovec_scores.assign(n_slots, -std::numeric_limits<float>::infinity());
+            std::vector<uint8_t> allowed_blocks;
+            if (allowed_slots != nullptr || active_count(idx) != n_slots) {
+                allowed_blocks.assign(idx.turbovec_blocked_n_blocks, 0);
+                if (allowed_slots != nullptr) {
+                    for (size_t slot : *allowed_slots) {
+                        if (slot < n_slots && slot_is_active(idx, slot)) {
+                            allowed_blocks[slot / 32] = 1;
+                        }
+                    }
+                } else {
+                    for (size_t slot = 0; slot < n_slots; ++slot) {
+                        if (slot_is_active(idx, slot)) {
+                            allowed_blocks[slot / 32] = 1;
+                        }
+                    }
+                }
+            }
+
+            const float * vector_scales = is_turbovec_q2(idx) ?
+                idx.turbovec_q2_scale.data() :
+                idx.turbovec_q4_scale.data();
+            std::array<float, 32> block_scores{};
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON
+            static const bool has_turbovec_avx2 = cpu_has_avx2_fma();
+#endif
+            for (size_t block = 0; block < idx.turbovec_blocked_n_blocks; ++block) {
+                if (!allowed_blocks.empty() && allowed_blocks[block] == 0) {
+                    continue;
+                }
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON
+                if (has_turbovec_avx2) {
+                    ggml_vec_index_detail::score_turbovec_lut_block_avx2(
+                        turbovec_lut.data(),
+                        turbovec_lut_scale,
+                        turbovec_lut_bias,
+                        idx.turbovec_blocked_data.data(),
+                        vector_scales,
+                        block,
+                        n_byte_groups,
+                        n_slots,
+                        block_scores.data());
+                } else
+#endif
+                {
+                    score_turbovec_lut_block(
+                        turbovec_lut.data(),
+                        turbovec_lut_scale,
+                        turbovec_lut_bias,
+                        idx.turbovec_blocked_data.data(),
+                        vector_scales,
+                        block,
+                        n_slots,
+                        bits,
+                        idx.dim,
+                        block_scores.data());
+                }
+                const size_t base_slot = block * 32;
+                const size_t count = std::min(static_cast<size_t>(32), n_slots - base_slot);
+                std::copy_n(
+                    block_scores.data(),
+                    count,
+                    turbovec_scores.data() + base_slot);
+            }
         }
     }
 
@@ -383,7 +497,7 @@ void search_one(
         if (!slot_is_active(idx, slot)) {
             return;
         }
-        const ScoreId candidate{
+        const float score = turbovec_scores.empty() ?
             score_slot(
                 idx,
                 score_query,
@@ -391,7 +505,10 @@ void search_one(
                 max_query,
                 turbovec_lut.data(),
                 turbovec_lut_scale,
-                turbovec_lut_bias),
+                turbovec_lut_bias) :
+            turbovec_scores[slot];
+        const ScoreId candidate{
+            score,
             idx.slot_to_id[slot]
         };
         if (heap.size() < static_cast<size_t>(k)) {
@@ -615,6 +732,15 @@ static int ggml_vec_index_search_impl(
 
         std::vector<ScoreId> heap;
         std::vector<ScoreId> drained;
+        std::vector<float> rotated_turbovec_queries;
+        if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
+            rotated_turbovec_queries.resize(n_q_sz * dim_sz);
+            rotate_turbovec_queries(
+                queries,
+                rotated_turbovec_queries.data(),
+                n_q,
+                dim);
+        }
         for (int q = 0; q < n_q; ++q) {
             search_one(
                 *idx,
@@ -624,7 +750,10 @@ static int ggml_vec_index_search_impl(
                 out_ids    + static_cast<size_t>(q) * static_cast<size_t>(k),
                 heap,
                 drained,
-                allowed_ptr);
+                allowed_ptr,
+                rotated_turbovec_queries.empty() ?
+                    nullptr :
+                    rotated_turbovec_queries.data() + static_cast<size_t>(q) * dim_sz);
         }
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;

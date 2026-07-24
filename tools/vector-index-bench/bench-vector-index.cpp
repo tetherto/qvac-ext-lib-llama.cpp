@@ -1098,14 +1098,22 @@ int main() {
         static_cast<size_t>(cfg.n_vec) * sizeof(float) +
         static_cast<size_t>(cfg.n_vec) * sizeof(uint64_t);
     const size_t tv_scale_bytes =
-        static_cast<size_t>(cfg.n_vec) * (static_cast<size_t>(cfg.dim) / 128) * sizeof(float);
+        static_cast<size_t>(cfg.n_vec) * sizeof(float);
+    const size_t tv_calibration_bytes =
+        2 * static_cast<size_t>(cfg.dim) * sizeof(float);
+    const size_t tv_block_slots =
+        ((static_cast<size_t>(cfg.n_vec) + 31) / 32) * 32;
     const size_t tvq2_memory_bytes =
         static_cast<size_t>(cfg.n_vec) * (static_cast<size_t>(cfg.dim) / 4) +
+        tv_block_slots * (static_cast<size_t>(cfg.dim) / 4) +
         tv_scale_bytes +
+        tv_calibration_bytes +
         static_cast<size_t>(cfg.n_vec) * sizeof(uint64_t);
     const size_t tvq4_memory_bytes =
         static_cast<size_t>(cfg.n_vec) * (static_cast<size_t>(cfg.dim) / 2) +
+        tv_block_slots * (static_cast<size_t>(cfg.dim) / 2) +
         tv_scale_bytes +
+        tv_calibration_bytes +
         static_cast<size_t>(cfg.n_vec) * sizeof(uint64_t);
 
     std::printf("bench-vector-index\n");
