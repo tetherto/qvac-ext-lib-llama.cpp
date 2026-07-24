@@ -224,33 +224,34 @@ struct DeltaAppendResult {
     bool record_complete = false;
 };
 
-#ifdef GGML_VEC_INDEX_EXPORT_TESTS
-#define GGML_VEC_INDEX_TEST_API GGML_API
-#else
-#define GGML_VEC_INDEX_TEST_API
-#endif
-
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
-GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
-GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
-GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_truncate_fail(int fail);
-GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_parent_fsync_fail(int fail);
-GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_delta_append_wait_target(int target);
-GGML_VEC_INDEX_TEST_API int ggml_vec_index_test_get_delta_append_waiters(void);
-GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
-GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_reset_delta_tail_scan_count(void);
-GGML_VEC_INDEX_TEST_API int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
-GGML_VEC_INDEX_TEST_API void ggml_vec_index_test_reset_state_crc_scan_count(void);
-GGML_VEC_INDEX_TEST_API int64_t ggml_vec_index_test_get_state_crc_scan_count(void);
-GGML_VEC_INDEX_TEST_API int ggml_vec_index_test_get_load_with_delta_waiters(void);
+void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
+void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
+void ggml_vec_index_test_set_truncate_fail(int fail);
+void ggml_vec_index_test_set_parent_fsync_fail(int fail);
+void ggml_vec_index_test_set_delta_append_wait_target(int target);
+int ggml_vec_index_test_get_delta_append_waiters(void);
+void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
+void ggml_vec_index_test_reset_delta_tail_scan_count(void);
+int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
+void ggml_vec_index_test_reset_state_crc_scan_count(void);
+int64_t ggml_vec_index_test_get_state_crc_scan_count(void);
+int ggml_vec_index_test_get_load_with_delta_waiters(void);
 }
-#endif
 
 void test_maybe_throw_bad_alloc();
 bool test_consume_write_bytes(size_t n);
 void test_wait_after_delta_validate();
 void test_wait_after_load_with_delta_snapshot();
+#else
+inline void test_maybe_throw_bad_alloc() {}
+inline bool test_consume_write_bytes(size_t) {
+    return true;
+}
+inline void test_wait_after_delta_validate() {}
+inline void test_wait_after_load_with_delta_snapshot() {}
+#endif
 
 bool is_supported_bit_width(int bit_width);
 bool is_valid_id(uint64_t id);
@@ -299,13 +300,14 @@ bool turbovec_q2_supported_dim(int dim);
 bool turbovec_q4_supported_dim(int dim);
 void turbovec_retain_rotation(int dim);
 void turbovec_release_rotation(int dim) noexcept;
-GGML_VEC_INDEX_TEST_API uint64_t turbovec_rotation_hash_for_test(int dim);
-GGML_VEC_INDEX_TEST_API size_t turbovec_rotation_cache_bytes_for_test(void);
-GGML_VEC_INDEX_TEST_API uint64_t turbovec_query_rotation_hash_for_test(
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+uint64_t turbovec_rotation_hash_for_test(int dim);
+size_t turbovec_rotation_cache_bytes_for_test(void);
+uint64_t turbovec_query_rotation_hash_for_test(
     const float * queries,
     int n_queries,
     int dim);
-GGML_VEC_INDEX_TEST_API uint64_t turbovec_lut_hash_for_test(
+uint64_t turbovec_lut_hash_for_test(
     const float * query,
     const float * tqplus_shift,
     const float * tqplus_scale,
@@ -314,14 +316,14 @@ GGML_VEC_INDEX_TEST_API uint64_t turbovec_lut_hash_for_test(
     int dim,
     uint32_t * lut_scale_bits,
     uint32_t * lut_bias_bits);
-GGML_VEC_INDEX_TEST_API uint64_t turbovec_codebook_hash_for_test(int bits, int dim);
-GGML_VEC_INDEX_TEST_API uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
-GGML_VEC_INDEX_TEST_API void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
-GGML_VEC_INDEX_TEST_API int turbovec_avx2_available_for_test();
-GGML_VEC_INDEX_TEST_API int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
-GGML_VEC_INDEX_TEST_API void turbovec_reset_block_score_call_count_for_test(void);
-GGML_VEC_INDEX_TEST_API int64_t turbovec_block_score_call_count_for_test(void);
-#undef GGML_VEC_INDEX_TEST_API
+uint64_t turbovec_codebook_hash_for_test(int bits, int dim);
+uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx);
+void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx);
+int turbovec_avx2_available_for_test();
+int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
+void turbovec_reset_block_score_call_count_for_test(void);
+int64_t turbovec_block_score_call_count_for_test(void);
+#endif
 void prepare_turbovec(int bits, int dim);
 void rotate_turbovec_query(const float * src, float * dst, int dim);
 void rotate_turbovec_queries(

@@ -49,6 +49,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Debug \
             -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
 
@@ -60,6 +61,7 @@ jobs:
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DGGML_VECTOR_INDEX=ON \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
 
@@ -71,6 +73,7 @@ jobs:
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DGGML_VECTOR_INDEX=ON \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DGGML_OPENMP=OFF

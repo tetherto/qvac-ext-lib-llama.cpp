@@ -1097,8 +1097,8 @@ int main() {
         CHECK(turbovec_avx2_lut_block_matches_scalar_for_test(bit_width, 256) == 1);
     }
 
-    // Sparse filters should not score whole TurboVec blocks when only a few
-    // lanes from those blocks are candidates.
+    // Sparse filters score only touched TurboVec blocks and preserve the exact
+    // scores produced by an unfiltered search.
     {
         constexpr int tv_dim = 128;
         constexpr int n_vecs = 96;
@@ -1132,6 +1132,15 @@ int main() {
             };
             std::array<float, 4> scores{};
             std::array<uint64_t, 4> out{};
+            std::vector<float> all_scores(n_vecs);
+            std::vector<uint64_t> all_out(n_vecs);
+            turbovec_reset_block_score_call_count_for_test();
+            CHECK(ggml_vec_index_search(
+                tv, tv_vecs.data(), 1, n_vecs, all_scores.data(), all_out.data()) ==
+                GGML_VEC_INDEX_OK);
+            CHECK(turbovec_block_score_call_count_for_test() ==
+                  static_cast<int64_t>((static_cast<size_t>(n_vecs) + 31) / 32));
+
             turbovec_reset_block_score_call_count_for_test();
             CHECK(ggml_vec_index_search_filtered(
                 tv,
@@ -1142,14 +1151,13 @@ int main() {
                 static_cast<int>(allowed.size()),
                 scores.data(),
                 out.data()) == GGML_VEC_INDEX_OK);
-            CHECK(turbovec_block_score_call_count_for_test() == 0);
-
-            turbovec_reset_block_score_call_count_for_test();
-            CHECK(ggml_vec_index_search(
-                tv, tv_vecs.data(), 1, 4, scores.data(), out.data()) ==
-                GGML_VEC_INDEX_OK);
-            CHECK(turbovec_block_score_call_count_for_test() ==
-                  static_cast<int64_t>((static_cast<size_t>(n_vecs) + 31) / 32));
+            CHECK(turbovec_block_score_call_count_for_test() == 2);
+            for (size_t i = 0; i < allowed.size(); ++i) {
+                const auto it = std::find(all_out.begin(), all_out.end(), out[i]);
+                CHECK(it != all_out.end());
+                const size_t position = static_cast<size_t>(it - all_out.begin());
+                CHECK(scores[i] == all_scores[position]);
+            }
             ggml_vec_index_free(tv);
         }
     }
@@ -2782,15 +2790,15 @@ int main() {
                 CHECK(std::fabs(mmap_scores[i] - normal_scores[i]) <= 1e-6f);
             }
 
-            std::filesystem::resize_file(mmap_path, 0);
-            std::array<float, 4> truncated_scores{};
-            std::array<uint64_t, 4> truncated_ids{};
+            CHECK(std::filesystem::remove(mmap_path));
+            std::array<float, 4> unlinked_scores{};
+            std::array<uint64_t, 4> unlinked_ids{};
             CHECK(ggml_vec_index_search(
                 mapped, query.data(), 1, /*k=*/4,
-                truncated_scores.data(), truncated_ids.data()) == GGML_VEC_INDEX_OK);
+                unlinked_scores.data(), unlinked_ids.data()) == GGML_VEC_INDEX_OK);
             for (int i = 0; i < 4; ++i) {
-                CHECK(truncated_ids[i] == normal_ids[i]);
-                CHECK(std::fabs(truncated_scores[i] - normal_scores[i]) <= 1e-6f);
+                CHECK(unlinked_ids[i] == normal_ids[i]);
+                CHECK(std::fabs(unlinked_scores[i] - normal_scores[i]) <= 1e-6f);
             }
 
             CHECK(ggml_vec_index_build_ivf(mapped, /*n_lists=*/2, /*n_iter=*/2)

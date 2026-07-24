@@ -874,6 +874,7 @@ void turbovec_release_rotation(int dim) noexcept {
     }
 }
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
 size_t turbovec_rotation_cache_bytes_for_test(void) {
     try {
         std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
@@ -990,6 +991,7 @@ uint64_t turbovec_codebook_hash_for_test(int bits, int dim) {
     }
     return hash;
 }
+#endif
 
 void prepare_turbovec(int bits, int dim) {
     if ((bits != 2 && bits != 4) || !turbovec_q4_supported_dim(dim)) {
@@ -999,6 +1001,7 @@ void prepare_turbovec(int bits, int dim) {
     (void) turbovec_codebook(bits, dim);
 }
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
 uint64_t turbovec_blocked_hash_for_test(const ggml_vec_index_t * idx) {
     if (idx == nullptr) {
         return 0;
@@ -1030,6 +1033,7 @@ void turbovec_clear_blocked_for_test(ggml_vec_index_t * idx) {
     } catch (...) {
     }
 }
+#endif
 
 size_t turbovec_q2_row_bytes(size_t dim) {
     return dim / 4;

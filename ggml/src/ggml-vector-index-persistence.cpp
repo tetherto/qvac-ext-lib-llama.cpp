@@ -90,13 +90,6 @@ void test_wait_after_load_with_delta_snapshot() {
     g_test_load_with_delta_waiters.fetch_add(1);
     std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms));
 }
-#else
-void test_maybe_throw_bad_alloc() {}
-bool test_consume_write_bytes(size_t) {
-    return true;
-}
-void test_wait_after_delta_validate() {}
-void test_wait_after_load_with_delta_snapshot() {}
 #endif
 
 inline bool write_bytes(std::FILE * f, const void * data, size_t size) {
@@ -3247,7 +3240,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
                     return load_fail(GGML_VEC_INDEX_E_IO);
                 }
             }
-            idx->q4_data.assign(q4, q4 + n * row_bytes);
+            idx->mapped_q4_data = q4;
         } else if (bit_width == 8) {
             const auto * q8 = reinterpret_cast<const int8_t *>(
                 bytes + static_cast<size_t>(vectors_offset));
@@ -3261,7 +3254,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
                     }
                 }
             }
-            idx->q8_data.assign(q8, q8 + n * dim_sz);
+            idx->mapped_q8_data = q8;
         } else {
             const auto * f32 = reinterpret_cast<const float *>(
                 bytes + static_cast<size_t>(vectors_offset));
@@ -3269,7 +3262,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
             if (!all_finite(f32, count)) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
-            idx->data.assign(f32, f32 + count);
+            idx->mapped_data = f32;
         }
 
         const uint8_t * ids = bytes + static_cast<size_t>(ids_offset);
@@ -3289,6 +3282,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
         idx->read_only_mmap = true;
         idx->mapped_source_path = path;
         idx->mapped_vector_bytes = static_cast<size_t>(vectors_bytes_u64);
+        idx->mapped_file = std::move(mapped);
         g_last_load_error = GGML_VEC_INDEX_OK;
         return idx.release();
     } catch (const std::bad_alloc &) {
