@@ -89,6 +89,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
         case GGML_OP_ADD_ID:            op_str = "add_id";            break;
         case GGML_OP_LIGHTNING_INDEXER: op_str = "lightning_indexer"; break;
         case GGML_OP_DSV4_HC_COMB:      op_str = "dsv4_hc_comb";      break;
+        case GGML_OP_DSV4_HC_PRE:       op_str = "dsv4_hc_pre";       break;
         default: GGML_ABORT("fatal error");
     };
 
