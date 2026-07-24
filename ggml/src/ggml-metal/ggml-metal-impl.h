@@ -277,6 +277,19 @@ typedef struct {
     uint64_t dst_nb3;
 } ggml_metal_kargs_lightning_indexer;
 
+typedef struct {
+    int64_t  n_tokens;
+    uint32_t n_iter;
+    float    eps;
+    uint64_t mixes_nb0;
+    uint64_t mixes_nb1;
+    uint64_t scale_nb0;
+    uint64_t base_nb0;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+} ggml_metal_kargs_dsv4_hc_comb;
+
 
 typedef struct {
     int32_t  ne00;

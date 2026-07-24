@@ -2716,6 +2716,94 @@ kernel void kernel_lightning_indexer_mm(
     }
 }
 
+kernel void kernel_dsv4_hc_comb(
+        constant ggml_metal_kargs_dsv4_hc_comb & args,
+        device const char * mixes,
+        device const char * scale,
+        device const char * base,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.n_tokens) {
+        return;
+    }
+
+    thread volatile float values[16];
+    const device float * scale_ptr = (device const float *) (scale + 2*args.scale_nb0);
+    const float scale_comb = *scale_ptr;
+
+    for (int64_t s = 0; s < 4; ++s) {
+        volatile float max_value = -INFINITY;
+        for (int64_t d = 0; d < 4; ++d) {
+            const int64_t idx = d + 4*s;
+            const device float * mixes_ptr = (device const float *) (
+                mixes + (8 + idx)*args.mixes_nb0 + gid*args.mixes_nb1);
+            const device float * base_ptr = (device const float *) (
+                base + (8 + idx)*args.base_nb0);
+            volatile float value = (*mixes_ptr) * scale_comb + (*base_ptr);
+            values[4*s + d] = value;
+            max_value = max(max_value, value);
+        }
+
+        volatile float total = 0.0f;
+        for (int64_t d = 0; d < 4; ++d) {
+            const int64_t idx = 4*s + d;
+            volatile float value = exp(values[idx] - max_value);
+            values[idx] = value;
+            total = total + value;
+        }
+
+        const float inv_total = 1.0f / total;
+        for (int64_t d = 0; d < 4; ++d) {
+            const int64_t idx = 4*s + d;
+            values[idx] = values[idx] * inv_total + args.eps;
+        }
+    }
+
+    for (int64_t d = 0; d < 4; ++d) {
+        volatile float total = args.eps;
+        for (int64_t s = 0; s < 4; ++s) {
+            total = total + values[4*s + d];
+        }
+        const float inv_total = 1.0f / total;
+        for (int64_t s = 0; s < 4; ++s) {
+            volatile float value = values[4*s + d] * inv_total;
+            values[4*s + d] = value;
+        }
+    }
+
+    for (uint32_t i = 1; i < args.n_iter; ++i) {
+        for (int64_t s = 0; s < 4; ++s) {
+            volatile float total = args.eps;
+            for (int64_t d = 0; d < 4; ++d) {
+                total = total + values[4*s + d];
+            }
+            const float inv_total = 1.0f / total;
+            for (int64_t d = 0; d < 4; ++d) {
+                values[4*s + d] = values[4*s + d] * inv_total;
+            }
+        }
+
+        for (int64_t d = 0; d < 4; ++d) {
+            volatile float total = args.eps;
+            for (int64_t s = 0; s < 4; ++s) {
+                total = total + values[4*s + d];
+            }
+            const float inv_total = 1.0f / total;
+            for (int64_t s = 0; s < 4; ++s) {
+                values[4*s + d] = values[4*s + d] * inv_total;
+            }
+        }
+    }
+
+    for (int64_t s = 0; s < 4; ++s) {
+        for (int64_t d = 0; d < 4; ++d) {
+            device float * dst_ptr = (device float *) (
+                dst + d*args.dst_nb0 + s*args.dst_nb1 + gid*args.dst_nb2);
+            *dst_ptr = values[4*s + d];
+        }
+    }
+}
+
 
 template<typename T>
 kernel void kernel_cumsum_blk(

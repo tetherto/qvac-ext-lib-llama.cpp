@@ -282,6 +282,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
             } break;
+        case GGML_OP_DSV4_HC_COMB:
+            {
+                n_fuse = ggml_metal_op_dsv4_hc_comb(ctx, idx);
+            } break;
         case GGML_OP_REPEAT:
             {
                 n_fuse = ggml_metal_op_repeat(ctx, idx);
@@ -2660,6 +2664,47 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(
             enc, args.n_kv, args.n_tokens, args.n_streams, nth, 1, 1);
     }
+
+    return 1;
+}
+
+int ggml_metal_op_dsv4_hc_comb(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * mixes = op->src[0];
+    const ggml_tensor * scale = op->src[1];
+    const ggml_tensor * base  = op->src[2];
+
+    ggml_metal_kargs_dsv4_hc_comb args = {
+        /*.n_tokens  =*/ mixes->ne[1],
+        /*.n_iter    =*/ (uint32_t) ggml_get_op_params_i32(op, 1),
+        /*.eps       =*/ ggml_get_op_params_f32(op, 0),
+        /*.mixes_nb0 =*/ mixes->nb[0],
+        /*.mixes_nb1 =*/ mixes->nb[1],
+        /*.scale_nb0 =*/ scale->nb[0],
+        /*.base_nb0  =*/ base->nb[0],
+        /*.dst_nb0   =*/ op->nb[0],
+        /*.dst_nb1   =*/ op->nb[1],
+        /*.dst_nb2   =*/ op->nb[2],
+    };
+
+    GGML_ASSERT(args.n_tokens <= std::numeric_limits<uint32_t>::max());
+
+    auto pipeline = ggml_metal_library_get_pipeline_base(lib, GGML_OP_DSV4_HC_COMB);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mixes), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scale), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(base),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),    4);
+
+    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    const int64_t n_groups = (args.n_tokens + nth - 1) / nth;
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_groups, 1, 1, nth, 1, 1);
 
     return 1;
 }
