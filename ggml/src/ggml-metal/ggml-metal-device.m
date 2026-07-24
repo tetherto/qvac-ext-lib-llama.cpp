@@ -1136,6 +1136,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
     const int64_t max_dispatch_dim     = INT_MAX;
+    const int64_t max_grid_id          = UINT_MAX;
 
     if (!has_simdgroup_reduction) {
         return false;
@@ -1281,6 +1282,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->src[2]->ne[3] % op->src[3]->ne[3] == 0 &&
                    op->ne[0] == op->src[1]->ne[2] && op->ne[1] == op->src[0]->ne[2] &&
                    op->ne[2] == 1 && op->ne[3] == op->src[0]->ne[3];
+        case GGML_OP_DSV4_HC_COMB:
+            return op->src[0]->ne[1] > 0 && op->src[0]->ne[1] <= max_grid_id &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] == 24 && op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[0] >= 3 && op->src[1]->ne[1] == 1 &&
+                   op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                   op->src[2]->ne[0] == 24 && op->src[2]->ne[1] == 1 &&
+                   op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
+                   op->ne[0] == 4 && op->ne[1] == 4 &&
+                   op->ne[2] == op->src[0]->ne[1] && op->ne[3] == 1 &&
+                   ggml_get_op_params_i32(op, 1) > 0;
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
