@@ -31,7 +31,6 @@ inline float float_score_from_double(double score) {
     }
     return static_cast<float>(score);
 }
-
 // Scalar dot product of two `dim`-length f32 vectors.
 inline float dot(const float * a, const float * b, int dim) {
     double acc = 0.0;
@@ -343,7 +342,6 @@ void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) 
             static_cast<size_t>(dim) * sizeof(float));
     }
 }
-
 size_t best_centroid(const float * query, const std::vector<float> & centroids, int n_lists, int dim) {
     size_t best = 0;
     float best_score = -FLT_MAX;
@@ -752,7 +750,6 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
         return GGML_VEC_INDEX_E_INTERNAL;
     }
 }
-
 int ggml_vec_index_build_ivf(ggml_vec_index_t * idx, int n_lists, int n_iter) {
     if (idx == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -1034,4 +1031,3 @@ int ggml_vec_index_search_ivf(
         return GGML_VEC_INDEX_E_INTERNAL;
     }
 }
-

@@ -149,29 +149,19 @@ if (TARGET ggml-vector-index)
     find_package(Threads REQUIRED)
     include(${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index-sources.cmake)
 
-    target_compile_definitions(ggml-vector-index PRIVATE GGML_VEC_INDEX_EXPORT_TESTS)
-
-    add_executable(test-vector-index test-vector-index.cpp)
-    target_compile_features(test-vector-index PRIVATE cxx_std_17)
-    target_link_libraries(test-vector-index PRIVATE ggml-vector-index Threads::Threads)
-    if (LLAMA_TESTS_INSTALL)
-        install(TARGETS test-vector-index RUNTIME)
-    endif()
-    llama_test(test-vector-index)
-
-    add_library(test-vector-index-fault-hooks STATIC
+    add_library(test-vector-index-impl STATIC
         ${GGML_VECTOR_INDEX_INTERNAL_HEADERS}
         ${GGML_VECTOR_INDEX_IMPL_SOURCES})
-    target_compile_features(test-vector-index-fault-hooks PRIVATE cxx_std_17)
-    target_compile_definitions(test-vector-index-fault-hooks PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+    target_compile_features(test-vector-index-impl PRIVATE cxx_std_17)
+    target_compile_definitions(test-vector-index-impl PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
     if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
-        target_compile_definitions(test-vector-index-fault-hooks PRIVATE GGML_BUILD)
+        target_compile_definitions(test-vector-index-impl PRIVATE GGML_BUILD)
     endif()
-    target_include_directories(test-vector-index-fault-hooks PUBLIC ${PROJECT_SOURCE_DIR}/ggml/include)
-    target_link_libraries(test-vector-index-fault-hooks PRIVATE Threads::Threads ggml-base)
+    target_include_directories(test-vector-index-impl PUBLIC ${PROJECT_SOURCE_DIR}/ggml/include)
+    target_link_libraries(test-vector-index-impl PRIVATE Threads::Threads ggml-base)
     if (APPLE)
-        target_compile_definitions(test-vector-index-fault-hooks PRIVATE ACCELERATE_NEW_LAPACK)
-        target_link_libraries(test-vector-index-fault-hooks PRIVATE "-framework Accelerate")
+        target_compile_definitions(test-vector-index-impl PRIVATE ACCELERATE_NEW_LAPACK)
+        target_link_libraries(test-vector-index-impl PRIVATE "-framework Accelerate")
     endif()
     get_target_property(GGML_VECTOR_INDEX_HAS_AVX2
         ggml-vector-index
@@ -180,9 +170,9 @@ if (TARGET ggml-vector-index)
         get_target_property(GGML_VECTOR_INDEX_AVX2_COMPILE_OPTION
             ggml-vector-index
             GGML_VECTOR_INDEX_AVX2_COMPILE_OPTION)
-        target_sources(test-vector-index-fault-hooks PRIVATE
+        target_sources(test-vector-index-impl PRIVATE
             ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index-avx2.cpp)
-        target_compile_definitions(test-vector-index-fault-hooks PRIVATE GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+        target_compile_definitions(test-vector-index-impl PRIVATE GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
         if (GGML_VECTOR_INDEX_AVX2_COMPILE_OPTION)
             set_source_files_properties(
                 ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vector-index-avx2.cpp
@@ -190,12 +180,20 @@ if (TARGET ggml-vector-index)
         endif()
     endif()
     if (NOT WIN32)
-        target_link_libraries(test-vector-index-fault-hooks PRIVATE m)
+        target_link_libraries(test-vector-index-impl PRIVATE m)
     endif()
+
+    add_executable(test-vector-index test-vector-index.cpp)
+    target_compile_features(test-vector-index PRIVATE cxx_std_17)
+    target_link_libraries(test-vector-index PRIVATE test-vector-index-impl)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-vector-index RUNTIME)
+    endif()
+    llama_test(test-vector-index)
 
     add_executable(test-vector-index-faults test-vector-index-faults.cpp)
     target_compile_features(test-vector-index-faults PRIVATE cxx_std_17)
-    target_link_libraries(test-vector-index-faults PRIVATE test-vector-index-fault-hooks)
+    target_link_libraries(test-vector-index-faults PRIVATE test-vector-index-impl)
     llama_test(test-vector-index-faults)
 endif()
 

@@ -81,7 +81,8 @@ GGML_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
 // queries. This implementation requires `0 < dim <= 65536 && dim % 8 == 0` and
 // supports add/search/filter/IVF plus regular snapshot write/load. TurboVec
 // materializes a dense `dim x dim` rotation matrix on first use, so very large
-// accepted dimensions may return GGML_VEC_INDEX_E_OOM from add/search/prepare.
+// accepted dimensions may return GGML_VEC_INDEX_E_OOM from add/search.
+// `ggml_vec_index_prepare` is best-effort and does not report allocation status.
 // mmap loading and logged mutations are reserved for later format work.
 GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
 
@@ -91,7 +92,8 @@ GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
 // queries. This implementation requires `0 < dim <= 65536 && dim % 8 == 0` and
 // supports add/search/filter/IVF plus regular snapshot write/load. TurboVec
 // materializes a dense `dim x dim` rotation matrix on first use, so very large
-// accepted dimensions may return GGML_VEC_INDEX_E_OOM from add/search/prepare.
+// accepted dimensions may return GGML_VEC_INDEX_E_OOM from add/search.
+// `ggml_vec_index_prepare` is best-effort and does not report allocation status.
 // mmap loading and logged mutations are reserved for later format work.
 GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
 

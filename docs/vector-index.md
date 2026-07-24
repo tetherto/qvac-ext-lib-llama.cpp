@@ -42,9 +42,10 @@ are multiples of 8. They store Lloyd-Max q2/q4 codes in Rust-style bit-plane
 rows with one score-correction scale per vector. Vectors and queries use a
 deterministic dense full-dimension Gaussian QR rotation before LUT scoring. The
 rotation is materialized as a dense `dim x dim` matrix on first use; very large
-accepted dimensions are format-valid, but add/search/prepare can return
-`GGML_VEC_INDEX_E_OOM` if the rotation state cannot be allocated. The
-first non-empty add fits TQ+ per-coordinate calibration when it contains at least
+accepted dimensions are format-valid, but add/search can return
+`GGML_VEC_INDEX_E_OOM` if the rotation state cannot be allocated.
+`ggml_vec_index_prepare` is best-effort and does not report allocation status.
+The first non-empty add fits TQ+ per-coordinate calibration when it contains at least
 1000 vectors, then reuses that calibration for later adds. TurboVec snapshots
 use `.tvim` v3 to persist the calibration. Regular snapshot write/load is
 supported; mmap loading and logged mutations are reserved for a later format
