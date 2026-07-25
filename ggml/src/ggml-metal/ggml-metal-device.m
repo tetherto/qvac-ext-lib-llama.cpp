@@ -1257,6 +1257,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (src0_type != src1_type || src0_type != op->type) {
                     return false;
                 }
+                if (ggml_is_quantized(src0_type)) {
+                    return ggml_is_contiguous_rows(op->src[0]) &&
+                           ggml_is_contiguous_rows(op->src[1]) &&
+                           op->src[0]->ne[0] % ggml_blck_size(src0_type) == 0 &&
+                           op->src[1]->ne[0] % ggml_blck_size(src1_type) == 0;
+                }
                 switch (src0_type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
