@@ -12768,8 +12768,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type != src1->type || src0->type != dst->type) {
             return nullptr;
         }
-        if (ggml_blck_size(src0->type) != 1) {
-            return nullptr;
+        if (ggml_is_quantized(src0->type)) {
+            if (!ggml_is_contiguous_rows(src0) || !ggml_is_contiguous_rows(src1) ||
+                src0->ne[0] % ggml_blck_size(src0->type) != 0 ||
+                src1->ne[0] % ggml_blck_size(src1->type) != 0) {
+                return nullptr;
+            }
+            return ctx->device->pipeline_concat_i8;
         }
         const size_t type_size = ggml_type_size(src0->type);
         switch (type_size) {
@@ -13544,11 +13549,15 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
 }
 
 template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_binary_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
-    const uint32_t a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
-    const uint32_t b_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
-    const uint32_t d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
+    const bool quant_concat = dst->op == GGML_OP_CONCAT && ggml_is_quantized(dst->type);
+    const uint32_t a_offset = get_misalign_bytes(ctx, src0) / (quant_concat ? 1 : ggml_type_size(src0->type));
+    const uint32_t b_offset = get_misalign_bytes(ctx, src1) / (quant_concat ? 1 : ggml_type_size(src1->type));
+    const uint32_t d_offset = get_misalign_bytes(ctx, dst)  / (quant_concat ? 1 : ggml_type_size(dst->type));
 
     GGML_ASSERT(dst->op != GGML_OP_GET_ROWS || (a_offset == 0 && b_offset == 0 && d_offset == 0));
+    GGML_ASSERT(a_offset < (1u << 8));
+    GGML_ASSERT(b_offset < (1u << 8));
+    GGML_ASSERT(d_offset < (1u << 8));
 
     p.misalign_offsets = (a_offset << 16) | (b_offset << 8) | d_offset;
 
@@ -13591,7 +13600,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
     std::cerr << "), " << ggml_op_name(op) << ")");
-    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_OUT_PROD || op == GGML_OP_MUL_MAT_ID_BACK_B || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
+    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_OUT_PROD || op == GGML_OP_MUL_MAT_ID_BACK_B ||
+                op == GGML_OP_CONCAT || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
     GGML_ASSERT(dst->buffer != nullptr);
     const uint64_t ne00 = src0->ne[0];
     const uint64_t ne01 = src0->ne[1];
@@ -13868,6 +13878,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_CONV_2D_DW:
         {
             uint32_t ne = ggml_nelements(dst);
+            if (op == GGML_OP_CONCAT && ggml_is_quantized(dst->type)) {
+                ne = ggml_nbytes(dst);
+            }
             if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
                 // Convert from number of logical elements to 2- or 4-byte units.
                 ne /= ggml_blck_size(src0->type);
@@ -14904,15 +14917,26 @@ static void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subc
 static void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     int * op_params = (int *)dst->op_params;
 
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
+    const bool quantized = ggml_is_quantized(dst->type);
+    const uint32_t src0_type_size = quantized ? 1 : ggml_type_size(src0->type);
+    const uint32_t src1_type_size = quantized ? 1 : ggml_type_size(src1->type);
+    const uint32_t dst_type_size  = quantized ? 1 : ggml_type_size(dst->type);
+
+    const uint32_t src0_ne0 = quantized ? ggml_row_size(src0->type, src0->ne[0]) : src0->ne[0];
+    const uint32_t src1_ne0 = quantized ? ggml_row_size(src1->type, src1->ne[0]) : src1->ne[0];
+    const uint32_t dst_ne0  = quantized ? ggml_row_size(dst->type,  dst->ne[0])  : dst->ne[0];
+
+    // Quantized rows are copied as byte arrays, so dimension 0 is byte-contiguous.
+    // Non-quantized pipelines are typed and must preserve dimension-0 view strides.
+    const uint32_t src0_nb0 = quantized ? 1 : (uint32_t) src0->nb[0] / src0_type_size;
+    const uint32_t src1_nb0 = quantized ? 1 : (uint32_t) src1->nb[0] / src1_type_size;
+    const uint32_t dst_nb0  = quantized ? 1 : (uint32_t)  dst->nb[0] /  dst_type_size;
 
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_CONCAT, {
-        (uint32_t)ggml_nelements(dst),
-        (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
-        (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
-        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
+        quantized ? (uint32_t)ggml_nbytes(dst) : (uint32_t)ggml_nelements(dst),
+        src0_ne0, (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)src0->ne[3], src0_nb0, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
+        src1_ne0, (uint32_t)src1->ne[1], (uint32_t)src1->ne[2], (uint32_t)src1->ne[3], src1_nb0, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
+        dst_ne0,  (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],  (uint32_t) dst->ne[3],  dst_nb0, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
         0.0f, 0.0f, op_params[0],
     });
@@ -20749,6 +20773,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_CONCAT: {
             if (op->src[0]->type != op->src[1]->type || op->src[0]->type != op->type) {
                 return false;
+            }
+            if (ggml_is_quantized(op->type)) {
+                return ggml_is_contiguous_rows(op->src[0]) &&
+                       ggml_is_contiguous_rows(op->src[1]) &&
+                       op->src[0]->ne[0] % ggml_blck_size(op->type) == 0 &&
+                       op->src[1]->ne[0] % ggml_blck_size(op->type) == 0;
             }
             const size_t type_size = ggml_type_size(op->type);
             return ggml_blck_size(op->type) == 1 &&
