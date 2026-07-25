@@ -594,44 +594,74 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
     const int32_t dim = ((const int32_t *) op->op_params)[0];
+    const bool quantized = ggml_is_quantized(op->type);
+
+    ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+    ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+    const int32_t src0_row_size = quantized ? ggml_row_size(op->src[0]->type, op->src[0]->ne[0]) : ne00;
+    const int32_t src1_row_size = quantized ? ggml_row_size(op->src[1]->type, op->src[1]->ne[0]) : ne10;
+    const int32_t dst_row_size  = quantized ? ggml_row_size(op->type,         op->ne[0])         : ne0;
+
+    const auto can_copy_aligned = [&](uint64_t size) {
+        return quantized &&
+            src0_row_size % size == 0 &&
+            src1_row_size % size == 0 &&
+            dst_row_size % size == 0 &&
+            bid_src0.offs % size == 0 &&
+            bid_src1.offs % size == 0 &&
+            bid_dst.offs % size == 0 &&
+            nb01 % size == 0 && nb02 % size == 0 && nb03 % size == 0 &&
+            nb11 % size == 0 && nb12 % size == 0 && nb13 % size == 0 &&
+            nb1  % size == 0 && nb2  % size == 0 && nb3  % size == 0;
+    };
+
+    const int32_t copy_size = can_copy_aligned(8) ? 8 : (can_copy_aligned(4) ? 4 : 1);
+    const int32_t src0_ne0 = quantized ? src0_row_size / copy_size : ne00;
+    const int32_t src1_ne0 = quantized ? src1_row_size / copy_size : ne10;
+    const int32_t dst_ne0  = quantized ? dst_row_size  / copy_size : ne0;
 
     ggml_metal_kargs_concat args = {
-        /*.ne00 =*/ ne00,
+        /*.ne00 =*/ src0_ne0,
         /*.ne01 =*/ ne01,
         /*.ne02 =*/ ne02,
         /*.ne03 =*/ ne03,
-        /*.nb00 =*/ nb00,
+        /*.nb00 =*/ quantized ? copy_size : nb00,
         /*.nb01 =*/ nb01,
         /*.nb02 =*/ nb02,
         /*.nb03 =*/ nb03,
-        /*.ne10 =*/ ne10,
+        /*.ne10 =*/ src1_ne0,
         /*.ne11 =*/ ne11,
         /*.ne12 =*/ ne12,
         /*.ne13 =*/ ne13,
-        /*.nb10 =*/ nb10,
+        /*.nb10 =*/ quantized ? copy_size : nb10,
         /*.nb11 =*/ nb11,
         /*.nb12 =*/ nb12,
         /*.nb13 =*/ nb13,
-        /*.ne0  =*/ ne0,
+        /*.ne0  =*/ dst_ne0,
         /*.ne1  =*/ ne1,
         /*.ne2  =*/ ne2,
         /*.ne3  =*/ ne3,
-        /*.nb0  =*/ nb0,
+        /*.nb0  =*/ quantized ? copy_size : nb0,
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
         /*.dim  =*/ dim,
     };
 
-    auto pipeline = ggml_metal_library_get_pipeline_concat(lib, op->type);
+    auto pipeline = ggml_metal_library_get_pipeline_concat(
+        lib, quantized ?
+            (copy_size == 8 ? GGML_TYPE_I64 : (copy_size == 4 ? GGML_TYPE_I32 : GGML_TYPE_I8)) :
+            op->type);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
 
-    int nth = std::min(256, ne0);
+    int nth = std::min(256, dst_ne0);
 
     // when rows are small, we can batch them together in a single threadgroup
     int nrptg = 1;
