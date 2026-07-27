@@ -191,7 +191,6 @@ add_library(ggml-base
             ../include/ggml-backend.h
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
-            ../include/ggml-vector-index.h
             ../include/gguf.h
             ../include/uint8-buff-stream.h
             ggml.c
@@ -205,7 +204,6 @@ add_library(ggml-base
             ggml-tbq-quants.c
             ggml-quants.c
             ggml-quants.h
-            ggml-vector-index.cpp
             gguf.cpp
             uint8-buff-stream.cpp)
 
@@ -516,6 +514,36 @@ foreach (target ggml-base ggml)
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
 endforeach()
+
+if (GGML_VECTOR_INDEX)
+    add_library(ggml-vector-index
+                ../include/ggml-vector-index.h
+                ggml-vector-index.cpp)
+
+    set_target_properties(ggml-vector-index PROPERTIES
+        VERSION ${GGML_VERSION}
+        SOVERSION ${GGML_VERSION_MAJOR}
+    )
+
+    target_include_directories(ggml-vector-index PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+        $<INSTALL_INTERFACE:include>)
+    target_compile_features(ggml-vector-index PRIVATE cxx_std_17)
+    target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)
+
+    if (DEFINED MATH_LIBRARY)
+        target_link_libraries(ggml-vector-index PRIVATE ${MATH_LIBRARY})
+    elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
+        target_link_libraries(ggml-vector-index PRIVATE m)
+    endif()
+
+    if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
+        set_target_properties(ggml-vector-index PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(ggml-vector-index PRIVATE GGML_BUILD)
+    endif()
+
+    install(TARGETS ggml-vector-index EXPORT ggml-targets)
+endif()
 
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
 

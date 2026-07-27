@@ -4,13 +4,11 @@
 //
 // POC NOTE
 // --------
-// This is the public C API for fabric's vector index. The implementation
-// under `ggml/src/ggml-vector-index.cpp` is intentionally naive (full f32
-// storage, scalar dot-product, min-heap top-k). The C API itself is final:
-// downstream Bare addon bindings + JS wrappers depend on this signature and
-// the on-disk file format documented at the bottom of this header.
-// Quantization / SIMD / GPU kernels are future work and will be swapped in
-// behind the same API without breaking callers.
+// This is an experimental public C API for fabric's vector index. The
+// implementation under `ggml/src/ggml-vector-index.cpp` is intentionally naive
+// (full f32 storage, scalar dot-product, min-heap top-k). The stacked follow-up
+// PRs expand the storage modes, error handling, and persistence format before
+// downstream bindings should treat the contract as stable.
 //
 // Threading: instances are NOT thread-safe. Callers must serialize access
 // to a given handle. Multiple handles can be used concurrently.
@@ -46,9 +44,8 @@ enum ggml_vec_index_error {
 
 // Lifecycle.
 //
-// `dim` must be > 0. `bit_width` is reserved for future quantization; the
-// POC accepts any value in [1, 32] but ignores it (storage is always full
-// f32). Returns NULL on bad args.
+// `dim` must be > 0. `bit_width` must be 32 in this foundation
+// implementation. Returns NULL on bad args.
 GGML_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
 
 GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
@@ -59,6 +56,8 @@ GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 // associating each with the corresponding `ids[i]` (caller-owned external id).
 // Returns 0 on success. Returns GGML_VEC_INDEX_E_DUPLICATE if any id already
 // exists in the index; in that case the index is unchanged (atomic add).
+// All vector components must be finite. UINT64_MAX is reserved for search
+// result padding and is not a valid id.
 GGML_API int ggml_vec_index_add(
     ggml_vec_index_t * idx,
     const float      * vectors,
@@ -85,9 +84,10 @@ GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // with sentinel values: -FLT_MAX for scores, UINT64_MAX for ids. Read-only
 // against the index (does not mutate state).
 //
-// Score semantics: scalar full-precision dot product. Callers that want
-// cosine similarity must L2-normalize their vectors before insert AND
-// before query; the index does NOT normalize internally.
+// Score semantics: scalar dot product accumulated in double and clamped to the
+// finite f32 range. Callers that want cosine similarity must L2-normalize their
+// vectors before insert AND before query; the index does NOT normalize
+// internally. All query components must be finite.
 GGML_API int ggml_vec_index_search(
     const ggml_vec_index_t * idx,
     const float            * queries,
