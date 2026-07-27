@@ -690,15 +690,6 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->optimizer        = params.optimizer;
 
     result->loss_scale = params.loss_scale > 0.0f ? params.loss_scale : 1.0f;
-    {
-        const char * ls = getenv("GGML_OPT_LOSS_SCALE");
-        if (ls) {
-            const float s = (float) atof(ls);
-            if (s > 0.0f) {
-                result->loss_scale = s;
-            }
-        }
-    }
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -989,7 +980,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 GGML_ASSERT(opt_pars.sgd.wd <= 1.0f);
                 float * sgd = ggml_get_data_f32(opt_ctx->opt_step_params);
                 sgd[0] = opt_pars.sgd.alpha / opt_ctx->loss_scale;
-                sgd[1] = opt_pars.sgd.wd;
+                sgd[1] = opt_pars.sgd.wd * opt_ctx->loss_scale;
             } break;
             default:
                 GGML_ABORT("fatal error");
