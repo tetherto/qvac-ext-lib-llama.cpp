@@ -1406,8 +1406,14 @@ int main(int argc, char ** argv) {
         reset_fault_hooks();
 
         CHECK(status_a == GGML_VEC_INDEX_OK);
-        CHECK(status_b == GGML_VEC_INDEX_E_IO);
-        CHECK(ggml_vec_index_contains(hardlink_writer_b, hardlink_id_b) == 0);
+        CHECK(status_b == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_contains(hardlink_writer_b, hardlink_id_b) == 1);
+        auto * hardlink_replayed = ggml_vec_index_load_with_delta(
+            hardlink_snapshot_path.c_str(), hardlink_delta_path.c_str());
+        CHECK(hardlink_replayed != nullptr);
+        CHECK(ggml_vec_index_contains(hardlink_replayed, hardlink_id_a) == 1);
+        CHECK(ggml_vec_index_contains(hardlink_replayed, hardlink_id_b) == 1);
+        ggml_vec_index_free(hardlink_replayed);
         ggml_vec_index_free(hardlink_writer_a);
         ggml_vec_index_free(hardlink_writer_b);
     }
