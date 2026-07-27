@@ -3875,7 +3875,8 @@ struct test_dsv4_hc : public test_case {
             float lo;
             float hi;
             if (!tensor_range(name, lo, hi)) {
-                continue;
+                lo = -1.0f;
+                hi = 1.0f;
             }
 
             GGML_ASSERT(t->type == GGML_TYPE_F32);
