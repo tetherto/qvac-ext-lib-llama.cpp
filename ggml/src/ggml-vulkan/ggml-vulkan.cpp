@@ -1650,6 +1650,14 @@ static uint32_t ggml_vk_lightning_indexer_cm1_shmem(int64_t n_head) {
     return q_tile + k_tile + scores;
 }
 
+static constexpr uint32_t LIGHTNING_INDEXER_CM1_SUBGROUP_SIZE = 64;
+
+static bool ggml_vk_lightning_indexer_cm1_subgroup_compatible(const vk_device & device) {
+    return device->subgroup_size_control &&
+           device->subgroup_min_size <= LIGHTNING_INDEXER_CM1_SUBGROUP_SIZE &&
+           LIGHTNING_INDEXER_CM1_SUBGROUP_SIZE <= device->subgroup_max_size;
+}
+
 static bool ggml_vk_lightning_indexer_cm1_compatible(
         const vk_device & device,
         const ggml_tensor * q,
@@ -1657,7 +1665,7 @@ static bool ggml_vk_lightning_indexer_cm1_compatible(
         const ggml_tensor * weights) {
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     return device->coopmat_support_16x16x16_f32acc &&
-           device->subgroup_size == 64 &&
+           ggml_vk_lightning_indexer_cm1_subgroup_compatible(device) &&
            q->ne[0] == 128 && ggml_vk_lightning_indexer_head_index(q->ne[1]) >= 0 &&
            k->ne[0] == 128 && weights->ne[0] == q->ne[1] &&
            ggml_vk_lightning_indexer_type_supported(k->type) &&
@@ -6176,13 +6184,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_LIGHTNING_INDEXER_GENERIC(GGML_TYPE_Q4_0, q4_0)
 #undef CREATE_LIGHTNING_INDEXER_GENERIC
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-        if (device->coopmat_support_16x16x16_f32acc && device->subgroup_size == 64) {
+        if (device->coopmat_support_16x16x16_f32acc &&
+            ggml_vk_lightning_indexer_cm1_subgroup_compatible(device)) {
 #define CREATE_LIGHTNING_INDEXER_CM1(TYPE, NAME, HEAD, HEAD_IDX, LOCAL_SIZE) \
             if (ggml_vk_lightning_indexer_cm1_shmem(HEAD) <= device->properties.limits.maxComputeSharedMemorySize) { \
                 ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm1[TYPE][HEAD_IDX], \
                     "lightning_indexer_" #NAME "_h" #HEAD "_cm1", lightning_indexer_ ## NAME ## _h ## HEAD ## _cm1_len, \
                     lightning_indexer_ ## NAME ## _h ## HEAD ## _cm1_data, "main", 5, \
-                    sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, { LOCAL_SIZE }, 1, false, true); \
+                    sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, { LOCAL_SIZE }, 1, false, true, \
+                    LIGHTNING_INDEXER_CM1_SUBGROUP_SIZE); \
             }
 #define CREATE_LIGHTNING_INDEXER_CM1_TYPE(TYPE, NAME) \
             CREATE_LIGHTNING_INDEXER_CM1(TYPE, NAME, 32, 0, 128) \
