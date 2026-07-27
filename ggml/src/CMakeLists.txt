@@ -191,6 +191,7 @@ add_library(ggml-base
             ../include/ggml-backend.h
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
+            ../include/ggml-vector-index.h
             ../include/gguf.h
             ../include/uint8-buff-stream.h
             ggml.c
@@ -204,6 +205,7 @@ add_library(ggml-base
             ggml-tbq-quants.c
             ggml-quants.c
             ggml-quants.h
+            ggml-vector-index.cpp
             gguf.cpp
             uint8-buff-stream.cpp)
 
