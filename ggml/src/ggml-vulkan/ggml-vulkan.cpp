@@ -1708,6 +1708,7 @@ struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t dst_offset;
 };
 static_assert(sizeof(vk_op_dsv4_hc_comb_push_constants) <= 128);
+static constexpr uint32_t DSV4_HC_COMB_WG_SIZE = 64;
 
 struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t ne;
@@ -6219,7 +6220,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #endif
     }
-    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {DSV4_HC_COMB_WG_SIZE, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32, "dsv4_hc_pre_f32", dsv4_hc_pre_f32_len, dsv4_hc_pre_f32_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32, "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {512, 1, 1}, {}, 1);
 
@@ -20433,7 +20434,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->ne[1] <= device->properties.limits.maxComputeWorkGroupCount[1] &&
                    op->ne[3] <= device->properties.limits.maxComputeWorkGroupCount[2];
         }
-        case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_COMB: {
+            const uint64_t groups_x = CEIL_DIV((uint64_t) op->src[0]->ne[1], DSV4_HC_COMB_WG_SIZE);
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] == 24 && op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
@@ -20442,7 +20444,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->src[2]->ne[0] == 24 && op->src[2]->ne[1] == 1 &&
                    op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
                    op->ne[0] == 4 && op->ne[1] == 4 && op->ne[2] == op->src[0]->ne[1] && op->ne[3] == 1 &&
-                   ggml_get_op_params_i32(op, 1) > 0;
+                   ggml_get_op_params_i32(op, 1) > 0 &&
+                   groups_x <= device->properties.limits.maxComputeWorkGroupCount[0];
+        }
         case GGML_OP_DSV4_HC_PRE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && op->src[0]->ne[1] > 0 && op->src[0]->ne[3] == 1 &&
