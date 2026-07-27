@@ -123,6 +123,7 @@ option(GGML_STATIC "ggml: static link libraries"                     OFF)
 option(GGML_NATIVE "ggml: optimize the build for the current system" ${GGML_NATIVE_DEFAULT})
 option(GGML_LTO    "ggml: enable link time optimization"             OFF)
 option(GGML_CCACHE "ggml: use ccache if available"                   ON)
+option(GGML_VECTOR_INDEX "ggml: build standalone vector index library" OFF)
 
 # debug
 option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"                   ON)
@@ -336,12 +337,15 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-rpc.h
     include/ggml-virtgpu.h
     include/ggml-sycl.h
-    include/ggml-vector-index.h
     include/ggml-vulkan.h
     include/ggml-webgpu.h
     include/ggml-zendnn.h
     include/ggml-openvino.h
     include/gguf.h)
+
+if (GGML_VECTOR_INDEX)
+    list(APPEND GGML_PUBLIC_HEADERS include/ggml-vector-index.h)
+endif()
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
 #if (GGML_METAL)

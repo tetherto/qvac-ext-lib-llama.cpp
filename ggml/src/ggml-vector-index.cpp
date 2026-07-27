@@ -15,9 +15,11 @@
 #include <cassert>
 #include <cerrno>
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -31,8 +33,59 @@ namespace {
 constexpr uint8_t  kTvimMagic[4]   = { 'T', 'V', 'P', 'I' };
 constexpr uint8_t  kTvimVersion    = 1;
 constexpr size_t   kTvimHeaderSize = 16;
+constexpr uint64_t kPaddingId      = UINT64_MAX;
 
 static_assert(sizeof(float) == sizeof(uint32_t), "ggml-vector-index requires float32");
+
+bool checked_mul_size(size_t a, size_t b, size_t & out) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
+bool checked_add_size(size_t a, size_t b, size_t & out) {
+    if (b > std::numeric_limits<size_t>::max() - a) {
+        return false;
+    }
+    out = a + b;
+    return true;
+}
+
+bool all_finite(const float * values, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(values[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+float float_score_from_double(double score) {
+    if (!std::isfinite(score)) {
+        return score < 0.0 ? -FLT_MAX : FLT_MAX;
+    }
+    if (score > static_cast<double>(FLT_MAX)) {
+        return FLT_MAX;
+    }
+    if (score < -static_cast<double>(FLT_MAX)) {
+        return -FLT_MAX;
+    }
+    return static_cast<float>(score);
+}
+
+bool expected_snapshot_size(size_t n, size_t dim, size_t & expected) {
+    size_t values = 0;
+    size_t vector_bytes = 0;
+    size_t id_bytes = 0;
+    size_t payload_bytes = 0;
+    return checked_mul_size(n, dim, values) &&
+        checked_mul_size(values, sizeof(float), vector_bytes) &&
+        checked_mul_size(n, sizeof(uint64_t), id_bytes) &&
+        checked_add_size(vector_bytes, id_bytes, payload_bytes) &&
+        checked_add_size(kTvimHeaderSize, payload_bytes, expected);
+}
 
 void put_u32_le(uint8_t * dst, uint32_t v) {
     dst[0] = static_cast<uint8_t>(v >> 0);
@@ -149,9 +202,7 @@ ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width) {
         if (dim <= 0) {
             return nullptr;
         }
-        if (bit_width <= 0 || bit_width > 32) {
-            // POC ignores bit_width but still validates the range so callers
-            // surface bad config early.
+        if (bit_width != 32) {
             return nullptr;
         }
         auto * idx = new (std::nothrow) ggml_vec_index();
@@ -195,9 +246,26 @@ int ggml_vec_index_add(
             return GGML_VEC_INDEX_OK;
         }
 
+        dim_sz = static_cast<size_t>(idx->dim);
+        const size_t n_sz = static_cast<size_t>(n);
+        if (idx->slot_to_id.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            n_sz > static_cast<size_t>(std::numeric_limits<int>::max()) - idx->slot_to_id.size()) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        size_t value_count = 0;
+        if (!checked_mul_size(n_sz, dim_sz, value_count)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (!all_finite(vectors, value_count)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
         // Atomic add: detect duplicates first (against existing AND in-batch),
         // bail before mutating any state.
         for (int i = 0; i < n; ++i) {
+            if (ids[i] == kPaddingId) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
             if (idx->id_to_slot.find(ids[i]) != idx->id_to_slot.end()) {
                 return GGML_VEC_INDEX_E_DUPLICATE;
             }
@@ -209,8 +277,6 @@ int ggml_vec_index_add(
         }
 
         base_slot = idx->slot_to_id.size();
-        dim_sz    = static_cast<size_t>(idx->dim);
-        const size_t n_sz = static_cast<size_t>(n);
         if (n_sz > std::numeric_limits<size_t>::max() - base_slot) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
@@ -307,11 +373,11 @@ namespace {
 
 // Scalar dot product of two `dim`-length f32 vectors.
 inline float dot(const float * a, const float * b, int dim) {
-    float acc = 0.0f;
+    double acc = 0.0;
     for (int i = 0; i < dim; ++i) {
-        acc += a[i] * b[i];
+        acc += static_cast<double>(a[i]) * static_cast<double>(b[i]);
     }
-    return acc;
+    return float_score_from_double(acc);
 }
 
 // Run a single query against all slots, write top-k into out_scores/out_ids.
@@ -389,6 +455,9 @@ int ggml_vec_index_search(
             n_q_sz > std::numeric_limits<size_t>::max() / k_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
+        if (!all_finite(queries, n_q_sz * dim_sz)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
 
         for (int q = 0; q < n_q; ++q) {
             search_one(
@@ -415,7 +484,8 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         if (idx == nullptr || path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (idx->slot_to_id.size() > std::numeric_limits<uint32_t>::max()) {
+        if (idx->slot_to_id.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            idx->slot_to_id.size() > std::numeric_limits<uint32_t>::max()) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         const size_t n      = idx->slot_to_id.size();
@@ -478,6 +548,12 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         if (!f.is_open()) {
             return nullptr;
         }
+        std::error_code ec;
+        const uintmax_t file_size_um = std::filesystem::file_size(path, ec);
+        if (ec || file_size_um > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
+            return nullptr;
+        }
+        const size_t file_size = static_cast<size_t>(file_size_um);
 
         uint8_t header[kTvimHeaderSize] = {};
         f.read(reinterpret_cast<char *>(header), sizeof(header));
@@ -497,17 +573,22 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         if (dim_le == 0 || dim_le > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
             return nullptr;
         }
+        if (n_le > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+            return nullptr;
+        }
         const int dim = static_cast<int>(dim_le);
+        const size_t dim_sz = static_cast<size_t>(dim);
+        const size_t n      = static_cast<size_t>(n_le);
+        size_t expected_size = 0;
+        if (!expected_snapshot_size(n, dim_sz, expected_size) ||
+            file_size != expected_size) {
+            return nullptr;
+        }
 
         std::unique_ptr<ggml_vec_index_t, decltype(&ggml_vec_index_free)> idx(
             ggml_vec_index_create(dim, bit_width),
             ggml_vec_index_free);
         if (idx == nullptr) {
-            return nullptr;
-        }
-        const size_t dim_sz = static_cast<size_t>(dim);
-        const size_t n      = static_cast<size_t>(n_le);
-        if (n != 0 && dim_sz > std::numeric_limits<size_t>::max() / n) {
             return nullptr;
         }
 
@@ -521,6 +602,9 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 return nullptr;
             }
             v = u32_to_float(bits);
+            if (!std::isfinite(v)) {
+                return nullptr;
+            }
         }
 
         for (uint64_t & id : idx->slot_to_id) {
@@ -531,6 +615,9 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
 
         for (size_t slot = 0; slot < n; ++slot) {
             const uint64_t id = idx->slot_to_id[slot];
+            if (id == kPaddingId) {
+                return nullptr;
+            }
             const bool inserted =
                 idx->id_to_slot.emplace(id, slot).second;
             if (!inserted) {
@@ -550,7 +637,13 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
 // ---------------------------------------------------------------------------
 
 int ggml_vec_index_len(const ggml_vec_index_t * idx) {
-    return idx ? static_cast<int>(idx->slot_to_id.size()) : 0;
+    if (idx == nullptr) {
+        return 0;
+    }
+    if (idx->slot_to_id.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(idx->slot_to_id.size());
 }
 
 int ggml_vec_index_dim(const ggml_vec_index_t * idx) {
