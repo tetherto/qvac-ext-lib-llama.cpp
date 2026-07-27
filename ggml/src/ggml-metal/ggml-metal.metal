@@ -2639,6 +2639,8 @@ kernel void kernel_lightning_indexer_mm_impl(
     }
 
     FOR_UNROLL (short ib = 0; ib < NE; ib += NB) {
+        // The matrix path intentionally narrows F32 Q and dequantized K to F16, matching the CUDA WMMA
+        // and Vulkan cooperative-matrix paths. Values outside the finite F16 range overflow during conversion.
         for (int i = tiitg; i < NH*NB/4; i += 4*N_SIMDWIDTH) {
             const int ih = i / (NB/4);
             const int ie = 4*(i % (NB/4));
