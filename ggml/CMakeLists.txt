@@ -357,6 +357,25 @@ install(
   NAMESPACE ggml::
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml)
 
+if (GGML_STANDALONE OR GGML_VECTOR_INDEX)
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+        set(GGML_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+        set(GGML_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+    else()
+        set(_GGML_PC_PREFIX_BASE "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-prefix")
+        file(RELATIVE_PATH GGML_PC_PREFIX_RELATIVE
+            "${_GGML_PC_PREFIX_BASE}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+            "${_GGML_PC_PREFIX_BASE}")
+        set(GGML_PC_PREFIX "\${pcfiledir}/${GGML_PC_PREFIX_RELATIVE}")
+        set(GGML_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+    endif()
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+        set(GGML_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+    else()
+        set(GGML_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+    endif()
+endif()
+
 if (GGML_STANDALONE)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml.pc.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
@@ -374,19 +393,6 @@ if (GGML_VECTOR_INDEX)
         endif()
     endforeach()
     string(JOIN " " GGML_VECTOR_INDEX_PRIVATE_LIBS ${GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST})
-
-    if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
-        set(GGML_VECTOR_INDEX_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
-        set(GGML_VECTOR_INDEX_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
-    else()
-        set(GGML_VECTOR_INDEX_PC_PREFIX "\${pcfiledir}/../..")
-        set(GGML_VECTOR_INDEX_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
-    endif()
-    if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
-        set(GGML_VECTOR_INDEX_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
-    else()
-        set(GGML_VECTOR_INDEX_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
-    endif()
 
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index.pc.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc

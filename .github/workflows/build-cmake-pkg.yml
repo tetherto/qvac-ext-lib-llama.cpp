@@ -54,13 +54,14 @@ jobs:
           cmake -S ggml -B build-ggml \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX="$GGML_PREFIX" \
+                -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu \
                 -DBUILD_SHARED_LIBS=OFF \
                 -DGGML_BUILD_TESTS=OFF \
                 -DGGML_BUILD_EXAMPLES=OFF \
                 -DGGML_VECTOR_INDEX=ON
           cmake --build build-ggml --config Release
           cmake --install build-ggml --config Release
-          export PKG_CONFIG_PATH="$GGML_PREFIX"/lib/pkgconfig
+          export PKG_CONFIG_PATH="$GGML_PREFIX"/lib/x86_64-linux-gnu/pkgconfig
           cc vector-index-cmake-pkg/main.c \
              $(pkg-config --cflags --libs --static ggml-vector-index) \
              -o vector-index-pkg-config
