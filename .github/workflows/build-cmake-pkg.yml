@@ -5,7 +5,7 @@ on:
 
 jobs:
   linux:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, CPU]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -32,7 +32,7 @@ jobs:
           project(vector_index_consumer C CXX)
           find_package(ggml CONFIG REQUIRED)
           add_executable(vector_index_consumer main.c)
-          target_link_libraries(vector_index_consumer PRIVATE ggml::ggml-vector-index)
+          target_link_libraries(vector_index_consumer PRIVATE ggml::vector-index)
           EOF
           cat > vector-index-cmake-pkg/main.c <<'EOF'
           #include "ggml-vector-index.h"
