@@ -8,7 +8,20 @@ on:
     paths: [
       '.github/workflows/build-sanitize.yml',
       '**/CMakeLists.txt',
-      '**/.cmake',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp'
+    ]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: [
+      '.github/workflows/build-sanitize.yml',
+      '**/CMakeLists.txt',
+      '**/*.cmake',
+      '**/*.cmake.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
@@ -72,6 +85,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
 
           cmake --build build --config Debug -j $(nproc)
@@ -83,6 +97,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
 
           cmake --build build --config RelWithDebInfo -j $(nproc)
@@ -94,6 +109,7 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DGGML_OPENMP=OFF
 

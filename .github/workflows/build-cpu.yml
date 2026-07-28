@@ -7,12 +7,12 @@ on:
       - master
     paths: [
       '.github/workflows/build-cpu.yml',
-      # Disable. There are some modifications in the fork
-      # so that ggml dynamic builds work with vcpkg.
-      # '.github/workflows/build-cmake-pkg.yml',
+      '.github/workflows/build-cmake-pkg.yml',
       '.github/workflows/build-linux-cross.yml',
       '**/CMakeLists.txt',
-      '**/.cmake',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.pc.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
@@ -23,13 +23,13 @@ on:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-cpu.yml',
-      # Disable. There are some modifications in the fork
-      # so that ggml dynamic builds work with vcpkg.
-      # '.github/workflows/build-cmake-pkg.yml',
+      '.github/workflows/build-cmake-pkg.yml',
       '.github/workflows/build-linux-cross.yml',
       'ggml/src/ggml-rpc/**',
       '**/CMakeLists.txt',
-      '**/.cmake',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.pc.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
@@ -48,8 +48,8 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
-  # build-cmake-pkg:
-    # uses: ./.github/workflows/build-cmake-pkg.yml
+  build-cmake-pkg:
+    uses: ./.github/workflows/build-cmake-pkg.yml
 
   ubuntu:
     strategy:
@@ -121,6 +121,18 @@ jobs:
           cd build
           ctest -L main --verbose --timeout 900
 
+      - name: Static vector-index smoke
+        id: vector_index_static
+        if: ${{ matrix.build == 'x64' }}
+        run: |
+          cmake -B build-vector-index-static \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DGGML_VECTOR_INDEX=ON \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build build-vector-index-static --target test-vector-index -j $(nproc)
+          ctest --test-dir build-vector-index-static -R '^test-vector-index$' --output-on-failure
+
       - name: Test llama2c conversion
         id: llama2c_test
         run: |
@@ -145,13 +157,13 @@ jobs:
         include:
           - build: 'x64-cpu-static'
             arch: 'x64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DBUILD_SHARED_LIBS=OFF'
+            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_VECTOR_INDEX=ON -DBUILD_SHARED_LIBS=OFF'
           - build: 'x64-openblas'
             arch: 'x64'
             defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_VECTOR_INDEX=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DBLAS_INCLUDE_DIRS="$env:RUNNER_TEMP/openblas/include" -DBLAS_LIBRARIES="$env:RUNNER_TEMP/openblas/lib/openblas.lib"'
           - build: 'arm64'
             arch: 'arm64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON'
+            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON -DGGML_VECTOR_INDEX=ON'
 
     steps:
       - name: Clone

@@ -169,6 +169,22 @@ if(NOT TARGET ggml::ggml)
             INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}"
             INTERFACE_LINK_LIBRARIES "${GGML_BASE_INTERFACE_LINK_LIBRARIES}")
 
+    if (GGML_VECTOR_INDEX)
+        find_library(GGML_VECTOR_INDEX_LIBRARY ggml-vector-index
+            REQUIRED
+            HINTS ${GGML_LIB_DIR}
+            NO_CMAKE_FIND_ROOT_PATH)
+
+        add_library(ggml::ggml-vector-index UNKNOWN IMPORTED)
+        set_target_properties(ggml::ggml-vector-index
+            PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}"
+                IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+                IMPORTED_LOCATION "${GGML_VECTOR_INDEX_LIBRARY}"
+                INTERFACE_COMPILE_FEATURES cxx_std_17
+                POSITION_INDEPENDENT_CODE ON)
+    endif()
+
     set(_ggml_all_targets "")
     if (NOT GGML_BACKEND_DL)
         foreach(_ggml_backend ${GGML_AVAILABLE_BACKENDS})
