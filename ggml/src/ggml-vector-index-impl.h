@@ -542,6 +542,7 @@ bool delta_log_matches_index_unlocked(
     const ggml_vec_index_t * idx,
     const char * delta_path,
     DeltaLogLock * lock);
+bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path, DeltaLogLock & lock);
 bool validate_logged_add_args(
     const ggml_vec_index_t * idx,
     const float * vectors,
