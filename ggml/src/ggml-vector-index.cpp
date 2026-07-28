@@ -48,7 +48,8 @@ constexpr uint8_t  kTvimVersion    = 1;
 constexpr size_t   kTvimHeaderSize = 16;
 constexpr uint64_t kPaddingId      = UINT64_MAX;
 
-static_assert(sizeof(float) == sizeof(uint32_t), "ggml-vector-index requires float32");
+static_assert(sizeof(float) == sizeof(uint32_t) && std::numeric_limits<float>::is_iec559,
+              "ggml-vector-index requires IEEE 754 float32");
 
 bool checked_mul_size(size_t a, size_t b, size_t & out) {
     if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
@@ -396,7 +397,7 @@ int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, con
 
 int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id) {
     try {
-        if (idx == nullptr) {
+        if (idx == nullptr || id == kPaddingId) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         auto it = idx->id_to_slot.find(id);

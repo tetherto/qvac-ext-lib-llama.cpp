@@ -41,7 +41,9 @@ env:
 
 jobs:
   ctest:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, X64, CPU, Linux]
+
+    continue-on-error: ${{ matrix.sanitizer == 'THREAD' }}
 
     strategy:
       matrix:
@@ -98,3 +100,9 @@ jobs:
         run: |
           cd build
           ctest -L main -E tokenizer --verbose --timeout 900
+
+      - name: Test vector index (undefined)
+        if: ${{ matrix.sanitizer == 'UNDEFINED' }}
+        run: |
+          cd build
+          ctest -R '^test-vector-index$' --verbose --timeout 900

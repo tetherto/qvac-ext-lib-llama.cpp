@@ -364,23 +364,36 @@ if (GGML_STANDALONE)
 
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+endif()
 
-    if (GGML_VECTOR_INDEX)
-        set(GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "")
-        foreach(lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
-            if (lib STREQUAL "c++" OR lib STREQUAL "stdc++")
-                list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "-l${lib}")
-            endif()
-        endforeach()
-        string(JOIN " " GGML_VECTOR_INDEX_PRIVATE_LIBS ${GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST})
+if (GGML_VECTOR_INDEX)
+    set(GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "")
+    foreach(lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
+        if (lib STREQUAL "c++" OR lib STREQUAL "stdc++")
+            list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "-l${lib}")
+        endif()
+    endforeach()
+    string(JOIN " " GGML_VECTOR_INDEX_PRIVATE_LIBS ${GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST})
 
-        configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index.pc.in
-            ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc
-            @ONLY)
-
-        install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc
-            DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+        set(GGML_VECTOR_INDEX_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+        set(GGML_VECTOR_INDEX_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+    else()
+        set(GGML_VECTOR_INDEX_PC_PREFIX "\${pcfiledir}/../..")
+        set(GGML_VECTOR_INDEX_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
     endif()
+    if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+        set(GGML_VECTOR_INDEX_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+    else()
+        set(GGML_VECTOR_INDEX_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+    endif()
+
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index.pc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc
+        @ONLY)
+
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()
 
 #
@@ -466,6 +479,7 @@ if (MSVC)
 
     configure_msvc_target(ggml-base)
     configure_msvc_target(ggml)
+    configure_msvc_target(ggml-vector-index)
     configure_msvc_target(ggml-cpu)
     configure_msvc_target(ggml-cpu-x64)
     configure_msvc_target(ggml-cpu-sse42)
