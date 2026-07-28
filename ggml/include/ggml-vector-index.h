@@ -13,12 +13,26 @@
 // Threading: instances are NOT thread-safe. Callers must serialize access
 // to a given handle. Multiple handles can be used concurrently.
 //
-// Endianness: persistence format is fixed little-endian. The POC asserts a
-// LE host; we do not currently support big-endian platforms.
-
-#include "ggml.h"
+// Endianness: persistence format is fixed little-endian. Values are converted
+// explicitly when snapshots are read and written.
 
 #include <stdint.h>
+
+#ifndef GGML_API
+#    ifdef GGML_SHARED
+#        if defined(_WIN32) && !defined(__MINGW32__)
+#            ifdef GGML_BUILD
+#                define GGML_API __declspec(dllexport) extern
+#            else
+#                define GGML_API __declspec(dllimport) extern
+#            endif
+#        else
+#            define GGML_API __attribute__((visibility("default"))) extern
+#        endif
+#    else
+#        define GGML_API extern
+#    endif
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,7 +74,7 @@ GGML_API int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, i
 
 // Removes the entry for `id` via swap-with-last (slot indices are NOT stable
 // across removes; external ids ARE). Returns 1 if removed, 0 if not present,
-// negative on error.
+// or GGML_VEC_INDEX_E_INVALID_ARG if `id` is the reserved UINT64_MAX value.
 GGML_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
 
 // Returns 1 if the id is in the index, 0 otherwise. Read-only.
@@ -75,7 +89,8 @@ GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // `out_ids` are caller-allocated buffers of size `n_q * k`. Each row is
 // sorted descending by score (higher = closer / more similar). If the index
 // holds fewer than k entries, the remaining slots in each row are filled
-// with sentinel values: -FLT_MAX for scores, UINT64_MAX for ids. Read-only
+// with -FLT_MAX scores and UINT64_MAX ids. Only the UINT64_MAX id identifies
+// padding because a real clamped score may also equal -FLT_MAX. Read-only
 // against the index (does not mutate state).
 //
 // Score semantics: scalar dot product accumulated in double and clamped to the

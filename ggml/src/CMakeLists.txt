@@ -633,6 +633,7 @@ if (GGML_VECTOR_INDEX)
     add_library(ggml-vector-index
                 ../include/ggml-vector-index.h
                 ggml-vector-index.cpp)
+    add_library(ggml::vector-index ALIAS ggml-vector-index)
 
     set_target_properties(ggml-vector-index PROPERTIES
         VERSION ${GGML_VERSION}

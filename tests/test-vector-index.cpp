@@ -173,10 +173,12 @@ int main() {
         CHECK(ggml_vec_index_search(idx, vector.data(), 1, 0, scores.data(), out_ids.data()) ==
               GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_search(idx, vector.data(), 1, 1, nullptr, out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search(idx, vector.data(), 1, 1, scores.data(), nullptr) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_search(idx, nullptr, 0, 1, nullptr, nullptr) == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_write(nullptr, "unused.tvim") == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_write(idx, nullptr) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_load(nullptr) == nullptr);
+        CHECK(ggml_vec_index_load(temp_path(".missing").string().c_str()) == nullptr);
         CHECK(ggml_vec_index_remove(nullptr, id) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_contains(nullptr, id) == 0);
         CHECK(ggml_vec_index_len(nullptr) == 0);
@@ -253,12 +255,16 @@ int main() {
     CHECK(ggml_vec_index_len(idx) == 4);
     CHECK(ggml_vec_index_contains(idx, ids[0]) == 1);
     CHECK(ggml_vec_index_contains(idx, 999ULL) == 0);
+    ggml_vec_index_prepare(idx);
+    CHECK(ggml_vec_index_len(idx) == 4);
 
     // UINT64_MAX is reserved for padded search results.
     {
         const std::vector<uint64_t> reserved_ids = { UINT64_MAX };
         std::vector<float>          reserved_vec(seeds[0]);
         CHECK(ggml_vec_index_add(idx, reserved_vec.data(), 1, reserved_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove(idx, UINT64_MAX) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_contains(idx, UINT64_MAX) == 0);
         CHECK(ggml_vec_index_len(idx) == 4);
     }
 
@@ -314,6 +320,8 @@ int main() {
         CHECK(ggml_vec_index_search(idx, queries.data(), 2, /*k=*/1, scores.data(), out_ids.data()) == 0);
         CHECK(out_ids[0] == ids[0]);
         CHECK(out_ids[1] == ids[2]);
+        CHECK(std::fabs(scores[0] - 1.0f) < 1e-5f);
+        CHECK(std::fabs(scores[1] - 1.0f) < 1e-5f);
     }
 
     // Top-k > len returns sentinel-padded tail.
@@ -345,6 +353,10 @@ int main() {
         CHECK(out_ids[1] == ids[0]);
         CHECK(out_ids[2] == ids[2]);
         CHECK(out_ids[3] == ids[3]);
+        CHECK(std::fabs(scores[0] - 0.75f) < 1e-5f);
+        CHECK(std::fabs(scores[1] - 0.50f) < 1e-5f);
+        CHECK(std::fabs(scores[2] - 0.25f) < 1e-5f);
+        CHECK(std::fabs(scores[3] - 0.00f) < 1e-5f);
         for (size_t i = 1; i < scores.size(); ++i) {
             CHECK(scores[i - 1] >= scores[i]);
         }
@@ -393,6 +405,28 @@ int main() {
         CHECK(scores[1] == -FLT_MAX);
         CHECK(out_ids[1] == UINT64_MAX);
         ggml_vec_index_free(overflow_idx);
+    }
+
+    // Removing the last slot leaves earlier entries and their vectors intact.
+    {
+        auto * remove_last_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(remove_last_idx != nullptr);
+        std::vector<float> remove_vecs;
+        remove_vecs.insert(remove_vecs.end(), seeds[0].begin(), seeds[0].end());
+        remove_vecs.insert(remove_vecs.end(), seeds[1].begin(), seeds[1].end());
+        const std::array<uint64_t, 2> remove_ids = { 8001ULL, 8002ULL };
+        CHECK(ggml_vec_index_add(remove_last_idx, remove_vecs.data(), 2, remove_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_remove(remove_last_idx, remove_ids[1]) == 1);
+        CHECK(ggml_vec_index_len(remove_last_idx) == 1);
+        CHECK(ggml_vec_index_contains(remove_last_idx, remove_ids[0]) == 1);
+
+        std::array<float, 1>    scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(remove_last_idx, seeds[0].data(), 1, 1, scores.data(), out_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == remove_ids[0]);
+        CHECK(std::fabs(scores[0] - 1.0f) < 1e-5f);
+        ggml_vec_index_free(remove_last_idx);
     }
 
     // Remove + search: the removed id must no longer surface.
@@ -449,35 +483,15 @@ int main() {
     CHECK(preserved != nullptr);
     CHECK(ggml_vec_index_len(preserved) == 3);
     ggml_vec_index_free(preserved);
-#ifndef _WIN32
-    {
-        temp_file protected_dir(".dir");
-        CHECK(std::filesystem::create_directory(protected_dir.path));
-        const std::filesystem::path protected_path = protected_dir.path / "snapshot.tvim";
-        CHECK(ggml_vec_index_write(idx, protected_path.string().c_str()) == GGML_VEC_INDEX_OK);
 
-        std::error_code ec;
-        std::filesystem::permissions(protected_dir.path,
-                                     std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec,
-                                     std::filesystem::perm_options::replace, ec);
-        if (!ec) {
-            const int rc = ggml_vec_index_write(idx, protected_path.string().c_str());
-            std::filesystem::permissions(protected_dir.path, std::filesystem::perms::owner_all,
-                                         std::filesystem::perm_options::replace, ec);
-            if (rc == GGML_VEC_INDEX_E_IO) {
-                preserved = ggml_vec_index_load(protected_path.string().c_str());
-                CHECK(preserved != nullptr);
-                CHECK(ggml_vec_index_len(preserved) == 3);
-                ggml_vec_index_free(preserved);
-                CHECK(!has_snapshot_tmp(protected_path));
-            } else {
-                CHECK(rc == GGML_VEC_INDEX_OK);
-            }
-        }
-        std::filesystem::remove(protected_path);
-        std::filesystem::remove(protected_dir.path);
+    // Replacement failure leaves the destination and no temporary file.
+    {
+        temp_file directory_path(".dir");
+        CHECK(std::filesystem::create_directory(directory_path.path));
+        CHECK(ggml_vec_index_write(idx, directory_path.path.string().c_str()) == GGML_VEC_INDEX_E_IO);
+        CHECK(std::filesystem::is_directory(directory_path.path));
+        CHECK(!has_snapshot_tmp(directory_path.path));
     }
-#endif
 
     ggml_vec_index_free(idx);
 
@@ -514,6 +528,12 @@ int main() {
                     snapshot_bytes(
                         /*dim=*/1, static_cast<uint32_t>(std::numeric_limits<int>::max()) + 1u, {}, {}));
         CHECK(ggml_vec_index_load(oversized_count.path.string().c_str()) == nullptr);
+    }
+    {
+        temp_file oversized_dim(".tvim");
+        write_bytes(oversized_dim.path, snapshot_bytes(static_cast<uint32_t>(std::numeric_limits<int>::max()) + 1u,
+                                                       /*n=*/0, {}, {}));
+        CHECK(ggml_vec_index_load(oversized_dim.path.string().c_str()) == nullptr);
     }
     {
         temp_file truncated_payload(".tvim");
