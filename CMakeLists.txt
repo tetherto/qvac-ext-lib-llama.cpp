@@ -276,7 +276,7 @@ foreach(FILE_PATH ${EXTRA_LICENSES})
     license_add_file("${NAME}" "${FILE_PATH}")
 endforeach()
 
-if (LLAMA_BUILD_COMMON)
+if (LLAMA_BUILD_COMMON AND TARGET llama-common)
     license_generate(llama-common)
 endif()
 
