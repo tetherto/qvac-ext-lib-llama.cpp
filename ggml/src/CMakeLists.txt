@@ -540,6 +540,7 @@ if (GGML_VECTOR_INDEX)
     if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
         set_target_properties(ggml-vector-index PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(ggml-vector-index PRIVATE GGML_BUILD)
+        target_compile_definitions(ggml-vector-index PUBLIC  GGML_SHARED)
     endif()
 
     install(TARGETS ggml-vector-index EXPORT ggml-targets)
