@@ -8,7 +8,8 @@ on:
     paths: [
       '.github/workflows/build-apple.yml',
       '**/CMakeLists.txt',
-      '**/.cmake',
+      '**/*.cmake',
+      '**/*.cmake.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
@@ -22,7 +23,14 @@ on:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-apple.yml',
-      'ggml/src/ggml-metal/**'
+      'CMakeLists.txt',
+      'ggml/CMakeLists.txt',
+      'ggml/src/ggml-metal/**',
+      'ggml/include/ggml-vector-index.h',
+      'ggml/src/CMakeLists.txt',
+      'ggml/src/ggml-vector-index.cpp',
+      'tests/CMakeLists.txt',
+      'tests/test-vector-index.cpp'
     ]
 
 concurrency:
@@ -99,6 +107,7 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
             -DGGML_METAL=OFF \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_RPC=ON \
             -DGGML_BLAS=OFF \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3

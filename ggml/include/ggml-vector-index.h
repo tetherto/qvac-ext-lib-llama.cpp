@@ -31,13 +31,10 @@ typedef struct ggml_vec_index ggml_vec_index_t;
 // Error codes returned from int-valued APIs. 0 = OK. Negative = failure.
 // `_remove` is the exception: it returns 1 on removal and 0 on miss.
 enum ggml_vec_index_error {
-    GGML_VEC_INDEX_OK            =  0,
-    GGML_VEC_INDEX_E_INVALID_DIM = -1,
+    GGML_VEC_INDEX_OK            = 0,
     GGML_VEC_INDEX_E_INVALID_ARG = -2,
     GGML_VEC_INDEX_E_DUPLICATE   = -3,
     GGML_VEC_INDEX_E_IO          = -4,
-    GGML_VEC_INDEX_E_BAD_MAGIC   = -5,
-    GGML_VEC_INDEX_E_BAD_VERSION = -6,
     GGML_VEC_INDEX_E_OOM         = -7,
     GGML_VEC_INDEX_E_INTERNAL    = -99,
 };
@@ -56,13 +53,10 @@ GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 // associating each with the corresponding `ids[i]` (caller-owned external id).
 // Returns 0 on success. Returns GGML_VEC_INDEX_E_DUPLICATE if any id already
 // exists in the index; in that case the index is unchanged (atomic add).
+// `n == 0` is a no-op and does not require non-NULL `vectors` or `ids`.
 // All vector components must be finite. UINT64_MAX is reserved for search
 // result padding and is not a valid id.
-GGML_API int ggml_vec_index_add(
-    ggml_vec_index_t * idx,
-    const float      * vectors,
-    int                n,
-    const uint64_t   * ids);
+GGML_API int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, const uint64_t * ids);
 
 // Removes the entry for `id` via swap-with-last (slot indices are NOT stable
 // across removes; external ids ARE). Returns 1 if removed, 0 if not present,
@@ -87,21 +81,23 @@ GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // Score semantics: scalar dot product accumulated in double and clamped to the
 // finite f32 range. Callers that want cosine similarity must L2-normalize their
 // vectors before insert AND before query; the index does NOT normalize
-// internally. All query components must be finite.
-GGML_API int ggml_vec_index_search(
-    const ggml_vec_index_t * idx,
-    const float            * queries,
-    int                      n_q,
-    int                      k,
-    float                  * out_scores,
-    uint64_t               * out_ids);
+// internally. All query components must be finite. Ties are not ordered
+// deterministically. `n_q == 0` is a no-op and does not require non-NULL
+// buffers.
+GGML_API int ggml_vec_index_search(const ggml_vec_index_t * idx,
+                                   const float *            queries,
+                                   int                      n_q,
+                                   int                      k,
+                                   float *                  out_scores,
+                                   uint64_t *               out_ids);
 
-// Persistence. Format is .tvim version 1; see bottom of this header.
-GGML_API int ggml_vec_index_write(
-    ggml_vec_index_t * idx,
-    const char       * path);
+// Persistence. Format is .tvim version 1; see bottom of this header. Write
+// replaces `path` through a same-directory temporary file so a failed write
+// does not truncate an existing snapshot.
+GGML_API int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path);
 
-// Returns NULL on failure (caller can inspect errno for I/O specifics).
+// Returns NULL on I/O, format, or validation failure. Detailed load errors are
+// not surfaced by this foundation API.
 GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 
 // Stats.
