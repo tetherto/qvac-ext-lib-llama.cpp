@@ -141,8 +141,8 @@ GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 // logged mutations and compaction with a different delta path return
 // GGML_VEC_INDEX_E_INVALID_ARG. Equivalent hardlink aliases identify the same
 // log. If another handle or process appends to the same log, stale writers are
-// rejected and must reload with `ggml_vec_index_load_with_delta` before
-// appending again.
+// caught up when possible; otherwise they are rejected and must reload with
+// `ggml_vec_index_load_with_delta` before appending again.
 // Cross-process protection relies on cooperative OS file locks. Store delta
 // logs on local filesystems and do not modify `.tvid` files outside this API.
 // If an append error occurs after a complete replayable record is observed, the

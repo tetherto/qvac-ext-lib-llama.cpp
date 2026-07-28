@@ -1031,7 +1031,8 @@ int ggml_vec_index_add_logged(
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
-        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock)) {
+        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock) &&
+            !replay_delta_log_unlocked(idx, delta_path, delta_lock)) {
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
@@ -1197,7 +1198,8 @@ int ggml_vec_index_remove_logged(
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
-        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock)) {
+        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock) &&
+            !replay_delta_log_unlocked(idx, delta_path, delta_lock)) {
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
