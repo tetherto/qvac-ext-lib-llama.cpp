@@ -523,19 +523,13 @@ if (GGML_VECTOR_INDEX)
     set_target_properties(ggml-vector-index PROPERTIES
         VERSION ${GGML_VERSION}
         SOVERSION ${GGML_VERSION_MAJOR}
+        PUBLIC_HEADER ../include/ggml-vector-index.h
     )
 
     target_include_directories(ggml-vector-index PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
         $<INSTALL_INTERFACE:include>)
     target_compile_features(ggml-vector-index PRIVATE cxx_std_17)
-    target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)
-
-    if (DEFINED MATH_LIBRARY)
-        target_link_libraries(ggml-vector-index PRIVATE ${MATH_LIBRARY})
-    elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
-        target_link_libraries(ggml-vector-index PRIVATE m)
-    endif()
 
     if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
         set_target_properties(ggml-vector-index PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -543,7 +537,10 @@ if (GGML_VECTOR_INDEX)
         target_compile_definitions(ggml-vector-index PUBLIC  GGML_SHARED)
     endif()
 
-    install(TARGETS ggml-vector-index EXPORT ggml-targets)
+    install(
+        TARGETS ggml-vector-index
+        EXPORT ggml-targets
+        PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
 target_link_libraries(ggml-base PRIVATE Threads::Threads)

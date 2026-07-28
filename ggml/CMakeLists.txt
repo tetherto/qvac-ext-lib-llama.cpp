@@ -344,10 +344,6 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-openvino.h
     include/gguf.h)
 
-if (GGML_VECTOR_INDEX)
-    list(APPEND GGML_PUBLIC_HEADERS include/ggml-vector-index.h)
-endif()
-
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
@@ -369,6 +365,23 @@ if (GGML_STANDALONE)
 
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+    if (GGML_VECTOR_INDEX)
+        set(GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "")
+        foreach(lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
+            if (lib STREQUAL "c++" OR lib STREQUAL "stdc++")
+                list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "-l${lib}")
+            endif()
+        endforeach()
+        string(JOIN " " GGML_VECTOR_INDEX_PRIVATE_LIBS ${GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST})
+
+        configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index.pc.in
+            ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc
+            @ONLY)
+
+        install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+    endif()
 endif()
 
 #

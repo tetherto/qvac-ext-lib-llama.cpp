@@ -5,7 +5,7 @@ on:
 
 jobs:
   linux:
-    runs-on: [self-hosted, Linux, CPU]
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
         with:
@@ -21,9 +21,50 @@ jobs:
                 -DLLAMA_BUILD_TOOLS=OFF \
                 -DLLAMA_BUILD_EXAMPLES=OFF \
                 -DLLAMA_BUILD_APP=OFF \
+                -DGGML_VECTOR_INDEX=ON \
                 -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release
           cmake --install build --prefix "$PREFIX" --config Release
+
+          mkdir -p vector-index-cmake-pkg
+          cat > vector-index-cmake-pkg/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(vector_index_consumer C CXX)
+          find_package(ggml CONFIG REQUIRED)
+          add_executable(vector_index_consumer main.c)
+          target_link_libraries(vector_index_consumer PRIVATE ggml::ggml-vector-index)
+          EOF
+          cat > vector-index-cmake-pkg/main.c <<'EOF'
+          #include "ggml-vector-index.h"
+
+          int main(void) {
+              ggml_vec_index_t * idx = ggml_vec_index_create(2, 32);
+              if (idx == 0) {
+                  return 1;
+              }
+              ggml_vec_index_free(idx);
+              return 0;
+          }
+          EOF
+          cmake -S vector-index-cmake-pkg -B vector-index-cmake-pkg/build -DCMAKE_PREFIX_PATH="$PREFIX"/share
+          cmake --build vector-index-cmake-pkg/build
+          ./vector-index-cmake-pkg/build/vector_index_consumer
+
+          GGML_PREFIX="$(pwd)"/inst-ggml
+          cmake -S ggml -B build-ggml \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX="$GGML_PREFIX" \
+                -DBUILD_SHARED_LIBS=OFF \
+                -DGGML_BUILD_TESTS=OFF \
+                -DGGML_BUILD_EXAMPLES=OFF \
+                -DGGML_VECTOR_INDEX=ON
+          cmake --build build-ggml --config Release
+          cmake --install build-ggml --config Release
+          export PKG_CONFIG_PATH="$GGML_PREFIX"/lib/pkgconfig
+          cc vector-index-cmake-pkg/main.c \
+             $(pkg-config --cflags --libs --static ggml-vector-index) \
+             -o vector-index-pkg-config
+          ./vector-index-pkg-config
 
           export LLAMA_CONFIG="$PREFIX"/share/llama/llama-config.cmake
           tclsh <<'EOF'
