@@ -272,8 +272,15 @@ int main() {
     {
         const std::vector<uint64_t> bad_ids = { 777ULL };
         std::vector<float>          bad_vec(seeds[0]);
-        bad_vec[2] = std::numeric_limits<float>::quiet_NaN();
-        CHECK(ggml_vec_index_add(idx, bad_vec.data(), 1, bad_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        const std::array<float, 3>   non_finite = {
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity(),
+        };
+        for (float value : non_finite) {
+            bad_vec[2] = value;
+            CHECK(ggml_vec_index_add(idx, bad_vec.data(), 1, bad_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        }
         CHECK(ggml_vec_index_contains(idx, bad_ids[0]) == 0);
         CHECK(ggml_vec_index_len(idx) == 4);
     }
@@ -330,6 +337,14 @@ int main() {
         std::array<uint64_t, 8> out_ids{};
         CHECK(ggml_vec_index_search(idx, seeds[0].data(), 1, /*k=*/8, scores.data(), out_ids.data()) == 0);
         CHECK(out_ids[0] == ids[0]);
+        CHECK(std::fabs(scores[0] - 1.0f) < 1e-5f);
+        for (int i = 1; i < 4; ++i) {
+            CHECK(std::find(ids.begin(), ids.end(), out_ids[i]) != ids.end());
+            CHECK(std::fabs(scores[i]) < 1e-5f);
+            for (int j = 0; j < i; ++j) {
+                CHECK(out_ids[i] != out_ids[j]);
+            }
+        }
         // Tail entries (positions 4..7) use sentinel score/id values.
         for (int i = 4; i < 8; ++i) {
             CHECK(scores[i] == -FLT_MAX);
@@ -372,9 +387,16 @@ int main() {
             0.0f,
             0.0f,
         };
-        bad_query[1] = std::numeric_limits<float>::infinity();
-        CHECK(ggml_vec_index_search(idx, bad_query.data(), 1, /*k=*/1, scores.data(), out_ids.data()) ==
-              GGML_VEC_INDEX_E_INVALID_ARG);
+        const std::array<float, 3> non_finite = {
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity(),
+        };
+        for (float value : non_finite) {
+            bad_query[1] = value;
+            CHECK(ggml_vec_index_search(idx, bad_query.data(), 1, /*k=*/1, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+        }
     }
 
     // Finite inputs that overflow f32 score range are clamped and still keep
@@ -404,6 +426,24 @@ int main() {
         CHECK(out_ids[0] == overflow_ids[0]);
         CHECK(scores[1] == -FLT_MAX);
         CHECK(out_ids[1] == UINT64_MAX);
+        ggml_vec_index_free(overflow_idx);
+    }
+    {
+        auto * overflow_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(overflow_idx != nullptr);
+        const std::array<float, kDim> overflow_vec = {
+            FLT_MAX,
+            0.0f,
+            0.0f,
+            0.0f,
+        };
+        const uint64_t overflow_id = 7654321ULL;
+        CHECK(ggml_vec_index_add(overflow_idx, overflow_vec.data(), 1, &overflow_id) == 0);
+        std::array<float, 1>    scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(overflow_idx, overflow_vec.data(), 1, 1, scores.data(), out_ids.data()) == 0);
+        CHECK(scores[0] == FLT_MAX);
+        CHECK(out_ids[0] == overflow_id);
         ggml_vec_index_free(overflow_idx);
     }
 
@@ -445,6 +485,14 @@ int main() {
 
         CHECK(ggml_vec_index_search(idx, seeds[3].data(), 1, /*k=*/1, scores.data(), out_ids.data()) == 0);
         CHECK(out_ids[0] == ids[3]);
+
+        const uint64_t replacement_id = 9001ULL;
+        CHECK(ggml_vec_index_add(idx, seeds[1].data(), 1, &replacement_id) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_len(idx) == 4);
+        CHECK(ggml_vec_index_search(idx, seeds[1].data(), 1, /*k=*/1, scores.data(), out_ids.data()) == 0);
+        CHECK(out_ids[0] == replacement_id);
+        CHECK(ggml_vec_index_remove(idx, replacement_id) == 1);
+        CHECK(ggml_vec_index_len(idx) == 3);
     }
 
     // Persistence round-trip: write, free, load, re-query.
@@ -512,6 +560,30 @@ int main() {
         CHECK(ggml_vec_index_search(loaded, seeds[0].data(), 1, /*k=*/1, scores.data(), out_ids.data()) == 0);
         CHECK(out_ids[0] == ids[0]);
         CHECK(std::fabs(scores[0] - 1.0f) < 1e-5f);
+    }
+
+    // Loaded indexes remain fully mutable and can be persisted again.
+    {
+        const uint64_t loaded_id = 9002ULL;
+        CHECK(ggml_vec_index_add(loaded, seeds[1].data(), 1, &loaded_id) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_remove(loaded, ids[2]) == 1);
+        CHECK(ggml_vec_index_contains(loaded, loaded_id) == 1);
+        CHECK(ggml_vec_index_contains(loaded, ids[2]) == 0);
+
+        temp_file mutated_file(".tvim");
+        CHECK(ggml_vec_index_write(loaded, mutated_file.path.string().c_str()) == GGML_VEC_INDEX_OK);
+        auto * mutated = ggml_vec_index_load(mutated_file.path.string().c_str());
+        CHECK(mutated != nullptr);
+        CHECK(ggml_vec_index_len(mutated) == 3);
+        CHECK(ggml_vec_index_contains(mutated, loaded_id) == 1);
+        CHECK(ggml_vec_index_contains(mutated, ids[2]) == 0);
+
+        std::array<float, 1>    scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(mutated, seeds[1].data(), 1, 1, scores.data(), out_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == loaded_id);
+        ggml_vec_index_free(mutated);
     }
 
     ggml_vec_index_free(loaded);
@@ -592,6 +664,10 @@ int main() {
             /*n=*/1, { 1.0f, 0.0f, 0.0f, 0.0f }, { 123ULL });
         CHECK(bytes.size() >= 8);
         bytes[6] = 1;
+        write_bytes(reserved_header.path, bytes);
+        CHECK(ggml_vec_index_load(reserved_header.path.string().c_str()) == nullptr);
+        bytes[6] = 0;
+        bytes[7] = 1;
         write_bytes(reserved_header.path, bytes);
         CHECK(ggml_vec_index_load(reserved_header.path.string().c_str()) == nullptr);
     }

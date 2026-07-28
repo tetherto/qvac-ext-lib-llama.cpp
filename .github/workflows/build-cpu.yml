@@ -174,15 +174,16 @@ jobs:
           cmake -S ggml -B build-vector-index-package-static \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$STATIC_PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_BUILD_TESTS=OFF \
             -DGGML_BUILD_EXAMPLES=OFF \
             -DGGML_VECTOR_INDEX=ON
           cmake --build build-vector-index-package-static -j $(nproc)
           cmake --install build-vector-index-package-static
-          PKG_CONFIG_PATH="$STATIC_PREFIX/lib/pkgconfig" \
+          PKG_CONFIG_PATH="$STATIC_PREFIX/lib/x86_64-linux-gnu/pkgconfig" \
             cc vector-index-consumer/main.c \
-              $(PKG_CONFIG_PATH="$STATIC_PREFIX/lib/pkgconfig" \
+              $(PKG_CONFIG_PATH="$STATIC_PREFIX/lib/x86_64-linux-gnu/pkgconfig" \
                 pkg-config --cflags --libs --static ggml-vector-index) \
               -o vector-index-pkg-config-static
           ./vector-index-pkg-config-static
