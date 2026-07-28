@@ -16,6 +16,7 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -37,7 +38,10 @@
 #        define NOMINMAX
 #    endif
 #    include <windows.h>
+#    include <fcntl.h>
+#    include <io.h>
 #else
+#    include <fcntl.h>
 #    include <unistd.h>
 #endif
 
@@ -151,6 +155,36 @@ bool replace_file(const std::filesystem::path & tmp_path, const std::filesystem:
 #endif
 }
 
+std::FILE * open_exclusive(const std::filesystem::path & path) {
+#ifdef _WIN32
+    const HANDLE handle =
+        CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | _O_WRONLY);
+    if (fd == -1) {
+        CloseHandle(handle);
+        return nullptr;
+    }
+    std::FILE * file = _fdopen(fd, "wb");
+    if (file == nullptr) {
+        _close(fd);
+    }
+    return file;
+#else
+    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd == -1) {
+        return nullptr;
+    }
+    std::FILE * file = fdopen(fd, "wb");
+    if (file == nullptr) {
+        close(fd);
+    }
+    return file;
+#endif
+}
+
 bool copy_permissions_if_exists(const std::filesystem::path & src_path, const std::filesystem::path & dst_path) {
     std::error_code                    ec;
     const std::filesystem::file_status src_status = std::filesystem::status(src_path, ec);
@@ -205,18 +239,16 @@ float u32_to_float(uint32_t bits) {
     return v;
 }
 
-bool write_u32_le(std::ofstream & f, uint32_t v) {
+bool write_u32_le(std::FILE * f, uint32_t v) {
     uint8_t bytes[4];
     put_u32_le(bytes, v);
-    f.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
-    return static_cast<bool>(f);
+    return std::fwrite(bytes, 1, sizeof(bytes), f) == sizeof(bytes);
 }
 
-bool write_u64_le(std::ofstream & f, uint64_t v) {
+bool write_u64_le(std::FILE * f, uint64_t v) {
     uint8_t bytes[8];
     put_u64_le(bytes, v);
-    f.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
-    return static_cast<bool>(f);
+    return std::fwrite(bytes, 1, sizeof(bytes), f) == sizeof(bytes);
 }
 
 bool read_u32_le(std::ifstream & f, uint32_t & v) {
@@ -560,16 +592,14 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
 
         const std::filesystem::path dst_path(path);
         const std::filesystem::path tmp_path = make_tmp_path(dst_path);
-        tmp_file_guard              tmp_guard(tmp_path);
 
-        std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!f.is_open()) {
+        std::unique_ptr<std::FILE, decltype(&std::fclose)> f(open_exclusive(tmp_path), &std::fclose);
+        if (f == nullptr) {
             return GGML_VEC_INDEX_E_IO;
         }
+        tmp_file_guard tmp_guard(tmp_path);
         const auto fail_io = [&]() {
-            if (f.is_open()) {
-                f.close();
-            }
+            f.reset();
             return GGML_VEC_INDEX_E_IO;
         };
 
@@ -585,30 +615,28 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         put_u32_le(header + 8, dim_le);
         put_u32_le(header + 12, n_le);
 
-        f.write(reinterpret_cast<const char *>(header), sizeof(header));
-        if (!f) {
+        if (std::fwrite(header, 1, sizeof(header), f.get()) != sizeof(header)) {
             return fail_io();
         }
 
         for (float v : idx->data) {
-            if (!write_u32_le(f, float_to_u32(v))) {
+            if (!write_u32_le(f.get(), float_to_u32(v))) {
                 return fail_io();
             }
         }
 
         for (uint64_t id : idx->slot_to_id) {
-            if (!write_u64_le(f, id)) {
+            if (!write_u64_le(f.get(), id)) {
                 return fail_io();
             }
         }
 
-        f.flush();
-        if (!f) {
+        if (std::fflush(f.get()) != 0) {
             return fail_io();
         }
-        f.close();
-        if (!f) {
-            return fail_io();
+        std::FILE * raw_file = f.release();
+        if (std::fclose(raw_file) != 0) {
+            return GGML_VEC_INDEX_E_IO;
         }
 
         if (!copy_permissions_if_exists(dst_path, tmp_path)) {

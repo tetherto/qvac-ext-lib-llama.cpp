@@ -98,7 +98,8 @@ GGML_API void ggml_vec_index_prepare(ggml_vec_index_t * idx);
 // vectors before insert AND before query; the index does NOT normalize
 // internally. All query components must be finite. Ties are not ordered
 // deterministically. `n_q == 0` is a no-op and does not require non-NULL
-// buffers.
+// buffers. If the function returns an error, the output buffers are
+// unspecified and must not be consumed.
 GGML_API int ggml_vec_index_search(const ggml_vec_index_t * idx,
                                    const float *            queries,
                                    int                      n_q,
