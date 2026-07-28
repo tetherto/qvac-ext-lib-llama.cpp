@@ -61,22 +61,6 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     }
 }
 
-static ggml_tensor * ggml_mul_mat_aux(
-        ggml_context * ctx,
-        ggml_tensor * cur,
-        ggml_tensor * rot) {
-    const auto n = rot->ne[0];
-
-    ggml_tensor * res;
-
-    res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
-    res = ggml_mul_mat   (ctx, rot, res);
-    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
-    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
-
-    return res;
-}
-
 //
 // llama_kv_cache
 //
@@ -2053,7 +2037,7 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         // auxiliary attention rotation matrix; standard quantized types such
         // as q8_0 do not configure one.
         if (rot) {
-            tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+            tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
         }
 
         if (is_mrope_shift) {
@@ -2068,7 +2052,7 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
 
         // rotate fwd, matching the optional inverse rotation above.
         if (rot) {
-            tmp = ggml_mul_mat_aux(ctx, tmp, rot);
+            tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
         }
 
         tmp = ggml_cpy(ctx, tmp, cur);

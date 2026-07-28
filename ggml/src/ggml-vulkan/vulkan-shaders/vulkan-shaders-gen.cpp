@@ -997,7 +997,7 @@ void process_shaders() {
 
     for (std::string t : {"q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
                            "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
-        string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         // f16 output variant: lets MUL_MAT dispatch dequantize non-contiguous
         // quantized src0 to f16 directly on the GPU, instead of falling back
@@ -1009,25 +1009,28 @@ void process_shaders() {
     // Norm-correction variants for TBQ/PQ copy_to_quant
     for (std::string t : {"tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
                            "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
-        string_to_spv("cpy_f32_" + t + "_nc", "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
-        string_to_spv("cpy_f32_" + t + "_nc_rte", "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+        string_to_spv("cpy_f32_" + t + "_nc", "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("cpy_f32_" + t + "_nc_rte", "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
     }
 
-    for (std::string t : {"f32", "f16", "bf16", "q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
-                           "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
-        string_to_spv("set_rows_" + t + "_i32",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
-        string_to_spv("set_rows_" + t + "_i32_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
-        string_to_spv("set_rows_" + t + "_i64",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
-        string_to_spv("set_rows_" + t + "_i64_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+    for (auto src : {std::pair{"f32", "float"}, std::pair{"f16", "float16_t"}}) {
+        for (std::string dst : {"f32", "f16", "bf16", "q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
+            string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+            string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        }
+    }
+
+    for (std::string dst : {"tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
+                            "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
+        string_to_spv("set_rows_" + dst + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("set_rows_" + dst + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
 
     // Norm-correction variants for TBQ/PQ set_rows
-    for (std::string t : {"tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
-                           "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
-        string_to_spv("set_rows_" + t + "_i32_nc",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
-        string_to_spv("set_rows_" + t + "_i32_nc_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
-        string_to_spv("set_rows_" + t + "_i64_nc",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
-        string_to_spv("set_rows_" + t + "_i64_nc_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+    for (std::string dst : {"tbq3_0", "tbq4_0", "pq3_0", "pq4_0",
+                            "tbq3_0_64", "tbq4_0_64", "pq3_0_64", "pq4_0_64"}) {
+        string_to_spv("set_rows_" + dst + "_i32_nc", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("set_rows_" + dst + "_i64_nc", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"TQ_NORM_CORRECTION", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
 
     // TBQ standalone MUL_MAT QJL (Stage 2) correction pass.
@@ -1080,6 +1083,31 @@ void process_shaders() {
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+
+    for (const auto & tname : {"f32", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"}) {
+        const std::string type(tname);
+        const std::map<std::string, std::string> type_dict = {
+            {"DATA_A_" + to_uppercase(type), "1"},
+            {"FLOAT_TYPE", "float"},
+            {"FLOAT_TYPEV2", "vec2"},
+            {"LOAD_VEC_A", "1"},
+        };
+        string_to_spv("lightning_indexer_" + type, "lightning_indexer.comp", type_dict);
+        for (const auto & n_head : {"32", "64"}) {
+            const auto head_dict = merge_maps(type_dict, {{"N_HEAD", n_head}});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+            string_to_spv("lightning_indexer_" + type + "_h" + n_head,
+                "lightning_indexer_cm1.comp", head_dict, true, true);
+#endif
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+            string_to_spv("lightning_indexer_" + type + "_h" + n_head,
+                "lightning_indexer_cm2.comp", head_dict, true, false, true);
+#endif
+        }
+    }
+    string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
+    string_to_spv("dsv4_hc_pre_f32", "dsv4_hc_pre.comp", {});
+    string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("div_f32", "div.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
