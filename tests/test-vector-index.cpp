@@ -1894,6 +1894,72 @@ uint64_t fnv1a_bytes(const uint8_t * values, size_t size) {
     return hash;
 }
 
+struct TvimSection {
+    size_t offset = 0;
+    size_t size = 0;
+};
+
+struct TurbovecTvimLayout {
+    int dim = 0;
+    int n = 0;
+    TvimSection qparams;
+    TvimSection calibration;
+    TvimSection vectors;
+    TvimSection ids;
+    TvimSection checksum;
+};
+
+TurbovecTvimLayout parse_turbovec_tvim_layout(const std::vector<uint8_t> & bytes, int bits) {
+    CHECK(bits == 2 || bits == 4);
+    CHECK(bytes.size() >= 32 + 16);
+    CHECK(bytes[0] == 'T' && bytes[1] == 'V' && bytes[2] == 'P' && bytes[3] == 'I');
+    CHECK(bytes[4] == 3);
+    CHECK(bytes[5] == static_cast<uint8_t>(bits));
+    CHECK(bytes[6] == static_cast<uint8_t>(bits == 2 ? 5 : 4));
+    CHECK((bytes[7] & 1) != 0);
+
+    TurbovecTvimLayout layout;
+    layout.dim = static_cast<int>(read_u32_le_from(bytes.data() + 8));
+    layout.n = static_cast<int>(read_u32_le_from(bytes.data() + 12));
+    const size_t qparam_bytes = read_u32_le_from(bytes.data() + 20);
+    const size_t comp_bytes = read_u32_le_from(bytes.data() + 24);
+    const size_t calibration_bytes = read_u32_le_from(bytes.data() + 28);
+    CHECK(layout.dim > 0);
+    CHECK(layout.n > 0);
+    CHECK(qparam_bytes == sizeof(float));
+    CHECK(comp_bytes == 0);
+    CHECK(calibration_bytes == 2 * static_cast<size_t>(layout.dim) * sizeof(float));
+
+    const size_t row_bytes = bits == 2 ?
+        static_cast<size_t>(layout.dim) / 4 :
+        static_cast<size_t>(layout.dim) / 2;
+    layout.qparams = { 32, static_cast<size_t>(layout.n) * qparam_bytes };
+    layout.calibration = {
+        layout.qparams.offset + layout.qparams.size,
+        calibration_bytes,
+    };
+    layout.vectors = {
+        layout.calibration.offset + layout.calibration.size,
+        static_cast<size_t>(layout.n) * row_bytes,
+    };
+    layout.ids = {
+        layout.vectors.offset + layout.vectors.size,
+        static_cast<size_t>(layout.n) * sizeof(uint64_t),
+    };
+    layout.checksum = {
+        layout.ids.offset + layout.ids.size,
+        16,
+    };
+    CHECK(bytes.size() == layout.checksum.offset + layout.checksum.size);
+    return layout;
+}
+
+uint64_t section_hash(const std::vector<uint8_t> & bytes, TvimSection section) {
+    CHECK(section.size > 0);
+    CHECK(bytes.size() >= section.offset + section.size);
+    return fnv1a_bytes(bytes.data() + section.offset, section.size);
+}
+
 float tqplus_golden_value(int row, int column) {
     const double x = static_cast<double>(row + 1);
     const double y = static_cast<double>(column + 1);
@@ -2159,6 +2225,317 @@ void check_turbovec_blocked_scalar_scores(int bits, int dim, int n, int n_querie
 
     ggml_vec_index_free(scalar);
     ggml_vec_index_free(blocked);
+}
+
+void fill_turbovec_regression_vectors(std::vector<float> & vectors, int n, int dim) {
+    CHECK(vectors.size() == static_cast<size_t>(n) * static_cast<size_t>(dim));
+    for (int row = 0; row < n; ++row) {
+        for (int col = 0; col < dim; ++col) {
+            const double x = static_cast<double>(row + 1);
+            const double y = static_cast<double>(col + 1);
+            vectors[static_cast<size_t>(row) * dim + static_cast<size_t>(col)] =
+                static_cast<float>(
+                    0.51 * std::sin(0.011 * x * y + 0.37) +
+                    0.34 * std::cos(0.017 * (x + 3.0) * (y + 5.0)) +
+                    0.15 * std::sin(0.043 * (x + y + 7.0)));
+        }
+    }
+}
+
+void set_distinct_turbovec_vector(float * vector, int dim) {
+    for (int col = 0; col < dim; ++col) {
+        vector[col] = (col % 3 == 0) ? 1.0f : ((col % 3 == 1) ? -0.35f : 0.12f);
+    }
+}
+
+void check_search_contains(
+        ggml_vec_index_t * idx,
+        const float * query,
+        int k,
+        uint64_t expected_id) {
+    std::vector<float> scores(static_cast<size_t>(k));
+    std::vector<uint64_t> out(static_cast<size_t>(k));
+    CHECK(ggml_vec_index_search(
+        idx, query, 1, k, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+    CHECK(std::find(out.begin(), out.end(), expected_id) != out.end());
+}
+
+void check_ivf_contains(
+        ggml_vec_index_t * idx,
+        const float * query,
+        int k,
+        int nprobe,
+        uint64_t expected_id) {
+    std::vector<float> scores(static_cast<size_t>(k));
+    std::vector<uint64_t> out(static_cast<size_t>(k));
+    CHECK(ggml_vec_index_search_ivf(
+        idx, query, 1, k, nprobe, scores.data(), out.data()) == GGML_VEC_INDEX_OK);
+    CHECK(std::find(out.begin(), out.end(), expected_id) != out.end());
+}
+
+float score_for_id(
+        const std::vector<uint64_t> & ids,
+        const std::vector<float> & scores,
+        uint64_t id) {
+    const auto it = std::find(ids.begin(), ids.end(), id);
+    CHECK(it != ids.end());
+    return scores[static_cast<size_t>(it - ids.begin())];
+}
+
+void check_loaded_blocked_scores_match_scalar(
+        const std::string & path,
+        int bits,
+        int dim,
+        const std::vector<float> & queries,
+        int n_queries,
+        const std::vector<uint64_t> & live_ids) {
+    auto * blocked = ggml_vec_index_load(path.c_str());
+    auto * scalar = ggml_vec_index_load(path.c_str());
+    CHECK(blocked != nullptr);
+    CHECK(scalar != nullptr);
+    CHECK(turbovec_blocked_hash_for_test(blocked) != 0);
+    turbovec_clear_blocked_for_test(scalar);
+    CHECK(turbovec_blocked_hash_for_test(scalar) == 0);
+
+    const int n_live = static_cast<int>(live_ids.size());
+    std::vector<float> blocked_scores(static_cast<size_t>(n_queries) * n_live);
+    std::vector<float> scalar_scores(static_cast<size_t>(n_queries) * n_live);
+    std::vector<uint64_t> blocked_ids(static_cast<size_t>(n_queries) * n_live);
+    std::vector<uint64_t> scalar_ids(static_cast<size_t>(n_queries) * n_live);
+    CHECK(ggml_vec_index_search(
+        blocked, queries.data(), n_queries, n_live, blocked_scores.data(), blocked_ids.data()) ==
+        GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search(
+        scalar, queries.data(), n_queries, n_live, scalar_scores.data(), scalar_ids.data()) ==
+        GGML_VEC_INDEX_OK);
+
+    const float tolerance = static_cast<float>(dim) * (bits == 2 ? 0.0045f : 0.0025f);
+    for (int query = 0; query < n_queries; ++query) {
+        const size_t base = static_cast<size_t>(query) * n_live;
+        std::vector<uint64_t> blocked_row(
+            blocked_ids.begin() + static_cast<std::ptrdiff_t>(base),
+            blocked_ids.begin() + static_cast<std::ptrdiff_t>(base + n_live));
+        std::vector<uint64_t> scalar_row(
+            scalar_ids.begin() + static_cast<std::ptrdiff_t>(base),
+            scalar_ids.begin() + static_cast<std::ptrdiff_t>(base + n_live));
+        std::vector<float> blocked_score_row(
+            blocked_scores.begin() + static_cast<std::ptrdiff_t>(base),
+            blocked_scores.begin() + static_cast<std::ptrdiff_t>(base + n_live));
+        std::vector<float> scalar_score_row(
+            scalar_scores.begin() + static_cast<std::ptrdiff_t>(base),
+            scalar_scores.begin() + static_cast<std::ptrdiff_t>(base + n_live));
+        for (uint64_t id : live_ids) {
+            const float blocked_score = score_for_id(blocked_row, blocked_score_row, id);
+            const float scalar_score = score_for_id(scalar_row, scalar_score_row, id);
+            CHECK(std::isfinite(blocked_score));
+            CHECK(std::isfinite(scalar_score));
+            CHECK(std::fabs(blocked_score - scalar_score) <= tolerance);
+        }
+    }
+
+    ggml_vec_index_free(scalar);
+    ggml_vec_index_free(blocked);
+}
+
+void check_turbovec_mutation_cache_regression(int bits) {
+    constexpr int dim = 128;
+    constexpr int n_initial = 1000;
+    constexpr int n_total = n_initial + 1;
+    constexpr int n_lists = 16;
+    constexpr int remove_row = 37;
+    CHECK(bits == 2 || bits == 4);
+
+    std::vector<float> vectors(static_cast<size_t>(n_total) * dim);
+    fill_turbovec_regression_vectors(vectors, n_total, dim);
+    set_distinct_turbovec_vector(vectors.data() + static_cast<size_t>(n_initial) * dim, dim);
+    std::vector<uint64_t> ids(static_cast<size_t>(n_total));
+    for (int row = 0; row < n_total; ++row) {
+        ids[static_cast<size_t>(row)] =
+            static_cast<uint64_t>(500000 + bits * 10000 + row);
+    }
+
+    auto * tv = bits == 2 ?
+        ggml_vec_index_create_turbovec_q2(dim) :
+        ggml_vec_index_create_turbovec_q4(dim);
+    CHECK(tv != nullptr);
+    CHECK(ggml_vec_index_add(tv, vectors.data(), n_initial, ids.data()) == GGML_VEC_INDEX_OK);
+    const uint64_t rotation_hash = turbovec_rotation_hash_for_test(dim);
+    const uint64_t initial_blocked_hash = turbovec_blocked_hash_for_test(tv);
+    CHECK(rotation_hash != 0);
+    CHECK(initial_blocked_hash != 0);
+
+    const std::string initial_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-turbovec-mutation-initial-q" + std::to_string(bits) + ".tvim")).string();
+    const std::string final_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-turbovec-mutation-final-q" + std::to_string(bits) + ".tvim")).string();
+    std::filesystem::remove(initial_path);
+    std::filesystem::remove(final_path);
+
+    CHECK(ggml_vec_index_write(tv, initial_path.c_str()) == GGML_VEC_INDEX_OK);
+    const std::vector<uint8_t> initial_bytes = read_file_bytes(initial_path);
+    const TurbovecTvimLayout initial_layout =
+        parse_turbovec_tvim_layout(initial_bytes, bits);
+    const uint64_t initial_calibration_hash =
+        section_hash(initial_bytes, initial_layout.calibration);
+    CHECK(initial_calibration_hash != 0);
+
+    CHECK(ggml_vec_index_build_ivf(tv, n_lists, 2) == GGML_VEC_INDEX_OK);
+    check_ivf_contains(tv, vectors.data(), 8, n_lists, ids[0]);
+
+    CHECK(ggml_vec_index_remove(tv, ids[remove_row]) == 1);
+    CHECK(ggml_vec_index_contains(tv, ids[remove_row]) == 0);
+    {
+        std::array<float, 1> scores{};
+        std::array<uint64_t, 1> out{};
+        CHECK(ggml_vec_index_search_ivf(
+            tv, vectors.data(), 1, 1, n_lists, scores.data(), out.data()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+    }
+
+    CHECK(ggml_vec_index_compact(tv) == GGML_VEC_INDEX_OK);
+    const uint64_t compacted_blocked_hash = turbovec_blocked_hash_for_test(tv);
+    CHECK(compacted_blocked_hash != 0);
+    CHECK(compacted_blocked_hash != initial_blocked_hash);
+    CHECK(turbovec_rotation_hash_for_test(dim) == rotation_hash);
+    CHECK(ggml_vec_index_build_ivf(tv, n_lists, 2) == GGML_VEC_INDEX_OK);
+    check_ivf_contains(tv, vectors.data(), 8, n_lists, ids[0]);
+
+    const uint64_t replacement_id = ids[static_cast<size_t>(n_initial)];
+    CHECK(ggml_vec_index_add(
+        tv,
+        vectors.data() + static_cast<size_t>(n_initial) * dim,
+        1,
+        &replacement_id) == GGML_VEC_INDEX_OK);
+    const uint64_t final_blocked_hash = turbovec_blocked_hash_for_test(tv);
+    CHECK(final_blocked_hash != 0);
+    CHECK(final_blocked_hash != compacted_blocked_hash);
+    CHECK(turbovec_rotation_hash_for_test(dim) == rotation_hash);
+    {
+        std::array<float, 1> scores{};
+        std::array<uint64_t, 1> out{};
+        CHECK(ggml_vec_index_search_ivf(
+            tv,
+            vectors.data() + static_cast<size_t>(n_initial) * dim,
+            1,
+            1,
+            n_lists,
+            scores.data(),
+            out.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+    }
+
+    CHECK(ggml_vec_index_build_ivf(tv, n_lists, 2) == GGML_VEC_INDEX_OK);
+    check_search_contains(
+        tv,
+        vectors.data() + static_cast<size_t>(n_initial) * dim,
+        8,
+        replacement_id);
+    check_ivf_contains(
+        tv,
+        vectors.data() + static_cast<size_t>(n_initial) * dim,
+        8,
+        n_lists,
+        replacement_id);
+
+    CHECK(ggml_vec_index_write(tv, final_path.c_str()) == GGML_VEC_INDEX_OK);
+    const std::vector<uint8_t> final_bytes = read_file_bytes(final_path);
+    const TurbovecTvimLayout final_layout = parse_turbovec_tvim_layout(final_bytes, bits);
+    CHECK(section_hash(final_bytes, final_layout.calibration) == initial_calibration_hash);
+
+    auto * loaded = ggml_vec_index_load(final_path.c_str());
+    CHECK(loaded != nullptr);
+    CHECK(turbovec_blocked_hash_for_test(loaded) == final_blocked_hash);
+    CHECK(turbovec_rotation_hash_for_test(dim) == rotation_hash);
+    check_search_contains(
+        loaded,
+        vectors.data() + static_cast<size_t>(n_initial) * dim,
+        8,
+        replacement_id);
+    CHECK(ggml_vec_index_build_ivf(loaded, n_lists, 2) == GGML_VEC_INDEX_OK);
+    check_ivf_contains(
+        loaded,
+        vectors.data() + static_cast<size_t>(n_initial) * dim,
+        8,
+        n_lists,
+        replacement_id);
+
+    std::vector<uint64_t> live_ids;
+    live_ids.reserve(n_initial);
+    for (int row = 0; row < n_initial; ++row) {
+        if (row != remove_row) {
+            live_ids.push_back(ids[static_cast<size_t>(row)]);
+        }
+    }
+    live_ids.push_back(replacement_id);
+    std::vector<float> queries(static_cast<size_t>(3) * dim);
+    std::memcpy(queries.data(), vectors.data(), static_cast<size_t>(dim) * sizeof(float));
+    std::memcpy(
+        queries.data() + dim,
+        vectors.data() + static_cast<size_t>(n_initial / 2) * dim,
+        static_cast<size_t>(dim) * sizeof(float));
+    std::memcpy(
+        queries.data() + static_cast<size_t>(2) * dim,
+        vectors.data() + static_cast<size_t>(n_initial) * dim,
+        static_cast<size_t>(dim) * sizeof(float));
+    check_loaded_blocked_scores_match_scalar(final_path, bits, dim, queries, 3, live_ids);
+
+    ggml_vec_index_free(loaded);
+    ggml_vec_index_free(tv);
+    std::filesystem::remove(initial_path);
+    std::filesystem::remove(final_path);
+}
+
+void check_turbovec_v3_corruption_rejected(int bits) {
+    constexpr int dim = 128;
+    constexpr int n = 1000;
+    CHECK(bits == 2 || bits == 4);
+
+    std::vector<float> vectors(static_cast<size_t>(n) * dim);
+    std::vector<uint64_t> ids(static_cast<size_t>(n));
+    fill_turbovec_regression_vectors(vectors, n, dim);
+    for (int row = 0; row < n; ++row) {
+        ids[static_cast<size_t>(row)] =
+            static_cast<uint64_t>(600000 + bits * 10000 + row);
+    }
+
+    auto * tv = bits == 2 ?
+        ggml_vec_index_create_turbovec_q2(dim) :
+        ggml_vec_index_create_turbovec_q4(dim);
+    CHECK(tv != nullptr);
+    CHECK(ggml_vec_index_add(tv, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+
+    const std::string path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-turbovec-v3-corrupt-q" + std::to_string(bits) + ".tvim")).string();
+    const std::string corrupt_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-turbovec-v3-corrupt-mutated-q" + std::to_string(bits) + ".tvim")).string();
+    std::filesystem::remove(path);
+    std::filesystem::remove(corrupt_path);
+    CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+
+    const std::vector<uint8_t> bytes = read_file_bytes(path);
+    const TurbovecTvimLayout layout = parse_turbovec_tvim_layout(bytes, bits);
+    expect_corrupt_load_fails(path, corrupt_path, [layout](std::vector<uint8_t> & corrupt) {
+        corrupt[layout.qparams.offset] ^= 0x01;
+    });
+    expect_corrupt_load_fails(path, corrupt_path, [layout](std::vector<uint8_t> & corrupt) {
+        corrupt[layout.calibration.offset] ^= 0x01;
+    });
+    expect_corrupt_load_fails(path, corrupt_path, [layout](std::vector<uint8_t> & corrupt) {
+        corrupt[layout.vectors.offset] ^= 0x01;
+    });
+    expect_corrupt_load_fails(path, corrupt_path, [layout](std::vector<uint8_t> & corrupt) {
+        corrupt[layout.ids.offset] ^= 0x01;
+    });
+    expect_corrupt_load_fails(path, corrupt_path, [layout](std::vector<uint8_t> & corrupt) {
+        corrupt[layout.checksum.offset + layout.checksum.size - 1] ^= 0x01;
+    });
+
+    ggml_vec_index_free(tv);
+    std::filesystem::remove(path);
+    std::filesystem::remove(corrupt_path);
 }
 
 }  // namespace
@@ -2633,6 +3010,11 @@ int main() {
         std::filesystem::remove(tv_snapshot_path);
         std::filesystem::remove(tv_delta_path + ".lock");
         ggml_vec_index_free(tv);
+    }
+
+    for (const int bit_width : { 2, 4 }) {
+        check_turbovec_mutation_cache_regression(bit_width);
+        check_turbovec_v3_corruption_rejected(bit_width);
     }
 
     // Rust TurboVec golden parity: generated by tests/turbovec-golden-gen.
