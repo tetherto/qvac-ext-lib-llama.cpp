@@ -566,6 +566,9 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         if (header[4] != kTvimVersion) {
             return nullptr;
         }
+        if (header[6] != 0 || header[7] != 0) {
+            return nullptr;
+        }
 
         const int bit_width = static_cast<int>(header[5]);
         const uint32_t dim_le = get_u32_le(header + 8);

@@ -129,6 +129,60 @@ int main() {
     CHECK(ggml_vec_index_dim(idx) == kDim);
     CHECK(ggml_vec_index_len(idx) == 0);
     CHECK(ggml_vec_index_bit_width(idx) == 32);
+    CHECK(ggml_vec_index_create(0, /*bit_width=*/32) == nullptr);
+    CHECK(ggml_vec_index_create(kDim, /*bit_width=*/31) == nullptr);
+
+    // Public APIs reject invalid arguments without mutating the index.
+    {
+        const std::array<float, kDim> vector = {
+            1.0f, 0.0f, 0.0f, 0.0f,
+        };
+        const uint64_t id = 123ULL;
+        std::array<float, 1> scores{};
+        std::array<uint64_t, 1> out_ids{};
+
+        CHECK(ggml_vec_index_add(nullptr, vector.data(), 1, &id)
+              == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_add(idx, nullptr, 1, &id)
+              == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_add(idx, vector.data(), 1, nullptr)
+              == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_add(idx, vector.data(), -1, &id)
+              == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search(
+            nullptr, vector.data(), 1, 1, scores.data(), out_ids.data())
+            == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search(
+            idx, nullptr, 1, 1, scores.data(), out_ids.data())
+            == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search(
+            idx, vector.data(), -1, 1, scores.data(), out_ids.data())
+            == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search(
+            idx, vector.data(), 1, 0, scores.data(), out_ids.data())
+            == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search(
+            idx, vector.data(), 1, 1, nullptr, out_ids.data())
+            == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove(nullptr, id) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_len(idx) == 0);
+    }
+
+    // Empty indexes return only sentinel-padded search results.
+    {
+        const std::array<float, kDim> query = {
+            1.0f, 0.0f, 0.0f, 0.0f,
+        };
+        std::array<float, 3> scores{};
+        std::array<uint64_t, 3> out_ids{};
+        CHECK(ggml_vec_index_search(
+            idx, query.data(), 1, static_cast<int>(scores.size()),
+            scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        for (size_t i = 0; i < scores.size(); ++i) {
+            CHECK(scores[i] == -FLT_MAX);
+            CHECK(out_ids[i] == UINT64_MAX);
+        }
+    }
 
     // Add 4 well-separated unit vectors. IDs are non-trivial uint64 to
     // catch sign-extension or BigInt round-trip bugs at the JS boundary
@@ -335,6 +389,63 @@ int main() {
             { 1.0f, 0.0f, 0.0f, 0.0f },
             {}));
         CHECK(ggml_vec_index_load(truncated_payload.path.string().c_str()) == nullptr);
+    }
+    {
+        TempFile bad_magic(".tvim");
+        std::vector<uint8_t> bytes = snapshot_bytes(
+            /*dim=*/kDim,
+            /*n=*/1,
+            { 1.0f, 0.0f, 0.0f, 0.0f },
+            { 123ULL });
+        bytes[0] = 'X';
+        write_bytes(bad_magic.path, bytes);
+        CHECK(ggml_vec_index_load(bad_magic.path.string().c_str()) == nullptr);
+    }
+    {
+        TempFile bad_version(".tvim");
+        std::vector<uint8_t> bytes = snapshot_bytes(
+            /*dim=*/kDim,
+            /*n=*/1,
+            { 1.0f, 0.0f, 0.0f, 0.0f },
+            { 123ULL });
+        bytes[4] = 99;
+        write_bytes(bad_version.path, bytes);
+        CHECK(ggml_vec_index_load(bad_version.path.string().c_str()) == nullptr);
+    }
+    {
+        TempFile bad_bit_width(".tvim");
+        std::vector<uint8_t> bytes = snapshot_bytes(
+            /*dim=*/kDim,
+            /*n=*/1,
+            { 1.0f, 0.0f, 0.0f, 0.0f },
+            { 123ULL });
+        bytes[5] = 8;
+        write_bytes(bad_bit_width.path, bytes);
+        CHECK(ggml_vec_index_load(bad_bit_width.path.string().c_str()) == nullptr);
+    }
+    {
+        TempFile reserved_header(".tvim");
+        std::vector<uint8_t> bytes = snapshot_bytes(
+            /*dim=*/kDim,
+            /*n=*/1,
+            { 1.0f, 0.0f, 0.0f, 0.0f },
+            { 123ULL });
+        CHECK(bytes.size() >= 8);
+        bytes[6] = 1;
+        write_bytes(reserved_header.path, bytes);
+        CHECK(ggml_vec_index_load(reserved_header.path.string().c_str()) == nullptr);
+    }
+    {
+        TempFile duplicate_ids(".tvim");
+        write_bytes(duplicate_ids.path, snapshot_bytes(
+            /*dim=*/kDim,
+            /*n=*/2,
+            {
+                1.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f, 0.0f,
+            },
+            { 321ULL, 321ULL }));
+        CHECK(ggml_vec_index_load(duplicate_ids.path.string().c_str()) == nullptr);
     }
     {
         TempFile reserved_id_file(".tvim");
