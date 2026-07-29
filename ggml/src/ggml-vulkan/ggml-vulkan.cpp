@@ -14668,11 +14668,17 @@ static void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, co
     const uint32_t src1_ne0 = quantized ? ggml_row_size(src1->type, src1->ne[0]) : src1->ne[0];
     const uint32_t dst_ne0  = quantized ? ggml_row_size(dst->type,  dst->ne[0])  : dst->ne[0];
 
+    // Quantized rows are copied as byte arrays, so dimension 0 is byte-contiguous.
+    // Non-quantized pipelines are typed and must preserve dimension-0 view strides.
+    const uint32_t src0_nb0 = quantized ? 1 : (uint32_t) src0->nb[0] / src0_type_size;
+    const uint32_t src1_nb0 = quantized ? 1 : (uint32_t) src1->nb[0] / src1_type_size;
+    const uint32_t dst_nb0  = quantized ? 1 : (uint32_t)  dst->nb[0] /  dst_type_size;
+
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_CONCAT, {
         quantized ? (uint32_t)ggml_nbytes(dst) : (uint32_t)ggml_nelements(dst),
-        src0_ne0, (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)src0->ne[3], 1, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
-        src1_ne0, (uint32_t)src1->ne[1], (uint32_t)src1->ne[2], (uint32_t)src1->ne[3], 1, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
-        dst_ne0,  (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],  (uint32_t) dst->ne[3],  1, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
+        src0_ne0, (uint32_t)src0->ne[1], (uint32_t)src0->ne[2], (uint32_t)src0->ne[3], src0_nb0, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
+        src1_ne0, (uint32_t)src1->ne[1], (uint32_t)src1->ne[2], (uint32_t)src1->ne[3], src1_nb0, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
+        dst_ne0,  (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],  (uint32_t) dst->ne[3],  dst_nb0, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
         0.0f, 0.0f, op_params[0],
     });
