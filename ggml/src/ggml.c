@@ -2246,7 +2246,7 @@ static struct ggml_tensor * ggml_acc_impl(
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    int32_t params[] = { nb1, nb2, nb3, offset, inplace ? 1 : 0 };
+    int32_t params[] = { nb1, nb2, nb3, offset, inplace ? 1 : 0, 1 };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_ACC;
@@ -6971,7 +6971,8 @@ static void ggml_acc_or_set(
         const  size_t         nb1,
         const  size_t         nb2,
         const  size_t         nb3,
-        const  size_t         offset) {
+        const  size_t         offset,
+        const  bool           wide_grad_acc) {
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
     struct ggml_tensor * tensor_cont = ggml_is_contiguous(tensor) ? tensor : ggml_cont(ctx, tensor);
@@ -6979,10 +6980,13 @@ static void ggml_acc_or_set(
         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor_cont, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
         // Build the zero base with ggml_fill, which never reads src's values.
-        struct ggml_tensor * a_zero = ggml_is_contiguous(src)
+        struct ggml_tensor * a_zero = (wide_grad_acc && ggml_is_contiguous(src))
             ? ggml_fill(ctx, src, 0.0f)
             : ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor_cont, nb1, nb2, nb3, offset, false);
+    }
+    if (!wide_grad_acc) {
+        ggml_set_op_params_i32(cgraph->grads[isrc], 5, 0);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
@@ -7021,7 +7025,7 @@ static void ggml_sub_or_set(
 }
 
 static void ggml_compute_backward(
-        struct ggml_context * ctx, struct ggml_cgraph * cgraph, int i, const bool * grads_needed) {
+        struct ggml_context * ctx, struct ggml_cgraph * cgraph, int i, const bool * grads_needed, const bool wide_grad_acc) {
     struct ggml_tensor * tensor = cgraph->nodes[i];
     struct ggml_tensor * grad   = ggml_graph_get_grad(cgraph, tensor);
 
@@ -7319,7 +7323,7 @@ static void ggml_compute_backward(
                     nb3 = (nb3 / n0) * ng;
                 }
 
-                ggml_acc_or_set(ctx, cgraph, isrc0, grad, nb1, nb2, nb3, offset);
+                ggml_acc_or_set(ctx, cgraph, isrc0, grad, nb1, nb2, nb3, offset, wide_grad_acc);
             }
         } break;
         case GGML_OP_PERMUTE: {
@@ -7720,6 +7724,14 @@ void ggml_build_backward_expand(
         struct ggml_context *  ctx,
         struct ggml_cgraph  *  cgraph,
         struct ggml_tensor  ** grad_accs) {
+    ggml_build_backward_expand_ext(ctx, cgraph, grad_accs, /*wide_grad_acc =*/ true);
+}
+
+void ggml_build_backward_expand_ext(
+        struct ggml_context *  ctx,
+        struct ggml_cgraph  *  cgraph,
+        struct ggml_tensor  ** grad_accs,
+        bool                   wide_grad_acc) {
     GGML_ASSERT(cgraph->n_nodes > 0);
     GGML_ASSERT(cgraph->grads);
     GGML_ASSERT(cgraph->grad_accs);
@@ -7818,7 +7830,7 @@ void ggml_build_backward_expand(
     for (int i = n_nodes_f - 1; i >= 0; --i) {
         // inplace operations to add gradients are not created by ggml_compute_backward except for gradient accumulation
         // use allocator to automatically make inplace operations
-        ggml_compute_backward(ctx, cgraph, i, grads_needed);
+        ggml_compute_backward(ctx, cgraph, i, grads_needed, wide_grad_acc);
     }
 
     free(grads_needed);

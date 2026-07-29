@@ -151,6 +151,8 @@ extern "C" {
         // loss*loss_scale so gradient magnitudes stay within fp32 range through deep
         // backprop.
         float loss_scale;
+
+        bool wide_grad_acc;
     };
 
     // get parameters for an optimization context with defaults set where possible

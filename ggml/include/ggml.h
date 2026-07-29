@@ -1244,7 +1244,7 @@ extern "C" {
            struct ggml_context * ctx,
            struct ggml_tensor  * grad,
            struct ggml_tensor  * g);
-    
+
     // a - dy
     // b - x
     GGML_API struct ggml_tensor * ggml_sigmoid_back(
@@ -2834,7 +2834,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // logits
-            struct ggml_tensor  * b,  // labels  
+            struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // mask (1 for assistant tokens, 0 for masked)
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked_back(
             struct ggml_context * ctx,
@@ -2901,6 +2901,12 @@ extern "C" {
         struct ggml_context *  ctx,        // context for gradient computation
         struct ggml_cgraph  *  cgraph,
         struct ggml_tensor  ** grad_accs);
+
+    GGML_API void ggml_build_backward_expand_ext(
+        struct ggml_context *  ctx,        // context for gradient computation
+        struct ggml_cgraph  *  cgraph,
+        struct ggml_tensor  ** grad_accs,
+        bool                   wide_grad_acc);
 
     // graph allocation in a context
     GGML_API struct ggml_cgraph * ggml_new_graph       (struct ggml_context * ctx); // size = GGML_DEFAULT_GRAPH_SIZE, grads = false

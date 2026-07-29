@@ -3290,11 +3290,12 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
-    // Seed the backward pass from a down-scaled loss for architectures (mixture-of-experts)
-    // whose gradients overflow fp32 before reaching the optimizer.
-    if (model->hparams.n_expert > 0 || llm_arch_is_hybrid(model->arch) || llm_arch_is_recurrent(model->arch)) {
+
+    const bool hardened_grads = model->hparams.n_expert > 0 || llm_arch_is_hybrid(model->arch) || llm_arch_is_recurrent(model->arch);
+    if (hardened_grads) {
         opt_params.loss_scale = 1e-10f;
     }
+    opt_params.wide_grad_acc = hardened_grads;
     opt_ctx = ggml_opt_init(opt_params);
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;

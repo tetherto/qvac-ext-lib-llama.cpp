@@ -71,6 +71,9 @@ struct ggml_opt_context {
     // magnitudes stay within fp32 range through deep backprop.
     float   loss_scale         = 1.0f;
 
+    // Use the hardened gradient-accumulation paths when building the backward graph.
+    bool    wide_grad_acc      = true;
+
     ggml_opt_get_optimizer_params get_opt_pars    = nullptr;
     void *                        get_opt_pars_ud = nullptr;
     struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
@@ -352,6 +355,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
         /*loss_scale      =*/ 1.0f,
+        /*wide_grad_acc   =*/ true,
     };
 }
 
@@ -616,7 +620,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
-    ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    ggml_build_backward_expand_ext(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data(), opt_ctx->wide_grad_acc);
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
@@ -689,7 +693,8 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
 
-    result->loss_scale = params.loss_scale > 0.0f ? params.loss_scale : 1.0f;
+    result->loss_scale    = params.loss_scale > 0.0f ? params.loss_scale : 1.0f;
+    result->wide_grad_acc = params.wide_grad_acc;
 
     GGML_ASSERT(result->opt_period >= 1);
 
