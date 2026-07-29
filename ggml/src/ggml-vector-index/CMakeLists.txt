@@ -1,6 +1,5 @@
 add_library(ggml-vector-index
             ../../include/ggml-vector-index.h
-            ../ggml-vector-index-impl.h
             ../ggml-vector-index.cpp)
 add_library(ggml::vector-index ALIAS ggml-vector-index)
 add_library(ggml::ggml-vector-index ALIAS ggml-vector-index)

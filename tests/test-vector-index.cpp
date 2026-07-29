@@ -4,7 +4,7 @@
 // public C API.
 
 #include "ggml-vector-index.h"
-#include "ggml-vector-index-impl.h"
+#include "ggml-vector-index-internal.h"
 
 #include <algorithm>
 #include <array>
@@ -224,10 +224,7 @@ int main() {
     {
         constexpr size_t n   = 262144;
         constexpr size_t dim = 4096;
-        size_t           data_size = 0;
-        CHECK(ggml_vec_index_detail::checked_mul_size(n, dim, data_size));
-        CHECK(ggml_vec_index_detail::snapshot_write_preflight(n, dim, data_size) ==
-              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(snapshot_write_v1_preflight(n, dim) == GGML_VEC_INDEX_E_INVALID_ARG);
     }
 
     // Empty indexes return only sentinel-padded search results.
@@ -726,6 +723,24 @@ int main() {
     }
 
     ggml_vec_index_free(loaded);
+
+
+    // Quantized storage keeps exact-search ranking close to the f32 baseline.
+    for (int bit_width : { 8, 4 }) {
+        auto * qidx = ggml_vec_index_create(kDim, bit_width);
+        CHECK(qidx != nullptr);
+        CHECK(ggml_vec_index_bit_width(qidx) == bit_width);
+        CHECK(ggml_vec_index_add(qidx, vecs.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+        std::array<float, 4> q_scores{};
+        std::array<uint64_t, 4> q_ids{};
+        CHECK(ggml_vec_index_search(qidx, seeds[0].data(), 1, 4, q_scores.data(), q_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(q_ids[0] == ids[0]);
+        CHECK(q_scores[0] > 0.95f);
+        CHECK(ggml_vec_index_remove(qidx, ids[0]) == 1);
+        CHECK(ggml_vec_index_search(qidx, seeds[0].data(), 1, 1, q_scores.data(), q_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(q_ids[0] != ids[0]);
+        ggml_vec_index_free(qidx);
+    }
 
     // Malformed snapshots are rejected before allocating from untrusted counts.
     {
