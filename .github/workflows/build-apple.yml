@@ -28,9 +28,10 @@ on:
       'ggml/src/ggml-metal/**',
       'ggml/include/ggml-vector-index.h',
       'ggml/src/CMakeLists.txt',
-      'ggml/src/ggml-vector-index.cpp',
+      'ggml/src/ggml-vector-index*',
       'tests/CMakeLists.txt',
-      'tests/test-vector-index.cpp'
+      'tests/test-vector-index*.cpp',
+      'tools/vector-index-bench/**'
     ]
 
 concurrency:
