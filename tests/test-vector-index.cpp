@@ -1244,6 +1244,47 @@ int main() {
     check_q8_ivf_extreme_centroid_routing();
     check_ivf_empty_batch_state_validation();
 
+    // Filtered, prepared-filter, and IVF-flat searches all reuse the same
+    // dot-product ordering as exact search.
+    {
+        auto * search_idx = ggml_vec_index_create(kDim, /*bit_width=*/8);
+        CHECK(search_idx != nullptr);
+        CHECK(ggml_vec_index_add(search_idx, vecs.data(), static_cast<int>(ids.size()), ids.data()) ==
+              GGML_VEC_INDEX_OK);
+
+        const std::array<uint64_t, 3> allowed = {
+            ids[2],
+            ids[1],
+            ids[1],
+        };
+        std::array<float, 2>    scores{};
+        std::array<uint64_t, 2> out_ids{};
+        CHECK(ggml_vec_index_search_filtered(
+                  search_idx, seeds[0].data(), 1, 2, allowed.data(), static_cast<int>(allowed.size()),
+                  scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == ids[1]);
+        CHECK(out_ids[1] == ids[2]);
+
+        ggml_vec_index_filter_t * filter =
+            ggml_vec_index_filter_create(search_idx, allowed.data(), static_cast<int>(allowed.size()));
+        CHECK(filter != nullptr);
+        CHECK(ggml_vec_index_search_prepared_filtered(
+                  search_idx, filter, seeds[0].data(), 1, 2, scores.data(), out_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == ids[1]);
+        CHECK(out_ids[1] == ids[2]);
+        ggml_vec_index_filter_free(filter);
+
+        CHECK(ggml_vec_index_build_ivf(search_idx, /*n_lists=*/2, /*n_iter=*/1) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_ivf(search_idx, seeds[3].data(), 1, 1, /*nprobe=*/2,
+                  scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == ids[3]);
+
+        CHECK(ggml_vec_index_search_ivf(search_idx, seeds[3].data(), 1, 1, /*nprobe=*/0,
+                  scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        ggml_vec_index_free(search_idx);
+    }
+
     // Malformed snapshots are rejected before allocating from untrusted counts.
     {
         temp_file truncated_header(".tvim");

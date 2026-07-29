@@ -86,3 +86,13 @@ delete/compact operations. Persistence for q4/q8 storage is not implemented yet.
 Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries
 before search.
+
+## Search Modes
+
+Exact search scans all live slots. `ggml_vec_index_search_filtered` restricts
+that scan to caller-provided ids, and `ggml_vec_index_filter_create` prepares
+the same id set for repeated `ggml_vec_index_search_prepared_filtered` calls.
+
+`ggml_vec_index_build_ivf` builds heap-owned IVF-flat state for approximate
+candidate selection. Call it again after loading an index and after successful
+add/remove mutations. IVF state is not persisted in snapshots.
