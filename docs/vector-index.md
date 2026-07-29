@@ -10,19 +10,61 @@ should enable it explicitly and link the vector-index target directly.
 
 ## How The Pieces Fit
 
-The public API owns an opaque index handle, caller ids, storage slots, and the
-exact top-k baseline used to check later search modes. Storage starts with f32
-for correctness, then q8 and packed q4 trade precision for smaller CPU-resident
-rows while keeping the query path in f32.
+The vector index is organized as layers. The storage, search, and persistence
+layers are general vector-index infrastructure; TurboVec is the q2/q4 algorithm
+built on top of them.
 
-Search layers build upward from exact scan: filtered search limits candidates by
-id, prepared filters reuse that id-to-slot mapping, and IVF-flat adds an
-in-memory candidate selector. Persistence is layered separately: `.tvim` full
-snapshots can be loaded normally or mmap-backed for read-only search, and
-`.tvid` logs replay or compact mutations on top of a snapshot. TurboVec then
-adds the q2/q4 path: rotation, TQ+ calibration, codebooks, bit-plane storage,
-LUT scoring, and blocked SIMD cache state. Tests cover each layer where it
-lands, with fault and cross-process checks reserved for durable persistence.
+```mermaid
+flowchart TD
+    api["C API and in-memory index"] --> storage["f32, q8, and packed q4 storage"]
+    storage --> exact["Exact CPU search"]
+    exact --> filters["Filtered and prepared-filter search"]
+    exact --> ivf["IVF-flat candidate selection"]
+    storage --> snapshot["tvim snapshots"]
+    snapshot --> mmap["Read-only mmap loading"]
+    snapshot --> delta["tvid mutation log and compaction"]
+    storage --> turbovec["TurboVec q2/q4"]
+    turbovec --> rotation["Rotation and TQ+ calibration"]
+    rotation --> codes["Lloyd-Max codes and bit-plane storage"]
+    codes --> lut["LUT scoring and blocked SIMD cache"]
+```
+
+The public C API owns the opaque index handle, caller-provided ids, vector
+slots, mutations, and the top-k result contract. f32 storage and exact search
+form the correctness baseline used to validate compressed or approximate paths.
+
+Generic q8 and packed q4 modes reduce memory used by CPU-resident vectors. Each
+vector stores an f32 scale, and search scores f32 queries directly against the
+quantized codes. These modes also provide comparison points for TurboVec q2/q4
+quality and performance.
+
+Exact search scans every live slot. Filtered search restricts that scan to a
+caller-provided id set, while prepared filters cache the id-to-slot mapping for
+repeated queries. IVF-flat reduces the number of vectors scored by assigning
+vectors and queries to in-memory centroid lists. It is an optional search
+accelerator and does not change the storage format.
+
+A `.tvim` file is a complete index snapshot. Normal loading materializes the
+index in memory, while mmap loading keeps supported vector sections mapped
+read-only for faster startup and lower memory duplication. A `.tvid` file
+records incremental add and remove operations after a snapshot. Replay
+reconstructs the latest state, and compaction replaces the snapshot and resets
+the log. State identities and file locking prevent stale or concurrent writers
+from silently producing a divergent index.
+
+TurboVec is a separate compressed search mode built on the same index API.
+Vectors and queries are rotated into a quantization-friendly space. TQ+
+calibration and Lloyd-Max codebooks produce q2 or q4 codes stored in bit-plane
+rows. Search builds lookup tables from the rotated query and scores packed
+codes without reconstructing full vectors. A blocked copy of the packed codes
+supports scalar, NEON, and AVX2 scoring. Derived rotation, calibration,
+blocked-code, and IVF state is invalidated or rebuilt after mutations,
+compaction, and snapshot loading.
+
+Each layer carries its own regression coverage: result ordering, architecture
+parity, snapshot corruption, mmap restrictions, delta replay, compaction, stale
+writers, hardlink aliases, cross-process locking, TurboVec golden fixtures,
+cache invalidation, benchmark coverage, and package smoke tests.
 
 ## Build
 
