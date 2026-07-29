@@ -344,6 +344,9 @@ int ggml_vec_index_load_ex(const char * path, ggml_vec_index_t ** out) {
                 return GGML_VEC_INDEX_E_IO;
             }
         }
+        if (f.peek() != std::ifstream::traits_type::eof()) {
+            return GGML_VEC_INDEX_E_IO;
+        }
         std::unique_ptr<ggml_vec_index_t, decltype(&ggml_vec_index_free)> idx(
             ggml_vec_index_create(static_cast<int>(dim), 32), ggml_vec_index_free);
         if (idx == nullptr) {
