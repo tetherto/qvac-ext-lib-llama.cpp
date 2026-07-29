@@ -704,6 +704,21 @@ int ggml_vec_index_remove_logged(
     return GGML_VEC_INDEX_E_INVALID_ARG;
 }
 
+int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id) {
+    if (idx == nullptr || !is_valid_id(id)) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        const auto it = idx->id_to_slot.find(id);
+        return it != idx->id_to_slot.end() && slot_is_active(*idx, it->second) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+void ggml_vec_index_prepare(ggml_vec_index_t *) {}
+
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
