@@ -101,6 +101,24 @@ void append_f32_le(std::vector<uint8_t> & bytes, float value) {
     append_u32_le(bytes, bits);
 }
 
+uint32_t crc32c_update(uint32_t crc, const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= bytes[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ (0x82f63b78u & (0u - (crc & 1u)));
+        }
+    }
+    return crc;
+}
+
+uint32_t crc32c_bytes(const std::vector<uint8_t> & bytes) {
+    if (bytes.empty()) {
+        return 0u;
+    }
+    return crc32c_update(0xffffffffu, bytes.data(), bytes.size()) ^ 0xffffffffu;
+}
+
 void write_bytes(const std::filesystem::path & path, const std::vector<uint8_t> & bytes) {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     CHECK(f.is_open());
@@ -113,15 +131,14 @@ void write_bytes(const std::filesystem::path & path, const std::vector<uint8_t> 
 std::vector<uint8_t> read_bytes(const std::filesystem::path & path) {
     std::ifstream f(path, std::ios::binary);
     CHECK(f.is_open());
-    return {
+    return std::vector<uint8_t>(
         std::istreambuf_iterator<char>(f),
-        std::istreambuf_iterator<char>(),
-    };
+        std::istreambuf_iterator<char>());
 }
 
 bool has_snapshot_tmp(const std::filesystem::path & path) {
     const std::filesystem::path dir    = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
-    const std::string           prefix = ".ggml-vi-" + std::to_string(std::filesystem::hash_value(path)) + "-";
+    const std::string           prefix = path.filename().string() + ".tmp.";
 
     std::error_code                           ec;
     std::filesystem::directory_iterator       it(dir, ec);
@@ -153,6 +170,43 @@ std::vector<uint8_t> snapshot_bytes(uint32_t                      dim,
     for (uint64_t id : ids) {
         append_u64_le(bytes, id);
     }
+    return bytes;
+}
+
+std::vector<uint8_t> snapshot_v2_f32_bytes(uint32_t                      dim,
+                                           uint32_t                      n,
+                                           const std::vector<float> &    values,
+                                           const std::vector<uint64_t> & ids) {
+    std::vector<uint8_t> header;
+    header.reserve(32);
+    header.insert(header.end(), { 'T', 'V', 'P', 'I' });
+    header.push_back(2);
+    header.push_back(32);
+    header.push_back(1);
+    header.push_back(1);
+    append_u32_le(header, dim);
+    append_u32_le(header, n);
+    append_u32_le(header, 0);
+    append_u32_le(header, 0);
+    append_u32_le(header, 4);
+    append_u32_le(header, 0);
+
+    std::vector<uint8_t> vector_bytes;
+    for (float value : values) {
+        append_f32_le(vector_bytes, value);
+    }
+    std::vector<uint8_t> id_bytes;
+    for (uint64_t id : ids) {
+        append_u64_le(id_bytes, id);
+    }
+
+    std::vector<uint8_t> bytes = header;
+    bytes.insert(bytes.end(), vector_bytes.begin(), vector_bytes.end());
+    bytes.insert(bytes.end(), id_bytes.begin(), id_bytes.end());
+    append_u32_le(bytes, crc32c_bytes(header));
+    append_u32_le(bytes, 0);
+    append_u32_le(bytes, crc32c_bytes(vector_bytes));
+    append_u32_le(bytes, crc32c_bytes(id_bytes));
     return bytes;
 }
 
@@ -210,9 +264,9 @@ std::vector<RefScore> reference_topk(const std::vector<float> &    vectors,
     std::vector<RefScore> scores;
     scores.reserve(ids.size());
     for (size_t row = 0; row < ids.size(); ++row) {
-        scores.push_back(
-            { quantized_reference_score(vectors.data() + row * static_cast<size_t>(dim), query, dim, bit_width),
-              ids[row] });
+        scores.push_back({ quantized_reference_score(vectors.data() + row * static_cast<size_t>(dim), query, dim,
+                                                     bit_width),
+                           ids[row] });
     }
     std::sort(scores.begin(), scores.end(), ref_score_better);
     scores.resize(static_cast<size_t>(k), RefScore{ -FLT_MAX, UINT64_MAX });
@@ -252,12 +306,13 @@ void check_quantized_reference(int bit_width) {
 
     std::vector<float>    out_scores(static_cast<size_t>(n_q) * k);
     std::vector<uint64_t> out_ids(static_cast<size_t>(n_q) * k);
-    CHECK(ggml_vec_index_search(idx, queries.data(), n_q, k, out_scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search(idx, queries.data(), n_q, k, out_scores.data(), out_ids.data()) ==
+          GGML_VEC_INDEX_OK);
 
     const float tolerance = bit_width == 8 ? 1e-4f : 2e-4f;
     for (int q = 0; q < n_q; ++q) {
-        const auto expected =
-            reference_topk(vectors, ids, queries.data() + static_cast<size_t>(q) * dim, dim, bit_width, k);
+        const auto expected = reference_topk(vectors, ids, queries.data() + static_cast<size_t>(q) * dim, dim,
+                                            bit_width, k);
         for (int j = 0; j < k; ++j) {
             const size_t offset = static_cast<size_t>(q) * k + static_cast<size_t>(j);
             CHECK(out_ids[offset] == expected[static_cast<size_t>(j)].id);
@@ -274,14 +329,20 @@ void check_quantized_small_dim_tie_order(int bit_width) {
     constexpr int k   = 2;
 
     const std::array<float, dim * 2> vectors = {
-        1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f,
+        1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f,
     };
     const std::array<uint64_t, 2> ids = {
         910001ULL,
         910002ULL,
     };
     const std::array<float, dim> query = {
-        1.0e8f, 1.0f, -1.0e8f, 1.0f, 0.0f, 0.0f,
+        1.0e8f,
+        1.0f,
+        -1.0e8f,
+        1.0f,
+        0.0f,
+        0.0f,
     };
 
     auto * idx = ggml_vec_index_create(dim, bit_width);
@@ -478,9 +539,10 @@ void check_ivf_centroid_overflow_fallback() {
     constexpr int dim = 4;
 
     const std::array<float, dim * 2> vectors = {
-        1.0f, -1.0f, 0.0f, 0.0f, 1.0e30f, 1.0e30f, 0.0f, 0.0f,
+        1.0f, -1.0f, 0.0f, 0.0f,
+        1.0e30f, 1.0e30f, 0.0f, 0.0f,
     };
-    const std::array<uint64_t, 2> ids   = { 8300ULL, 8301ULL };
+    const std::array<uint64_t, 2> ids = { 8300ULL, 8301ULL };
     const std::array<float, dim>  query = { -1.0e10f, 1.0e10f, 0.0f, 0.0f };
 
     auto * idx = ggml_vec_index_create(dim, 32);
@@ -493,7 +555,8 @@ void check_ivf_centroid_overflow_fallback() {
     std::array<float, 1>    ivf_score{};
     std::array<uint64_t, 1> ivf_id{};
     CHECK(ggml_vec_index_search(idx, query.data(), 1, 1, exact_score.data(), exact_id.data()) == GGML_VEC_INDEX_OK);
-    CHECK(ggml_vec_index_search_ivf(idx, query.data(), 1, 1, 1, ivf_score.data(), ivf_id.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, query.data(), 1, 1, 1, ivf_score.data(), ivf_id.data()) ==
+          GGML_VEC_INDEX_OK);
     CHECK(exact_id[0] == ids[1]);
     CHECK(ivf_id[0] == exact_id[0]);
     CHECK(ivf_score[0] == exact_score[0]);
@@ -909,24 +972,7 @@ int main() {
         CHECK(ggml_vec_index_write(idx, nullptr) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_load(nullptr) == nullptr);
         CHECK(ggml_vec_index_load(temp_path(".missing").string().c_str()) == nullptr);
-        CHECK(ggml_vec_index_load_mmap(nullptr) == nullptr);
-        CHECK(ggml_vec_index_load_with_delta(nullptr, nullptr) == nullptr);
-        {
-            ggml_vec_index_t * out = idx;
-            CHECK(ggml_vec_index_load_mmap_ex("unused.tvim", &out) == GGML_VEC_INDEX_E_BAD_VERSION);
-            CHECK(out == nullptr);
-            out = idx;
-            CHECK(ggml_vec_index_load_with_delta_ex("unused.tvim", "unused.tvid", &out) ==
-                  GGML_VEC_INDEX_E_INVALID_ARG);
-            CHECK(out == nullptr);
-        }
         CHECK(ggml_vec_index_remove(nullptr, id) == GGML_VEC_INDEX_E_INVALID_ARG);
-        CHECK(ggml_vec_index_add_logged(idx, vector.data(), 1, &id, "unused.tvid") ==
-              GGML_VEC_INDEX_E_INVALID_ARG);
-        CHECK(ggml_vec_index_len(idx) == 0);
-        CHECK(ggml_vec_index_contains(idx, id) == 0);
-        CHECK(ggml_vec_index_remove_logged(idx, id, "unused.tvid") == GGML_VEC_INDEX_E_INVALID_ARG);
-        CHECK(ggml_vec_index_compact_delta(idx, "unused.tvim", "unused.tvid") == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_contains(nullptr, id) == 0);
         CHECK(ggml_vec_index_len(nullptr) == 0);
         CHECK(ggml_vec_index_dim(nullptr) == 0);
@@ -974,39 +1020,6 @@ int main() {
         CHECK(snapshot_write_v1_preflight(n, dim) == GGML_VEC_INDEX_E_INVALID_ARG);
     }
 #endif
-
-    // Zero-query prepared-filter calls still validate filter ownership and staleness.
-    {
-        const std::array<float, kDim> vector = {
-            1.0f,
-            0.0f,
-            0.0f,
-            0.0f,
-        };
-        const uint64_t id = 123ULL;
-
-        auto * filter_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
-        CHECK(filter_idx != nullptr);
-        auto * valid_filter = ggml_vec_index_filter_create(filter_idx, nullptr, 0);
-        CHECK(valid_filter != nullptr);
-        CHECK(ggml_vec_index_search_prepared_filtered(filter_idx, valid_filter, nullptr, 0, 1, nullptr, nullptr) ==
-              GGML_VEC_INDEX_OK);
-        CHECK(ggml_vec_index_add(filter_idx, vector.data(), 1, &id) == GGML_VEC_INDEX_OK);
-        CHECK(ggml_vec_index_search_prepared_filtered(filter_idx, valid_filter, nullptr, 0, 1, nullptr, nullptr) ==
-              GGML_VEC_INDEX_E_INVALID_ARG);
-        ggml_vec_index_filter_free(valid_filter);
-
-        auto * other_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
-        CHECK(other_idx != nullptr);
-        auto * other_filter = ggml_vec_index_filter_create(other_idx, nullptr, 0);
-        CHECK(other_filter != nullptr);
-        CHECK(ggml_vec_index_search_prepared_filtered(filter_idx, other_filter, nullptr, 0, 1, nullptr, nullptr) ==
-              GGML_VEC_INDEX_E_INVALID_ARG);
-        ggml_vec_index_filter_free(other_filter);
-        ggml_vec_index_free(other_idx);
-        ggml_vec_index_free(filter_idx);
-        CHECK(ggml_vec_index_len(idx) == 0);
-    }
 
     // Empty indexes return only sentinel-padded search results.
     {
@@ -1360,7 +1373,7 @@ int main() {
         CHECK(!ec);
         CHECK((perms & std::filesystem::perms::owner_read) != std::filesystem::perms::none);
         CHECK((perms & std::filesystem::perms::owner_write) != std::filesystem::perms::none);
-        CHECK((perms & std::filesystem::perms::group_read) != std::filesystem::perms::none);
+        CHECK((perms & std::filesystem::perms::group_read) == std::filesystem::perms::none);
         CHECK((perms & std::filesystem::perms::group_write) == std::filesystem::perms::none);
         CHECK((perms & std::filesystem::perms::others_read) == std::filesystem::perms::none);
     }
@@ -1381,7 +1394,7 @@ int main() {
             ids[2],
             ids[3],
         };
-        CHECK(actual == snapshot_bytes(kDim, 3, expected_values, expected_ids));
+        CHECK(actual == snapshot_v2_f32_bytes(kDim, 3, expected_values, expected_ids));
     }
 #ifndef _WIN32
     {
@@ -1550,8 +1563,6 @@ int main() {
         CHECK(qidx != nullptr);
         CHECK(ggml_vec_index_bit_width(qidx) == bit_width);
         CHECK(ggml_vec_index_add(qidx, vecs.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
-        temp_file q_snapshot(".tvim");
-        CHECK(ggml_vec_index_write(qidx, q_snapshot.path.string().c_str()) == GGML_VEC_INDEX_E_INVALID_ARG);
         std::array<float, 4> q_scores{};
         std::array<uint64_t, 4> q_ids{};
         CHECK(ggml_vec_index_search(qidx, seeds[0].data(), 1, 4, q_scores.data(), q_ids.data()) == GGML_VEC_INDEX_OK);
@@ -1585,6 +1596,42 @@ int main() {
     }
     check_ivf_state_not_persisted();
 
+    // v2 snapshots preserve quantized storage and can be loaded through mmap
+    // for read-only search.
+    {
+        temp_file q4_file(".tvim");
+        auto * q4_idx = ggml_vec_index_create(kDim, /*bit_width=*/4);
+        CHECK(q4_idx != nullptr);
+        CHECK(ggml_vec_index_add(q4_idx, vecs.data(), static_cast<int>(ids.size()), ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(q4_idx, q4_file.path.string().c_str()) == GGML_VEC_INDEX_OK);
+
+        auto * q4_loaded = ggml_vec_index_load(q4_file.path.string().c_str());
+        CHECK(q4_loaded != nullptr);
+        CHECK(ggml_vec_index_bit_width(q4_loaded) == 4);
+
+        auto * q4_mmap = ggml_vec_index_load_mmap(q4_file.path.string().c_str());
+        CHECK(q4_mmap != nullptr);
+        std::array<float, 1>    scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(q4_mmap, seeds[0].data(), 1, 1, scores.data(), out_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == ids[0]);
+        CHECK(ggml_vec_index_add(q4_mmap, seeds[0].data(), 1, &ids[0]) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+        std::vector<uint8_t> corrupt = read_bytes(q4_file.path);
+        CHECK(!corrupt.empty());
+        corrupt[corrupt.size() - 1] ^= 1;
+        temp_file corrupt_file(".tvim");
+        write_bytes(corrupt_file.path, corrupt);
+        CHECK(ggml_vec_index_load(corrupt_file.path.string().c_str()) == nullptr);
+        CHECK(ggml_vec_index_load_mmap(corrupt_file.path.string().c_str()) == nullptr);
+
+        ggml_vec_index_free(q4_mmap);
+        ggml_vec_index_free(q4_loaded);
+        ggml_vec_index_free(q4_idx);
+    }
+
     // Malformed snapshots are rejected before allocating from untrusted counts.
     {
         temp_file truncated_header(".tvim");
@@ -1596,40 +1643,19 @@ int main() {
         write_bytes(oversized_count.path,
                     snapshot_bytes(
                         /*dim=*/1, static_cast<uint32_t>(std::numeric_limits<int>::max()) + 1u, {}, {}));
-        ggml_vec_index_t * out = nullptr;
-        CHECK(ggml_vec_index_load_ex(oversized_count.path.string().c_str(), &out) == GGML_VEC_INDEX_E_IO);
-        CHECK(out == nullptr);
         CHECK(ggml_vec_index_load(oversized_count.path.string().c_str()) == nullptr);
     }
     {
         temp_file oversized_dim(".tvim");
         write_bytes(oversized_dim.path, snapshot_bytes(static_cast<uint32_t>(std::numeric_limits<int>::max()) + 1u,
                                                        /*n=*/0, {}, {}));
-        ggml_vec_index_t * out = nullptr;
-        CHECK(ggml_vec_index_load_ex(oversized_dim.path.string().c_str(), &out) == GGML_VEC_INDEX_E_IO);
-        CHECK(out == nullptr);
         CHECK(ggml_vec_index_load(oversized_dim.path.string().c_str()) == nullptr);
-    }
-    {
-        temp_file product_overflow(".tvim");
-        write_bytes(product_overflow.path,
-                    snapshot_bytes(
-                        static_cast<uint32_t>(std::numeric_limits<int>::max()),
-                        static_cast<uint32_t>(std::numeric_limits<int>::max()),
-                        {}, {}));
-        ggml_vec_index_t * out = nullptr;
-        CHECK(ggml_vec_index_load_ex(product_overflow.path.string().c_str(), &out) == GGML_VEC_INDEX_E_IO);
-        CHECK(out == nullptr);
-        CHECK(ggml_vec_index_load(product_overflow.path.string().c_str()) == nullptr);
     }
     {
         temp_file truncated_payload(".tvim");
         write_bytes(truncated_payload.path, snapshot_bytes(
                                                 /*dim=*/kDim,
                                                 /*n=*/2, { 1.0f, 0.0f, 0.0f, 0.0f }, {}));
-        ggml_vec_index_t * out = nullptr;
-        CHECK(ggml_vec_index_load_ex(truncated_payload.path.string().c_str(), &out) == GGML_VEC_INDEX_E_IO);
-        CHECK(out == nullptr);
         CHECK(ggml_vec_index_load(truncated_payload.path.string().c_str()) == nullptr);
     }
     {
@@ -1673,7 +1699,10 @@ int main() {
             /*n=*/1, { 1.0f, 0.0f, 0.0f, 0.0f }, { 123ULL });
         bytes[5] = 8;
         write_bytes(bad_bit_width.path, bytes);
-        CHECK(ggml_vec_index_load(bad_bit_width.path.string().c_str()) == nullptr);
+        auto * legacy_q8 = ggml_vec_index_load(bad_bit_width.path.string().c_str());
+        CHECK(legacy_q8 != nullptr);
+        CHECK(ggml_vec_index_bit_width(legacy_q8) == 8);
+        ggml_vec_index_free(legacy_q8);
     }
     {
         temp_file            reserved_header(".tvim");

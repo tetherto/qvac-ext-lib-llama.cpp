@@ -20,7 +20,7 @@ flowchart TD
     storage --> exact["Exact CPU search"]
     exact --> filters["Filtered and prepared-filter search"]
     exact --> ivf["IVF-flat candidate selection"]
-    storage --> snapshot["f32 tvim snapshots"]
+    storage --> snapshot["tvim snapshots"]
 ```
 
 The public C API owns the opaque index handle, caller-provided ids, vector
@@ -37,10 +37,10 @@ repeated queries. IVF-flat reduces the number of vectors scored by assigning
 vectors and queries to in-memory centroid lists. It is an optional search
 accelerator and does not change the storage format.
 
-The current persistence implementation supports complete f32 (`bit_width=32`)
-`.tvim` snapshots. q4/q8 snapshots, mmap loading, `.tvid` mutation logs, and
-delta compaction are reserved API surface and return explicit unsupported errors
-until their implementations land.
+The current persistence implementation supports complete `.tvim` snapshots for
+f32 (`bit_width=32`), q8 (`bit_width=8`), and q4 (`bit_width=4`) storage. `.tvid`
+mutation logs and delta compaction are reserved API surface and return explicit
+unsupported errors until their implementations land.
 
 TurboVec-style q2/q4 search, rotations, TQ+ calibration, Lloyd-Max codebooks,
 LUT scoring, blocked-code caches, and related golden fixtures are planned work.
@@ -80,8 +80,8 @@ Create an index with a fixed dimension and bit width:
 - `bit_width=4`: per-vector symmetric packed q4 storage with f32 scales.
 
 The generic q4/q8 layouts are local to vector-index and are not `ggml-quants`
-block formats. They keep one scale per external vector for random row lookup and
-delete/compact operations. Persistence for q4/q8 storage is not implemented yet.
+block formats. They keep one scale per external vector for random row lookup,
+delete/compact operations, and snapshot round trips.
 
 Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries
@@ -109,3 +109,13 @@ before search.
   search fewer lists and may return different results from exact search.
   Probing at least the number of built lists searches all lists, so candidate
   coverage matches exact search. IVF state is not persisted in snapshots.
+
+## Persistence
+
+Snapshots use `.tvim`. Version 2 records the storage kind, ids, quantization
+scales, vector bytes, and checksums. The loader still accepts legacy v1 f32
+snapshots; legacy `bit_width=8` files are quantized to q8 on load.
+
+`ggml_vec_index_load_mmap` maps the vector section read-only and copies ids and
+scales into memory. mmap-loaded handles allow search and IVF preparation, but
+reject content mutations.
