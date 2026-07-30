@@ -46,11 +46,11 @@ typedef struct ggml_vec_index ggml_vec_index_t;
 // `_remove` is the exception: it returns 1 on removal and 0 on miss.
 enum ggml_vec_index_error {
     GGML_VEC_INDEX_OK            = 0,
-    GGML_VEC_INDEX_E_INVALID_ARG = -2,
-    GGML_VEC_INDEX_E_DUPLICATE   = -3,
-    GGML_VEC_INDEX_E_IO          = -4,
-    GGML_VEC_INDEX_E_OOM         = -7,
-    GGML_VEC_INDEX_E_INTERNAL    = -99,
+    GGML_VEC_INDEX_E_INVALID_ARG = -1,
+    GGML_VEC_INDEX_E_DUPLICATE   = -2,
+    GGML_VEC_INDEX_E_IO          = -3,
+    GGML_VEC_INDEX_E_OOM         = -4,
+    GGML_VEC_INDEX_E_INTERNAL    = -5,
 };
 
 // Lifecycle.
