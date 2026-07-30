@@ -63,6 +63,11 @@ int turbovec_avx2_available_for_test();
 int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim);
 void turbovec_reset_block_score_call_count_for_test(void);
 int64_t turbovec_block_score_call_count_for_test(void);
+uint64_t turbovec_ziggurat_table_hash_for_test(void);
+double turbovec_ziggurat_x_for_test(int index);
+double turbovec_ziggurat_f_for_test(int index);
+double turbovec_regularized_beta_for_test(double x, double a, double b);
+double turbovec_inverse_regularized_beta_for_test(double probability, double a);
 #endif
 
 namespace {
@@ -96,6 +101,15 @@ void check_bits_within_ulp(
         uint32_t actual,
         uint32_t expected,
         uint32_t max_ulp);
+void check_double_close(
+        const char * label,
+        double actual,
+        double expected,
+        double tolerance);
+void check_u64_equal(
+        const char * label,
+        uint64_t actual,
+        uint64_t expected);
 
 std::vector<float> normalize(std::vector<float> v) {
     double sumsq = 0.0;
@@ -555,6 +569,40 @@ void check_bits_within_ulp(
             max_ulp);
     }
     CHECK(diff <= max_ulp);
+}
+
+void check_double_close(
+        const char * label,
+        double actual,
+        double expected,
+        double tolerance) {
+    const double diff = std::fabs(actual - expected);
+    if (!(diff <= tolerance)) {
+        std::fprintf(
+            stderr,
+            "FAIL %s: actual=%.17g expected=%.17g diff=%.17g max=%.17g\n",
+            label,
+            actual,
+            expected,
+            diff,
+            tolerance);
+    }
+    CHECK(diff <= tolerance);
+}
+
+void check_u64_equal(
+        const char * label,
+        uint64_t actual,
+        uint64_t expected) {
+    if (actual != expected) {
+        std::fprintf(
+            stderr,
+            "FAIL %s: actual=0x%016llx expected=0x%016llx\n",
+            label,
+            static_cast<unsigned long long>(actual),
+            static_cast<unsigned long long>(expected));
+    }
+    CHECK(actual == expected);
 }
 
 uint64_t slot_state_hash_f32(uint64_t id, const std::vector<float> & vector) {
@@ -1969,6 +2017,102 @@ float tqplus_golden_value(int row, int column) {
         0.06 * std::sin(0.097 * (x + y)));
 }
 
+void check_turbovec_numeric_helper_parity() {
+    // The hash covers all 257 x and f table entries from Rust rand_distr 0.4.3.
+    // Values are quantized in the test hook to avoid irrelevant libm bit noise.
+    check_u64_equal(
+        "Ziggurat x/f table hash",
+        turbovec_ziggurat_table_hash_for_test(),
+        UINT64_C(0xc9ae9c919c45a9e9));
+    check_double_close(
+        "Ziggurat x[0]",
+        turbovec_ziggurat_x_for_test(0),
+        3.910757959537090045,
+        0.0);
+    check_double_close(
+        "Ziggurat x[1]",
+        turbovec_ziggurat_x_for_test(1),
+        3.654152885361008796,
+        0.0);
+    check_double_close("Ziggurat x[256]", turbovec_ziggurat_x_for_test(256), 0.0, 0.0);
+    check_double_close(
+        "Ziggurat f[0]",
+        turbovec_ziggurat_f_for_test(0),
+        0.0004774677645866553,
+        1e-15);
+    check_double_close(
+        "Ziggurat f[1]",
+        turbovec_ziggurat_f_for_test(1),
+        0.001260285930498598,
+        1e-15);
+    check_double_close("Ziggurat f[256]", turbovec_ziggurat_f_for_test(256), 1.0, 0.0);
+
+    // statrs 0.17.1 Beta::cdf and default ContinuousCDF::inverse_cdf behavior
+    // used by Rust turbovec v0.9.0 TQ+ calibration.
+    struct RegularizedBetaCase {
+        const char * label;
+        double x;
+        double a;
+        double b;
+        double expected;
+        double tolerance;
+    };
+    const RegularizedBetaCase beta_cases[] = {
+        { "regularized beta symmetric", 0.5, 3.5, 3.5, 0.5, 1e-13 },
+        { "regularized beta asymmetric", 0.2, 2.5, 5.0, 0.22997511934989717, 1e-12 },
+        { "regularized beta dim8 lower tail", 0.25, 3.5, 3.5, 0.085235330393527292, 1e-12 },
+        { "regularized beta dim128 q05", 0.427276611328125, 63.5, 63.5, 0.050022388729378635, 1e-10 },
+        { "regularized beta dim1536 lower tail", 0.484405517578125, 767.5, 767.5, 0.11084377073802887, 1e-9 },
+        { "regularized beta dim65536 lower tail", 0.4960784912109375, 32767.5, 32767.5, 0.022331190135124888, 1e-8 },
+    };
+    for (const RegularizedBetaCase & test : beta_cases) {
+        check_double_close(
+            test.label,
+            turbovec_regularized_beta_for_test(test.x, test.a, test.b),
+            test.expected,
+            test.tolerance);
+    }
+
+    struct InverseBetaCase {
+        int dim;
+        double probability;
+        double a;
+        double quantile;
+        double cdf;
+        double cdf_tolerance;
+    };
+    const InverseBetaCase inverse_cases[] = {
+        { 8, 0.01, 3.5, 0.125091552734375, 0.0099946943498694478, 1e-12 },
+        { 8, 0.05, 3.5, 0.208892822265625, 0.049996830392321556, 1e-12 },
+        { 8, 0.95, 3.5, 0.791107177734375, 0.9500031696076785, 1e-12 },
+        { 8, 0.99, 3.5, 0.874908447265625, 0.99000530565013056, 1e-12 },
+        { 128, 0.01, 63.5, 0.397674560546875, 0.0099974788182620299, 1e-10 },
+        { 128, 0.05, 63.5, 0.427276611328125, 0.050022388729378635, 1e-10 },
+        { 128, 0.95, 63.5, 0.572723388671875, 0.94997761127062141, 1e-10 },
+        { 128, 0.99, 63.5, 0.602325439453125, 0.99000252118173793, 1e-10 },
+        { 1536, 0.01, 767.5, 0.470306396484375, 0.00994511332916251, 1e-9 },
+        { 1536, 0.05, 767.5, 0.479034423828125, 0.050162611666987017, 1e-9 },
+        { 1536, 0.95, 767.5, 0.520965576171875, 0.94983738833301012, 1e-9 },
+        { 1536, 0.99, 767.5, 0.529693603515625, 0.99005488667083696, 1e-9 },
+        { 65536, 0.01, 32767.5, 0.495452880859375, 0.0099521630676677759, 1e-8 },
+        { 65536, 0.05, 32767.5, 0.496795654296875, 0.050437841492088784, 1e-8 },
+        { 65536, 0.95, 32767.5, 0.503204345703125, 0.94956215850791126, 1e-8 },
+        { 65536, 0.99, 32767.5, 0.504547119140625, 0.99004783693233223, 1e-8 },
+    };
+    for (const InverseBetaCase & test : inverse_cases) {
+        char label[96];
+        std::snprintf(label, sizeof(label), "inverse beta dim%d p%.2f", test.dim, test.probability);
+        const double quantile = turbovec_inverse_regularized_beta_for_test(test.probability, test.a);
+        check_double_close(label, quantile, test.quantile, 0.0);
+        std::snprintf(label, sizeof(label), "inverse beta dim%d p%.2f cdf", test.dim, test.probability);
+        check_double_close(
+            label,
+            turbovec_regularized_beta_for_test(quantile, test.a, test.a),
+            test.cdf,
+            test.cdf_tolerance);
+    }
+}
+
 void check_tqplus_rust_parity(
         int bits,
         uint64_t expected_codes_hash,
@@ -2384,7 +2528,7 @@ void check_turbovec_mutation_cache_regression(int bits) {
     CHECK(ggml_vec_index_build_ivf(tv, n_lists, 2) == GGML_VEC_INDEX_OK);
     check_ivf_contains(tv, vectors.data(), 8, n_lists, ids[0]);
 
-    CHECK(ggml_vec_index_remove(tv, ids[remove_row]) == 1);
+    CHECK(ggml_vec_index_remove(tv, ids[remove_row]) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_contains(tv, ids[remove_row]) == 0);
     {
         std::array<float, 1> scores{};
@@ -3016,6 +3160,8 @@ int main() {
         check_turbovec_mutation_cache_regression(bit_width);
         check_turbovec_v3_corruption_rejected(bit_width);
     }
+
+    check_turbovec_numeric_helper_parity();
 
     // Rust TurboVec golden parity: generated by tests/turbovec-golden-gen.
     // The small fixtures use Rust's identity TQ+ fallback.
