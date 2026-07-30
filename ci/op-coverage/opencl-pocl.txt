@@ -43,4 +43,5 @@ SET_ROWS type_src=f32 type_dst=q8_0 type_idx=i32
 SET_ROWS type_src=f32 type_dst=q8_0 type_idx=i64
 UPSCALE type=f32 mode=bilinear
 UPSCALE type=f32 mode=bilinear|align_corners
+UPSCALE type=f32 mode=bilinear|antialias
 UPSCALE type=f32 mode=nearest
