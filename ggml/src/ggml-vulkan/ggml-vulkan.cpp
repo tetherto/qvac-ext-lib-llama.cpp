@@ -4475,11 +4475,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // Xe2/Xe3 with coopmat enabled - warptile performance tuning
             l_warptile = { 512, 128, 128, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
-        } else if (device->vendor_id == VK_VENDOR_ID_ARM) {
+        } else if (device->vendor_id == VK_VENDOR_ID_ARM &&
+                   device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
+                   device->properties.limits.maxComputeWorkGroupSize[0] >= 512) {
             // QVAC-21257 iter2: Mali/Valhall (16-wide subgroup, no coopmat). The q8_0 MMQ matmuls
             // dominate the CLIP vision-encode (~65 %, ~90 GFLOPS/s, run #80). The generic large MMQ
             // tile uses only 8 warps/workgroup (block_size 128); widen to a 32-warp shape (block_size
-            // 512, wm=16/wn=32 — the valid 16-wide layout the Intel Xe2 branch uses) to raise GPU
+            // 512, wm=16/wn=32 - the valid 16-wide layout the Intel Xe2 branch uses) to raise GPU
             // occupancy on the dominant matmul path. Falls back automatically (shmem check below) if
             // it doesn't fit. Float MMQ path only (q8_0 goes through mul_mat_q_f16).
             l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
