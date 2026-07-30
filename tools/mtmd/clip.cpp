@@ -4008,13 +4008,14 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         const int n_tokens_per_tile = clip_n_output_tokens(ctx, &imgs.entries[0]);
         const int out_embd          = clip_n_mmproj_embd(ctx);
         const size_t tile_size      = (size_t)n_tokens_per_tile * out_embd;
+        // reused across iterations: same-size tiles, so the buffers are allocated once
+        clip_image_f32_batch single;
+        single.entries.resize(1);
+        single.grid_x = 1;
+        single.grid_y = 1;
+        std::vector<float> single_out;
         for (int b = 0; b < n_batch_cur; b++) {
-            clip_image_f32_batch single;
-            single.entries.push_back(imgs.entries[b]);
-            single.grid_x = 1;
-            single.grid_y = 1;
-
-            std::vector<float> single_out;
+            single.entries[0] = imgs.entries[b];
             if (!out_batch_embd.empty()) {
                 single_out.resize(tile_size);
             }
