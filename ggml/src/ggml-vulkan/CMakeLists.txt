@@ -129,16 +129,6 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    if (TARGET SPIRV-Headers::SPIRV-Headers)
-        # Provides <spirv/unified1/spirv.hpp> on platforms (e.g. Android NDK)
-        # whose Vulkan package does not bundle the SPIRV headers. It is a
-        # header-only dependency needed only to compile ggml-vulkan.cpp, so wrap
-        # it in BUILD_INTERFACE: as a static lib the PRIVATE link would otherwise
-        # leak into the installed ggml-targets export and break downstream
-        # find_package(ggml) on platforms whose Vulkan SDK ships the config
-        # target (e.g. Windows), which never call find_package(SPIRV-Headers).
-        target_link_libraries(ggml-vulkan PRIVATE $<BUILD_INTERFACE:SPIRV-Headers::SPIRV-Headers>)
-    endif()
     target_include_directories(ggml-vulkan
         PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR}
