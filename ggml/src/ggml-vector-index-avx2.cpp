@@ -15,6 +15,15 @@ inline float horizontal_sum(__m256 v) {
     return _mm_cvtss_f32(sum);
 }
 
+inline __m256 cvtepi8_epi32_ps(__m128i bytes) {
+    const __m128i q16 = _mm_srai_epi16(_mm_unpacklo_epi8(bytes, bytes), 8);
+    const __m128i q32_lo = _mm_srai_epi32(_mm_unpacklo_epi16(q16, q16), 16);
+    const __m128i q32_hi = _mm_srai_epi32(_mm_unpackhi_epi16(q16, q16), 16);
+    const __m128 lo = _mm_cvtepi32_ps(q32_lo);
+    const __m128 hi = _mm_cvtepi32_ps(q32_hi);
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(lo), hi, 1);
+}
+
 } // namespace
 
 float dot_q8_avx2(const float * query, const int8_t * codes, float scale, int dim) {
@@ -25,7 +34,7 @@ float dot_q8_avx2(const float * query, const int8_t * codes, float scale, int di
     for (; i + 8 <= dim; i += 8) {
         const __m128i q8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(codes + i));
         const __m256 q = _mm256_mul_ps(
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8)),
+            cvtepi8_epi32_ps(q8),
             scale_v);
         acc_v = _mm256_add_ps(acc_v, _mm256_mul_ps(_mm256_loadu_ps(query + i), q));
     }
@@ -55,10 +64,10 @@ float dot_q4_avx2(const float * query, const uint8_t * codes, float scale, int d
         const __m128i qbytes = _mm_sub_epi8(nibbles, zero_point);
 
         const __m256 q0 = _mm256_mul_ps(
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(qbytes)),
+            cvtepi8_epi32_ps(qbytes),
             scale_v);
         const __m256 q1 = _mm256_mul_ps(
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(qbytes, 8))),
+            cvtepi8_epi32_ps(_mm_srli_si128(qbytes, 8)),
             scale_v);
         acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(query + i), q0));
         acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(query + i + 8), q1));

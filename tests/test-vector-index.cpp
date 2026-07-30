@@ -140,6 +140,171 @@ std::vector<uint8_t> snapshot_bytes(uint32_t                      dim,
     return bytes;
 }
 
+struct RefScore {
+    float    score = 0.0f;
+    uint64_t id    = 0;
+};
+
+bool ref_score_better(const RefScore & a, const RefScore & b) {
+    if (a.score != b.score) {
+        return a.score > b.score;
+    }
+    return a.id < b.id;
+}
+
+int round_nearest_even_ref(float value) {
+    const float lower_f    = std::floor(value);
+    const float upper_f    = lower_f + 1.0f;
+    const float lower_dist = value - lower_f;
+    const float upper_dist = upper_f - value;
+    if (lower_dist < upper_dist) {
+        return static_cast<int>(lower_f);
+    }
+    if (upper_dist < lower_dist) {
+        return static_cast<int>(upper_f);
+    }
+
+    const int lower = static_cast<int>(lower_f);
+    return (lower % 2) == 0 ? lower : static_cast<int>(upper_f);
+}
+
+float quantized_reference_score(const float * vector, const float * query, int dim, int bit_width) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < dim; ++i) {
+        max_abs = std::max(max_abs, std::fabs(vector[i]));
+    }
+
+    const int   max_code = bit_width == 8 ? 127 : 7;
+    const float scale    = max_abs == 0.0f ? 1.0f : max_abs / static_cast<float>(max_code);
+    double      acc      = 0.0;
+    for (int i = 0; i < dim; ++i) {
+        int q = max_abs == 0.0f ? 0 : round_nearest_even_ref(vector[i] / scale);
+        q     = std::max(-max_code, std::min(max_code, q));
+        acc += static_cast<double>(query[i]) * static_cast<double>(q) * static_cast<double>(scale);
+    }
+    return static_cast<float>(acc);
+}
+
+std::vector<RefScore> reference_topk(const std::vector<float> &    vectors,
+                                     const std::vector<uint64_t> & ids,
+                                     const float *                 query,
+                                     int                           dim,
+                                     int                           bit_width,
+                                     int                           k) {
+    std::vector<RefScore> scores;
+    scores.reserve(ids.size());
+    for (size_t row = 0; row < ids.size(); ++row) {
+        scores.push_back({ quantized_reference_score(vectors.data() + row * static_cast<size_t>(dim), query, dim,
+                                                     bit_width),
+                           ids[row] });
+    }
+    std::sort(scores.begin(), scores.end(), ref_score_better);
+    scores.resize(static_cast<size_t>(k));
+    return scores;
+}
+
+void check_quantized_reference(int bit_width) {
+    constexpr int dim = 19;
+    constexpr int n   = 6;
+    constexpr int n_q = 3;
+    constexpr int k   = 4;
+
+    std::vector<float> vectors;
+    vectors.reserve(static_cast<size_t>(n) * dim);
+    for (int row = 0; row < n; ++row) {
+        for (int col = 0; col < dim; ++col) {
+            const float sign = ((row + col) & 1) == 0 ? 1.0f : -1.0f;
+            vectors.push_back(sign * (0.03f * static_cast<float>((row + 1) * (col + 1)) +
+                                      0.01f * static_cast<float>((row * 3 + col) % 7)));
+        }
+    }
+
+    const std::vector<uint64_t> ids = { 7105ULL, 7102ULL, 7109ULL, 7101ULL, 7107ULL, 7103ULL };
+    std::vector<float>          queries;
+    queries.reserve(static_cast<size_t>(n_q) * dim);
+    for (int row = 0; row < n_q; ++row) {
+        for (int col = 0; col < dim; ++col) {
+            const float sign = ((row * 2 + col) & 1) == 0 ? 1.0f : -1.0f;
+            queries.push_back(sign * (0.02f * static_cast<float>((row + 2) * (col + 1)) -
+                                      0.015f * static_cast<float>((row + col) % 5)));
+        }
+    }
+
+    auto * idx = ggml_vec_index_create(dim, bit_width);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+
+    std::vector<float>    out_scores(static_cast<size_t>(n_q) * k);
+    std::vector<uint64_t> out_ids(static_cast<size_t>(n_q) * k);
+    CHECK(ggml_vec_index_search(idx, queries.data(), n_q, k, out_scores.data(), out_ids.data()) ==
+          GGML_VEC_INDEX_OK);
+
+    const float tolerance = bit_width == 8 ? 1e-4f : 2e-4f;
+    for (int q = 0; q < n_q; ++q) {
+        const auto expected = reference_topk(vectors, ids, queries.data() + static_cast<size_t>(q) * dim, dim,
+                                            bit_width, k);
+        for (int j = 0; j < k; ++j) {
+            const size_t offset = static_cast<size_t>(q) * k + static_cast<size_t>(j);
+            CHECK(out_ids[offset] == expected[static_cast<size_t>(j)].id);
+            const float limit = tolerance * std::max(1.0f, std::fabs(expected[static_cast<size_t>(j)].score));
+            CHECK(std::fabs(out_scores[offset] - expected[static_cast<size_t>(j)].score) <= limit);
+        }
+    }
+
+    ggml_vec_index_free(idx);
+}
+
+void check_ivf_full_probe_recall(int bit_width) {
+    constexpr int dim     = 6;
+    constexpr int n       = 12;
+    constexpr int n_q     = 4;
+    constexpr int k       = 3;
+    constexpr int n_lists = 4;
+
+    std::vector<float> vectors;
+    vectors.reserve(static_cast<size_t>(n) * dim);
+    std::vector<uint64_t> ids;
+    ids.reserve(n);
+    for (int row = 0; row < n; ++row) {
+        const int cluster = row % n_lists;
+        ids.push_back(8200ULL + static_cast<uint64_t>(row));
+        for (int col = 0; col < dim; ++col) {
+            const float base = col == cluster ? 1.0f : 0.05f * static_cast<float>((row + col) % 3);
+            vectors.push_back(base + 0.01f * static_cast<float>(row + 1));
+        }
+    }
+
+    std::vector<float> queries;
+    queries.reserve(static_cast<size_t>(n_q) * dim);
+    for (int q = 0; q < n_q; ++q) {
+        for (int col = 0; col < dim; ++col) {
+            queries.push_back(col == q ? 1.0f : 0.02f * static_cast<float>((q + col) % 4));
+        }
+    }
+
+    auto * idx = ggml_vec_index_create(dim, bit_width);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+
+    std::vector<float>    exact_scores(static_cast<size_t>(n_q) * k);
+    std::vector<uint64_t> exact_ids(static_cast<size_t>(n_q) * k);
+    std::vector<float>    ivf_scores(static_cast<size_t>(n_q) * k);
+    std::vector<uint64_t> ivf_ids(static_cast<size_t>(n_q) * k);
+
+    CHECK(ggml_vec_index_search(idx, queries.data(), n_q, k, exact_scores.data(), exact_ids.data()) ==
+          GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_build_ivf(idx, n_lists, 2) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, queries.data(), n_q, k, n_lists, ivf_scores.data(), ivf_ids.data()) ==
+          GGML_VEC_INDEX_OK);
+
+    for (size_t i = 0; i < exact_ids.size(); ++i) {
+        CHECK(ivf_ids[i] == exact_ids[i]);
+        CHECK(std::fabs(ivf_scores[i] - exact_scores[i]) <= 1e-5f * std::max(1.0f, std::fabs(exact_scores[i])));
+    }
+
+    ggml_vec_index_free(idx);
+}
+
 }  // namespace
 
 int main() {
@@ -740,6 +905,13 @@ int main() {
         CHECK(ggml_vec_index_search(qidx, seeds[0].data(), 1, 1, q_scores.data(), q_ids.data()) == GGML_VEC_INDEX_OK);
         CHECK(q_ids[0] != ids[0]);
         ggml_vec_index_free(qidx);
+    }
+
+    check_quantized_reference(8);
+    check_quantized_reference(4);
+
+    for (int bit_width : { 32, 8, 4 }) {
+        check_ivf_full_probe_recall(bit_width);
     }
 
     // Malformed snapshots are rejected before allocating from untrusted counts.
