@@ -21,6 +21,19 @@ constexpr int kTurboVecScoreBlock = 32;
 constexpr int kTurboVecFlushEvery = 256;
 #endif
 constexpr uint64_t kTurboVecRotationSeed = 42;
+constexpr int kTurboVecZigguratLayers = 256;
+constexpr int kTurboVecZigguratTableSize = kTurboVecZigguratLayers + 1;
+constexpr uint64_t kTurboVecZigguratLayerMask = 0xff;
+constexpr int kTurboVecZigguratFloatShift = 12;
+constexpr int kTurboVecF64MantissaBits = 52;
+constexpr uint64_t kTurboVecF64ExponentBias = 1023;
+constexpr uint64_t kTurboVecF64Open01Exponent = kTurboVecF64ExponentBias;
+constexpr uint64_t kTurboVecF64SymmetricExponent = kTurboVecF64ExponentBias + 1;
+constexpr double kTurboVecNormalPdfExponent = -0.5;
+constexpr double kTurboVecZigNormX0 = 3.910757959537090045;
+constexpr double kTurboVecZigNormR = 3.654152885361008796;
+constexpr int kStatrsRegularizedBetaIterations = 141;
+constexpr int kStatrsContinuousCdfInverseIterations = 16;
 
 struct TurboVecCodebook {
     std::vector<float> boundaries;
@@ -124,8 +137,10 @@ static uint64_t chacha8_next_u64(ChaCha8 & rng) {
 }
 
 static double chacha8_open01(ChaCha8 & rng) {
-    const uint64_t fraction = chacha8_next_u64(rng) >> 12;
-    uint64_t bits = fraction | (UINT64_C(1023) << 52);
+    // Use 52 high bits as an f64 mantissa, set exponent 1023 to build [1, 2),
+    // then subtract 1 - eps/2 to match rand::distributions::Open01.
+    const uint64_t fraction = chacha8_next_u64(rng) >> kTurboVecZigguratFloatShift;
+    const uint64_t bits = fraction | (kTurboVecF64Open01Exponent << kTurboVecF64MantissaBits);
     double value = 0.0;
     std::memcpy(&value, &bits, sizeof(value));
     return value - (1.0 - std::numeric_limits<double>::epsilon() * 0.5);
@@ -137,49 +152,57 @@ static double chacha8_standard_f64(ChaCha8 & rng) {
 }
 
 struct TurboVecNormalTables {
-    double x[257] = {};
-    double f[257] = {};
+    double x[kTurboVecZigguratTableSize] = {};
+    double f[kTurboVecZigguratTableSize] = {};
 };
 
-static const TurboVecNormalTables & turbovec_normal_tables() {
+// Rust turbovec v0.9.0 builds the dense QR rotation from
+// rand_distr::StandardNormal. rand_distr 0.4.3 implements StandardNormal with
+// the ZIGNOR variant of the Ziggurat method from Doornik 2005:
+// https://docs.rs/rand_distr/0.4.3/src/rand_distr/normal.rs.html
+// https://docs.rs/rand_distr/0.4.3/src/rand_distr/utils.rs.html
+// https://docs.rs/rand_distr/0.4.3/src/rand_distr/ziggurat_tables.rs.html
+static const TurboVecNormalTables & ziggurat_standard_normal_tables() {
     static const TurboVecNormalTables tables = []() {
         TurboVecNormalTables out;
-        constexpr double x0 = 3.910757959537090045;
-        constexpr double r = 3.654152885361008796;
-        const double area = x0 * std::exp(-0.5 * r * r);
-        out.x[0] = x0;
-        out.x[1] = r;
-        for (int i = 1; i < 256; ++i) {
-            const double density = std::exp(-0.5 * out.x[i] * out.x[i]);
+        const double area =
+            kTurboVecZigNormX0 * std::exp(kTurboVecNormalPdfExponent * kTurboVecZigNormR * kTurboVecZigNormR);
+        out.x[0] = kTurboVecZigNormX0;
+        out.x[1] = kTurboVecZigNormR;
+        for (int i = 1; i < kTurboVecZigguratLayers; ++i) {
+            const double density = std::exp(kTurboVecNormalPdfExponent * out.x[i] * out.x[i]);
             out.x[i + 1] = std::sqrt(-2.0 * std::log(area / out.x[i] + density));
         }
-        out.x[256] = 0.0;
-        for (int i = 0; i < 257; ++i) {
-            out.f[i] = std::exp(-0.5 * out.x[i] * out.x[i]);
+        out.x[kTurboVecZigguratLayers] = 0.0;
+        for (int i = 0; i < kTurboVecZigguratTableSize; ++i) {
+            out.f[i] = std::exp(kTurboVecNormalPdfExponent * out.x[i] * out.x[i]);
         }
         return out;
     }();
     return tables;
 }
 
-static double chacha8_normal_tail(ChaCha8 & rng, double u) {
-    constexpr double r = 3.654152885361008796;
+static double sample_standard_normal_ziggurat_tail(ChaCha8 & rng, double u) {
     double x = 1.0;
     double y = 0.0;
     while (-2.0 * y < x * x) {
-        x = std::log(chacha8_open01(rng)) / r;
+        x = std::log(chacha8_open01(rng)) / kTurboVecZigNormR;
         y = std::log(chacha8_open01(rng));
     }
-    return u < 0.0 ? x - r : r - x;
+    return u < 0.0 ? x - kTurboVecZigNormR : kTurboVecZigNormR - x;
 }
 
-static double chacha8_standard_normal(ChaCha8 & rng) {
-    const TurboVecNormalTables & tables = turbovec_normal_tables();
+static double sample_standard_normal_ziggurat(ChaCha8 & rng) {
+    const TurboVecNormalTables & tables = ziggurat_standard_normal_tables();
     for (;;) {
         const uint64_t bits = chacha8_next_u64(rng);
-        const int index = static_cast<int>(bits & 0xff);
-        const uint64_t fraction = bits >> 12;
-        uint64_t float_bits = fraction | (UINT64_C(1024) << 52);
+        const int index = static_cast<int>(bits & kTurboVecZigguratLayerMask);
+        // The low 8 bits choose one of 256 Ziggurat layers. Dropping 12 bits
+        // leaves 52 mantissa bits; exponent 1024 builds [2, 4), minus 3.0
+        // gives the symmetric [-1, 1) variate used by rand_distr::ziggurat.
+        const uint64_t fraction = bits >> kTurboVecZigguratFloatShift;
+        const uint64_t float_bits =
+            fraction | (kTurboVecF64SymmetricExponent << kTurboVecF64MantissaBits);
         double u = 0.0;
         std::memcpy(&u, &float_bits, sizeof(u));
         u -= 3.0;
@@ -188,9 +211,9 @@ static double chacha8_standard_normal(ChaCha8 & rng) {
             return x;
         }
         if (index == 0) {
-            return chacha8_normal_tail(rng, u);
+            return sample_standard_normal_ziggurat_tail(rng, u);
         }
-        const double density = std::exp(-0.5 * x * x);
+        const double density = std::exp(kTurboVecNormalPdfExponent * x * x);
         if (tables.f[index + 1] +
                 (tables.f[index] - tables.f[index + 1]) * chacha8_standard_f64(rng) <
             density) {
@@ -208,7 +231,7 @@ static std::vector<float> make_turbovec_rotation(int dim) {
     for (int column = 0; column < dim; ++column) {
         for (int row = 0; row < dim; ++row) {
             matrix[static_cast<size_t>(row) * dim_sz + static_cast<size_t>(column)] =
-                chacha8_standard_normal(rng);
+                sample_standard_normal_ziggurat(rng);
         }
     }
 
@@ -399,6 +422,11 @@ static float float_score_from_double_local(double score) {
     return static_cast<float>(score);
 }
 
+// Local subset of statrs 0.17.1 used by Rust turbovec v0.9.0 through
+// statrs::distribution::Beta. These helpers derive TQ+ theoretical quantiles
+// and Lloyd-Max codebooks; they do not sample rotation vectors.
+// https://docs.rs/statrs/0.17.1/src/statrs/function/gamma.rs.html
+// https://docs.rs/statrs/0.17.1/src/statrs/function/beta.rs.html
 static double statrs_ln_gamma(double x) {
     static constexpr double coefficients[] = {
         2.48574089138753565546e-5,
@@ -459,6 +487,8 @@ static double regularized_beta(double x, double a, double b) {
         return 1.0;
     }
 
+    // Matches statrs::function::beta::checked_beta_reg: modified Lentz
+    // continued fraction with the statrs f64 precision and 1..141 cap.
     constexpr double eps = 0.00000000000000011102230246251565;
     constexpr double fpmin = std::numeric_limits<double>::min() / eps;
     const double bt = std::exp(
@@ -481,7 +511,7 @@ static double regularized_beta(double x, double a, double b) {
     d = 1.0 / d;
     double h = d;
 
-    for (int m_integer = 1; m_integer < 141; ++m_integer) {
+    for (int m_integer = 1; m_integer < kStatrsRegularizedBetaIterations; ++m_integer) {
         const double m = static_cast<double>(m_integer);
         const double m2 = m * 2.0;
         double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
@@ -518,7 +548,10 @@ static double regularized_beta(double x, double a, double b) {
 static double inverse_regularized_beta(double probability, double a) {
     double lo = -2.0;
     double hi = 2.0;
-    for (int iteration = 0; iteration < 16; ++iteration) {
+    // Rust's Beta distribution does not specialize inverse_cdf in statrs 0.17.1,
+    // so ContinuousCDF::inverse_cdf uses this 16-step domain bisection.
+    // https://docs.rs/statrs/0.17.1/src/statrs/distribution/mod.rs.html
+    for (int iteration = 0; iteration < kStatrsContinuousCdfInverseIterations; ++iteration) {
         const double mid = (lo + hi) * 0.5;
         const double cdf = mid <= 0.0 ? 0.0 :
             mid >= 1.0 ? 1.0 :
@@ -875,6 +908,51 @@ void turbovec_release_rotation(int dim) noexcept {
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
+static uint64_t turbovec_fnv1a_quantized_double_for_test(uint64_t hash, double value) {
+    const int64_t quantized = static_cast<int64_t>(std::llround(value * 1.0e12));
+    uint64_t bits = 0;
+    std::memcpy(&bits, &quantized, sizeof(bits));
+    for (int byte = 0; byte < 8; ++byte) {
+        hash ^= static_cast<uint8_t>(bits >> (byte * 8));
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+uint64_t turbovec_ziggurat_table_hash_for_test(void) {
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    const TurboVecNormalTables & tables = ziggurat_standard_normal_tables();
+    for (int i = 0; i < kTurboVecZigguratTableSize; ++i) {
+        hash = turbovec_fnv1a_quantized_double_for_test(hash, tables.x[i]);
+    }
+    for (int i = 0; i < kTurboVecZigguratTableSize; ++i) {
+        hash = turbovec_fnv1a_quantized_double_for_test(hash, tables.f[i]);
+    }
+    return hash;
+}
+
+double turbovec_ziggurat_x_for_test(int index) {
+    if (index < 0 || index >= kTurboVecZigguratTableSize) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return ziggurat_standard_normal_tables().x[index];
+}
+
+double turbovec_ziggurat_f_for_test(int index) {
+    if (index < 0 || index >= kTurboVecZigguratTableSize) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return ziggurat_standard_normal_tables().f[index];
+}
+
+double turbovec_regularized_beta_for_test(double x, double a, double b) {
+    return regularized_beta(x, a, b);
+}
+
+double turbovec_inverse_regularized_beta_for_test(double probability, double a) {
+    return inverse_regularized_beta(probability, a);
+}
+
 size_t turbovec_rotation_cache_bytes_for_test(void) {
     try {
         std::lock_guard<std::mutex> lock(turbovec_rotation_cache_mutex());
@@ -1340,6 +1418,9 @@ void quantize_turbovec_batch(
         if (n >= 1000) {
             constexpr double p_lo = 0.05;
             constexpr double p_hi = 0.95;
+            // TQ+ maps empirical per-coordinate 5/95% quantiles onto the
+            // canonical Beta((dim - 1) / 2, (dim - 1) / 2) marginal used by
+            // Rust turbovec v0.9.0 before Lloyd-Max quantization.
             const double beta_a = (static_cast<double>(dim) - 1.0) * 0.5;
             const float canonical_lo =
                 static_cast<float>(2.0 * inverse_regularized_beta(p_lo, beta_a) - 1.0);
