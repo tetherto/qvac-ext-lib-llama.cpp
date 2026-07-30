@@ -1,4 +1,5 @@
 include(CheckCXXCompilerFlag)
+include(CheckCXXSourceCompiles)
 include("../cmake/common.cmake")
 
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
@@ -269,6 +270,21 @@ if (GGML_VECTOR_INDEX)
         ${GGML_VECTOR_INDEX_IMPL_SOURCES})
 
     set(GGML_VECTOR_INDEX_AVX2_FLAG "")
+    set(GGML_VECTOR_INDEX_AVX2_CHECK_SOURCE [=[
+        #include <immintrin.h>
+        int main() {
+            const __m128i bytes = _mm_set1_epi8(-1);
+            const __m128i q16 = _mm_srai_epi16(_mm_unpacklo_epi8(bytes, bytes), 8);
+            const __m128i q32_lo = _mm_srai_epi32(_mm_unpacklo_epi16(q16, q16), 16);
+            const __m128i q32_hi = _mm_srai_epi32(_mm_unpackhi_epi16(q16, q16), 16);
+            const __m128 lo = _mm_cvtepi32_ps(q32_lo);
+            const __m128 hi = _mm_cvtepi32_ps(q32_hi);
+            const __m256 q = _mm256_insertf128_ps(_mm256_castps128_ps256(lo), hi, 1);
+            alignas(32) float out[8];
+            _mm256_store_ps(out, q);
+            return out[0] == -1.0f ? 0 : 1;
+        }
+    ]=])
     # GGML_NATIVE applies architecture flags only to the CPU backend target.
     # Build this AVX2 object separately and keep runtime dispatch in the baseline TU.
     if ((GGML_AVX2 OR GGML_NATIVE) AND GGML_SYSTEM_ARCH STREQUAL "x86")
@@ -282,6 +298,17 @@ if (GGML_VECTOR_INDEX)
             if (GGML_VECTOR_INDEX_SUPPORTS_AVX2)
                 set(GGML_VECTOR_INDEX_AVX2_FLAG "-mavx2")
             endif()
+        endif()
+    endif()
+    if (GGML_VECTOR_INDEX_AVX2_FLAG)
+        set(CMAKE_REQUIRED_FLAGS_SAVE ${CMAKE_REQUIRED_FLAGS})
+        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${GGML_VECTOR_INDEX_AVX2_FLAG}")
+        check_cxx_source_compiles(
+            "${GGML_VECTOR_INDEX_AVX2_CHECK_SOURCE}"
+            GGML_VECTOR_INDEX_SUPPORTS_AVX2_KERNEL)
+        set(CMAKE_REQUIRED_FLAGS ${CMAKE_REQUIRED_FLAGS_SAVE})
+        if (NOT GGML_VECTOR_INDEX_SUPPORTS_AVX2_KERNEL)
+            set(GGML_VECTOR_INDEX_AVX2_FLAG "")
         endif()
     endif()
 
