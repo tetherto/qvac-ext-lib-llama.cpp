@@ -192,8 +192,8 @@ inline double dot_q8_neon(const float * query, const int8_t * codes, float scale
 
     double acc = horizontal_sum(acc0) + horizontal_sum(acc1) + horizontal_sum(acc2) + horizontal_sum(acc3);
     for (; i < dim; ++i) {
-        const float value = static_cast<float>(codes[i]) * scale;
-        acc += query[i] * value;
+        const double value = static_cast<double>(codes[i]) * static_cast<double>(scale);
+        acc += static_cast<double>(query[i]) * value;
     }
     return acc;
 }
@@ -233,8 +233,8 @@ inline double dot_q4_neon(const float * query, const uint8_t * codes, float scal
         const uint8_t nibble = (i & 1) == 0 ?
             static_cast<uint8_t>(byte & 0x0f) :
             static_cast<uint8_t>(byte >> 4);
-        const float value = static_cast<float>(q4_decode(nibble)) * scale;
-        acc += query[i] * value;
+        const double value = static_cast<double>(q4_decode(nibble)) * static_cast<double>(scale);
+        acc += static_cast<double>(query[i]) * value;
     }
     return acc;
 }
