@@ -37,9 +37,10 @@ public:
     void read(void * dst, size_t size) { read_to(dst, size); }
 
     // qvac: kv-cache/memory state-deserialization callers still rely on the
-    // tensor convenience that upstream b9341 dropped. Implement it on top of
-    // read() so concrete readers (buffer/file) don't need to change.
-    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size);
+    // tensor convenience that upstream b9341 dropped. The base implements it on
+    // top of read(); the host/device readers (added upstream after b9341)
+    // override it to batch the backend copies, so it must stay virtual.
+    virtual void read_tensor(ggml_tensor * tensor, size_t offset, size_t size);
 
     // bytes read so far
     virtual size_t n_bytes() = 0;

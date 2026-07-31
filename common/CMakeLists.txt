@@ -1,8 +1,10 @@
-# common
-
 find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
+
+#
+# llama-common-base
+#
 
 # Build info header
 
@@ -33,56 +35,61 @@ endif()
 
 set(TEMPLATE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/build-info.cpp.in")
 set(OUTPUT_FILE   "${CMAKE_CURRENT_BINARY_DIR}/build-info.cpp")
+
 configure_file(${TEMPLATE_FILE} ${OUTPUT_FILE})
 
-set(TARGET build_info)
-add_library(${TARGET} OBJECT ${OUTPUT_FILE})
+set(TARGET llama-common-base)
+add_library(${TARGET} STATIC ${OUTPUT_FILE})
+
+target_include_directories(${TARGET} PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}/common>)
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
-# qvac: the generated build-info.cpp lives under ${CMAKE_CURRENT_BINARY_DIR}, so
-# CMake didn't pick up the sibling build-info.h from the source tree without an
-# explicit include path. The rebase onto upstream b9341 dropped these.
-target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-set(TARGET common)
+#
+# llama-common
+#
+
+set(TARGET llama-common)
 
 set(${TARGET}_HEADERS
-  arg.h
-  base64.hpp
-  chat-auto-parser.h
-  chat-peg-parser.h
-  chat.h
-  common.h
-  console.h
-  debug.h
-  download.h
-  fit.h   # qvac: declarations for the fit helpers (memory_breakdown_print, get_device_memory_data)
-  hf-cache.h
-  http.h
-  json-partial.h
-  json-schema-to-grammar.h
-  log.h
-  ngram-cache.h
-  ngram-map.h
-  ngram-mod.h
-  peg-parser.h
-  preset.h
-  reasoning-budget.h
-  regex-partial.h
-  sampling.h
-  speculative.h
-  unicode.h
+    arg.h
+    base64.hpp
+    chat-auto-parser.h
+    chat-peg-parser.h
+    chat.h
+    common.h
+    console.h
+    debug.h
+    download.h
+    fit.h   # qvac: declarations for the fit helpers (memory_breakdown_print, get_device_memory_data)
+    hf-cache.h
+    http.h
+    imatrix-loader.h
+    json-schema-to-grammar.h
+    log.h
+    ngram-cache.h
+    ngram-map.h
+    ngram-mod.h
+    peg-parser.h
+    preset.h
+    reasoning-budget.h
+    sampling.h
+    speculative.h
+    unicode.h
 )
 
 set(${TARGET}_JINJA_HEADERS
-  jinja/caps.h
-  jinja/lexer.h
-  jinja/parser.h
-  jinja/runtime.h
-  jinja/string.h
-  jinja/utils.h
-  jinja/value.h
+    jinja/caps.h
+    jinja/lexer.h
+    jinja/parser.h
+    jinja/runtime.h
+    jinja/string.h
+    jinja/utils.h
+    jinja/value.h
 )
 
 list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
@@ -99,9 +106,9 @@ add_library(${TARGET} STATIC
     console.cpp
     debug.cpp
     download.cpp
-    fit.cpp   # qvac: common_memory_breakdown_print / common_get_device_memory_data live here; was missing from this list after the rebase
+    fit.cpp
     hf-cache.cpp
-    json-partial.cpp
+    imatrix-loader.cpp
     json-schema-to-grammar.cpp
     llguidance.cpp
     log.cpp
@@ -110,7 +117,6 @@ add_library(${TARGET} STATIC
     ngram-mod.cpp
     peg-parser.cpp
     preset.cpp
-    regex-partial.cpp
     reasoning-budget.cpp
     sampling.cpp
     speculative.cpp
@@ -125,18 +131,25 @@ add_library(${TARGET} STATIC
     ${${TARGET}_JINJA_HEADERS}
     )
 
+set_target_properties(${TARGET} PROPERTIES
+    VERSION ${LLAMA_INSTALL_VERSION}
+    SOVERSION 0
+    MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+)
+
 set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${${TARGET}_HEADERS}")
 install(FILES ${${TARGET}_JINJA_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llama/common/jinja)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    # TODO: make fine-grained exports in the future
+    set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
-target_link_libraries(${TARGET} PRIVATE
-    build_info
-    cpp-httplib
-)
+target_link_libraries(${TARGET} PUBLIC  llama-common-base)
+target_link_libraries(${TARGET} PRIVATE cpp-httplib)
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)
@@ -164,12 +177,11 @@ if (LLAMA_LLGUIDANCE)
     add_dependencies(llguidance llguidance_ext)
 
     target_include_directories(${TARGET} PRIVATE ${LLGUIDANCE_PATH})
-    # Add platform libraries to the main target
-    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} llguidance)
+    target_link_libraries(${TARGET} PRIVATE llguidance)
     if (WIN32)
-        set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ws2_32 userenv ntdll bcrypt)
+        target_link_libraries(${TARGET} PRIVATE ws2_32 userenv ntdll bcrypt)
     endif()
-endif ()
+endif()
 
 target_include_directories(
   ${TARGET}

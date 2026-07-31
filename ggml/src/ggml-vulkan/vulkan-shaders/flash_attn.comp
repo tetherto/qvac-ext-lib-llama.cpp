@@ -21,7 +21,11 @@
 #extension GL_KHR_shader_subgroup_vote : enable
 
 #include "types.glsl"
+#include "dot_product_funcs.glsl"
 #include "flash_attn_base.glsl"
+#ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
+#include "flash_attn_dequant.glsl"
+#endif
 
 const uint32_t HSK_per_thread = HSK / D_split;
 const uint32_t HSV_per_thread = HSV / D_split;
@@ -76,50 +80,7 @@ shared vec4 occupancy_limiter[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM 
 #include "flash_attn_mmq_funcs.glsl"
 #endif
 
-#ifdef HAS_QJL_CORRECTION
-shared float Qf_qjl_proj[Br][QUANT_K];
-
-void qjl_project_q_block(uint32_t q_offset, uint32_t qjl_block_start, uint32_t tid) {
-    // Pre-compute QJL projection of one K block of Q:
-    // proj_q = FHT(D_qjl * q[qjl_block_start:qjl_block_start+QUANT_K]).
-    //
-    // Read Q straight from the input SSBO (data_qv4). The alternative is to
-    // read the already-loaded Qf shared array and divide by p.scale to undo
-    // the p.scale that was multiplied into Qf for the main Q·K dot. For the
-    // scalar FA path Qf is f32 and p.scale is usually a power of two
-    // (1/sqrt(head_dim)), so the round-trip is mathematically exact; for
-    // the coopmat1 path Qf is f16, which makes the round-trip lossy for
-    // large-magnitude activations. Reading the raw f32 Q directly avoids
-    // both issues and matches what the non-FA mul_mm_tbq_qjl_correction pass
-    // does with src1.
-    [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
-        if (i * Br + r < N) {
-            for (uint32_t idx = tid; idx < QUANT_K; idx += gl_WorkGroupSize.x) {
-                vec4 qv = vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + (qjl_block_start + idx) / 4]);
-                float q_val = qv[idx % 4];
-                Qf_qjl_proj[r][idx] = q_val * qjl_get_sign(idx);
-            }
-        }
-        barrier();
-
-        if (i * Br + r < N) {
-            for (uint h = 1u; h < QUANT_K; h <<= 1u) {
-                for (uint idx = tid; idx < QUANT_K / 2u; idx += gl_WorkGroupSize.x) {
-                    uint grp = idx / h;
-                    uint pos = idx % h;
-                    uint j = grp * (h << 1u) + pos;
-                    float a = Qf_qjl_proj[r][j];
-                    float b = Qf_qjl_proj[r][j + h];
-                    Qf_qjl_proj[r][j]     = a + b;
-                    Qf_qjl_proj[r][j + h] = a - b;
-                }
-                barrier();
-            }
-        }
-        barrier();
-    }
-}
-#endif
+#include "turbo-quant/flash_attn.glsl"
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -173,18 +134,28 @@ void main() {
 
         Qf[buf_ib].qs[buf_iqs] = pack32(i8vec4(vals));
 
-#if defined(DATA_A_Q8_0) || defined(DATA_A_IQ4_NL)
-        if (buf_iqs == 0) {
-            Qf[buf_ib].ds = FLOAT_TYPEV2(qd, 0.0);
-        }
+#ifdef LLAMA_UPSTREAM_FA_MIXED_TYPES
+    #define IS_FA_TYPE_Q8_0 (FaTypeK == FA_TYPE_Q8_0)
+#elif defined(DATA_A_Q8_0) || defined(DATA_A_IQ4_NL)
+    #define IS_FA_TYPE_Q8_0 true
 #else // Q4_0, Q4_1, Q5_0, Q5_1
-        const FLOAT_TYPE thread_sum = vals.x + vals.y + vals.z + vals.w;
-        const FLOAT_TYPE sum = subgroupClusteredAdd(thread_sum, 8);
-
-        if (buf_iqs == 0) {
-            Qf[buf_ib].ds = FLOAT_TYPEV2(qd, sum * qd);
-        }
+    #define IS_FA_TYPE_Q8_0 false
 #endif
+
+        // Q8_0 K only needs (qd, _); the asymmetric Q4_*/Q5_* family also stores
+        // the row-sum scaled by qd, used in k_dot_correction.
+        if (IS_FA_TYPE_Q8_0) {
+            if (buf_iqs == 0) {
+                Qf[buf_ib].ds = FLOAT_TYPEV2(qd, 0.0);
+            }
+        } else {
+            const FLOAT_TYPE thread_sum = vals.x + vals.y + vals.z + vals.w;
+            const FLOAT_TYPE sum = subgroupClusteredAdd(thread_sum, 8);
+
+            if (buf_iqs == 0) {
+                Qf[buf_ib].ds = FLOAT_TYPEV2(qd, sum * qd);
+            }
+        }
 #endif
     }
     barrier();
@@ -222,21 +193,9 @@ void main() {
     // mo_offset will point to the tile starting at row i*Br and col 0
     uint32_t mo_offset = mo_stride * i;
 
-#if K_BLOCK_SIZE > 1
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / K_BLOCK_BYTE_SIZE;
-#elif BLOCK_SIZE > 1
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
-#else
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
-#endif
-
-#if V_BLOCK_SIZE > 1
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / V_BLOCK_BYTE_SIZE;
-#elif BLOCK_SIZE > 1
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
-#else
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
-#endif
+    // FaBlockBytesK/V == 2 for f16, 16 for f32, ggml block byte size for quants.
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FA_BLOCK_BYTES_K;
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / FA_BLOCK_BYTES_V;
     uint32_t m_offset = gqa_iq1*KV;
     if (p.nem2 != 1 || p.nem3 != 1) {
         m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
@@ -310,19 +269,14 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSK / 4 || c < Bc) {
                     FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
-#if K_BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * k_stride * K_BLOCK_SIZE + 4 * d;
-                        uint ib = coord / K_BLOCK_SIZE;
-                        uint iqs = (coord % K_BLOCK_SIZE);
-                        K_Tf = FLOAT_TYPEV4(dequantize4_k(ib, iqs, k_offset));
-#elif BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE + 4 * d;
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
-                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
-#else
-                        K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
-#endif
+                        if (USE_DECODE_K) {
+                            uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE_K + 4 * d;
+                            uint ib = coord / BLOCK_SIZE_K;
+                            uint iqs = (coord % BLOCK_SIZE_K);
+                            K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+                        } else {
+                            K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
+                        }
                     }
 
                     kvsh[c * kvsh_stride + d] = K_Tf;
@@ -368,23 +322,16 @@ void main() {
                     FLOAT_TYPEV4 K_Tf;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
-                    } else {
-#if K_BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / K_BLOCK_SIZE;
-                        uint iqs = (coord % K_BLOCK_SIZE);
-                        K_Tf = FLOAT_TYPEV4(dequantize4_k(ib, iqs, k_offset));
-#elif BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
+                    } else if (USE_DECODE_K) {
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE_K + 4 * (d * D_split + d_tid);
+                        uint ib = coord / BLOCK_SIZE_K;
+                        uint iqs = (coord % BLOCK_SIZE_K);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
-#else
+                    } else {
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
-#endif
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                        Sf[r][c] += dot(ACC_TYPEV4(Q_cache[r]), ACC_TYPEV4(K_Tf));
+                        Sf[r][c] = dot_product(Q_cache[r], K_Tf, Sf[r][c]);
                     }
                 }
             }
@@ -435,23 +382,16 @@ void main() {
                     FLOAT_TYPEV4 K_Tf;
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
-                    } else {
-#if K_BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / K_BLOCK_SIZE;
-                        uint iqs = (coord % K_BLOCK_SIZE);
-                        K_Tf = FLOAT_TYPEV4(dequantize4_k(ib, iqs, k_offset));
-#elif BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
+                    } else if (USE_DECODE_K) {
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE_K + 4 * (d * D_split + d_tid);
+                        uint ib = coord / BLOCK_SIZE_K;
+                        uint iqs = (coord % BLOCK_SIZE_K);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
-#else
+                    } else {
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
-#endif
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                        Sf[r][c] += dot(ACC_TYPEV4(Qf[tile_row(r) * qf_stride + d * D_split + d_tid]), ACC_TYPEV4(K_Tf));
+                        Sf[r][c] = dot_product(Qf[tile_row(r) * qf_stride + d * D_split + d_tid], K_Tf, Sf[r][c]);
                     }
                 }
             }
@@ -624,6 +564,7 @@ void main() {
                 }
                 rowmaxf = max(rowmaxf, float(Sf[r][c]));
             }
+            rowmaxf += FATTN_KQ_MAX_OFFSET;
             float Moldf = Mf[r];
 
             // M = max(rowmax, Mold)
@@ -648,19 +589,14 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
-#if V_BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * v_stride * V_BLOCK_SIZE + 4 * d;
-                        uint ib = coord / V_BLOCK_SIZE;
-                        uint iqs = (coord % V_BLOCK_SIZE);
-                        V_Tf = FLOAT_TYPEV4(dequantize4_v(ib, iqs, v_offset));
-#elif BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
-                        V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-#else
-                        V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
-#endif
+                        if (USE_DECODE_V) {
+                            uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
+                            uint ib = coord / BLOCK_SIZE_V;
+                            uint iqs = (coord % BLOCK_SIZE_V);
+                            V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+                        } else {
+                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
+                        }
                     }
 
                     kvsh[c * kvsh_stride + d] = V_Tf;
@@ -684,20 +620,13 @@ void main() {
                 FLOAT_TYPEV4 Vf;
                 if (SHMEM_STAGING != 0) {
                     Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
-                } else {
-#if V_BLOCK_SIZE > 1
-                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * V_BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                    uint ib = coord / V_BLOCK_SIZE;
-                    uint iqs = (coord % V_BLOCK_SIZE);
-                    Vf = FLOAT_TYPEV4(dequantize4_v(ib, iqs, v_offset));
-#elif BLOCK_SIZE > 1
-                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                    uint ib = coord / BLOCK_SIZE;
-                    uint iqs = (coord % BLOCK_SIZE);
+                } else if (USE_DECODE_V) {
+                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE_V + 4 * (d * D_split + d_tid);
+                    uint ib = coord / BLOCK_SIZE_V;
+                    uint iqs = (coord % BLOCK_SIZE_V);
                     Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-#else
+                } else {
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
-#endif
                 }
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                     Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);

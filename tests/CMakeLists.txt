@@ -10,7 +10,7 @@ function(llama_build source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
-    target_link_libraries(${TEST_TARGET} PRIVATE common llama-common-test)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common llama-common-test)
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
@@ -105,7 +105,7 @@ function(llama_build_and_test source)
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
-    target_link_libraries(${TEST_TARGET} PRIVATE common llama-common-test)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama-common llama-common-test)
 
     add_test(
         NAME ${TEST_TARGET}
@@ -131,6 +131,7 @@ llama_test(test-tokenizer-0 NAME test-tokenizer-0-llama-spm         ARGS ${PROJE
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-mpt               ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-mpt.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-phi-3             ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-phi-3.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen2             ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen35            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
 
@@ -154,15 +155,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
-    llama_build_and_test(test-chat.cpp
-        ${PROJECT_SOURCE_DIR}/tools/server/server-chat.cpp
-        ${PROJECT_SOURCE_DIR}/tools/server/server-common.cpp
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-    # qvac: test-chat transitively includes server-common.h which #include "mtmd.h",
-    # and references server_chat_convert_responses_to_chatcmpl from server-chat.cpp
-    # plus get_media_marker from server-common.cpp.
-    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
-    target_link_libraries(test-chat PRIVATE mtmd)
+    llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-chat PRIVATE server-context)
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -208,7 +203,6 @@ llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
-llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
@@ -221,7 +215,6 @@ llama_build_and_test(
     peg-parser/test-unicode.cpp
     peg-parser/tests.h
 )
-llama_build_and_test(test-regex-partial.cpp)
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
@@ -255,11 +248,18 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
-# Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with
-# different GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's
-# cross-subgroup stitch path on hardware that only exposes one native
-# subgroup size. Auto-skips when no GPU backend is available.
+# Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
+# GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
+# path on hardware that only exposes one native subgroup size. Auto-skips when no
+# GPU backend is available.
 llama_build_and_test(test-copy-tbq-subgroups.cpp)
+
+# QVAC-21914: ggml-opencl flash-attention q-chunking parity vs the CPU
+# backend. Unconditional and self-skipping at runtime when no OpenCL device is
+# present (like test-copy-tbq-subgroups above), so it exercises chunking
+# wherever OpenCL exists (Adreno devices, desktop OpenCL, PoCL). Does not link
+# mtmd, so it is intentionally outside the LLAMA_MTMD block below.
+llama_build_and_test(test-opencl-fa-chunking.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")
 llama_build_and_test(test-model-load-disk.cpp         LABEL "model")
@@ -273,6 +273,9 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 # Requires a model, uses same args pattern as test-thread-safety
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+llama_build_and_test(test-recurrent-state-rollback.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
@@ -289,6 +292,7 @@ if (NOT GGML_BACKEND_DL)
     target_include_directories(test-quantize-fns PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
+    llama_build_and_test(test-col2im-1d.cpp)
 endif()
 
 # libmtmd
@@ -296,6 +300,13 @@ if (LLAMA_MTMD)
     set(LLAMA_TEST_NAME test-mtmd-c-api)
     llama_build_and_test(test-mtmd-c-api.c)
     target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+    unset(LLAMA_TEST_NAME)
+
+    # QVAC-21914: clip flash-attention AUTO budget arithmetic (pure CPU).
+    set(LLAMA_TEST_NAME test-clip-fa-cutoff)
+    llama_build_and_test(test-clip-fa-cutoff.cpp)
+    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+    target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
     unset(LLAMA_TEST_NAME)
 endif()
 
@@ -305,11 +316,11 @@ if (TARGET cpp-httplib)
     get_target_property(_cpp_httplib_defs cpp-httplib INTERFACE_COMPILE_DEFINITIONS)
     if (_cpp_httplib_defs MATCHES "CPPHTTPLIB_OPENSSL_SUPPORT")
         add_library(gguf-model-data STATIC gguf-model-data.cpp)
-        target_link_libraries(gguf-model-data PRIVATE common cpp-httplib)
+        target_link_libraries(gguf-model-data PRIVATE llama-common cpp-httplib)
         target_include_directories(gguf-model-data PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
         add_executable(test-gguf-model-data test-gguf-model-data.cpp)
-        target_link_libraries(test-gguf-model-data PRIVATE gguf-model-data common)
+        target_link_libraries(test-gguf-model-data PRIVATE gguf-model-data llama-common)
         llama_test(test-gguf-model-data LABEL "model")
 
         # test-quant-type-selection requires gguf-model-data for remote model metadata
@@ -328,9 +339,9 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
-llama_build(export-graph-ops.cpp)
-target_include_directories(export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build(test-export-graph-ops.cpp)
+target_include_directories(test-export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (TARGET gguf-model-data)
-    target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
-    target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
+    target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+    target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()

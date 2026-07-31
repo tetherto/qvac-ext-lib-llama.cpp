@@ -339,6 +339,7 @@ extern "C" {
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -388,6 +389,9 @@ extern "C" {
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
 
+        // a source/target/parent context
+        // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+        struct llama_context * ctx_other;
         bool training;    // if true, we're in training mode (affects LoRA K/V gradient flow)
     };
 
@@ -581,14 +585,15 @@ extern "C" {
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 
-    LLAMA_API int32_t llama_model_n_ctx_train(const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_embd     (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_embd_inp (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_embd_out (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_layer    (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_head     (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
-    LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -1012,7 +1017,11 @@ extern "C" {
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
-    LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+    //
+    // note: using this can cause extra graph reallocations because it changes the graph topology with MoE models,
+    //       so it is generally not recommended to use in practice. will be removed in the future
+    DEPRECATED(LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup),
+            "user code should do warmup runs manually [TAG_LLAMA_GRAPH_NO_WARMUP]");
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
@@ -1600,7 +1609,7 @@ extern "C" {
         // Optional checkpoint loading
         const char * checkpoint_path;        // path to checkpoint file to load optimizer state from (nullptr = don't load)
         bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
-
+        
         bool assistant_loss_only;
     };
 
@@ -1645,22 +1654,26 @@ extern "C" {
 
     // LoRA training parameters
     enum llama_lora_target_module {
-        LLAMA_LORA_TARGET_ATTN_Q    = 1 << 0,
-        LLAMA_LORA_TARGET_ATTN_K    = 1 << 1,
-        LLAMA_LORA_TARGET_ATTN_V    = 1 << 2,
-        LLAMA_LORA_TARGET_ATTN_O    = 1 << 3,
-        LLAMA_LORA_TARGET_FFN_GATE  = 1 << 4,
-        LLAMA_LORA_TARGET_FFN_UP    = 1 << 5,
-        LLAMA_LORA_TARGET_FFN_DOWN  = 1 << 6,
-        LLAMA_LORA_TARGET_OUTPUT    = 1 << 7,
-        LLAMA_LORA_TARGET_ALL       = -1
+        LLAMA_LORA_TARGET_ATTN_Q            = 1 << 0,
+        LLAMA_LORA_TARGET_ATTN_K            = 1 << 1,
+        LLAMA_LORA_TARGET_ATTN_V            = 1 << 2,
+        LLAMA_LORA_TARGET_ATTN_O            = 1 << 3,
+        LLAMA_LORA_TARGET_FFN_GATE          = 1 << 4,
+        LLAMA_LORA_TARGET_FFN_UP            = 1 << 5,
+        LLAMA_LORA_TARGET_FFN_DOWN          = 1 << 6,
+        LLAMA_LORA_TARGET_OUTPUT            = 1 << 7,
+        LLAMA_LORA_TARGET_FFN_GATE_EXPS     = 1 << 8,
+        LLAMA_LORA_TARGET_FFN_UP_EXPS       = 1 << 9,
+        LLAMA_LORA_TARGET_FFN_DOWN_EXPS     = 1 << 10,
+        LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS  = 1 << 11,
+        LLAMA_LORA_TARGET_ALL               = -1
     };
 
     struct llama_lora_training_params {
         uint32_t target_modules;
         int32_t  rank;
         float    alpha;
-        float    dropout;    // reserved, not yet implemented
+        float    dropout;    // reserved, not yet implemented 
         float    init_std;
         uint32_t seed;       // seed for reproducible weight initialization (0 = non-deterministic)
     };
@@ -1675,7 +1688,7 @@ extern "C" {
 
     // LoRA parameter filter (returns true for LoRA tensors only)
     LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
-
+    
     LLAMA_API int64_t llama_opt_get_iter(struct llama_context * ctx);
 
     LLAMA_API bool llama_lora_save_adapter(
@@ -1683,7 +1696,7 @@ extern "C" {
         const char * filename,
         const struct llama_model * model
     );
-
+    
     LLAMA_API bool llama_lora_save_checkpoint(
         const struct llama_adapter_lora * adapter,
         const char * filename,

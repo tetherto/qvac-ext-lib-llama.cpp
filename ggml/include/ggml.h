@@ -511,15 +511,20 @@ extern "C" {
         GGML_OP_REPEAT_BACK,
         GGML_OP_CONCAT,
         GGML_OP_SILU_BACK,
+        GGML_OP_GELU_BACK,
         GGML_OP_GEGLU_BACK,
+        GGML_OP_SIGMOID_BACK,
         GGML_OP_NORM, // normalize
         GGML_OP_RMS_NORM,
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
+        GGML_OP_L2_NORM_BACK,
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_ID_BACK_A,
+        GGML_OP_MUL_MAT_ID_BACK_B,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -545,6 +550,7 @@ extern "C" {
         GGML_OP_IM2COL,
         GGML_OP_IM2COL_BACK,
         GGML_OP_IM2COL_3D,
+        GGML_OP_COL2IM_1D,
         GGML_OP_CONV_2D,
         GGML_OP_CONV_3D,
         GGML_OP_CONV_2D_DW,
@@ -567,6 +573,8 @@ extern "C" {
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
+        GGML_OP_SSM_CONV_BACK_SX,
+        GGML_OP_SSM_CONV_BACK_C,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
         GGML_OP_WIN_UNPART,
@@ -577,6 +585,11 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_GATED_DELTA_NET_BACK,
+        GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_HC_COMB,
+        GGML_OP_DSV4_HC_PRE,
+        GGML_OP_DSV4_HC_POST,
 
         GGML_OP_UNARY,
 
@@ -796,6 +809,11 @@ extern "C" {
 
     // true if the elements in dimension 0 are contiguous, or there is just 1 block of elements
     GGML_API bool ggml_is_contiguous_rows(const struct ggml_tensor * tensor);
+
+    GGML_API bool ggml_is_tbq_or_pq_64(enum ggml_type type);
+    GGML_API bool ggml_is_tbq_or_pq(enum ggml_type type);
+    GGML_API bool ggml_is_tbq_64(enum ggml_type type);
+    GGML_API bool ggml_is_tbq(enum ggml_type type);
 
     GGML_API bool ggml_are_same_shape (const struct ggml_tensor * t0, const struct ggml_tensor * t1);
     GGML_API bool ggml_are_same_stride(const struct ggml_tensor * t0, const struct ggml_tensor * t1);
@@ -1215,10 +1233,25 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
-   GGML_API struct ggml_tensor * ggml_geglu_back(
+    // a - dy
+    // b - x
+    GGML_API struct ggml_tensor * ggml_gelu_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_geglu_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * grad,
            struct ggml_tensor  * g);
+    
+    // a - dy
+    // b - x
+    GGML_API struct ggml_tensor * ggml_sigmoid_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     // hardswish(x) = x * relu6(x + 3) / 6
     GGML_API struct ggml_tensor * ggml_hardswish(
             struct ggml_context * ctx,
@@ -1426,6 +1459,14 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 eps);
 
+    // a - dy
+    // b - x
+    GGML_API struct ggml_tensor * ggml_l2_norm_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 eps);
+
     // a - x
     // b - dy
     GGML_API struct ggml_tensor * ggml_rms_norm_back(
@@ -1459,6 +1500,22 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // Backward of ggml_mul_mat_id w.r.t. `as` (expert weight stack).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_back_a(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad_out,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * as_like);
+
+    // Backward of ggml_mul_mat_id w.r.t. `b` (per-token activations).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_back_b(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * grad_out,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * b_like);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
@@ -2030,6 +2087,16 @@ extern "C" {
         int                   d1, // dilation dimension 1
         bool                  is_2D);
 
+    // col2im_1d: scatter-add GEMM columns back to 1D signal
+    // a: [K*OC, T_in]  (columns from matmul, K = a->ne[0]/OC)
+    // result: [T_out, OC]  where T_out = (T_in - 1)*s0 + K - 2*p0
+    GGML_API struct ggml_tensor * ggml_col2im_1d(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,   // columns [K*OC, T_in]
+        int                   s0,  // stride
+        int                   oc,  // output channels
+        int                   p0); // padding to crop from both sides
+
     GGML_API struct ggml_tensor * ggml_conv_1d(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,   // convolution kernel
@@ -2453,6 +2520,20 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // Backward of ggml_ssm_conv w.r.t. `sx` (conv input).
+    GGML_API struct ggml_tensor * ggml_ssm_conv_back_sx(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad_out,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * sx_like);
+
+    // Backward of ggml_ssm_conv w.r.t. `c` (conv weight).
+    GGML_API struct ggml_tensor * ggml_ssm_conv_back_c(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad_out,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * c_like);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2565,10 +2646,16 @@ extern "C" {
     // TODO: add ggml_gated_delta_net_set_bcast() to be able to configure Q, K broadcast type: tiled vs interleaved [TAG_GGML_GDN_BCAST]
     // ref: https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306
     //
-    // state is a 3D tensor of shape (S_v*S_v*H, K, n_seqs):
-    //   K == 1: output carries the final state only.
-    //   K  > 1: output carries K snapshot slots; the kernel writes the last min(n_tokens, K)
-    //   per-token snapshots into the trailing slots
+    // tensor shapes (S_k == S_v, H_v % H_k == 0):
+    //   q, k  : [S_k, H_k, n_tokens, n_seqs]
+    //   v     : [S_v, H_v, n_tokens, n_seqs]
+    //   g     : [1, H_v, n_tokens, n_seqs] (scalar gate) or [S_v, H_v, n_tokens, n_seqs] (KDA)
+    //   beta  : [1, H_v, n_tokens, n_seqs]
+    //   state : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0
+    //
+    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
+    // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
+    // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2576,7 +2663,78 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
-            struct ggml_tensor  * state);
+            struct ggml_tensor  * state,
+            int64_t               K);
+
+    // backward of ggml_gated_delta_net: given the inputs and the gradient `d` of
+    // the forward result, returns a packed 1D tensor holding the gradients of
+    // (q, k, v, g, beta, state) as contiguous MEM_ALIGN-padded slices in that order.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * d);
+
+    // DSA lightning indexer
+    //
+    // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+    // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
+    // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
+    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
+    // res:     [n_kv,       n_batch,    1,       ne3 ]
+    //
+    // broadcast:
+    //   ne3 % ne33 == 0
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask);
+
+    // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
+    // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
+    // using a richer representation through streams.
+    //
+    // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
+    //          -> [dst_hc, src_hc, n_tokens]
+    // logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2]
+    //                         + base[2*hc + dst + hc*src]
+    // Softmax over dst, add eps, normalize over src, then repeat normalization
+    // over dst followed by src for iterations 1 through n_iter - 1.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
+    // hc_pre: x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
+    //   result[i, t] = sum_h x[i, h, t]*weights[h, t]
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weights);
+
+    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
+    //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
+    //          -> [n_embd, hc, n_tokens]
+    //   result[i, dst, t] = x[i, t]*post[dst, t]
+    //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb);
 
     // custom operators
 
@@ -2676,7 +2834,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // logits
-            struct ggml_tensor  * b,  // labels
+            struct ggml_tensor  * b,  // labels  
             struct ggml_tensor  * c); // mask (1 for assistant tokens, 0 for masked)
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked_back(
             struct ggml_context * ctx,
@@ -2879,53 +3037,3 @@ extern "C" {
 #ifdef  __cplusplus
 }
 #endif
-
-static inline bool ggml_is_tbq_or_pq_64(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_TBQ3_0_64:
-        case GGML_TYPE_TBQ4_0_64:
-        case GGML_TYPE_PQ3_0_64:
-        case GGML_TYPE_PQ4_0_64:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static inline bool ggml_is_tbq_or_pq(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_TBQ3_0:
-        case GGML_TYPE_TBQ4_0:
-        case GGML_TYPE_PQ3_0:
-        case GGML_TYPE_PQ4_0:
-        case GGML_TYPE_TBQ3_0_64:
-        case GGML_TYPE_TBQ4_0_64:
-        case GGML_TYPE_PQ3_0_64:
-        case GGML_TYPE_PQ4_0_64:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static inline bool ggml_is_tbq_64(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_TBQ3_0_64:
-        case GGML_TYPE_TBQ4_0_64:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static inline bool ggml_is_tbq(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_TBQ3_0:
-        case GGML_TYPE_TBQ4_0:
-        case GGML_TYPE_TBQ3_0_64:
-        case GGML_TYPE_TBQ4_0_64:
-            return true;
-        default:
-            return false;
-    }
-}

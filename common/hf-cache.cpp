@@ -229,7 +229,7 @@ static nl::json api_get(const std::string & url,
 static std::string get_repo_commit(const std::string & repo_id,
                                    const std::string & token) {
     try {
-        auto endpoint = get_model_endpoint();
+        auto endpoint = common_get_model_endpoint();
         auto json = api_get(endpoint + "api/models/" + repo_id + "/refs", token);
 
         if (!json.is_object() ||
@@ -307,7 +307,7 @@ hf_files get_repo_files(const std::string & repo_id,
     hf_files files;
 
     try {
-        auto endpoint = get_model_endpoint();
+        auto endpoint = common_get_model_endpoint();
         auto json = api_get(endpoint + "api/models/" + repo_id + "/tree/" + commit + "?recursive=true", token);
 
         if (!json.is_array()) {
@@ -493,6 +493,21 @@ std::string finalize_file(const hf_file & file) {
         }
     }
     return file.final_path;
+}
+
+bool remove_cached_repo(const std::string & repo_id) {
+    if (!is_valid_repo_id(repo_id)) {
+        LOG_WRN("%s: invalid repository: %s\n", __func__, repo_id.c_str());
+        return false;
+    }
+    fs::path repo_path = get_repo_path(repo_id);
+    std::error_code ec;
+    auto removed = fs::remove_all(repo_path, ec);
+    if (ec) {
+        LOG_ERR("%s: failed to remove repo cache %s: %s\n", __func__, repo_path.string().c_str(), ec.message().c_str());
+        return false;
+    }
+    return removed > 0;
 }
 
 } // namespace hf_cache

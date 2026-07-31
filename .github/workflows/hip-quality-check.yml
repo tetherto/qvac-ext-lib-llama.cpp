@@ -28,9 +28,9 @@ concurrency:
 env:
   GGML_NLOOP: 3
   GGML_N_THREADS: 1
-  LLAMA_LOG_COLORS: 1
-  LLAMA_LOG_PREFIX: 1
-  LLAMA_LOG_TIMESTAMPS: 1
+  LLAMA_ARG_LOG_COLORS: 1
+  LLAMA_ARG_LOG_PREFIX: 1
+  LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
   ubuntu-22-hip-quality-check:
@@ -41,6 +41,11 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
+      - name: Setup Node.js (build the embedded web UI from source)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Dependencies
         id: depends
         run: |
@@ -50,7 +55,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: ubuntu-22-hip-quality-check
+          key: hip-quality-check-ubuntu-22.04
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 

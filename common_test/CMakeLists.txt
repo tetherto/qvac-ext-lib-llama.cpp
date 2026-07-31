@@ -12,4 +12,4 @@ target_compile_definitions(${TARGET} INTERFACE LLAMA_COMMON_TEST_HEADERS)
 
 target_compile_features(${TARGET} INTERFACE cxx_std_17)
 
-target_link_libraries(${TARGET} INTERFACE common)
+target_link_libraries(${TARGET} INTERFACE llama-common)

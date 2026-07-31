@@ -11,8 +11,13 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 #if defined(_WIN32)
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#       define NOMINMAX
+#    endif
 #    include <io.h>
 #    include <windows.h>
 #    define isatty _isatty
@@ -62,16 +67,15 @@ static const char* g_col[] = {
 };
 
 struct common_log_entry {
-    enum ggml_log_level level;
-
-    bool prefix;
-
-    int64_t timestamp;
+    enum ggml_log_level level {GGML_LOG_LEVEL_INFO};
 
     std::vector<char> msg;
 
-    // signals the worker thread to stop
-    bool is_end;
+    int64_t timestamp { 0 };
+    bool is_end       { false }; // signals the worker thread to stop
+    bool prefix       { false };
+
+    common_log_entry(size_t size = 256) : msg(size) { }
 
     void print(FILE * file = nullptr, ggml_log_callback callback = nullptr, void * callback_user_data = nullptr) const {
         // if callback is provided, use it instead of printing
@@ -79,7 +83,6 @@ struct common_log_entry {
             callback(level, msg.data(), callback_user_data);
             return;
         }
-
 
         FILE * fcur = file;
         if (!fcur) {
@@ -129,24 +132,17 @@ struct common_log_entry {
 };
 
 struct common_log {
-    // default capacity - will be expanded if needed
-    common_log() : common_log(256) {}
-
-    common_log(size_t capacity) {
-        file = nullptr;
-        prefix = false;
-        timestamps = false;
-        running = false;
-        t_start = t_us();
-        callback = nullptr;
+    // default capacity
+    common_log(size_t capacity = 512) {
+        file               = nullptr;
+        prefix             = false;
+        timestamps         = false;
+        running            = false;
+        t_start            = t_us();
+        callback           = nullptr;
         callback_user_data = nullptr;
 
-        // initial message size - will be expanded if longer messages arrive
-        entries.resize(capacity);
-        for (auto & entry : entries) {
-            entry.msg.resize(256);
-        }
-
+        queue.resize(capacity, common_log_entry(256));
         head = 0;
         tail = 0;
 
@@ -161,9 +157,10 @@ struct common_log {
     }
 
 private:
-    std::mutex mtx;
-    std::thread thrd;
-    std::condition_variable cv;
+    std::mutex              mtx;
+    std::thread             thrd;
+    std::condition_variable cv_new;  // new entry
+    std::condition_variable cv_full; // wait on full
 
     FILE * file;
 
@@ -173,28 +170,58 @@ private:
 
     int64_t t_start;
 
-    // ring buffer of entries
-    std::vector<common_log_entry> entries;
+    // queue of entries
+    std::vector<common_log_entry> queue;
     size_t head;
     size_t tail;
 
-    // worker thread copies into this
-    common_log_entry cur;
+    bool print_entry(const common_log_entry & e, ggml_log_callback cb, void * cb_user_data) const {
+        if (e.is_end) return true;
+
+        e.print(nullptr, cb, cb_user_data);
+        if (file) {
+            e.print(file);
+        }
+        return false;
+    }
+
+    bool flush_queue(size_t start_head, size_t end_tail, size_t & out_head,
+                     ggml_log_callback cb, void * cb_user_data) const {
+        bool stop = false;
+        size_t h = start_head;
+        while (h != end_tail && !stop) {
+            stop = print_entry(queue[h], cb, cb_user_data);
+            h = (h + 1) % queue.size();
+        }
+        out_head = h;
+        return stop;
+    }
 
     // custom callback for log messages
     ggml_log_callback callback;
     void * callback_user_data;
 
 public:
+    bool is_full() const {
+        return ((tail + 1) % queue.size()) == head;
+    }
+
+    bool is_empty() const {
+        return head == tail;
+    }
+
     void add(enum ggml_log_level level, const char * fmt, va_list args) {
-        std::lock_guard<std::mutex> lock(mtx);
+        std::unique_lock<std::mutex> lock(mtx);
+
+        // block if the queue is full
+        cv_full.wait(lock, [this]() { return !running || !is_full(); });
 
         if (!running) {
             // discard messages while the worker thread is paused
             return;
         }
 
-        auto & entry = entries[tail];
+        auto & entry = queue[tail];
 
         {
             // cannot use args twice, so make a copy in case we need to expand the buffer
@@ -229,38 +256,16 @@ public:
             va_end(args_copy);
         }
 
-        entry.level = level;
-        entry.prefix = prefix;
+        entry.is_end    = false;
+        entry.level     = level;
+        entry.prefix    = prefix;
         entry.timestamp = 0;
         if (timestamps) {
             entry.timestamp = t_us() - t_start;
         }
-        entry.is_end = false;
 
-        tail = (tail + 1) % entries.size();
-        if (tail == head) {
-            // expand the buffer
-            std::vector<common_log_entry> new_entries(2*entries.size());
-
-            size_t new_tail = 0;
-
-            do {
-                new_entries[new_tail] = std::move(entries[head]);
-
-                head     = (head     + 1) % entries.size();
-                new_tail = (new_tail + 1);
-            } while (head != tail);
-
-            head = 0;
-            tail = new_tail;
-
-            for (size_t i = tail; i < new_entries.size(); i++) {
-                new_entries[i].msg.resize(256);
-            }
-
-            entries = std::move(new_entries);
-        }
-        cv.notify_one();
+        tail = (tail + 1) % queue.size();
+        cv_new.notify_one();
     }
 
     void resume() {
@@ -274,26 +279,26 @@ public:
 
         thrd = std::thread([this]() {
             while (true) {
-                ggml_log_callback cb = nullptr;
-                void * cb_user_data = nullptr;
-                {
-                    std::unique_lock<std::mutex> lock(mtx);
-                    cv.wait(lock, [this]() { return head != tail; });
-                    cur = entries[head];
-                    cb = callback;
-                    cb_user_data = callback_user_data;
+                std::unique_lock<std::mutex> lock(mtx);
+                cv_new.wait(lock, [this]() { return !is_empty(); });
 
-                    head = (head + 1) % entries.size();
-                }
+                ggml_log_callback cb = callback;
+                void * cb_user_data = callback_user_data;
 
-                if (cur.is_end) {
+                size_t cached_head = head;
+                size_t cached_tail = tail;
+
+                lock.unlock(); // drop the lock during flush
+
+                size_t next_head;
+                bool stop = flush_queue(cached_head, cached_tail, next_head, cb, cb_user_data);
+
+                lock.lock();
+                head = next_head;
+                cv_full.notify_all();
+
+                if (stop) {
                     break;
-                }
-
-                cur.print(nullptr, cb, cb_user_data); // stdout and stderr or callback
-
-                if (file) {
-                    cur.print(file);
                 }
             }
         });
@@ -310,13 +315,13 @@ public:
             running = false;
 
             // push an entry to signal the worker thread to stop
-            {
-                auto & entry = entries[tail];
-                entry.is_end = true;
+            auto & entry = queue[tail];
+            entry.is_end = true;
+            tail = (tail + 1) % queue.size();
 
-                tail = (tail + 1) % entries.size();
-            }
-            cv.notify_one();
+            // wakeup everyone
+            cv_new.notify_one();
+            cv_full.notify_all();
         }
 
         thrd.join();

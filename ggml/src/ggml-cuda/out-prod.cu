@@ -3,14 +3,41 @@
 
 #include <cstdint>
 
+static __global__ void k_compute_out_prod_ptrs(
+        const float * src0_d, const float * src1_d, float * dst_d,
+        const float ** ptrs_a, const float ** ptrs_b, float ** ptrs_c,
+        const int64_t ne2, const int64_t ne3,
+        const int64_t dps2, const int64_t dps3,
+        const size_t s02, const size_t s03,
+        const size_t s12, const size_t s13,
+        const size_t s2,  const size_t s3) {
+    const int64_t i2 = blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t i3 = blockIdx.y*blockDim.y + threadIdx.y;
+
+    if (i2 >= ne2 || i3 >= ne3) {
+        return;
+    }
+
+    const int64_t idx = i3*ne2 + i2;
+
+    ptrs_a[idx] = src0_d + (i3/dps3)*s03 + (i2/dps2)*s02;
+    ptrs_b[idx] = src1_d +  i3      *s13 +  i2      *s12;
+    ptrs_c[idx] = dst_d  +  i3      *s3  +  i2      *s2;
+}
+
 void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const bool src0_is_quantized = (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16);
-    const bool src1_is_quantized = (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16);
+    // Anything that is not already f32 must be converted to a contiguous f32 buffer before the
+    // cublasSgemm below: the GEMM is f32-only. f16 is included here on purpose — reinterpreting
+    // f16 bytes as f32 both corrupts the values and halves the leading dimension (e.g.
+    // ldb = nb11/sizeof(float) = ne10/2), which rocBLAS rejects with CUBLAS_STATUS_INVALID_VALUE
+    // (NVIDIA's cuBLAS is laxer but still computes garbage). Converting gives ne-based strides.
+    const bool src0_needs_f32 = (src0->type != GGML_TYPE_F32);
+    const bool src1_needs_f32 = (src1->type != GGML_TYPE_F32);
 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -25,7 +52,7 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool_alloc<float> src0_alloc(pool);
     ggml_cuda_pool_alloc<float> src1_alloc(pool);
 
-    if (src0_is_quantized) {
+    if (src0_needs_f32) {
         const size_t src0_size = ggml_nelements(src0);
         src0_alloc.alloc(src0_size);
         src0_f32 = src0_alloc.ptr;
@@ -40,9 +67,9 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     } else {
         src0_f32 = (float *) src0->data;
-    }
+    } 
 
-    if (src1_is_quantized) {
+    if (src1_needs_f32) {
         const size_t src1_size = ggml_nelements(src1);
         src1_alloc.alloc(src1_size);
         src1_f32 = src1_alloc.ptr;
@@ -56,8 +83,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     } else {
         src1_f32 = (float *) src1->data;
-    }
-
+    } 
+    
 
     GGML_ASSERT(ne01 == ne11);
     GGML_ASSERT(ne0 == ne00);
@@ -86,10 +113,10 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const bool src1_T = ggml_is_transposed(src1);
     const cublasOperation_t src1_cublas_op =  src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
-    const int64_t           ldb            = allocated_src1 ?
+    const int64_t           ldb            = allocated_src1 ? 
                                              (src1_T ? ne10 : ne11) :
                                              ((src1_T ?        nb10 :        nb11) /  sizeof(float));
-
+                                
     // Only assert for non dequantized src1
     if (!allocated_src1) {
         GGML_ASSERT((src1_T ? nb11 : nb10) == sizeof(float));
@@ -120,19 +147,40 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                         &beta,  dst_d  +  i3     *s3,  ldc, s2,
                         batch_count));
         }
+    } else if (ne2 > 1 || ne3 > 1) {
+        // dps2 > 1 (src0 broadcast along dim 2 with non-uniform stride) or multiple GEMMs
+        // along dim 3: compute per-GEMM pointers on the device and use a single batched GEMM.
+        GGML_ASSERT(ne3 > 0);
+        GGML_ASSERT(ne2 <= (int64_t) std::numeric_limits<int>::max() / ne3);
+        const int batch_count = (int) (ne2 * ne3);
+
+        ggml_cuda_pool_alloc<const float *> ptrs_a(ctx.pool(), batch_count);
+        ggml_cuda_pool_alloc<const float *> ptrs_b(ctx.pool(), batch_count);
+        ggml_cuda_pool_alloc<      float *> ptrs_c(ctx.pool(), batch_count);
+
+        const dim3 block_dims(16, 16);
+        const dim3 grid_dims((ne2 + block_dims.x - 1)/block_dims.x, (ne3 + block_dims.y - 1)/block_dims.y);
+        k_compute_out_prod_ptrs<<<grid_dims, block_dims, 0, stream>>>(
+            src0_d, src1_d, dst_d,
+            ptrs_a.get(), ptrs_b.get(), ptrs_c.get(),
+            ne2, ne3, dps2, dps3, s02, s03, s12, s13, s2, s3);
+        CUDA_CHECK(cudaGetLastError());
+
+        CUBLAS_CHECK(
+            cublasSgemmBatched(handle, CUBLAS_OP_N, src1_cublas_op,
+                    ne0, ne1, ne01,
+                    &alpha, ptrs_a.get(), lda,
+                            ptrs_b.get(), ldb,
+                    &beta,  ptrs_c.get(), ldc,
+                    batch_count));
     } else {
-        // Fallback: ne2 == 1 (no batching benefit) or dps2 > 1 (src0 broadcast along dim 2
-        // with non-uniform stride; would need cublasSgemmBatched with pointer arrays).
-        for (int64_t i3 = 0; i3 < ne3; ++i3) {
-            for (int64_t i2 = 0; i2 < ne2; ++i2) {
-                CUBLAS_CHECK(
-                    cublasSgemm(handle, CUBLAS_OP_N, src1_cublas_op,
-                            ne0, ne1, ne01,
-                            &alpha, src0_d + (i3/dps3)*s03 + (i2/dps2)*s02, lda,
-                                    src1_d +  i3      *s13 +  i2      *s12, ldb,
-                            &beta,  dst_d  +  i3      *s3  +  i2      *s2,  ldc));
-            }
-        }
+        // ne2 == 1 && ne3 == 1: single GEMM
+        CUBLAS_CHECK(
+            cublasSgemm(handle, CUBLAS_OP_N, src1_cublas_op,
+                    ne0, ne1, ne01,
+                    &alpha, src0_d, lda,
+                            src1_d, ldb,
+                    &beta,  dst_d,  ldc));
     }
 
 }

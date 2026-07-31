@@ -548,7 +548,7 @@ ensure_promise_registry(const std::string & key) {
     }
     auto result =
         promise_registry<Writable>().emplace(key, std::promise<std::unique_ptr<llama_file_buffer<Writable>>>());
-    LLAMA_LOG_CMAKE_DEBUG("%s: created future file buffer %p for %s\n", __func__, (void *) &(*it), key.c_str());
+    LLAMA_LOG_CMAKE_DEBUG("%s: created future file buffer %p for %s\n", __func__, (void *) &(*result.first), key.c_str());
     return result.first;
 }
 }  // namespace

@@ -105,13 +105,16 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
 # extra artifacts
-option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_WEBUI    "llama: build the embedded Web UI for server"  ON)
-option(LLAMA_TOOLS_INSTALL  "llama: install tools"        ${LLAMA_TOOLS_INSTALL_DEFAULT})
-option(LLAMA_TESTS_INSTALL  "llama: install tests"        ON)
+option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_TOOLS     "llama: build tools"                                                                ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                                                             ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       ON)
+option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" ON)
+
+option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
+option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 
 # specific extras
 option(LLAMA_MTMD "llama: multimodal support" ${LLAMA_BUILD_TOOLS})
@@ -205,6 +208,14 @@ add_subdirectory(src)
 # utils, programs, examples and tests
 #
 
+# LLAMA_INCLUDE_INSTALL_DIR is referenced by common/CMakeLists.txt (added just
+# below) in llama-common-base's $<INSTALL_INTERFACE:> include dir. It must be
+# defined here, before add_subdirectory(common); otherwise it expands empty and
+# the installed llama::llama-common target carries a bogus "/common" include
+# path that breaks downstream find_package(llama) consumers.
+include(GNUInstallDirs)
+set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header files")
+
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
     add_subdirectory(vendor/cpp-httplib)
@@ -230,6 +241,20 @@ elseif (LLAMA_MTMD)
     add_subdirectory(tools/mtmd)
 endif()
 
+if (LLAMA_BUILD_APP)
+    add_subdirectory(app)
+endif()
+
+# Standalone libmtmd build without pulling in the rest of the tools/ tree.
+# Useful when packaging just the mtmd library for language bindings (e.g. an
+# Apple XCFramework, or a WASM build). When the full tools build is enabled,
+# mtmd is already built by the tools/ subdirectory above; this hook only fires
+# when LLAMA_BUILD_TOOLS is OFF to avoid double-adding the target.
+option(LLAMA_BUILD_MTMD "llama: build tools/mtmd library standalone" OFF)
+if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
+    add_subdirectory(tools/mtmd)
+endif()
+
 endif() # NOT BUILD_LLAMA
 
 # Automatically add all files from the 'licenses' directory
@@ -242,7 +267,7 @@ foreach(FILE_PATH ${EXTRA_LICENSES})
 endforeach()
 
 if (LLAMA_BUILD_COMMON)
-    license_generate(common)
+    license_generate(llama-common)
 endif()
 
 #
@@ -278,7 +303,7 @@ if (LLAMA_BUILD_COMMON)
       EXPORT llama-targets)
 
   install(
-    TARGETS common build_info
+    TARGETS llama-common llama-common-base
     EXPORT llama-targets
     PUBLIC_HEADER
       DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
@@ -305,6 +330,10 @@ install(
   FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
+if (LLAMA_BUILD_COMMON)
+    install(TARGETS llama-common LIBRARY)
+endif()
+
 configure_package_config_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
   ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
@@ -320,19 +349,7 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 install(
-    FILES convert_hf_to_gguf.py
-    PERMISSIONS
-        OWNER_READ
-        OWNER_WRITE
-        OWNER_EXECUTE
-        GROUP_READ
-        GROUP_EXECUTE
-        WORLD_READ
-        WORLD_EXECUTE
-    DESTINATION ${CMAKE_INSTALL_BINDIR})
-
-install(
-    PROGRAMS vulkan_profiling_analyzer.py
+    PROGRAMS convert_hf_to_gguf.py vulkan_profiling_analyzer.py
     DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 configure_file(cmake/llama.pc.in

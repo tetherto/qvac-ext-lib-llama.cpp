@@ -93,6 +93,10 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q4_1_f32_flat
     mul_mv_q4_k_f32
     mul_mv_q4_k_f32_flat
+    mul_mv_q5_0_f32
+    mul_mv_q5_0_f32_flat
+    mul_mv_q5_1_f32
+    mul_mv_q5_1_f32_flat
     mul_mv_q5_k_f32
     mul_mv_q5_k_f32_flat
     mul_mv_q6_k_f32
@@ -132,6 +136,8 @@ set(GGML_OPENCL_KERNELS
     mul_mm_f16_f32_l4_lm
     mul_mm_q4_0_f32_l4_lm
     mul_mm_q4_1_f32_l4_lm
+    mul_mm_q5_0_f32_l4_lm
+    mul_mm_q5_1_f32_l4_lm
     mul_mm_q8_0_f32_l4_lm
     mul_mm_iq4_nl_f32_l4_lm
     mul_mm_q4_k_f32_l4_lm
@@ -146,6 +152,10 @@ set(GGML_OPENCL_KERNELS
     gemm_noshuffle_q4_0_f32
     gemv_noshuffle_q4_1_f32
     gemm_noshuffle_q4_1_f32
+    gemv_noshuffle_q5_0_f32
+    gemm_noshuffle_q5_0_f32
+    gemv_noshuffle_q5_1_f32
+    gemm_noshuffle_q5_1_f32
     gemv_noshuffle_iq4_nl_f32
     gemm_noshuffle_iq4_nl_f32
     gemv_noshuffle_q8_0_f32
@@ -164,7 +174,6 @@ set(GGML_OPENCL_KERNELS
     pool_2d
     relu
     l2_norm
-    gated_delta_net
     rms_norm
     rope
     scale
@@ -178,6 +187,7 @@ set(GGML_OPENCL_KERNELS
     sqr
     sqrt
     ssm_conv
+    gated_delta_net
     sub
     sum_rows
     cumsum
@@ -196,7 +206,10 @@ set(GGML_OPENCL_KERNELS
     conv2d
     conv2d_f16_f32
     conv2d_dw
+    flash_attn_pre_f16
     flash_attn_f32_f16
+    flash_attn_f32_q8_0
+    flash_attn_f32_q4_0
     flash_attn_f16
     flash_attn_f32
 )

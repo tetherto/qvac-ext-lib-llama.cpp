@@ -87,8 +87,6 @@
 #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
 // quants.c
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
-// qvac: x86 has a native ggml_vec_dot_q1_0_q8_0 in arch/x86/quants.c, so no
-// fallback-rename here; keeping the macro caused a duplicate-symbol link error.
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
 #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
@@ -217,9 +215,9 @@
 // quants.c
 #define ggml_vec_dot_nvfp4_q8_0_generic ggml_vec_dot_nvfp4_q8_0
 #define ggml_vec_dot_q1_0_q8_0_generic ggml_vec_dot_q1_0_q8_0
+#define ggml_vec_dot_q8_1_q8_1_generic ggml_vec_dot_q8_1_q8_1
 #define ggml_vec_dot_tq2_0_q8_0_generic ggml_vec_dot_tq2_0_q8_0
 #define ggml_vec_dot_tq2_0_q8_1_generic ggml_vec_dot_tq2_0_q8_1
-#define ggml_vec_dot_q8_1_q8_1_generic ggml_vec_dot_q8_1_q8_1
 // repack.cpp
 #define ggml_quantize_mat_q8_0_4x1_generic ggml_quantize_mat_q8_0_4x1
 #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
@@ -313,7 +311,6 @@
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #elif defined(__wasm__)
 // quants.c
-#define ggml_vec_dot_q4_1_q8_1_generic ggml_vec_dot_q4_1_q8_1
 #define ggml_vec_dot_tq1_0_q8_K_generic ggml_vec_dot_tq1_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_K_generic ggml_vec_dot_tq2_0_q8_K
 #define ggml_vec_dot_tq2_0_q8_1_generic ggml_vec_dot_tq2_0_q8_1
