@@ -52,18 +52,18 @@ struct ggml_vec_index_filter;
 typedef struct ggml_vec_index_filter ggml_vec_index_filter_t;
 
 // Error codes returned from int-valued APIs. 0 = OK. Negative = failure.
-// `_remove` is the exception: it returns 1 on removal and 0 on miss.
 enum ggml_vec_index_error {
-    GGML_VEC_INDEX_OK            =  0,
-    GGML_VEC_INDEX_E_INVALID_ARG = -1,
-    GGML_VEC_INDEX_E_DUPLICATE   = -2,
-    GGML_VEC_INDEX_E_IO          = -3,
-    GGML_VEC_INDEX_E_OOM         = -4,
-    GGML_VEC_INDEX_E_INTERNAL    = -5,
-    GGML_VEC_INDEX_E_BAD_MAGIC   = -6,
-    GGML_VEC_INDEX_E_BAD_VERSION = -7,
+    GGML_VEC_INDEX_OK                = 0,
+    GGML_VEC_INDEX_E_INVALID_ARG     = -1,
+    GGML_VEC_INDEX_E_DUPLICATE       = -2,
+    GGML_VEC_INDEX_E_IO              = -3,
+    GGML_VEC_INDEX_E_OOM             = -4,
+    GGML_VEC_INDEX_E_INTERNAL        = -5,
+    GGML_VEC_INDEX_E_BAD_MAGIC       = -6,
+    GGML_VEC_INDEX_E_BAD_VERSION     = -7,
     GGML_VEC_INDEX_E_PARTIAL_COMPACT = -8,
-    GGML_VEC_INDEX_E_NOT_DURABLE = -10,
+    GGML_VEC_INDEX_E_NOT_FOUND       = -9,
+    GGML_VEC_INDEX_E_NOT_DURABLE     = -10,
 };
 
 // Returns a stable string for ggml_vec_index_error values.
@@ -85,16 +85,14 @@ GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 // Returns 0 on success. Returns GGML_VEC_INDEX_E_DUPLICATE if any id already
 // exists in the index; in that case the index is unchanged (atomic add).
 // All vector components must be finite. UINT64_MAX is reserved for search
-// result padding and is not a valid id. Live index length is capped at INT_MAX.
-GGML_API int ggml_vec_index_add(
-    ggml_vec_index_t * idx,
-    const float      * vectors,
-    int                n,
-    const uint64_t   * ids);
+// result padding and is not a valid id. `n == 0` is a no-op on handles that
+// accept plain mutations. Live index length and total allocated slots are capped
+// at INT_MAX; compact after bulk removes to reclaim tombstoned slots.
+GGML_API int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, const uint64_t * ids);
 
 // Removes the entry for `id` by marking its internal slot deleted. Physical
-// storage is compacted only when writing a snapshot. Returns 1 if removed,
-// 0 if not present, negative on error.
+// storage is compacted only when writing a snapshot. Returns GGML_VEC_INDEX_OK
+// if removed, GGML_VEC_INDEX_E_NOT_FOUND if not present, negative on error.
 GGML_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
 
 // Physically removes deleted slots from in-memory storage. This does not write

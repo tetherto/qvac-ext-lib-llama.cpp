@@ -1,6 +1,6 @@
 // ggml-vector-index-persistence.cpp - f32 snapshot shim for early search split.
 
-#include "ggml-vector-index-internal.h"
+#include "ggml-vector-index-impl.h"
 
 MappedFile::~MappedFile() = default;
 

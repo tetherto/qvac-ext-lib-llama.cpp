@@ -4,7 +4,7 @@
 // Storage: full f32 vectors or per-vector symmetric q8/q4 codes. Search and
 // persistence live in companion translation units.
 
-#include "ggml-vector-index-internal.h"
+#include "ggml-vector-index-impl.h"
 
 static std::atomic<uint64_t> g_next_filter_cookie{ 1 };
 
@@ -184,13 +184,18 @@ void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
     for (int i = 0; i < dim; ++i) {
         const float scaled = src[i] / scale;
         int q = round_nearest_even(scaled);
-        q = std::max(-127, std::min(127, q));
-        dst[i] = static_cast<int8_t>(q);
+        q                  = std::max(-127, std::min(127, q));
+        dst[i]             = static_cast<int8_t>(q);
     }
 }
 
 void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale) {
     const ScopedNearestRounding rounding_guard;
+
+    if (dim <= 0) {
+        scale = 1.0f;
+        return;
+    }
 
     float max_abs = 0.0f;
     for (int i = 0; i < dim; ++i) {
@@ -209,10 +214,10 @@ void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale) {
     }
     for (int i = 0; i < dim; ++i) {
         const float scaled = src[i] / scale;
-        int q = round_nearest_even(scaled);
-        q = std::max(-7, std::min(7, q));
+        int         q      = round_nearest_even(scaled);
+        q                  = std::max(-7, std::min(7, q));
         const uint8_t code = q4_encode(q);
-        uint8_t & byte = dst[static_cast<size_t>(i) / 2];
+        uint8_t &     byte = dst[static_cast<size_t>(i) / 2];
         if ((i & 1) == 0) {
             byte = static_cast<uint8_t>((byte & 0xf0u) | code);
         } else {
@@ -243,6 +248,8 @@ const char * ggml_vec_index_error_to_string(int error) {
             return "out of memory";
         case GGML_VEC_INDEX_E_PARTIAL_COMPACT:
             return "partial compaction";
+        case GGML_VEC_INDEX_E_NOT_FOUND:
+            return "not found";
         case GGML_VEC_INDEX_E_INTERNAL:
             return "internal error";
         default:
@@ -333,13 +340,16 @@ int ggml_vec_index_add_unlocked(
         if (n < 0) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (n == 0) {
-            return GGML_VEC_INDEX_OK;
-        }
-        if (vectors == nullptr || ids == nullptr || idx->read_only_mmap) {
+        if (idx->read_only_mmap) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (finalize && idx->delta_log_bound) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (n == 0) {
+            return GGML_VEC_INDEX_OK;
+        }
+        if (vectors == nullptr || ids == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
@@ -360,10 +370,10 @@ int ggml_vec_index_add_unlocked(
             }
         }
 
-        base_slot = idx->slot_to_id.size();
-        dim_sz    = static_cast<size_t>(idx->dim);
+        base_slot         = idx->slot_to_id.size();
+        dim_sz            = static_cast<size_t>(idx->dim);
         const size_t n_sz = static_cast<size_t>(n);
-        if (n_sz > kMaxIndexLen || active_count(*idx) > kMaxIndexLen - n_sz) {
+        if (n_sz > kMaxIndexLen || active_count(*idx) > kMaxIndexLen - n_sz || base_slot > kMaxIndexLen - n_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (n_sz > std::numeric_limits<size_t>::max() - base_slot) {
@@ -534,12 +544,12 @@ int ggml_vec_index_remove_unlocked(
         }
         auto it = idx->id_to_slot.find(id);
         if (it == idx->id_to_slot.end()) {
-            return 0;
+            return GGML_VEC_INDEX_E_NOT_FOUND;
         }
         const size_t slot = it->second;
         if (!slot_is_active(*idx, slot)) {
             idx->id_to_slot.erase(it);
-            return 0;
+            return GGML_VEC_INDEX_E_NOT_FOUND;
         }
         if (idx->delta_log_bound && !allow_delta_bound) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -553,7 +563,7 @@ int ggml_vec_index_remove_unlocked(
         if (!allow_delta_bound) {
             idx->delta_log_start_allowed = false;
         }
-        return 1;
+        return GGML_VEC_INDEX_OK;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
@@ -581,9 +591,17 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
         }
 
         const size_t n_slots = idx->slot_to_id.size();
-        const size_t n_live = active_count(*idx);
+        const size_t n_live  = active_count(*idx);
         if (idx->delta_log_bound) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        size_t counted_live = 0;
+        for (size_t slot = 0; slot < n_slots; ++slot) {
+            counted_live += slot_is_active(*idx, slot) ? 1 : 0;
+        }
+        if (idx->slot_active.size() != n_slots || counted_live != n_live || idx->id_to_slot.size() != n_live ||
+            !has_vector_storage(*idx)) {
+            return GGML_VEC_INDEX_E_INTERNAL;
         }
         if (n_live == n_slots) {
             return GGML_VEC_INDEX_OK;
@@ -595,8 +613,8 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
         }
 
         test_maybe_throw_bad_alloc();
-        std::vector<uint64_t> new_slot_to_id;
-        std::vector<uint8_t> new_slot_active;
+        std::vector<uint64_t>                new_slot_to_id;
+        std::vector<uint8_t>                 new_slot_active;
         std::unordered_map<uint64_t, size_t> new_id_to_slot;
         new_slot_to_id.reserve(n_live);
         new_slot_active.assign(n_live, 1);
