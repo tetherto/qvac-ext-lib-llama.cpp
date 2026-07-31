@@ -23,6 +23,7 @@
 #ifdef _WIN32
 #    include <process.h>
 #else
+#    include <sys/stat.h>
 #    include <unistd.h>
 #endif
 
@@ -522,14 +523,27 @@ int main() {
     // Persistence round-trip: write, free, load, re-query.
     temp_file         round_trip_file(".tvim");
     const std::string path = round_trip_file.path.string();
-    CHECK(ggml_vec_index_write(idx, path.c_str()) == 0);
+#ifndef _WIN32
+    const mode_t previous_umask = umask(0027);
+#endif
+    const int write_result = ggml_vec_index_write(idx, path.c_str());
+#ifndef _WIN32
+    const mode_t write_umask = umask(previous_umask);
+#endif
+    CHECK(write_result == 0);
+#ifndef _WIN32
+    CHECK(write_umask == 0027);
+#endif
     CHECK(!has_snapshot_tmp(round_trip_file.path));
 #ifndef _WIN32
     {
         std::error_code ec;
         const auto      perms = std::filesystem::status(round_trip_file.path, ec).permissions();
         CHECK(!ec);
-        CHECK((perms & std::filesystem::perms::group_read) == std::filesystem::perms::none);
+        CHECK((perms & std::filesystem::perms::owner_read) != std::filesystem::perms::none);
+        CHECK((perms & std::filesystem::perms::owner_write) != std::filesystem::perms::none);
+        CHECK((perms & std::filesystem::perms::group_read) != std::filesystem::perms::none);
+        CHECK((perms & std::filesystem::perms::group_write) == std::filesystem::perms::none);
         CHECK((perms & std::filesystem::perms::others_read) == std::filesystem::perms::none);
     }
 #endif
