@@ -141,13 +141,6 @@ set_and_check(GGML_LIB_DIR "@PACKAGE_GGML_LIB_INSTALL_DIR@")
 # Include the exported targets file
 include("${CMAKE_CURRENT_LIST_DIR}/ggml-targets.cmake")
 
-if(TARGET ggml::ggml-vector-index AND NOT TARGET ggml::vector-index)
-    add_library(ggml::vector-index INTERFACE IMPORTED)
-    set_target_properties(ggml::vector-index
-        PROPERTIES
-            INTERFACE_LINK_LIBRARIES ggml::ggml-vector-index)
-endif()
-
 if(NOT TARGET ggml::ggml)
     find_package(Threads REQUIRED)
 
@@ -175,22 +168,6 @@ if(NOT TARGET ggml::ggml)
             IMPORTED_LOCATION "${GGML_BASE_LIBRARY}"
             INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}"
             INTERFACE_LINK_LIBRARIES "${GGML_BASE_INTERFACE_LINK_LIBRARIES}")
-
-    if (GGML_VECTOR_INDEX)
-        find_library(GGML_VECTOR_INDEX_LIBRARY ggml-vector-index
-            REQUIRED
-            HINTS ${GGML_LIB_DIR}
-            NO_CMAKE_FIND_ROOT_PATH)
-
-        add_library(ggml::ggml-vector-index UNKNOWN IMPORTED)
-        set_target_properties(ggml::ggml-vector-index
-            PROPERTIES
-                INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}"
-                IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
-                IMPORTED_LOCATION "${GGML_VECTOR_INDEX_LIBRARY}"
-                INTERFACE_COMPILE_FEATURES cxx_std_17
-                POSITION_INDEPENDENT_CODE ON)
-    endif()
 
     set(_ggml_all_targets "")
     if (NOT GGML_BACKEND_DL)
@@ -279,6 +256,29 @@ if(NOT TARGET ggml::all)
     set_target_properties(ggml::all
         PROPERTIES
             INTERFACE_LINK_LIBRARIES "${_ggml_all_targets}")
+endif()
+
+if(GGML_VECTOR_INDEX AND NOT TARGET ggml::ggml-vector-index)
+    find_library(GGML_VECTOR_INDEX_LIBRARY ggml-vector-index
+        REQUIRED
+        HINTS ${GGML_LIB_DIR}
+        NO_CMAKE_FIND_ROOT_PATH)
+
+    add_library(ggml::ggml-vector-index UNKNOWN IMPORTED)
+    set_target_properties(ggml::ggml-vector-index
+        PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${GGML_INCLUDE_DIR}"
+            IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+            IMPORTED_LOCATION "${GGML_VECTOR_INDEX_LIBRARY}"
+            INTERFACE_COMPILE_FEATURES cxx_std_17
+            POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(TARGET ggml::ggml-vector-index AND NOT TARGET ggml::vector-index)
+    add_library(ggml::vector-index INTERFACE IMPORTED)
+    set_target_properties(ggml::vector-index
+        PROPERTIES
+            INTERFACE_LINK_LIBRARIES ggml::ggml-vector-index)
 endif()
 
 check_required_components(ggml)

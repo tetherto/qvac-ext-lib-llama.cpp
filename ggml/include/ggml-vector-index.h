@@ -43,7 +43,6 @@ struct ggml_vec_index;
 typedef struct ggml_vec_index ggml_vec_index_t;
 
 // Error codes returned from int-valued APIs. 0 = OK. Negative = failure.
-// `_remove` is the exception: it returns 1 on removal and 0 on miss.
 enum ggml_vec_index_error {
     GGML_VEC_INDEX_OK            = 0,
     GGML_VEC_INDEX_E_INVALID_ARG = -1,
@@ -51,6 +50,7 @@ enum ggml_vec_index_error {
     GGML_VEC_INDEX_E_IO          = -3,
     GGML_VEC_INDEX_E_OOM         = -4,
     GGML_VEC_INDEX_E_INTERNAL    = -5,
+    GGML_VEC_INDEX_E_NOT_FOUND   = -6,
 };
 
 // Lifecycle.
@@ -73,8 +73,9 @@ GGML_API void ggml_vec_index_free(ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, const uint64_t * ids);
 
 // Removes the entry for `id` via swap-with-last (slot indices are NOT stable
-// across removes; external ids ARE). Returns 1 if removed, 0 if not present,
-// or GGML_VEC_INDEX_E_INVALID_ARG if `id` is the reserved UINT64_MAX value.
+// across removes; external ids ARE). Returns GGML_VEC_INDEX_OK if removed,
+// GGML_VEC_INDEX_E_NOT_FOUND if not present, or
+// GGML_VEC_INDEX_E_INVALID_ARG if `id` is the reserved UINT64_MAX value.
 GGML_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
 
 // Returns 1 if the id is in the index, 0 otherwise. Read-only.
@@ -110,7 +111,7 @@ GGML_API int ggml_vec_index_search(const ggml_vec_index_t * idx,
 // Persistence. Format is .tvim version 1; see bottom of this header. Write
 // replaces `path` through a same-directory temporary file so a failed write
 // does not truncate an existing snapshot.
-GGML_API int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path);
+GGML_API int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path);
 
 // Returns NULL on I/O, format, or validation failure. Detailed load errors are
 // not surfaced by this foundation API.
