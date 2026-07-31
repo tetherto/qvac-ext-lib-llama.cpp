@@ -1,6 +1,6 @@
 // ggml-vector-index-search.cpp - search and IVF implementation.
 
-#include "ggml-vector-index-internal.h"
+#include "ggml-vector-index-impl.h"
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
@@ -35,6 +35,9 @@ bool search_buffers_addressable(size_t n_q, size_t k, size_t dim) {
 }
 
 inline float float_score_from_double(double score) {
+    if (std::isnan(score)) {
+        return -FLT_MAX;
+    }
     if (score > static_cast<double>(FLT_MAX)) {
         return FLT_MAX;
     }
@@ -45,12 +48,31 @@ inline float float_score_from_double(double score) {
 }
 
 // Scalar dot product of two `dim`-length f32 vectors.
-inline float dot(const float * a, const float * b, int dim) {
+inline double dot(const float * a, const float * b, int dim) {
     double acc = 0.0;
     for (int i = 0; i < dim; ++i) {
         acc += static_cast<double>(a[i]) * static_cast<double>(b[i]);
     }
-    return float_score_from_double(acc);
+    return acc;
+}
+
+inline float dot_f32_fast(const float * a, const float * b, int dim) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    int   i    = 0;
+    for (; i + 4 <= dim; i += 4) {
+        acc0 += a[i + 0] * b[i + 0];
+        acc1 += a[i + 1] * b[i + 1];
+        acc2 += a[i + 2] * b[i + 2];
+        acc3 += a[i + 3] * b[i + 3];
+    }
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (; i < dim; ++i) {
+        acc += a[i] * b[i];
+    }
+    return std::isfinite(acc) ? acc : float_score_from_double(dot(a, b, dim));
 }
 
 inline float dot_q8_scalar(const float * query, const int8_t * codes, float scale, int dim) {
@@ -65,11 +87,9 @@ inline float dot_q8_scalar(const float * query, const int8_t * codes, float scal
 inline float dot_q4_scalar(const float * query, const uint8_t * codes, float scale, int dim) {
     double acc = 0.0;
     for (int i = 0; i < dim; ++i) {
-        const uint8_t byte = codes[static_cast<size_t>(i) / 2];
-        const uint8_t nibble = (i & 1) == 0 ?
-            static_cast<uint8_t>(byte & 0x0f) :
-            static_cast<uint8_t>(byte >> 4);
-        const double value = static_cast<double>(q4_decode(nibble)) * static_cast<double>(scale);
+        const uint8_t byte   = codes[static_cast<size_t>(i) / 2];
+        const uint8_t nibble = (i & 1) == 0 ? static_cast<uint8_t>(byte & 0x0f) : static_cast<uint8_t>(byte >> 4);
+        const double  value  = static_cast<double>(q4_decode(nibble)) * static_cast<double>(scale);
         acc += static_cast<double>(query[i]) * value;
     }
     return float_score_from_double(acc);
@@ -117,12 +137,12 @@ bool validate_queries_and_maybe_max_abs(
 #if GGML_VEC_INDEX_USE_NEON
 
 inline float horizontal_sum(float32x4_t v) {
-#if defined(__aarch64__)
+#    if defined(__aarch64__)
     return vaddvq_f32(v);
-#else
+#    else
     const float32x2_t sum2 = vadd_f32(vget_low_f32(v), vget_high_f32(v));
     return vget_lane_f32(vpadd_f32(sum2, sum2), 0);
-#endif
+#    endif
 }
 
 inline float dot_q8_neon(const float * query, const int8_t * codes, float scale, int dim) {
@@ -131,38 +151,31 @@ inline float dot_q8_neon(const float * query, const int8_t * codes, float scale,
 
     int i = 0;
     for (; i + 8 <= dim; i += 8) {
-        const int16x8_t q16 = vmovl_s8(vld1_s8(codes + i));
-        const float32x4_t q0 =
-            vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
-        const float32x4_t q1 =
-            vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))), scale);
-        acc0 = vmlaq_f32(acc0, vld1q_f32(query + i), q0);
-        acc1 = vmlaq_f32(acc1, vld1q_f32(query + i + 4), q1);
+        const int16x8_t   q16 = vmovl_s8(vld1_s8(codes + i));
+        const float32x4_t q0  = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
+        const float32x4_t q1  = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))), scale);
+        acc0                  = vmlaq_f32(acc0, vld1q_f32(query + i), q0);
+        acc1                  = vmlaq_f32(acc1, vld1q_f32(query + i + 4), q1);
     }
 
-    float acc = horizontal_sum(acc0) + horizontal_sum(acc1);
+    double acc = static_cast<double>(horizontal_sum(acc0)) + static_cast<double>(horizontal_sum(acc1));
     for (; i < dim; ++i) {
-        const float value = static_cast<float>(codes[i]) * scale;
-        acc += query[i] * value;
+        const double value = static_cast<double>(codes[i]) * static_cast<double>(scale);
+        acc += static_cast<double>(query[i]) * value;
     }
-    return acc;
+    return float_score_from_double(acc);
 }
 
-inline void dot_q4_neon_accum8(
-        const float * query,
-        uint8x8_t codes,
-        float scale,
-        float32x4_t & acc0,
-        float32x4_t & acc1) {
-    const int16x8_t q16 = vsubq_s16(
-        vreinterpretq_s16_u16(vmovl_u8(codes)),
-        vdupq_n_s16(8));
-    const float32x4_t q0 =
-        vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
-    const float32x4_t q1 =
-        vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))), scale);
-    acc0 = vmlaq_f32(acc0, vld1q_f32(query), q0);
-    acc1 = vmlaq_f32(acc1, vld1q_f32(query + 4), q1);
+inline void dot_q4_neon_accum8(const float * query,
+                               uint8x8_t     codes,
+                               float         scale,
+                               float32x4_t & acc0,
+                               float32x4_t & acc1) {
+    const int16x8_t   q16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(codes)), vdupq_n_s16(8));
+    const float32x4_t q0  = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
+    const float32x4_t q1  = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))), scale);
+    acc0                  = vmlaq_f32(acc0, vld1q_f32(query), q0);
+    acc1                  = vmlaq_f32(acc1, vld1q_f32(query + 4), q1);
 }
 
 inline float dot_q4_neon(const float * query, const uint8_t * codes, float scale, int dim) {
@@ -173,27 +186,24 @@ inline float dot_q4_neon(const float * query, const uint8_t * codes, float scale
 
     int i = 0;
     for (; i + 16 <= dim; i += 16) {
-        const uint8x8_t packed = vld1_u8(codes + static_cast<size_t>(i) / 2);
-        const uint8x8_t low = vand_u8(packed, vdup_n_u8(0x0f));
-        const uint8x8_t high = vshr_n_u8(packed, 4);
+        const uint8x8_t   packed = vld1_u8(codes + static_cast<size_t>(i) / 2);
+        const uint8x8_t   low    = vand_u8(packed, vdup_n_u8(0x0f));
+        const uint8x8_t   high   = vshr_n_u8(packed, 4);
         const uint8x8x2_t zipped = vzip_u8(low, high);
 
         dot_q4_neon_accum8(query + i, zipped.val[0], scale, acc0, acc1);
         dot_q4_neon_accum8(query + i + 8, zipped.val[1], scale, acc2, acc3);
     }
 
-    float acc =
-        horizontal_sum(acc0) + horizontal_sum(acc1) +
-        horizontal_sum(acc2) + horizontal_sum(acc3);
+    double acc = static_cast<double>(horizontal_sum(acc0)) + static_cast<double>(horizontal_sum(acc1)) +
+                 static_cast<double>(horizontal_sum(acc2)) + static_cast<double>(horizontal_sum(acc3));
     for (; i < dim; ++i) {
-        const uint8_t byte = codes[static_cast<size_t>(i) / 2];
-        const uint8_t nibble = (i & 1) == 0 ?
-            static_cast<uint8_t>(byte & 0x0f) :
-            static_cast<uint8_t>(byte >> 4);
-        const float value = static_cast<float>(q4_decode(nibble)) * scale;
-        acc += query[i] * value;
+        const uint8_t byte   = codes[static_cast<size_t>(i) / 2];
+        const uint8_t nibble = (i & 1) == 0 ? static_cast<uint8_t>(byte & 0x0f) : static_cast<uint8_t>(byte >> 4);
+        const double  value  = static_cast<double>(q4_decode(nibble)) * static_cast<double>(scale);
+        acc += static_cast<double>(query[i]) * value;
     }
-    return acc;
+    return float_score_from_double(acc);
 }
 
 #endif
@@ -201,7 +211,9 @@ inline float dot_q4_neon(const float * query, const uint8_t * codes, float scale
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
 
 bool cpu_has_avx2() {
-#if defined(_MSC_VER)
+    // Keep vector-index linkable without ggml-cpu; this mirrors ggml-cpu's
+    // CPUID/XCR0 gating locally for the standalone library.
+#    if defined(_MSC_VER)
     int regs[4] = {};
     __cpuid(regs, 0);
     if (regs[0] < 7) {
@@ -209,29 +221,26 @@ bool cpu_has_avx2() {
     }
     __cpuidex(regs, 1, 0);
     constexpr int kOsxsave = 1 << 27;
-    constexpr int kAvx = 1 << 28;
-    if ((regs[2] & (kOsxsave | kAvx)) != (kOsxsave | kAvx) ||
-        (_xgetbv(0) & 0x6) != 0x6) {
+    constexpr int kAvx     = 1 << 28;
+    if ((regs[2] & (kOsxsave | kAvx)) != (kOsxsave | kAvx) || (_xgetbv(0) & 0x6) != 0x6) {
         return false;
     }
     __cpuidex(regs, 7, 0);
     return (regs[1] & (1 << 5)) != 0;
-#elif defined(__GNUC__) || defined(__clang__)
+#    elif defined(__GNUC__) || defined(__clang__)
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx2");
-#else
+#    else
     return false;
-#endif
+#    endif
 }
 
 #endif
 
-inline float dot_q8(
-        const float * query,
-        const int8_t * codes,
-        float scale,
-        int dim,
-        double max_query) {
+inline float dot_q8(const float * query, const int8_t * codes, float scale, int dim, double max_query) {
+    if (dim < 8) {
+        return dot_q8_scalar(query, codes, scale, dim);
+    }
 #if GGML_VEC_INDEX_USE_NEON
     if (!quantized_dot_float_path_is_safe(max_query, dim, scale, 127.0f)) {
         return dot_q8_scalar(query, codes, scale, dim);
@@ -251,12 +260,10 @@ inline float dot_q8(
 #endif
 }
 
-inline float dot_q4(
-        const float * query,
-        const uint8_t * codes,
-        float scale,
-        int dim,
-        double max_query) {
+inline float dot_q4(const float * query, const uint8_t * codes, float scale, int dim, double max_query) {
+    if (dim < 16) {
+        return dot_q4_scalar(query, codes, scale, dim);
+    }
 #if GGML_VEC_INDEX_USE_NEON
     if (!quantized_dot_float_path_is_safe(max_query, dim, scale, 7.0f)) {
         return dot_q4_scalar(query, codes, scale, dim);
@@ -276,38 +283,25 @@ inline float dot_q4(
 #endif
 }
 
-inline float score_slot(
+inline double score_slot(
         const ggml_vec_index_t & idx,
         const float * query,
         size_t slot,
         double max_query) {
     const int dim = idx.dim;
     return is_q4(idx) ?
-        dot_q4(
-            query,
-            q4_data_ptr(idx) + slot * q4_row_bytes(static_cast<size_t>(dim)),
-            idx.q4_scale[slot],
-            dim,
-            max_query) :
-        is_q8(idx) ?
-        dot_q8(
-            query,
-            q8_data_ptr(idx) + slot * static_cast<size_t>(dim),
-            idx.q8_scale[slot],
-            dim,
-            max_query) :
-        dot(
-            query,
-            f32_data_ptr(idx) + slot * static_cast<size_t>(dim),
-            dim);
+               dot_q4(query, q4_data_ptr(idx) + slot * q4_row_bytes(static_cast<size_t>(dim)), idx.q4_scale[slot], dim,
+                      max_query) :
+           is_q8(idx) ?
+               dot_q8(query, q8_data_ptr(idx) + slot * static_cast<size_t>(dim), idx.q8_scale[slot], dim, max_query) :
+               dot(query, f32_data_ptr(idx) + slot * static_cast<size_t>(dim), dim);
 }
 
 void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) {
     const int dim = idx.dim;
     if (is_q4(idx)) {
-        const uint8_t * codes =
-            q4_data_ptr(idx) + slot * q4_row_bytes(static_cast<size_t>(dim));
-        const float scale = idx.q4_scale[slot];
+        const uint8_t * codes = q4_data_ptr(idx) + slot * q4_row_bytes(static_cast<size_t>(dim));
+        const float     scale = idx.q4_scale[slot];
         for (int i = 0; i < dim; ++i) {
             const uint8_t byte = codes[static_cast<size_t>(i) / 2];
             const uint8_t nibble = (i & 1) == 0 ?
@@ -322,21 +316,18 @@ void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) 
             dst[i] = static_cast<float>(codes[i]) * scale;
         }
     } else {
-        std::memcpy(
-            dst,
-            f32_data_ptr(idx) + slot * static_cast<size_t>(dim),
-            static_cast<size_t>(dim) * sizeof(float));
+        std::memcpy(dst, f32_data_ptr(idx) + slot * static_cast<size_t>(dim), static_cast<size_t>(dim) * sizeof(float));
     }
 }
 
 size_t best_centroid(const float * query, const std::vector<float> & centroids, int n_lists, int dim) {
-    size_t best = 0;
-    float best_score = -FLT_MAX;
+    size_t best       = 0;
+    float  best_score = -FLT_MAX;
     for (int list = 0; list < n_lists; ++list) {
-        const float s = dot(query, centroids.data() + static_cast<size_t>(list) * dim, dim);
+        const float s = dot_f32_fast(query, centroids.data() + static_cast<size_t>(list) * dim, dim);
         if (s > best_score) {
             best_score = s;
-            best = static_cast<size_t>(list);
+            best       = static_cast<size_t>(list);
         }
     }
     return best;
@@ -344,27 +335,23 @@ size_t best_centroid(const float * query, const std::vector<float> & centroids, 
 
 // Run a single query against all slots, write top-k into out_scores/out_ids.
 // If the index holds fewer than k entries, pad with sentinels.
-void search_one(
-    const ggml_vec_index_t & idx,
-    const float            * query,
-    int                      k,
-    float                  * out_scores,
-    uint64_t               * out_ids,
-    double                   max_query,
-    std::vector<ScoreId>   & heap,
-    std::vector<ScoreId>   & drained,
-    const std::vector<size_t> * allowed_slots = nullptr) {
-
+void search_one(const ggml_vec_index_t &    idx,
+                const float *               query,
+                int                         k,
+                float *                     out_scores,
+                uint64_t *                  out_ids,
+                double                      max_query,
+                std::vector<ScoreId> &      heap,
+                std::vector<ScoreId> &      drained,
+                const std::vector<size_t> * allowed_slots = nullptr) {
     const size_t n_slots = idx.slot_to_id.size();
 
     test_maybe_throw_bad_alloc();
     heap.clear();
     drained.clear();
-    const size_t candidate_hint = allowed_slots != nullptr ?
-        std::min(allowed_slots->size(), n_slots) :
-        active_count(idx);
-    const size_t heap_capacity =
-        std::min(static_cast<size_t>(k), candidate_hint);
+    const size_t candidate_hint =
+        allowed_slots != nullptr ? std::min(allowed_slots->size(), n_slots) : active_count(idx);
+    const size_t heap_capacity = std::min(static_cast<size_t>(k), candidate_hint);
     heap.reserve(heap_capacity);
 
     auto visit_slot = [&](size_t slot) {
@@ -409,7 +396,7 @@ void search_one(
 
     for (int i = 0; i < k; ++i) {
         if (static_cast<size_t>(i) < drained.size()) {
-            out_scores[i] = drained[i].score;
+            out_scores[i] = float_score_from_double(drained[i].score);
             out_ids[i]    = drained[i].id;
         } else {
             out_scores[i] = -FLT_MAX;
@@ -435,7 +422,7 @@ std::vector<size_t> allowed_slots_for_ids(
     return slots;
 }
 
-} // namespace
+}  // namespace
 
 static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists, int n_iter) {
     try {
@@ -444,29 +431,27 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
         }
 
         const size_t n_slots = idx->slot_to_id.size();
-        const size_t n_live = active_count(*idx);
-        const int dim = idx->dim;
+        const size_t n_live  = active_count(*idx);
+        const int    dim     = idx->dim;
         if (n_live == 0) {
             invalidate_ivf(*idx);
             idx->ivf_generation = idx->generation;
             return GGML_VEC_INDEX_OK;
         }
 
-        const int actual_lists = static_cast<int>(
-            std::min(static_cast<size_t>(n_lists), n_live));
-        const size_t dim_sz = static_cast<size_t>(dim);
-        if (dim_sz != 0 &&
-            static_cast<size_t>(actual_lists) > std::numeric_limits<size_t>::max() / dim_sz) {
+        const int    actual_lists = static_cast<int>(std::min(static_cast<size_t>(n_lists), n_live));
+        const size_t dim_sz       = static_cast<size_t>(dim);
+        if (dim_sz != 0 && static_cast<size_t>(actual_lists) > std::numeric_limits<size_t>::max() / dim_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         test_maybe_throw_bad_alloc();
 
-        std::vector<float> centroids(static_cast<size_t>(actual_lists) * dim_sz);
-        std::vector<double> next_centroids(centroids.size());
-        std::vector<int> counts(static_cast<size_t>(actual_lists));
-        std::vector<float> row(dim_sz);
+        std::vector<float>               centroids(static_cast<size_t>(actual_lists) * dim_sz);
+        std::vector<double>              next_centroids(centroids.size());
+        std::vector<int>                 counts(static_cast<size_t>(actual_lists));
+        std::vector<float>               row(dim_sz);
         std::vector<std::vector<size_t>> lists(static_cast<size_t>(actual_lists));
-        std::vector<size_t> active_slots;
+        std::vector<size_t>              active_slots;
         active_slots.reserve(n_live);
         for (size_t slot = 0; slot < n_slots; ++slot) {
             if (slot_is_active(*idx, slot)) {
@@ -474,23 +459,43 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
             }
         }
 
+        std::vector<float> decoded_rows;
+        if (is_quantized(*idx)) {
+            if (dim_sz != 0 && active_slots.size() > std::numeric_limits<size_t>::max() / dim_sz) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
+            decoded_rows.resize(active_slots.size() * dim_sz);
+            for (size_t active_index = 0; active_index < active_slots.size(); ++active_index) {
+                decode_slot_to_f32(*idx, active_slots[active_index], decoded_rows.data() + active_index * dim_sz);
+            }
+        }
+
         for (int list = 0; list < actual_lists; ++list) {
-            const size_t slot = active_slots[static_cast<size_t>(list) * active_slots.size() /
-                static_cast<size_t>(actual_lists)];
+            const size_t active_index =
+                static_cast<size_t>(list) * active_slots.size() / static_cast<size_t>(actual_lists);
             float * centroid = centroids.data() + static_cast<size_t>(list) * dim_sz;
-            decode_slot_to_f32(*idx, slot, centroid);
+            if (decoded_rows.empty()) {
+                decode_slot_to_f32(*idx, active_slots[active_index], centroid);
+            } else {
+                std::copy_n(decoded_rows.data() + active_index * dim_sz, dim_sz, centroid);
+            }
         }
 
         for (int iter = 0; iter < n_iter; ++iter) {
             std::fill(next_centroids.begin(), next_centroids.end(), 0.0);
             std::fill(counts.begin(), counts.end(), 0);
 
-            for (size_t slot : active_slots) {
-                decode_slot_to_f32(*idx, slot, row.data());
-                const size_t list = best_centroid(row.data(), centroids, actual_lists, dim);
-                double * dst = next_centroids.data() + list * dim_sz;
+            for (size_t active_index = 0; active_index < active_slots.size(); ++active_index) {
+                const float * row_data = row.data();
+                if (decoded_rows.empty()) {
+                    decode_slot_to_f32(*idx, active_slots[active_index], row.data());
+                } else {
+                    row_data = decoded_rows.data() + active_index * dim_sz;
+                }
+                const size_t list = best_centroid(row_data, centroids, actual_lists, dim);
+                double *     dst  = next_centroids.data() + list * dim_sz;
                 for (int i = 0; i < dim; ++i) {
-                    dst[i] += static_cast<double>(row[static_cast<size_t>(i)]);
+                    dst[i] += static_cast<double>(row_data[static_cast<size_t>(i)]);
                 }
                 ++counts[list];
             }
@@ -500,21 +505,23 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
                 if (counts[static_cast<size_t>(list)] == 0) {
                     continue;
                 }
-                const double inv_count = 1.0 /
-                    static_cast<double>(counts[static_cast<size_t>(list)]);
-                const double * src =
-                    next_centroids.data() + static_cast<size_t>(list) * dim_sz;
+                const double   inv_count = 1.0 / static_cast<double>(counts[static_cast<size_t>(list)]);
+                const double * src       = next_centroids.data() + static_cast<size_t>(list) * dim_sz;
                 for (int i = 0; i < dim; ++i) {
-                    centroid[i] = static_cast<float>(
-                        src[static_cast<size_t>(i)] * inv_count);
+                    centroid[i] = static_cast<float>(src[static_cast<size_t>(i)] * inv_count);
                 }
             }
         }
 
-        for (size_t slot : active_slots) {
-            decode_slot_to_f32(*idx, slot, row.data());
-            const size_t list = best_centroid(row.data(), centroids, actual_lists, dim);
-            lists[list].push_back(slot);
+        for (size_t active_index = 0; active_index < active_slots.size(); ++active_index) {
+            const float * row_data = row.data();
+            if (decoded_rows.empty()) {
+                decode_slot_to_f32(*idx, active_slots[active_index], row.data());
+            } else {
+                row_data = decoded_rows.data() + active_index * dim_sz;
+            }
+            const size_t list = best_centroid(row_data, centroids, actual_lists, dim);
+            lists[list].push_back(active_slots[active_index]);
         }
 
         idx->ivf_centroids = std::move(centroids);
@@ -759,32 +766,25 @@ int ggml_vec_index_search_ivf(
 
             centroid_scores.clear();
             for (int list = 0; list < idx->ivf_n_lists; ++list) {
-                const float score = dot(
-                    query,
-                    idx->ivf_centroids.data() + static_cast<size_t>(list) * dim_sz,
-                    dim);
+                if (idx->ivf_lists[static_cast<size_t>(list)].empty()) {
+                    continue;
+                }
+                const float score =
+                    dot_f32_fast(query, idx->ivf_centroids.data() + static_cast<size_t>(list) * dim_sz, dim);
                 centroid_scores.push_back({ score, static_cast<uint64_t>(list) });
             }
-            std::sort(
-                centroid_scores.begin(),
-                centroid_scores.end(),
-                [](const ScoreId & a, const ScoreId & b) {
-                    return score_id_better(a, b);
-                });
+            const size_t n_top = std::min(static_cast<size_t>(probe_count), centroid_scores.size());
+            std::partial_sort(centroid_scores.begin(), centroid_scores.begin() + n_top, centroid_scores.end(),
+                              [](const ScoreId & a, const ScoreId & b) { return score_id_better(a, b); });
 
             selected_lists.clear();
             size_t candidate_count = 0;
-            for (const ScoreId & centroid : centroid_scores) {
-                const size_t list_id = static_cast<size_t>(centroid.id);
-                const auto & list = idx->ivf_lists[list_id];
-                if (list.empty()) {
-                    continue;
-                }
+            for (size_t i = 0; i < n_top; ++i) {
+                const ScoreId & centroid = centroid_scores[i];
+                const size_t    list_id  = static_cast<size_t>(centroid.id);
+                const auto &    list     = idx->ivf_lists[list_id];
                 selected_lists.push_back(list_id);
                 candidate_count += list.size();
-                if (selected_lists.size() == static_cast<size_t>(probe_count)) {
-                    break;
-                }
             }
             candidate_slots.clear();
             candidate_slots.reserve(candidate_count);

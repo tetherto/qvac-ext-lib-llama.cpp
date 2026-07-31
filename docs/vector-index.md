@@ -94,6 +94,10 @@ Create an index with a fixed dimension and bit width:
 - `bit_width=8`: per-vector symmetric q8 storage with f32 scales.
 - `bit_width=4`: per-vector symmetric packed q4 storage with f32 scales.
 
+The generic q4/q8 layouts are local to vector-index and are not `ggml-quants`
+block formats. They keep one scale per external vector for random row lookup,
+delete/compact operations, and compact `.tvim` snapshots.
+
 Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries
 before search.
