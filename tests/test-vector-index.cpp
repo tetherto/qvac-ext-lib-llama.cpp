@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <vector>
@@ -272,7 +273,7 @@ int main() {
     {
         const std::vector<uint64_t> bad_ids = { 777ULL };
         std::vector<float>          bad_vec(seeds[0]);
-        const std::array<float, 3>   non_finite = {
+        const std::array<float, 3>  non_finite = {
             std::numeric_limits<float>::quiet_NaN(),
             std::numeric_limits<float>::infinity(),
             -std::numeric_limits<float>::infinity(),
@@ -377,6 +378,23 @@ int main() {
         }
     }
 
+    // Top-k eviction keeps the best rows even when they are scanned last.
+    {
+        const std::array<float, kDim> query = {
+            0.10f,
+            0.20f,
+            0.70f,
+            0.90f,
+        };
+        std::array<float, 2>    scores{};
+        std::array<uint64_t, 2> out_ids{};
+        CHECK(ggml_vec_index_search(idx, query.data(), 1, /*k=*/2, scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == ids[3]);
+        CHECK(out_ids[1] == ids[2]);
+        CHECK(std::fabs(scores[0] - 0.90f) < 1e-5f);
+        CHECK(std::fabs(scores[1] - 0.70f) < 1e-5f);
+    }
+
     // Non-finite queries are rejected.
     {
         std::array<float, 1>    scores{};
@@ -431,19 +449,25 @@ int main() {
     {
         auto * overflow_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
         CHECK(overflow_idx != nullptr);
-        const std::array<float, kDim> overflow_vec = {
+        const std::array<float, 2 * kDim> overflow_vecs = {
+            1.0e30f, 0.0f, 0.0f, 0.0f, FLT_MAX, 0.0f, 0.0f, 0.0f,
+        };
+        const std::array<uint64_t, 2> overflow_ids = {
+            7654321ULL,
+            7654322ULL,
+        };
+        CHECK(ggml_vec_index_add(overflow_idx, overflow_vecs.data(), 2, overflow_ids.data()) == 0);
+        const std::array<float, kDim> overflow_query = {
             FLT_MAX,
             0.0f,
             0.0f,
             0.0f,
         };
-        const uint64_t overflow_id = 7654321ULL;
-        CHECK(ggml_vec_index_add(overflow_idx, overflow_vec.data(), 1, &overflow_id) == 0);
         std::array<float, 1>    scores{};
         std::array<uint64_t, 1> out_ids{};
-        CHECK(ggml_vec_index_search(overflow_idx, overflow_vec.data(), 1, 1, scores.data(), out_ids.data()) == 0);
+        CHECK(ggml_vec_index_search(overflow_idx, overflow_query.data(), 1, 1, scores.data(), out_ids.data()) == 0);
         CHECK(scores[0] == FLT_MAX);
-        CHECK(out_ids[0] == overflow_id);
+        CHECK(out_ids[0] == overflow_ids[1]);
         ggml_vec_index_free(overflow_idx);
     }
 
@@ -456,7 +480,7 @@ int main() {
         remove_vecs.insert(remove_vecs.end(), seeds[1].begin(), seeds[1].end());
         const std::array<uint64_t, 2> remove_ids = { 8001ULL, 8002ULL };
         CHECK(ggml_vec_index_add(remove_last_idx, remove_vecs.data(), 2, remove_ids.data()) == GGML_VEC_INDEX_OK);
-        CHECK(ggml_vec_index_remove(remove_last_idx, remove_ids[1]) == 1);
+        CHECK(ggml_vec_index_remove(remove_last_idx, remove_ids[1]) == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_len(remove_last_idx) == 1);
         CHECK(ggml_vec_index_contains(remove_last_idx, remove_ids[0]) == 1);
 
@@ -471,8 +495,8 @@ int main() {
 
     // Remove + search: the removed id must no longer surface.
     {
-        CHECK(ggml_vec_index_remove(idx, ids[1]) == 1);
-        CHECK(ggml_vec_index_remove(idx, ids[1]) == 0);  // already gone
+        CHECK(ggml_vec_index_remove(idx, ids[1]) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_remove(idx, ids[1]) == GGML_VEC_INDEX_E_NOT_FOUND);
         CHECK(ggml_vec_index_len(idx) == 3);
         CHECK(ggml_vec_index_contains(idx, ids[1]) == 0);
 
@@ -491,7 +515,7 @@ int main() {
         CHECK(ggml_vec_index_len(idx) == 4);
         CHECK(ggml_vec_index_search(idx, seeds[1].data(), 1, /*k=*/1, scores.data(), out_ids.data()) == 0);
         CHECK(out_ids[0] == replacement_id);
-        CHECK(ggml_vec_index_remove(idx, replacement_id) == 1);
+        CHECK(ggml_vec_index_remove(idx, replacement_id) == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_len(idx) == 3);
     }
 
@@ -500,6 +524,33 @@ int main() {
     const std::string path = round_trip_file.path.string();
     CHECK(ggml_vec_index_write(idx, path.c_str()) == 0);
     CHECK(!has_snapshot_tmp(round_trip_file.path));
+#ifndef _WIN32
+    {
+        std::error_code ec;
+        const auto      perms = std::filesystem::status(round_trip_file.path, ec).permissions();
+        CHECK(!ec);
+        CHECK((perms & std::filesystem::perms::group_read) == std::filesystem::perms::none);
+        CHECK((perms & std::filesystem::perms::others_read) == std::filesystem::perms::none);
+    }
+#endif
+    {
+        std::ifstream in(round_trip_file.path, std::ios::binary);
+        CHECK(in.is_open());
+        const std::vector<uint8_t> actual{
+            std::istreambuf_iterator<char>(in),
+            std::istreambuf_iterator<char>(),
+        };
+        std::vector<float> expected_values;
+        expected_values.insert(expected_values.end(), seeds[0].begin(), seeds[0].end());
+        expected_values.insert(expected_values.end(), seeds[3].begin(), seeds[3].end());
+        expected_values.insert(expected_values.end(), seeds[2].begin(), seeds[2].end());
+        const std::vector<uint64_t> expected_ids = {
+            ids[0],
+            ids[3],
+            ids[2],
+        };
+        CHECK(actual == snapshot_bytes(kDim, 3, expected_values, expected_ids));
+    }
 #ifndef _WIN32
     {
         std::error_code ec;
@@ -566,7 +617,7 @@ int main() {
     {
         const uint64_t loaded_id = 9002ULL;
         CHECK(ggml_vec_index_add(loaded, seeds[1].data(), 1, &loaded_id) == GGML_VEC_INDEX_OK);
-        CHECK(ggml_vec_index_remove(loaded, ids[2]) == 1);
+        CHECK(ggml_vec_index_remove(loaded, ids[2]) == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_contains(loaded, loaded_id) == 1);
         CHECK(ggml_vec_index_contains(loaded, ids[2]) == 0);
 
