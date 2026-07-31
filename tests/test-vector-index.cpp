@@ -440,6 +440,40 @@ void check_f32_ivf_extreme_centroid_routing() {
     ggml_vec_index_free(idx);
 }
 
+void check_ivf_partial_probe_routing() {
+    constexpr int dim = 2;
+
+    const std::array<float, dim * 4> vectors = {
+        1.0f,   0.0f,
+        2.0f,   0.0f,
+        0.0f,   1.0f,
+        100.0f, 101.0f,
+    };
+    const std::array<uint64_t, 4> ids   = { 8250ULL, 8251ULL, 8252ULL, 8253ULL };
+    const std::array<float, dim>  query = { 1.0f, 0.0f };
+
+    auto * idx = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vectors.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/0) == GGML_VEC_INDEX_OK);
+
+    std::array<float, 1>    partial_score{};
+    std::array<uint64_t, 1> partial_id{};
+    CHECK(ggml_vec_index_search_ivf(idx, query.data(), 1, 1, /*nprobe=*/1,
+                                    partial_score.data(), partial_id.data()) == GGML_VEC_INDEX_OK);
+    CHECK(partial_id[0] == ids[1]);
+    CHECK(partial_score[0] == 2.0f);
+
+    std::array<float, 1>    full_score{};
+    std::array<uint64_t, 1> full_id{};
+    CHECK(ggml_vec_index_search_ivf(idx, query.data(), 1, 1, /*nprobe=*/2,
+                                    full_score.data(), full_id.data()) == GGML_VEC_INDEX_OK);
+    CHECK(full_id[0] == ids[3]);
+    CHECK(full_score[0] == 100.0f);
+
+    ggml_vec_index_free(idx);
+}
+
 void check_ivf_centroid_overflow_fallback() {
     constexpr int dim = 4;
 
@@ -1468,6 +1502,7 @@ int main() {
     check_ivf_centroid_overflow_fallback();
     check_q8_ivf_extreme_centroid_routing();
     check_ivf_empty_batch_state_validation();
+    check_ivf_partial_probe_routing();
     for (int bit_width : { 32, 8, 4 }) {
         check_filtered_and_ivf_search(bit_width);
     }
