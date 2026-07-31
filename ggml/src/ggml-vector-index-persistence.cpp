@@ -1,13 +1,38 @@
 // ggml-vector-index-persistence.cpp - f32 snapshot shim for early search split.
 
-#include "ggml-vector-index-impl.h"
+#include "ggml-vector-index-internal.h"
 
 MappedFile::~MappedFile() = default;
 
 void test_maybe_throw_bad_alloc() {}
-bool test_consume_write_bytes(size_t) { return true; }
 void test_wait_after_delta_validate() {}
 void test_wait_after_load_with_delta_snapshot() {}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+static std::atomic<int64_t> g_write_bytes_remaining{ -1 };
+
+extern "C" {
+GGML_API void ggml_vec_index_test_set_write_fail_after(int64_t bytes) {
+    g_write_bytes_remaining.store(bytes, std::memory_order_relaxed);
+}
+}
+
+bool test_consume_write_bytes(size_t n) {
+    int64_t remaining = g_write_bytes_remaining.load(std::memory_order_relaxed);
+    if (remaining < 0) {
+        return true;
+    }
+    if (n > static_cast<size_t>(remaining)) {
+        return false;
+    }
+    g_write_bytes_remaining.store(remaining - static_cast<int64_t>(n), std::memory_order_relaxed);
+    return true;
+}
+#else
+bool test_consume_write_bytes(size_t) {
+    return true;
+}
+#endif
 
 bool is_supported_bit_width(int bit_width) {
     return bit_width == 4 || bit_width == 8 || bit_width == 32;
@@ -194,18 +219,107 @@ bool build_add_delta_payload_from_slots(const ggml_vec_index_t *, size_t, int, s
 std::vector<uint8_t> build_remove_delta_payload(uint64_t) { return {}; }
 DeltaAppendResult append_delta_record_locked(ggml_vec_index &, const char *, DeltaLogFormat, uint8_t, uint32_t, uint32_t, uint32_t, const DeltaStateWide &, const DeltaStateWide &, const std::vector<uint8_t> &) { return { GGML_VEC_INDEX_E_INVALID_ARG, false }; }
 
-static bool write_u32(std::ofstream & f, uint32_t v) {
-    uint8_t bytes[4];
-    put_u32_le(bytes, v);
-    f.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
-    return static_cast<bool>(f);
+static bool write_all(std::FILE * f, const void * data, size_t size) {
+    return test_consume_write_bytes(size) && std::fwrite(data, 1, size, f) == size;
 }
 
-static bool write_u64(std::ofstream & f, uint64_t v) {
+static bool write_u32(std::FILE * f, uint32_t v) {
+    uint8_t bytes[4];
+    put_u32_le(bytes, v);
+    return write_all(f, bytes, sizeof(bytes));
+}
+
+static bool write_u64(std::FILE * f, uint64_t v) {
     uint8_t bytes[8];
     put_u64_le(bytes, v);
-    f.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
-    return static_cast<bool>(f);
+    return write_all(f, bytes, sizeof(bytes));
+}
+
+static bool create_file_write_binary_exclusive(const std::filesystem::path & path, std::FILE *& out) {
+#ifdef _WIN32
+    const int fd = _wopen(
+        path.wstring().c_str(),
+        _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+        _S_IREAD | _S_IWRITE);
+    if (fd < 0) {
+        return false;
+    }
+    out = _fdopen(fd, "wb");
+    if (out == nullptr) {
+        _close(fd);
+        _wunlink(path.wstring().c_str());
+        return false;
+    }
+#else
+    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) {
+        return false;
+    }
+    out = fdopen(fd, "wb");
+    if (out == nullptr) {
+        close(fd);
+        unlink(path.c_str());
+        return false;
+    }
+#endif
+    return true;
+}
+
+static bool flush_file_to_disk(std::FILE * f) {
+    if (std::fflush(f) != 0) {
+        return false;
+    }
+#ifdef _WIN32
+    const int fd = _fileno(f);
+    return fd >= 0 && _commit(fd) == 0;
+#else
+    const int fd = fileno(f);
+    return fd >= 0 && fsync(fd) == 0;
+#endif
+}
+
+static bool close_file(std::FILE *& f) {
+    if (f == nullptr) {
+        return true;
+    }
+    const bool ok = std::fclose(f) == 0;
+    f = nullptr;
+    return ok;
+}
+
+static bool sync_parent_dir(const std::filesystem::path & path) {
+#ifdef _WIN32
+    (void) path;
+    return true;
+#else
+    const std::filesystem::path parent = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+    const int fd = open(parent.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return false;
+    }
+    const bool ok = fsync(fd) == 0;
+    return close(fd) == 0 && ok;
+#endif
+}
+
+static bool rename_replace(const std::filesystem::path & src, const std::filesystem::path & dst) {
+#ifdef _WIN32
+    return MoveFileExW(
+        src.wstring().c_str(),
+        dst.wstring().c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return std::rename(src.c_str(), dst.c_str()) == 0;
+#endif
+}
+
+static std::filesystem::path snapshot_tmp_path(const std::filesystem::path & path, int attempt) {
+    const std::filesystem::path parent = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string name =
+        ".ggml-vi-" + std::to_string(std::filesystem::hash_value(path)) + "-" +
+        std::to_string(nonce) + "-" + std::to_string(attempt) + ".tmp";
+    return parent / std::filesystem::path(name);
 }
 
 static bool read_u32(std::ifstream & f, uint32_t & v) {
@@ -228,12 +342,53 @@ static bool read_u64(std::ifstream & f, uint64_t & v) {
     return true;
 }
 
+static bool validate_tvim_v1_layout(
+        std::ifstream & f,
+        uint32_t dim,
+        uint32_t n,
+        size_t & component_count) {
+    component_count = 0;
+    if (dim == 0 || dim > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        n > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+
+    const std::streampos current = f.tellg();
+    if (current < 0) {
+        return false;
+    }
+    f.seekg(0, std::ios::end);
+    const std::streampos end = f.tellg();
+    f.seekg(current);
+    if (!f || end < 0) {
+        return false;
+    }
+    const uint64_t file_size = static_cast<uint64_t>(end);
+
+    uint64_t components = 0;
+    uint64_t expected_size = 0;
+    if (!checked_mul_u64(static_cast<uint64_t>(n), static_cast<uint64_t>(dim), components) ||
+        !supported_v1_snapshot_size(n, dim, expected_size)) {
+        return false;
+    }
+    if (components > static_cast<uint64_t>(std::vector<float>().max_size()) ||
+        static_cast<uint64_t>(n) > static_cast<uint64_t>(std::vector<uint64_t>().max_size())) {
+        return false;
+    }
+
+    if (expected_size != file_size) {
+        return false;
+    }
+    component_count = static_cast<size_t>(components);
+    return true;
+}
+
 int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
     if (idx == nullptr || path == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     try {
-        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
         if (idx->bit_width != 32 || idx->read_only_mmap || idx->delta_log_bound) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
@@ -242,17 +397,41 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         if (preflight_status != GGML_VEC_INDEX_OK) {
             return preflight_status;
         }
-        std::ofstream f(path, std::ios::binary | std::ios::trunc);
-        if (!f.is_open()) {
+        std::filesystem::path dst_path;
+        if (!filesystem_path_from_utf8(path, dst_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        std::error_code ec;
+        const auto existing_status = std::filesystem::status(dst_path, ec);
+        const bool preserve_permissions = !ec && std::filesystem::exists(existing_status);
+        const auto existing_permissions = preserve_permissions ? existing_status.permissions() : std::filesystem::perms::unknown;
+
+        std::filesystem::path tmp_path;
+        std::FILE * f = nullptr;
+        for (int attempt = 0; attempt < 100 && f == nullptr; ++attempt) {
+            tmp_path = snapshot_tmp_path(dst_path, attempt);
+            if (create_file_write_binary_exclusive(tmp_path, f)) {
+                break;
+            }
+        }
+        if (f == nullptr) {
             return GGML_VEC_INDEX_E_IO;
         }
+        if (preserve_permissions) {
+            std::filesystem::permissions(tmp_path, existing_permissions, std::filesystem::perm_options::replace, ec);
+            if (ec) {
+                close_file(f);
+                std::filesystem::remove(tmp_path, ec);
+                return GGML_VEC_INDEX_E_IO;
+            }
+        }
         const uint32_t n_le = static_cast<uint32_t>(n);
-        f.write(reinterpret_cast<const char *>(kTvimMagic), 4);
-        f.put(static_cast<char>(kTvimVersionV1));
-        f.put(32);
-        f.put(0);
-        f.put(0);
+        bool ok = write_all(f, kTvimMagic, 4);
+        const uint8_t header_tail[4] = { kTvimVersionV1, 32, 0, 0 };
+        ok = ok && write_all(f, header_tail, sizeof(header_tail));
         if (!write_u32(f, static_cast<uint32_t>(idx->dim)) || !write_u32(f, n_le)) {
+            close_file(f);
+            std::filesystem::remove(tmp_path, ec);
             return GGML_VEC_INDEX_E_IO;
         }
         const size_t dim = static_cast<size_t>(idx->dim);
@@ -263,16 +442,33 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
             }
             for (size_t i = 0; i < dim; ++i) {
                 if (!write_u32(f, float_to_u32(data[slot * dim + i]))) {
+                    close_file(f);
+                    std::filesystem::remove(tmp_path, ec);
                     return GGML_VEC_INDEX_E_IO;
                 }
             }
         }
         for (size_t slot = 0; slot < idx->slot_to_id.size(); ++slot) {
             if (slot_is_active(*idx, slot) && !write_u64(f, idx->slot_to_id[slot])) {
+                close_file(f);
+                std::filesystem::remove(tmp_path, ec);
                 return GGML_VEC_INDEX_E_IO;
             }
         }
-        return static_cast<bool>(f) ? GGML_VEC_INDEX_OK : GGML_VEC_INDEX_E_IO;
+        ok = ok && flush_file_to_disk(f);
+        ok = close_file(f) && ok;
+        if (!ok) {
+            std::filesystem::remove(tmp_path, ec);
+            return GGML_VEC_INDEX_E_IO;
+        }
+        if (!rename_replace(tmp_path, dst_path)) {
+            std::filesystem::remove(tmp_path, ec);
+            return GGML_VEC_INDEX_E_IO;
+        }
+        if (!sync_parent_dir(dst_path)) {
+            return GGML_VEC_INDEX_E_IO;
+        }
+        return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
@@ -289,7 +485,11 @@ int ggml_vec_index_load_ex(const char * path, ggml_vec_index_t ** out) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     try {
-        std::ifstream f(path, std::ios::binary);
+        std::filesystem::path src_path;
+        if (!filesystem_path_from_utf8(path, src_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        std::ifstream f(src_path, std::ios::binary);
         if (!f.is_open()) {
             return GGML_VEC_INDEX_E_IO;
         }
@@ -320,14 +520,12 @@ int ggml_vec_index_load_ex(const char * path, ggml_vec_index_t ** out) {
         }
         uint32_t dim = 0;
         uint32_t n = 0;
-        if (!read_u32(f, dim) || !read_u32(f, n) || dim == 0 || dim > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        size_t component_count = 0;
+        if (!read_u32(f, dim) || !read_u32(f, n) ||
+            !validate_tvim_v1_layout(f, dim, n, component_count)) {
             return GGML_VEC_INDEX_E_IO;
         }
-        uint64_t expected_size = 0;
-        if (!supported_v1_snapshot_size(n, dim, expected_size) || file_size != expected_size) {
-            return GGML_VEC_INDEX_E_IO;
-        }
-        std::vector<float> vectors(static_cast<size_t>(n) * static_cast<size_t>(dim));
+        std::vector<float> vectors(component_count);
         for (float & v : vectors) {
             uint32_t bits = 0;
             if (!read_u32(f, bits)) {
@@ -338,7 +536,7 @@ int ggml_vec_index_load_ex(const char * path, ggml_vec_index_t ** out) {
                 return GGML_VEC_INDEX_E_IO;
             }
         }
-        std::vector<uint64_t> ids(n);
+        std::vector<uint64_t> ids(static_cast<size_t>(n));
         for (uint64_t & id : ids) {
             if (!read_u64(f, id) || !is_valid_id(id)) {
                 return GGML_VEC_INDEX_E_IO;

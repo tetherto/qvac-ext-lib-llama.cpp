@@ -283,6 +283,10 @@ inline float dot_q4(const float * query, const uint8_t * codes, float scale, int
 #endif
 }
 
+inline float quantized_value_to_f32(int code, float scale) {
+    return float_score_from_double(static_cast<double>(code) * static_cast<double>(scale));
+}
+
 inline double score_slot(
         const ggml_vec_index_t & idx,
         const float * query,
@@ -307,13 +311,13 @@ void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) 
             const uint8_t nibble = (i & 1) == 0 ?
                 static_cast<uint8_t>(byte & 0x0f) :
                 static_cast<uint8_t>(byte >> 4);
-            dst[i] = static_cast<float>(q4_decode(nibble)) * scale;
+            dst[i] = quantized_value_to_f32(q4_decode(nibble), scale);
         }
     } else if (is_q8(idx)) {
         const int8_t * codes = q8_data_ptr(idx) + slot * static_cast<size_t>(dim);
         const float scale = idx.q8_scale[slot];
         for (int i = 0; i < dim; ++i) {
-            dst[i] = static_cast<float>(codes[i]) * scale;
+            dst[i] = quantized_value_to_f32(codes[i], scale);
         }
     } else {
         std::memcpy(dst, f32_data_ptr(idx) + slot * static_cast<size_t>(dim), static_cast<size_t>(dim) * sizeof(float));
@@ -508,7 +512,7 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
                 const double   inv_count = 1.0 / static_cast<double>(counts[static_cast<size_t>(list)]);
                 const double * src       = next_centroids.data() + static_cast<size_t>(list) * dim_sz;
                 for (int i = 0; i < dim; ++i) {
-                    centroid[i] = static_cast<float>(src[static_cast<size_t>(i)] * inv_count);
+                    centroid[i] = float_score_from_double(src[static_cast<size_t>(i)] * inv_count);
                 }
             }
         }
@@ -568,28 +572,10 @@ static int ggml_vec_index_search_impl(
          (n_allowed < 0 || (n_allowed > 0 && allowed_ids == nullptr)))) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
-    if (n_q == 0) {
-        return GGML_VEC_INDEX_OK;
-    }
-    if (queries == nullptr || out_scores == nullptr || out_ids == nullptr) {
-        return GGML_VEC_INDEX_E_INVALID_ARG;
-    }
 
     try {
         std::shared_lock<std::shared_mutex> lock(idx->mutex);
         const int dim = idx->dim;
-        const size_t n_q_sz = static_cast<size_t>(n_q);
-        const size_t k_sz   = static_cast<size_t>(k);
-        const size_t dim_sz = static_cast<size_t>(dim);
-        if (!search_buffers_addressable(n_q_sz, k_sz, dim_sz)) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        std::vector<double> query_max_abs_values;
-        if (!validate_queries_and_maybe_max_abs(
-                queries, n_q, dim, is_quantized(*idx), query_max_abs_values)) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-
         std::vector<size_t> allowed_slots;
         const std::vector<size_t> * allowed_ptr = nullptr;
         if (prepared_filter != nullptr) {
@@ -601,7 +587,27 @@ static int ggml_vec_index_search_impl(
                 return GGML_VEC_INDEX_E_INVALID_ARG;
             }
             allowed_ptr = &prepared_filter->slots;
-        } else if (filtered) {
+        }
+
+        if (n_q == 0) {
+            return GGML_VEC_INDEX_OK;
+        }
+        if (queries == nullptr || out_scores == nullptr || out_ids == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        const size_t n_q_sz = static_cast<size_t>(n_q);
+        const size_t k_sz   = static_cast<size_t>(k);
+        const size_t dim_sz = static_cast<size_t>(dim);
+        if (!search_buffers_addressable(n_q_sz, k_sz, dim_sz)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        std::vector<double> query_max_abs_values;
+        if (!validate_queries_and_maybe_max_abs(
+                queries, n_q, dim, is_quantized(*idx), query_max_abs_values)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (prepared_filter == nullptr && filtered) {
             allowed_slots = allowed_slots_for_ids(*idx, allowed_ids, n_allowed);
             allowed_ptr = &allowed_slots;
         }

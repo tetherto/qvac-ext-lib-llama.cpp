@@ -83,6 +83,10 @@ set_target_properties(ggml-vector-index PROPERTIES
 
 target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)
 
+if (LLAMA_BUILD_TESTS)
+    target_compile_definitions(ggml-vector-index PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+endif()
+
 install(
     TARGETS ggml-vector-index
     EXPORT ggml-targets

@@ -15,9 +15,8 @@
 // full duration of any `ggml_vec_index_search_prepared_filtered` call using
 // them; do not free a filter concurrently with a search that uses it.
 //
-// Endianness: persistence format is fixed little-endian. Non-mmap loaders
-// decode little-endian fields into host values; mmap loading requires a
-// little-endian host because vector bytes are read in place.
+// Endianness: persistence format is fixed little-endian. Loaders decode
+// little-endian fields into host values.
 
 #include <stdint.h>
 
@@ -100,25 +99,8 @@ GGML_API int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id);
 // invalidated. Returns 0 on success, negative on error.
 GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 
-// Logged mutations for incremental persistence. These update `idx` and append
-// a durable delta record to `delta_path`. Replay the log on top of a full .tvim
-// snapshot with `ggml_vec_index_load_with_delta`.
-//
-// A new log can only start from a handle whose current state was loaded from or
-// successfully written to a snapshot. Write a new snapshot after plain mutations.
-// Delta logs are state-bound and single-writer per snapshot lineage. Use one
-// evolving writer handle for a given {snapshot, delta_path} pair. If another
-// handle or process appends to the same log, stale writers are rejected and
-// must reload with `ggml_vec_index_load_with_delta` before appending again.
-// Cross-process protection relies on cooperative OS file locks. Store delta
-// logs on local filesystems and do not modify `.tvid` files outside this API.
-// If an append error occurs after a complete replayable record is observed,
-// the mutation is treated as committed and the API returns OK.
-// Once a handle participates in delta logging, use logged mutations for
-// content changes and compact_delta for snapshots; plain add/remove/compact/write
-// return GGML_VEC_INDEX_E_INVALID_ARG.
-// Adding q4/q8 entries to legacy v1/v2 f32-payload logs is rejected; compact
-// the snapshot+delta pair first so new quantized adds use native-code v4 logs.
+// Reserved for future incremental persistence. Currently returns
+// GGML_VEC_INDEX_E_INVALID_ARG without mutating `idx` or writing `delta_path`.
 GGML_API int ggml_vec_index_add_logged(
     ggml_vec_index_t * idx,
     const float      * vectors,
@@ -126,8 +108,8 @@ GGML_API int ggml_vec_index_add_logged(
     const uint64_t   * ids,
     const char       * delta_path);
 
-// Same return convention as `ggml_vec_index_remove`: 1 if removed, 0 if not
-// present, negative on error.
+// Reserved for future incremental persistence. Currently returns
+// GGML_VEC_INDEX_E_INVALID_ARG without mutating `idx` or writing `delta_path`.
 GGML_API int ggml_vec_index_remove_logged(
     ggml_vec_index_t * idx,
     uint64_t           id,
@@ -230,15 +212,16 @@ GGML_API int ggml_vec_index_search_ivf(
     float                  * out_scores,
     uint64_t               * out_ids);
 
-// Persistence. Format is .tvim version 2; see bottom of this header. Legacy
-// v1 snapshots are limited to 4 GiB serialized size; larger v1 states are
-// rejected by write and load.
+// Persistence. The current implementation supports f32 (`bit_width=32`)
+// legacy .tvim version 1 snapshots only; q4/q8 snapshots return
+// GGML_VEC_INDEX_E_INVALID_ARG. V1 snapshots are limited to 4 GiB serialized
+// size; larger states are rejected by write and load. See bottom of this
+// header.
 GGML_API int ggml_vec_index_write(
     ggml_vec_index_t * idx,
     const char       * path);
 
-// Loads v2 files and migrates v1 f32 snapshots. Legacy bit_width=8 snapshots
-// are quantized to q8; all other legacy bit widths migrate to f32/32-bit.
+// Loads f32 legacy .tvim version 1 snapshots.
 // Returns 0 on success and stores the loaded handle in `out`.
 GGML_API int ggml_vec_index_load_ex(
     const char         * path,
@@ -247,28 +230,17 @@ GGML_API int ggml_vec_index_load_ex(
 // Returns NULL on failure.
 GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 
-// Loads a v2 .tvim snapshot with its vector section memory-mapped read-only.
-// IDs and quantization scales are copied into memory for lookup and scoring.
-// Data-mutating and logged mutation APIs return
-// GGML_VEC_INDEX_E_INVALID_ARG on mmap-backed handles.
-// Heap-only search preparation such as `ggml_vec_index_build_ivf` is allowed.
-// `ggml_vec_index_write` can snapshot mmap-backed handles, but callers must
-// write to a different path than the mapped source file.
-// This loader is snapshot-only: it does not replay .tvid delta logs. Use
-// `ggml_vec_index_load_with_delta` when loading a snapshot plus delta log;
-// that path materializes the resulting index in memory.
-// Requires a little-endian host; use `ggml_vec_index_load` on other hosts.
-// Returns 0 on success and stores the loaded handle in `out`.
+// Reserved for future mmap snapshot loading. Currently returns
+// GGML_VEC_INDEX_E_BAD_VERSION and stores NULL in `out`.
 GGML_API int ggml_vec_index_load_mmap_ex(
     const char         * path,
     ggml_vec_index_t  ** out);
 
-// Returns NULL on failure or unsupported file format.
+// Returns NULL; mmap loading is not implemented yet.
 GGML_API ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path);
 
-// Loads a full .tvim snapshot and replays an append-only delta log. Missing
-// delta logs are treated as empty.
-// Returns 0 on success and stores the loaded handle in `out`.
+// Reserved for future .tvid delta replay. Currently returns
+// GGML_VEC_INDEX_E_INVALID_ARG and stores NULL in `out`.
 GGML_API int ggml_vec_index_load_with_delta_ex(
     const char         * snapshot_path,
     const char         * delta_path,
@@ -278,10 +250,8 @@ GGML_API ggml_vec_index_t * ggml_vec_index_load_with_delta(
     const char * snapshot_path,
     const char * delta_path);
 
-// Compacts incremental persistence by writing a full snapshot and replacing
-// the delta log with an empty matching .tvid header. Returns
-// GGML_VEC_INDEX_E_PARTIAL_COMPACT if the snapshot was written but replacing
-// the delta log failed; loading snapshot+delta remains idempotent in this state.
+// Reserved for future delta compaction. Currently returns
+// GGML_VEC_INDEX_E_INVALID_ARG.
 GGML_API int ggml_vec_index_compact_delta(
     ggml_vec_index_t * idx,
     const char       * snapshot_path,
@@ -292,81 +262,23 @@ GGML_API int ggml_vec_index_len(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_dim(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 
-// File format (.tvim version 2, all little-endian):
+// File format (.tvim legacy version 1, all little-endian):
 //
 //   offset  size   field
 //   ------  -----  -------------------------------------------------------
 //   0       4      magic = "TVPI" (bytes 0x54, 0x56, 0x50, 0x49)
-//   4       1      version = 2
-//   5       1      bit_width (4, 8, or 32)
-//   6       1      storage kind (1 = f32, 2 = q8, 3 = q4)
-//   7       1      flags (bit 0 = checksum trailer present)
+//   4       1      version = 1
+//   5       1      bit_width = 32
+//   6       1      reserved (zero)
+//   7       1      reserved (zero)
 //   8       4      dim (uint32)
 //   12      4      n_vectors (uint32)
-//   16      4      qparam_type (0 = none, 1 = per-vector f32 scale)
-//   20      4      qparam_bytes_per_vector (0 or 4)
-//   24      4      bytes_per_component (0 for packed q4, 1 for q8, 4 for f32)
-//   28      4      reserved (zero)
-//   32      ...    qparams:
-//                    - f32: empty
-//                    - q4/q8: N float32 scales
-//   ...     ...    vectors:
-//                    - f32: N*D float32 values, row-major
-//                    - q8:  N*D int8 codes, row-major
-//                    - q4:  N*ceil(D/2) packed unsigned nibbles, row-major
+//   16      ...    vectors: N*D float32 values, row-major
 //   ...     N*8    ids (uint64)
-//   ...     4      header CRC32C, when flag bit 0 is set
-//   ...     4      qparams CRC32C, when flag bit 0 is set
-//   ...     4      vectors CRC32C, when flag bit 0 is set
-//   ...     4      ids CRC32C, when flag bit 0 is set
 //
-// Where N = n_vectors and D = dim. q8 uses symmetric per-vector quantization:
-// scale = max(abs(v)) / 127, code = round(v / scale) clamped to [-127, 127].
-// q4 uses scale = max(abs(v)) / 7, code = round(v / scale) clamped to [-7, 7],
-// stored as unsigned nibble `code + 8` (0 is invalid). Zero vectors use
-// scale = 1 and all-zero dequantized codes. Each CRC32C covers exactly its
-// corresponding serialized section; the header CRC covers bytes [0, 32), and
-// the CRC32C of an empty section is zero.
-// Legacy v2 files with flags=0 and no checksum trailer remain readable.
-// Writers emit checksummed v2 files. Readers reject unknown versions and v2
-// flag bits; they also accept legacy v1 f32 snapshots. Legacy bit_width=8
-// snapshots migrate to q8, while all other legacy widths migrate to f32.
-//
-// Delta log (.tvid version 4, all little-endian):
-//
-//   file header:
-//     0   4   magic = "TVDL"
-//     4   1   version = 4
-//     5   1   bit_width (4, 8, or 32)
-//     6   2   reserved (zero)
-//     8   4   dim (uint32)
-//     12  4   reserved (zero)
-//     16  32  base snapshot state identity
-//
-//   record header:
-//     0   1   op (1 = add, 2 = remove)
-//     1   3   reserved (zero)
-//     4   4   n (add count; remove uses 1)
-//     8   8   payload bytes
-//     16  4   CRC32C over record header bytes [0, 16), state identity, and payload
-//     20  4   reserved (zero)
-//     24  32  state identity after applying this record
-//
-//   add payload:
-//     - f32: N uint64 ids, then N*D float32 vectors
-//     - q8:  N uint64 ids, then N float32 scales, then N*D int8 codes
-//     - q4:  N uint64 ids, then N float32 scales, then
-//            N*ceil(D/2) packed unsigned nibbles
-//   remove payload: one uint64 id
-//
-// The base snapshot state identity binds the log to the snapshot state it
-// extends. It stores the active count plus the three maintained 64-bit state
-// hash aggregates, with sums maintained modulo 2^64. Record state identities
-// let loading validate each replayed record's post-state
-// and recognize a compacted snapshot when a process crashed before replacing
-// the old delta log. Readers also accept legacy .tvid v1 logs, whose state
-// field is a full-index CRC32C, v2 logs, whose add payloads always store f32
-// vectors, and v3 logs, whose state field is a 32-bit token.
+// Where N = n_vectors and D = dim. Readers reject unknown versions, non-f32
+// bit widths, nonzero reserved bytes, duplicate or reserved ids, non-finite
+// vector components, truncated payloads, and trailing bytes.
 
 #ifdef __cplusplus
 }

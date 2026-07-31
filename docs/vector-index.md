@@ -10,9 +10,9 @@ should enable it explicitly and link the vector-index target directly.
 
 ## How The Pieces Fit
 
-The vector index is organized as layers. The storage, search, and persistence
-layers are general vector-index infrastructure; TurboVec is the q2/q4 algorithm
-built on top of them.
+The vector index is organized as layers. This revision provides the public C
+API, in-memory storage, exact search, filtering, IVF-flat search, and limited
+persistence for the generic f32/q8/q4 storage modes.
 
 ```mermaid
 flowchart TD
@@ -20,13 +20,7 @@ flowchart TD
     storage --> exact["Exact CPU search"]
     exact --> filters["Filtered and prepared-filter search"]
     exact --> ivf["IVF-flat candidate selection"]
-    storage --> snapshot["tvim snapshots"]
-    snapshot --> mmap["Read-only mmap loading"]
-    snapshot --> delta["tvid mutation log and compaction"]
-    storage --> turbovec["TurboVec q2/q4"]
-    turbovec --> rotation["Rotation and TQ+ calibration"]
-    rotation --> codes["Lloyd-Max codes and bit-plane storage"]
-    codes --> lut["LUT scoring and blocked SIMD cache"]
+    storage --> snapshot["f32 tvim snapshots"]
 ```
 
 The public C API owns the opaque index handle, caller-provided ids, vector
@@ -35,8 +29,7 @@ form the correctness baseline used to validate compressed or approximate paths.
 
 Generic q8 and packed q4 modes reduce memory used by CPU-resident vectors. Each
 vector stores an f32 scale, and search scores f32 queries directly against the
-quantized codes. These modes also provide comparison points for TurboVec q2/q4
-quality and performance.
+quantized codes.
 
 Exact search scans every live slot. Filtered search restricts that scan to a
 caller-provided id set, while prepared filters cache the id-to-slot mapping for
@@ -44,27 +37,19 @@ repeated queries. IVF-flat reduces the number of vectors scored by assigning
 vectors and queries to in-memory centroid lists. It is an optional search
 accelerator and does not change the storage format.
 
-A `.tvim` file is a complete index snapshot. Normal loading materializes the
-index in memory, while mmap loading keeps supported vector sections mapped
-read-only for faster startup and lower memory duplication. A `.tvid` file
-records incremental add and remove operations after a snapshot. Replay
-reconstructs the latest state, and compaction replaces the snapshot and resets
-the log. State identities and file locking prevent stale or concurrent writers
-from silently producing a divergent index.
+The current persistence implementation supports complete f32 (`bit_width=32`)
+`.tvim` snapshots. q4/q8 snapshots, mmap loading, `.tvid` mutation logs, and
+delta compaction are reserved API surface and return explicit unsupported errors
+until their implementations land.
 
-TurboVec is a separate compressed search mode built on the same index API.
-Vectors and queries are rotated into a quantization-friendly space. TQ+
-calibration and Lloyd-Max codebooks produce q2 or q4 codes stored in bit-plane
-rows. Search builds lookup tables from the rotated query and scores packed
-codes without reconstructing full vectors. A blocked copy of the packed codes
-supports scalar, NEON, and AVX2 scoring. Derived rotation, calibration,
-blocked-code, and IVF state is invalidated or rebuilt after mutations,
-compaction, and snapshot loading.
+TurboVec-style q2/q4 search, rotations, TQ+ calibration, Lloyd-Max codebooks,
+LUT scoring, blocked-code caches, and related golden fixtures are planned work.
+They are not implemented by this component revision.
 
-Each layer carries its own regression coverage: result ordering, architecture
-parity, snapshot corruption, mmap restrictions, delta replay, compaction, stale
-writers, hardlink aliases, cross-process locking, TurboVec golden fixtures,
-cache invalidation, benchmark coverage, and package smoke tests.
+Each implemented layer carries its own regression coverage: result ordering,
+architecture parity, f32 snapshot round trips and corruption handling,
+unsupported persistence entry points, IVF cache invalidation, benchmark
+coverage, and package smoke tests.
 
 ## Build
 
@@ -95,8 +80,8 @@ Create an index with a fixed dimension and bit width:
 - `bit_width=4`: per-vector symmetric packed q4 storage with f32 scales.
 
 The generic q4/q8 layouts are local to vector-index and are not `ggml-quants`
-block formats. They keep one scale per external vector for random row lookup,
-delete/compact operations, and compact `.tvim` snapshots.
+block formats. They keep one scale per external vector for random row lookup and
+delete/compact operations. Persistence for q4/q8 storage is not implemented yet.
 
 Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries
