@@ -89,10 +89,18 @@ before search.
 
 ## Search Modes
 
-Exact search scans all live slots. `ggml_vec_index_search_filtered` restricts
-that scan to caller-provided ids, and `ggml_vec_index_filter_create` prepares
-the same id set for repeated `ggml_vec_index_search_prepared_filtered` calls.
-
-`ggml_vec_index_build_ivf` builds heap-owned IVF-flat state for approximate
-candidate selection. Call it again after loading an index and after successful
-add/remove mutations. IVF state is not persisted in snapshots.
+- Exact search (`ggml_vec_index_search`) scans every live slot.
+- Filtered search (`ggml_vec_index_search_filtered`) restricts that scan to
+  caller-provided ids.
+- Prepared-filter search (`ggml_vec_index_filter_create` and
+  `ggml_vec_index_search_prepared_filtered`) caches the id-to-slot mapping for
+  repeated calls. The source index must outlive the filter. An `add` that
+  inserts one or more vectors, a successful `remove`, or a `compact` that
+  removes tombstones makes the filter stale. Subsequent searches with it return
+  `GGML_VEC_INDEX_E_INVALID_ARG`.
+- IVF-flat search (`ggml_vec_index_build_ivf` and
+  `ggml_vec_index_search_ivf`) builds heap-owned state for approximate candidate
+  selection. Rebuild it after loading an index, after an `add` that inserts one
+  or more vectors, after a successful `remove`, and after a `compact` that
+  removes tombstones. Until it is rebuilt, IVF search returns
+  `GGML_VEC_INDEX_E_INVALID_ARG`. IVF state is not persisted in snapshots.
