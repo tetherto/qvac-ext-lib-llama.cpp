@@ -194,12 +194,12 @@ std::vector<RefScore> reference_topk(const std::vector<float> &    vectors,
     std::vector<RefScore> scores;
     scores.reserve(ids.size());
     for (size_t row = 0; row < ids.size(); ++row) {
-        scores.push_back({ quantized_reference_score(vectors.data() + row * static_cast<size_t>(dim), query, dim,
-                                                     bit_width),
-                           ids[row] });
+        scores.push_back(
+            { quantized_reference_score(vectors.data() + row * static_cast<size_t>(dim), query, dim, bit_width),
+              ids[row] });
     }
     std::sort(scores.begin(), scores.end(), ref_score_better);
-    scores.resize(static_cast<size_t>(k));
+    scores.resize(static_cast<size_t>(k), RefScore{ -FLT_MAX, UINT64_MAX });
     return scores;
 }
 
@@ -236,13 +236,12 @@ void check_quantized_reference(int bit_width) {
 
     std::vector<float>    out_scores(static_cast<size_t>(n_q) * k);
     std::vector<uint64_t> out_ids(static_cast<size_t>(n_q) * k);
-    CHECK(ggml_vec_index_search(idx, queries.data(), n_q, k, out_scores.data(), out_ids.data()) ==
-          GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search(idx, queries.data(), n_q, k, out_scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
 
     const float tolerance = bit_width == 8 ? 1e-4f : 2e-4f;
     for (int q = 0; q < n_q; ++q) {
-        const auto expected = reference_topk(vectors, ids, queries.data() + static_cast<size_t>(q) * dim, dim,
-                                            bit_width, k);
+        const auto expected =
+            reference_topk(vectors, ids, queries.data() + static_cast<size_t>(q) * dim, dim, bit_width, k);
         for (int j = 0; j < k; ++j) {
             const size_t offset = static_cast<size_t>(q) * k + static_cast<size_t>(j);
             CHECK(out_ids[offset] == expected[static_cast<size_t>(j)].id);
@@ -250,6 +249,35 @@ void check_quantized_reference(int bit_width) {
             CHECK(std::fabs(out_scores[offset] - expected[static_cast<size_t>(j)].score) <= limit);
         }
     }
+
+    ggml_vec_index_free(idx);
+}
+
+void check_quantized_small_dim_tie_order(int bit_width) {
+    constexpr int dim = 6;
+    constexpr int k   = 2;
+
+    const std::array<float, dim * 2> vectors = {
+        1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f,
+    };
+    const std::array<uint64_t, 2> ids = {
+        910001ULL,
+        910002ULL,
+    };
+    const std::array<float, dim> query = {
+        1.0e8f, 1.0f, -1.0e8f, 1.0f, 0.0f, 0.0f,
+    };
+
+    auto * idx = ggml_vec_index_create(dim, bit_width);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vectors.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+
+    std::array<float, k>    scores{};
+    std::array<uint64_t, k> out_ids{};
+    CHECK(ggml_vec_index_search(idx, query.data(), 1, k, scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(out_ids[0] == ids[0]);
+    CHECK(out_ids[1] == ids[1]);
+    CHECK(scores[0] == scores[1]);
 
     ggml_vec_index_free(idx);
 }
@@ -301,6 +329,33 @@ void check_ivf_full_probe_recall(int bit_width) {
         CHECK(ivf_ids[i] == exact_ids[i]);
         CHECK(std::fabs(ivf_scores[i] - exact_scores[i]) <= 1e-5f * std::max(1.0f, std::fabs(exact_scores[i])));
     }
+
+    ggml_vec_index_free(idx);
+}
+
+void check_ivf_centroid_overflow_fallback() {
+    constexpr int dim = 4;
+
+    const std::array<float, dim * 2> vectors = {
+        1.0f, -1.0f, 0.0f, 0.0f, 1.0e30f, 1.0e30f, 0.0f, 0.0f,
+    };
+    const std::array<uint64_t, 2> ids   = { 8300ULL, 8301ULL };
+    const std::array<float, dim>  query = { -1.0e10f, 1.0e10f, 0.0f, 0.0f };
+
+    auto * idx = ggml_vec_index_create(dim, 32);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vectors.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/0) == GGML_VEC_INDEX_OK);
+
+    std::array<float, 1>    exact_score{};
+    std::array<uint64_t, 1> exact_id{};
+    std::array<float, 1>    ivf_score{};
+    std::array<uint64_t, 1> ivf_id{};
+    CHECK(ggml_vec_index_search(idx, query.data(), 1, 1, exact_score.data(), exact_id.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, query.data(), 1, 1, 1, ivf_score.data(), ivf_id.data()) == GGML_VEC_INDEX_OK);
+    CHECK(exact_id[0] == ids[1]);
+    CHECK(ivf_id[0] == exact_id[0]);
+    CHECK(ivf_score[0] == exact_score[0]);
 
     ggml_vec_index_free(idx);
 }
@@ -758,12 +813,12 @@ int main() {
         };
         std::vector<float> expected_values;
         expected_values.insert(expected_values.end(), seeds[0].begin(), seeds[0].end());
-        expected_values.insert(expected_values.end(), seeds[3].begin(), seeds[3].end());
         expected_values.insert(expected_values.end(), seeds[2].begin(), seeds[2].end());
+        expected_values.insert(expected_values.end(), seeds[3].begin(), seeds[3].end());
         const std::vector<uint64_t> expected_ids = {
             ids[0],
-            ids[3],
             ids[2],
+            ids[3],
         };
         CHECK(actual == snapshot_bytes(kDim, 3, expected_values, expected_ids));
     }
@@ -901,7 +956,7 @@ int main() {
         CHECK(ggml_vec_index_search(qidx, seeds[0].data(), 1, 4, q_scores.data(), q_ids.data()) == GGML_VEC_INDEX_OK);
         CHECK(q_ids[0] == ids[0]);
         CHECK(q_scores[0] > 0.95f);
-        CHECK(ggml_vec_index_remove(qidx, ids[0]) == 1);
+        CHECK(ggml_vec_index_remove(qidx, ids[0]) == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_search(qidx, seeds[0].data(), 1, 1, q_scores.data(), q_ids.data()) == GGML_VEC_INDEX_OK);
         CHECK(q_ids[0] != ids[0]);
         ggml_vec_index_free(qidx);
@@ -909,10 +964,13 @@ int main() {
 
     check_quantized_reference(8);
     check_quantized_reference(4);
+    check_quantized_small_dim_tie_order(8);
+    check_quantized_small_dim_tie_order(4);
 
     for (int bit_width : { 32, 8, 4 }) {
         check_ivf_full_probe_recall(bit_width);
     }
+    check_ivf_centroid_overflow_fallback();
 
     // Malformed snapshots are rejected before allocating from untrusted counts.
     {

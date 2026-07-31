@@ -130,7 +130,7 @@ struct DeltaTailCache {
 };
 
 struct ScoreId {
-    float score = 0.0f;
+    double score = 0.0;
     uint64_t id = 0;
 };
 
@@ -142,21 +142,19 @@ inline bool score_id_better(const ScoreId & a, const ScoreId & b) {
 }
 
 struct MinHeapCmp {
-    bool operator()(const ScoreId & a, const ScoreId & b) const {
-        return score_id_better(a, b);
-    }
+    bool operator()(const ScoreId & a, const ScoreId & b) const { return score_id_better(a, b); }
 };
 
 struct ggml_vec_index {
     mutable std::shared_mutex mutex;
 
-    int dim       = 0;
-    int bit_width = 32;
-    uint64_t generation = 0;
-    uint64_t filter_cookie = 0;
-    bool read_only_mmap = false;
-    bool delta_log_start_allowed = false;
-    bool delta_log_bound = false;
+    int            dim                     = 0;
+    int            bit_width               = 32;
+    uint64_t       generation              = 0;
+    uint64_t       filter_cookie           = 0;
+    bool           read_only_mmap          = false;
+    bool           delta_log_start_allowed = false;
+    bool           delta_log_bound         = false;
     std::string bound_delta_log_path_key;
     bool delta_log_rebase_pending = false;
     uint32_t delta_log_rebase_crc = 0;

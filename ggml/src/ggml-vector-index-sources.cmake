@@ -6,4 +6,4 @@ set(GGML_VECTOR_INDEX_IMPL_SOURCES
     "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-persistence.cpp")
 
 set(GGML_VECTOR_INDEX_INTERNAL_HEADERS
-    "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-internal.h")
+    "${GGML_VECTOR_INDEX_SOURCE_DIR}/ggml-vector-index-impl.h")
