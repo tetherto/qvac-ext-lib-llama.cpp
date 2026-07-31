@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
@@ -41,6 +42,7 @@
 #    include <windows.h>
 #else
 #    include <fcntl.h>
+#    include <sys/stat.h>
 #    include <unistd.h>
 #endif
 
@@ -151,6 +153,12 @@ struct tmp_file_guard {
     bool                  active = true;
 };
 
+struct file_closer {
+    void operator()(std::FILE * file) const {
+        std::fclose(file);
+    }
+};
+
 bool replace_file(const std::filesystem::path & tmp_path, const std::filesystem::path & dst_path) {
 #ifdef _WIN32
     const std::wstring tmp_native = tmp_path.wstring();
@@ -193,6 +201,7 @@ std::FILE * open_exclusive(const std::filesystem::path & path) {
 #endif
 }
 
+#ifdef _WIN32
 bool copy_permissions_if_exists(const std::filesystem::path & src_path, const std::filesystem::path & dst_path) {
     std::error_code                    ec;
     const std::filesystem::file_status src_status = std::filesystem::status(src_path, ec);
@@ -208,6 +217,39 @@ bool copy_permissions_if_exists(const std::filesystem::path & src_path, const st
     std::filesystem::permissions(dst_path, src_status.permissions(), std::filesystem::perm_options::replace, ec);
     return !ec;
 }
+#else
+bool default_file_mode(const std::filesystem::path & dst_path, mode_t & mode) {
+    // An empty probe observes umask and default ACLs without changing process-global state.
+    std::filesystem::path probe_path = make_tmp_path(dst_path);
+    probe_path += ".mode";
+
+    const int fd = open(probe_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd == -1) {
+        return false;
+    }
+    tmp_file_guard probe_guard(probe_path);
+
+    struct stat probe_stat;
+    const bool  stat_ok  = fstat(fd, &probe_stat) == 0;
+    const bool  close_ok = close(fd) == 0;
+    if (!stat_ok || !close_ok) {
+        return false;
+    }
+    mode = probe_stat.st_mode & 0777;
+    return true;
+}
+
+bool set_snapshot_permissions(std::FILE * file, const std::filesystem::path & dst_path) {
+    struct stat dst_stat;
+    mode_t      mode = 0;
+    if (stat(dst_path.c_str(), &dst_stat) == 0) {
+        mode = dst_stat.st_mode & 07777;
+    } else if (errno != ENOENT || !default_file_mode(dst_path, mode)) {
+        return false;
+    }
+    return fchmod(fileno(file), mode) == 0;
+}
+#endif
 
 void put_u32_le(uint8_t * dst, uint32_t v) {
     dst[0] = static_cast<uint8_t>(v >> 0);
@@ -702,9 +744,9 @@ int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path) {
         if (raw == nullptr) {
             return GGML_VEC_INDEX_E_IO;
         }
-        tmp_file_guard                                     tmp_guard(tmp_path);
-        std::unique_ptr<std::FILE, decltype(&std::fclose)> f(raw, &std::fclose);
-        const auto                                         fail_io = [&]() {
+        tmp_file_guard                         tmp_guard(tmp_path);
+        std::unique_ptr<std::FILE, file_closer> f(raw);
+        const auto                             fail_io = [&]() {
             f.reset();
             return GGML_VEC_INDEX_E_IO;
         };
@@ -740,15 +782,20 @@ int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path) {
         if (fsync(fileno(f.get())) != 0) {
             return fail_io();
         }
+        if (!set_snapshot_permissions(f.get(), dst_path)) {
+            return fail_io();
+        }
 #endif
         std::FILE * raw_file = f.release();
         if (std::fclose(raw_file) != 0) {
             return GGML_VEC_INDEX_E_IO;
         }
 
+#ifdef _WIN32
         if (!copy_permissions_if_exists(dst_path, tmp_path)) {
             return fail_io();
         }
+#endif
 
         if (!replace_file(tmp_path, dst_path)) {
             return GGML_VEC_INDEX_E_IO;
