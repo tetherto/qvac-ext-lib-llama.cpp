@@ -1234,7 +1234,7 @@ void check_q8_ivf_extreme_centroid_routing() {
         0.0f,    1.0f,
     };
     const std::array<uint64_t, 2> ids   = { 8400ULL, 8401ULL };
-    const std::array<float, dim>  query = { 0.0f, -1.0f };
+    const std::array<float, dim>  query = { -1.0f, 0.0f };
 
     auto * idx = ggml_vec_index_create(dim, /*bit_width=*/8);
     CHECK(idx != nullptr);
@@ -1247,7 +1247,7 @@ void check_q8_ivf_extreme_centroid_routing() {
     std::array<uint64_t, 1> ivf_id{};
     CHECK(ggml_vec_index_search(idx, query.data(), 1, 1, exact_score.data(), exact_id.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_search_ivf(idx, query.data(), 1, 1, 1, ivf_score.data(), ivf_id.data()) == GGML_VEC_INDEX_OK);
-    CHECK(exact_id[0] == ids[0]);
+    CHECK(exact_id[0] == ids[1]);
     CHECK(ivf_id[0] == exact_id[0]);
     CHECK(ivf_score[0] == exact_score[0]);
 
@@ -1725,15 +1725,17 @@ void check_ivf_state_not_persisted() {
     };
     const std::array<uint64_t, 2> ids = { 9201ULL, 9202ULL };
 
-    temp_file snapshot(".tvim");
-    auto *    built = ggml_vec_index_create(kDim, /*bit_width=*/32);
+    const std::string snapshot_path =
+        (std::filesystem::temp_directory_path() / "ggml-vector-index-ivf-state.tvim").string();
+    std::filesystem::remove(snapshot_path);
+    auto * built = ggml_vec_index_create(kDim, /*bit_width=*/32);
     CHECK(built != nullptr);
     CHECK(ggml_vec_index_add(built, vectors.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_build_ivf(built, /*n_lists=*/2, /*n_iter=*/1) == GGML_VEC_INDEX_OK);
-    CHECK(ggml_vec_index_write(built, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(built, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
     ggml_vec_index_free(built);
 
-    auto * loaded = ggml_vec_index_load(snapshot.path.string().c_str());
+    auto * loaded = ggml_vec_index_load(snapshot_path.c_str());
     CHECK(loaded != nullptr);
     std::array<float, 1>    scores{};
     std::array<uint64_t, 1> out_ids{};
@@ -1750,6 +1752,7 @@ void check_ivf_state_not_persisted() {
     CHECK(out_ids == exact_ids);
     CHECK(scores == exact_scores);
     ggml_vec_index_free(loaded);
+    std::filesystem::remove(snapshot_path);
 }
 
 void write_v2_turbovec_index(
@@ -3377,7 +3380,10 @@ int main() {
         CHECK(ggml_vec_index_write(nullptr, "unused.tvim") == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_write(idx, nullptr) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_load(nullptr) == nullptr);
-        CHECK(ggml_vec_index_load(temp_path(".missing").string().c_str()) == nullptr);
+        const std::string missing_path =
+            (std::filesystem::temp_directory_path() / "ggml-vector-index-missing.tvim").string();
+        std::filesystem::remove(missing_path);
+        CHECK(ggml_vec_index_load(missing_path.c_str()) == nullptr);
         CHECK(ggml_vec_index_remove(nullptr, id) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_contains(nullptr, id) == 0);
         CHECK(ggml_vec_index_len(nullptr) == 0);
