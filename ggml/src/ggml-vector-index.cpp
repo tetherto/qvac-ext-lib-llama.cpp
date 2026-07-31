@@ -16,15 +16,14 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <new>
-#include <queue>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,9 +36,9 @@
 #    ifndef NOMINMAX
 #        define NOMINMAX
 #    endif
-#    include <windows.h>
 #    include <fcntl.h>
 #    include <io.h>
+#    include <windows.h>
 #else
 #    include <fcntl.h>
 #    include <unistd.h>
@@ -81,6 +80,9 @@ bool all_finite(const float * values, size_t n) {
 }
 
 float float_score_from_double(double score) {
+    if (std::isnan(score)) {
+        return -FLT_MAX;
+    }
     if (!std::isfinite(score)) {
         return score < 0.0 ? -FLT_MAX : FLT_MAX;
     }
@@ -93,6 +95,10 @@ float float_score_from_double(double score) {
     return static_cast<float>(score);
 }
 
+double rank_score_from_double(double score) {
+    return std::isnan(score) ? -std::numeric_limits<double>::infinity() : score;
+}
+
 bool expected_snapshot_size(size_t n, size_t dim, size_t & expected) {
     size_t values        = 0;
     size_t vector_bytes  = 0;
@@ -102,6 +108,8 @@ bool expected_snapshot_size(size_t n, size_t dim, size_t & expected) {
            checked_mul_size(n, sizeof(uint64_t), id_bytes) && checked_add_size(vector_bytes, id_bytes, payload_bytes) &&
            checked_add_size(kTvimHeaderSize, payload_bytes, expected);
 }
+
+constexpr uint64_t kMaxSnapshotBytes = UINT64_C(1) << 32;
 
 uint64_t process_id() {
 #ifdef _WIN32
@@ -173,7 +181,7 @@ std::FILE * open_exclusive(const std::filesystem::path & path) {
     }
     return file;
 #else
-    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd == -1) {
         return nullptr;
     }
@@ -239,42 +247,122 @@ float u32_to_float(uint32_t bits) {
     return v;
 }
 
-bool write_u32_le(std::FILE * f, uint32_t v) {
-    uint8_t bytes[4];
-    put_u32_le(bytes, v);
-    return std::fwrite(bytes, 1, sizeof(bytes), f) == sizeof(bytes);
+bool host_is_little_endian() {
+    const uint16_t value = 1;
+    uint8_t        bytes[sizeof(value)];
+    std::memcpy(bytes, &value, sizeof(value));
+    return bytes[0] == 1;
 }
 
-bool write_u64_le(std::FILE * f, uint64_t v) {
-    uint8_t bytes[8];
-    put_u64_le(bytes, v);
-    return std::fwrite(bytes, 1, sizeof(bytes), f) == sizeof(bytes);
-}
-
-bool read_u32_le(std::ifstream & f, uint32_t & v) {
-    uint8_t bytes[4];
-    f.read(reinterpret_cast<char *>(bytes), sizeof(bytes));
-    if (!f) {
-        return false;
+bool write_f32_array_le(std::FILE * f, const std::vector<float> & values) {
+    if (values.empty()) {
+        return true;
     }
-    v = get_u32_le(bytes);
+    if (host_is_little_endian()) {
+        return std::fwrite(values.data(), sizeof(float), values.size(), f) == values.size();
+    }
+
+    constexpr size_t     kChunkElements = 4096;
+    std::vector<uint8_t> bytes(kChunkElements * sizeof(uint32_t));
+    for (size_t offset = 0; offset < values.size(); offset += kChunkElements) {
+        const size_t count = std::min(kChunkElements, values.size() - offset);
+        for (size_t i = 0; i < count; ++i) {
+            put_u32_le(bytes.data() + i * sizeof(uint32_t), float_to_u32(values[offset + i]));
+        }
+        const size_t byte_count = count * sizeof(uint32_t);
+        if (std::fwrite(bytes.data(), 1, byte_count, f) != byte_count) {
+            return false;
+        }
+    }
     return true;
 }
 
-bool read_u64_le(std::ifstream & f, uint64_t & v) {
-    uint8_t bytes[8];
-    f.read(reinterpret_cast<char *>(bytes), sizeof(bytes));
-    if (!f) {
-        return false;
+bool write_u64_array_le(std::FILE * f, const std::vector<uint64_t> & values) {
+    if (values.empty()) {
+        return true;
     }
-    v = get_u64_le(bytes);
+    if (host_is_little_endian()) {
+        return std::fwrite(values.data(), sizeof(uint64_t), values.size(), f) == values.size();
+    }
+
+    constexpr size_t     kChunkElements = 4096;
+    std::vector<uint8_t> bytes(kChunkElements * sizeof(uint64_t));
+    for (size_t offset = 0; offset < values.size(); offset += kChunkElements) {
+        const size_t count = std::min(kChunkElements, values.size() - offset);
+        for (size_t i = 0; i < count; ++i) {
+            put_u64_le(bytes.data() + i * sizeof(uint64_t), values[offset + i]);
+        }
+        const size_t byte_count = count * sizeof(uint64_t);
+        if (std::fwrite(bytes.data(), 1, byte_count, f) != byte_count) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool read_bytes(std::ifstream & f, void * data, size_t size) {
+    constexpr size_t kMaxReadSize = 1U << 30;
+    auto *           dst          = static_cast<uint8_t *>(data);
+    while (size > 0) {
+        const size_t chunk = std::min(size, kMaxReadSize);
+        f.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(chunk));
+        if (!f) {
+            return false;
+        }
+        dst += chunk;
+        size -= chunk;
+    }
+    return true;
+}
+
+bool read_f32_array_le(std::ifstream & f, std::vector<float> & values) {
+    if (values.empty()) {
+        return true;
+    }
+    if (host_is_little_endian()) {
+        return read_bytes(f, values.data(), values.size() * sizeof(float));
+    }
+
+    constexpr size_t     kChunkElements = 4096;
+    std::vector<uint8_t> bytes(kChunkElements * sizeof(uint32_t));
+    for (size_t offset = 0; offset < values.size(); offset += kChunkElements) {
+        const size_t count = std::min(kChunkElements, values.size() - offset);
+        if (!read_bytes(f, bytes.data(), count * sizeof(uint32_t))) {
+            return false;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            values[offset + i] = u32_to_float(get_u32_le(bytes.data() + i * sizeof(uint32_t)));
+        }
+    }
+    return true;
+}
+
+bool read_u64_array_le(std::ifstream & f, std::vector<uint64_t> & values) {
+    if (values.empty()) {
+        return true;
+    }
+    if (host_is_little_endian()) {
+        return read_bytes(f, values.data(), values.size() * sizeof(uint64_t));
+    }
+
+    constexpr size_t     kChunkElements = 4096;
+    std::vector<uint8_t> bytes(kChunkElements * sizeof(uint64_t));
+    for (size_t offset = 0; offset < values.size(); offset += kChunkElements) {
+        const size_t count = std::min(kChunkElements, values.size() - offset);
+        if (!read_bytes(f, bytes.data(), count * sizeof(uint64_t))) {
+            return false;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            values[offset + i] = get_u64_le(bytes.data() + i * sizeof(uint64_t));
+        }
+    }
     return true;
 }
 
 // Top-k via min-heap of (score, id). The heap holds at most `k` candidates;
 // each new score is compared against the smallest in the heap.
 struct score_id {
-    float    score;
+    double   score;
     uint64_t id;
 };
 
@@ -393,16 +481,16 @@ int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, con
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
-        idx->data.resize(new_slots * dim_sz);
-        resized = true;
-        idx->slot_to_id.resize(new_slots);
+        idx->data.reserve(new_slots * dim_sz);
+        idx->slot_to_id.reserve(new_slots);
         idx->id_to_slot.reserve(new_slots);
+
+        idx->data.insert(idx->data.end(), vectors, vectors + value_count);
+        resized = true;
 
         for (int i = 0; i < n; ++i) {
             const size_t slot = base_slot + static_cast<size_t>(i);
-            std::memcpy(idx->data.data() + slot * dim_sz, vectors + static_cast<size_t>(i) * dim_sz,
-                        dim_sz * sizeof(float));
-            idx->slot_to_id[slot] = ids[i];
+            idx->slot_to_id.push_back(ids[i]);
             idx->id_to_slot.emplace(ids[i], slot);
         }
     } catch (const std::bad_alloc &) {
@@ -434,24 +522,29 @@ int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id) {
         }
         auto it = idx->id_to_slot.find(id);
         if (it == idx->id_to_slot.end()) {
-            return 0;
+            return GGML_VEC_INDEX_E_NOT_FOUND;
         }
         const size_t slot   = it->second;
         const size_t last   = idx->slot_to_id.size() - 1;
         const size_t dim_sz = static_cast<size_t>(idx->dim);
 
+        idx->id_to_slot.erase(it);
+
         if (slot != last) {
             // Move last vector into the freed slot and update its id mapping.
+            const uint64_t moved_id = idx->slot_to_id[last];
+            auto           moved_it = idx->id_to_slot.find(moved_id);
+            if (moved_it == idx->id_to_slot.end()) {
+                return GGML_VEC_INDEX_E_INTERNAL;
+            }
             std::memcpy(idx->data.data() + slot * dim_sz, idx->data.data() + last * dim_sz, dim_sz * sizeof(float));
-            const uint64_t moved_id   = idx->slot_to_id[last];
-            idx->slot_to_id[slot]     = moved_id;
-            idx->id_to_slot[moved_id] = slot;
+            idx->slot_to_id[slot] = moved_id;
+            moved_it->second      = slot;
         }
 
         idx->slot_to_id.pop_back();
         idx->data.resize(last * dim_sz);
-        idx->id_to_slot.erase(it);
-        return 1;
+        return GGML_VEC_INDEX_OK;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
@@ -475,44 +568,52 @@ void ggml_vec_index_prepare(ggml_vec_index_t * /*idx*/) {
 namespace {
 
 // Scalar dot product of two `dim`-length f32 vectors.
-inline float dot(const float * a, const float * b, int dim) {
+inline double dot(const float * a, const float * b, int dim) {
     double acc = 0.0;
     for (int i = 0; i < dim; ++i) {
         acc += static_cast<double>(a[i]) * static_cast<double>(b[i]);
     }
-    return float_score_from_double(acc);
+    return acc;
 }
 
 // Run a single query against all slots, write top-k into out_scores/out_ids.
 // If the index holds fewer than k entries, pad with sentinels.
-void search_one(const ggml_vec_index_t & idx, const float * query, int k, float * out_scores, uint64_t * out_ids) {
+void search_one(const ggml_vec_index_t & idx,
+                const float *            query,
+                int                      k,
+                float *                  out_scores,
+                uint64_t *               out_ids,
+                std::vector<score_id> &  heap,
+                std::vector<score_id> &  drained) {
     const int    dim     = idx.dim;
     const size_t n_slots = idx.slot_to_id.size();
 
-    std::priority_queue<score_id, std::vector<score_id>, score_id_min_heap_cmp> heap;
+    heap.clear();
+    drained.clear();
 
     for (size_t slot = 0; slot < n_slots; ++slot) {
-        const float s = dot(query, idx.data.data() + slot * static_cast<size_t>(dim), dim);
+        const double s = rank_score_from_double(dot(query, idx.data.data() + slot * static_cast<size_t>(dim), dim));
         if (heap.size() < static_cast<size_t>(k)) {
-            heap.push({ s, idx.slot_to_id[slot] });
-        } else if (s > heap.top().score) {
-            heap.pop();
-            heap.push({ s, idx.slot_to_id[slot] });
+            heap.push_back({ s, idx.slot_to_id[slot] });
+            std::push_heap(heap.begin(), heap.end(), score_id_min_heap_cmp());
+        } else if (s > heap.front().score) {
+            std::pop_heap(heap.begin(), heap.end(), score_id_min_heap_cmp());
+            heap.back() = { s, idx.slot_to_id[slot] };
+            std::push_heap(heap.begin(), heap.end(), score_id_min_heap_cmp());
         }
     }
 
     // Drain the heap into a temporary descending list.
-    std::vector<score_id> drained;
-    drained.reserve(heap.size());
     while (!heap.empty()) {
-        drained.push_back(heap.top());
-        heap.pop();
+        std::pop_heap(heap.begin(), heap.end(), score_id_min_heap_cmp());
+        drained.push_back(heap.back());
+        heap.pop_back();
     }
     std::reverse(drained.begin(), drained.end());  // now descending by score
 
     for (int i = 0; i < k; ++i) {
         if (static_cast<size_t>(i) < drained.size()) {
-            out_scores[i] = drained[i].score;
+            out_scores[i] = float_score_from_double(drained[i].score);
             out_ids[i]    = drained[i].id;
         } else {
             out_scores[i] = -FLT_MAX;
@@ -555,10 +656,14 @@ int ggml_vec_index_search(const ggml_vec_index_t * idx,
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
+        std::vector<score_id> heap;
+        std::vector<score_id> drained;
+        heap.reserve(k_sz);
+        drained.reserve(k_sz);
         for (int q = 0; q < n_q; ++q) {
             search_one(*idx, queries + static_cast<size_t>(q) * static_cast<size_t>(dim), k,
                        out_scores + static_cast<size_t>(q) * static_cast<size_t>(k),
-                       out_ids + static_cast<size_t>(q) * static_cast<size_t>(k));
+                       out_ids + static_cast<size_t>(q) * static_cast<size_t>(k), heap, drained);
         }
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
@@ -572,7 +677,7 @@ int ggml_vec_index_search(const ggml_vec_index_t * idx,
 // Persistence
 // ---------------------------------------------------------------------------
 
-int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
+int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path) {
     try {
         if (idx == nullptr || path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -593,12 +698,13 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         const std::filesystem::path dst_path(path);
         const std::filesystem::path tmp_path = make_tmp_path(dst_path);
 
-        std::unique_ptr<std::FILE, decltype(&std::fclose)> f(open_exclusive(tmp_path), &std::fclose);
-        if (f == nullptr) {
+        std::FILE * raw = open_exclusive(tmp_path);
+        if (raw == nullptr) {
             return GGML_VEC_INDEX_E_IO;
         }
-        tmp_file_guard tmp_guard(tmp_path);
-        const auto fail_io = [&]() {
+        tmp_file_guard                                     tmp_guard(tmp_path);
+        std::unique_ptr<std::FILE, decltype(&std::fclose)> f(raw, &std::fclose);
+        const auto                                         fail_io = [&]() {
             f.reset();
             return GGML_VEC_INDEX_E_IO;
         };
@@ -619,21 +725,22 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
             return fail_io();
         }
 
-        for (float v : idx->data) {
-            if (!write_u32_le(f.get(), float_to_u32(v))) {
-                return fail_io();
-            }
+        if (!write_f32_array_le(f.get(), idx->data)) {
+            return fail_io();
         }
 
-        for (uint64_t id : idx->slot_to_id) {
-            if (!write_u64_le(f.get(), id)) {
-                return fail_io();
-            }
+        if (!write_u64_array_le(f.get(), idx->slot_to_id)) {
+            return fail_io();
         }
 
         if (std::fflush(f.get()) != 0) {
             return fail_io();
         }
+#ifndef _WIN32
+        if (fsync(fileno(f.get())) != 0) {
+            return fail_io();
+        }
+#endif
         std::FILE * raw_file = f.release();
         if (std::fclose(raw_file) != 0) {
             return GGML_VEC_INDEX_E_IO;
@@ -664,12 +771,20 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         if (!f.is_open()) {
             return nullptr;
         }
-        std::error_code ec;
-        const uintmax_t file_size_um = std::filesystem::file_size(path, ec);
-        if (ec || file_size_um > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
+        f.seekg(0, std::ios::end);
+        if (!f) {
             return nullptr;
         }
-        const size_t file_size = static_cast<size_t>(file_size_um);
+        const std::streamoff end_off = f.tellg();
+        if (end_off < 0 ||
+            static_cast<uintmax_t>(end_off) > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
+            return nullptr;
+        }
+        const size_t file_size = static_cast<size_t>(end_off);
+        f.seekg(0, std::ios::beg);
+        if (!f) {
+            return nullptr;
+        }
 
         uint8_t header[kTvimHeaderSize] = {};
         f.read(reinterpret_cast<char *>(header), sizeof(header));
@@ -699,7 +814,8 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         const size_t dim_sz        = static_cast<size_t>(dim);
         const size_t n             = static_cast<size_t>(n_le);
         size_t       expected_size = 0;
-        if (!expected_snapshot_size(n, dim_sz, expected_size) || file_size != expected_size) {
+        if (!expected_snapshot_size(n, dim_sz, expected_size) ||
+            static_cast<uint64_t>(expected_size) > kMaxSnapshotBytes || file_size != expected_size) {
             return nullptr;
         }
 
@@ -713,21 +829,17 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         idx->slot_to_id.resize(n);
         idx->id_to_slot.reserve(n);
 
-        for (float & v : idx->data) {
-            uint32_t bits = 0;
-            if (!read_u32_le(f, bits)) {
-                return nullptr;
-            }
-            v = u32_to_float(bits);
+        if (!read_f32_array_le(f, idx->data)) {
+            return nullptr;
+        }
+        for (float v : idx->data) {
             if (!std::isfinite(v)) {
                 return nullptr;
             }
         }
 
-        for (uint64_t & id : idx->slot_to_id) {
-            if (!read_u64_le(f, id)) {
-                return nullptr;
-            }
+        if (!read_u64_array_le(f, idx->slot_to_id)) {
+            return nullptr;
         }
 
         for (size_t slot = 0; slot < n; ++slot) {

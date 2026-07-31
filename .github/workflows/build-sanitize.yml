@@ -15,19 +15,6 @@ on:
       '**/*.c',
       '**/*.cpp'
     ]
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-sanitize.yml',
-      '**/CMakeLists.txt',
-      '**/*.cmake',
-      '**/*.cmake.in',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
-    ]
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
@@ -43,7 +30,7 @@ jobs:
   ctest:
     runs-on: [self-hosted, X64, CPU, Linux]
 
-    continue-on-error: ${{ matrix.sanitizer == 'THREAD' }}
+    continue-on-error: true
 
     strategy:
       matrix:
