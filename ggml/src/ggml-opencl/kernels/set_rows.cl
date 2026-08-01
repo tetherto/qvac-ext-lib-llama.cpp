@@ -158,6 +158,239 @@ kernel void kernel_set_rows_f32_i32(
     }
 }
 
+// f32 -> q8_0 quantize set_rows. Block = half d + char qs[32].
+#define QK8_0 32
+
+inline void quantize_q8_0_block(global float * x, global char * qs, global half * d_out) {
+    float amax = 0.0f;
+    for (int j = 0; j < QK8_0; j++) {
+        amax = fmax(amax, fabs(x[j]));
+    }
+
+    float d  = amax / 127.0f;
+    float id = (d != 0.0f) ? 127.0f / amax : 0.0f;
+
+    vstore_half(d, 0, d_out);
+
+    for (int j = 0; j < QK8_0; j++) {
+        qs[j] = (char)((int)round(x[j] * id));
+    }
+}
+
+kernel void kernel_set_rows_q8_0_i64(
+        global char * src0,
+        ulong         offset0,
+        global char * src1,
+        ulong         offset1,
+        global char * dst,
+        ulong         offsetd,
+        int           ne01,
+        ulong         nb01,
+        ulong         nb02,
+        ulong         nb03,
+        uint4         ne11,
+        uint4         ne12,
+        ulong         nb10,
+        ulong         nb11,
+        ulong         nb12,
+        int           nblk0,
+        ulong         nb1,
+        ulong         nb2,
+        ulong         nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst  + offsetd;
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    int i12 = fastmod(i03, ne12);
+    int i11 = fastmod(i02, ne11);
+
+    int i10 = i01;
+    long i1 = ((global long *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
+
+    global char  * dst_row = (global char  *) (dst  +  i1*nb1  + i02*nb2  + i03*nb3);
+    global float * src_row = (global float *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
+
+    for (int blk = get_local_id(0); blk < nblk0; blk += get_local_size(0)) {
+        global float * x = src_row + blk * QK8_0;
+        global char  * y = dst_row + blk * (2 + QK8_0);
+
+        quantize_q8_0_block(x, y + 2, (global half *)y);
+    }
+}
+
+kernel void kernel_set_rows_q8_0_i32(
+        global char * src0,
+        ulong         offset0,
+        global char * src1,
+        ulong         offset1,
+        global char * dst,
+        ulong         offsetd,
+        int           ne01,
+        ulong         nb01,
+        ulong         nb02,
+        ulong         nb03,
+        uint4         ne11,
+        uint4         ne12,
+        ulong         nb10,
+        ulong         nb11,
+        ulong         nb12,
+        int           nblk0,
+        ulong         nb1,
+        ulong         nb2,
+        ulong         nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst  + offsetd;
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    int i12 = fastmod(i03, ne12);
+    int i11 = fastmod(i02, ne11);
+
+    int i10 = i01;
+    int i1  = ((global int *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
+
+    global char  * dst_row = (global char  *) (dst  +  i1*nb1  + i02*nb2  + i03*nb3);
+    global float * src_row = (global float *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
+
+    for (int blk = get_local_id(0); blk < nblk0; blk += get_local_size(0)) {
+        global float * x = src_row + blk * QK8_0;
+        global char  * y = dst_row + blk * (2 + QK8_0);
+
+        quantize_q8_0_block(x, y + 2, (global half *)y);
+    }
+}
+
+// SoA q8_0 variants. dst_q: int8[QK8_0] per block; dst_d: fp16 scale per block.
+// Layout matches kernel_convert_block_q8_0; block index follows dst element order.
+kernel void kernel_set_rows_q8_0_soa_i64(
+        global char * src0,
+        ulong         offset0,
+        global char * src1,
+        ulong         offset1,
+        global char * dst_q,
+        ulong         offset_q,
+        global char * dst_d,
+        ulong         offset_d,
+        int           ne01,
+        ulong         nb01,
+        ulong         nb02,
+        ulong         nb03,
+        uint4         ne11,
+        uint4         ne12,
+        ulong         nb10,
+        ulong         nb11,
+        ulong         nb12,
+        int           nblk0,
+        int           ne1_dst,
+        int           ne2_dst,
+        int           ne3_dst
+) {
+    src0  = src0  + offset0;
+    src1  = src1  + offset1;
+    dst_q = dst_q + offset_q;
+    dst_d = dst_d + offset_d;
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    int i12 = fastmod(i03, ne12);
+    int i11 = fastmod(i02, ne11);
+
+    int i10 = i01;
+    long i1 = ((global long *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
+
+    long row_blk_base = ((long)i03 * ne2_dst * ne1_dst + (long)i02 * ne1_dst + i1) * nblk0;
+
+    global half  * d_row = (global half  *)(dst_d) + row_blk_base;
+    global char  * q_row = (global char  *)(dst_q) + row_blk_base * QK8_0;
+    global float * src_row = (global float *)(src0 + i01*nb01 + i02*nb02 + i03*nb03);
+
+    for (int blk = get_local_id(0); blk < nblk0; blk += get_local_size(0)) {
+        global float * x = src_row + blk * QK8_0;
+        global char  * q = q_row + blk * QK8_0;
+
+        quantize_q8_0_block(x, q, d_row + blk);
+    }
+}
+
+kernel void kernel_set_rows_q8_0_soa_i32(
+        global char * src0,
+        ulong         offset0,
+        global char * src1,
+        ulong         offset1,
+        global char * dst_q,
+        ulong         offset_q,
+        global char * dst_d,
+        ulong         offset_d,
+        int           ne01,
+        ulong         nb01,
+        ulong         nb02,
+        ulong         nb03,
+        uint4         ne11,
+        uint4         ne12,
+        ulong         nb10,
+        ulong         nb11,
+        ulong         nb12,
+        int           nblk0,
+        int           ne1_dst,
+        int           ne2_dst,
+        int           ne3_dst
+) {
+    src0  = src0  + offset0;
+    src1  = src1  + offset1;
+    dst_q = dst_q + offset_q;
+    dst_d = dst_d + offset_d;
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    int i12 = fastmod(i03, ne12);
+    int i11 = fastmod(i02, ne11);
+
+    int i10 = i01;
+    int i1  = ((global int *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
+
+    long row_blk_base = ((long)i03 * ne2_dst * ne1_dst + (long)i02 * ne1_dst + i1) * nblk0;
+
+    global half  * d_row = (global half  *)(dst_d) + row_blk_base;
+    global char  * q_row = (global char  *)(dst_q) + row_blk_base * QK8_0;
+    global float * src_row = (global float *)(src0 + i01*nb01 + i02*nb02 + i03*nb03);
+
+    for (int blk = get_local_id(0); blk < nblk0; blk += get_local_size(0)) {
+        global float * x = src_row + blk * QK8_0;
+        global char  * q = q_row + blk * QK8_0;
+
+        quantize_q8_0_block(x, q, d_row + blk);
+    }
+}
+
 kernel void kernel_set_rows_f16_i32(
         global char * src0,
         ulong         offset0,
@@ -207,233 +440,269 @@ kernel void kernel_set_rows_f16_i32(
     }
 }
 
-// =========================================================================
-// Quantized and BF16 set_rows kernels
-// =========================================================================
+// f32 -> q4_0 quantize set_rows. Block = half d + uchar qs[16] (shuffled
+// nibbles: qs[j] low/high = elem j / j+16).
+// Dequant: val[i] = d * (nibble_i - 8)
+// nblk0 = number of q4_0 blocks per row = ne00 / 32.
+#define QK4_0 32
+#define Q4_0_BLOCK_SIZE 18
 
-typedef char  int8_t;
-typedef uchar uint8_t;
-typedef uint  uint32_t;
-
-#define QK4_0  32
-#define QK4_1  32
-#define QK5_0  32
-#define QK5_1  32
-#define QK8_0  32
-#define QK4_NL 32
-
-typedef struct { half    d;          uint8_t qs[QK4_0/2]; } block_q4_0;
-typedef struct { half    d; half m;  uint8_t qs[QK4_1/2]; } block_q4_1;
-typedef struct { half    d;          uint8_t qh[4]; uint8_t qs[QK5_0/2]; } block_q5_0;
-typedef struct { half    d; half m;  uint8_t qh[4]; uint8_t qs[QK5_1/2]; } block_q5_1;
-typedef struct { half    d;          int8_t  qs[QK8_0]; } block_q8_0;
-typedef struct { half    d;          uint8_t qs[QK4_NL/2]; } block_iq4_nl;
-
-constant int8_t kvalues_iq4nl[16] = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
-};
-
-inline ushort float_to_bf16(float f) {
-    uint u = as_uint(f);
-    u += 0x7FFF + ((u >> 16) & 1);
-    return (ushort)(u >> 16);
-}
-
-inline int best_index_iq4nl(float x) {
-    if (x <= (float)kvalues_iq4nl[0])  return 0;
-    if (x >= (float)kvalues_iq4nl[15]) return 15;
-    int lo = 0, hi = 15;
-    while (hi - lo > 1) {
-        int mid = (lo + hi) / 2;
-        if (x < (float)kvalues_iq4nl[mid]) hi = mid; else lo = mid;
-    }
-    return x - (float)kvalues_iq4nl[lo] < (float)kvalues_iq4nl[hi] - x ? lo : hi;
-}
-
-// --- Quantization helpers (f32 source → quantized block destination) ---
-
-inline void quantize_f32_q4_0(global const float * x, global block_q4_0 * y) {
-    float amax = 0.0f, vmax = 0.0f;
-    for (int j = 0; j < QK4_0; ++j) {
-        float v = x[j];
-        if (amax < fabs(v)) { amax = fabs(v); vmax = v; }
-    }
-    float d  = vmax / -8.0f;
-    float id = d != 0.0f ? 1.0f/d : 0.0f;
-    y->d = (half)d;
-    for (int j = 0; j < QK4_0/2; ++j) {
-        uint8_t xi0 = (uint8_t)clamp((int)(x[j]         * id + 8.5f), 0, 15);
-        uint8_t xi1 = (uint8_t)clamp((int)(x[QK4_0/2+j] * id + 8.5f), 0, 15);
-        y->qs[j] = xi0 | (xi1 << 4);
-    }
-}
-
-inline void quantize_f32_q4_1(global const float * x, global block_q4_1 * y) {
-    float vmin = FLT_MAX, vmax = -FLT_MAX;
-    for (int j = 0; j < QK4_1; ++j) {
-        vmin = fmin(vmin, x[j]);
-        vmax = fmax(vmax, x[j]);
-    }
-    float d  = (vmax - vmin) / 15.0f;
-    float id = d != 0.0f ? 1.0f/d : 0.0f;
-    y->d = (half)d;
-    y->m = (half)vmin;
-    for (int j = 0; j < QK4_1/2; ++j) {
-        uint8_t xi0 = (uint8_t)clamp((int)((x[j]         - vmin)*id + 0.5f), 0, 15);
-        uint8_t xi1 = (uint8_t)clamp((int)((x[QK4_1/2+j] - vmin)*id + 0.5f), 0, 15);
-        y->qs[j] = xi0 | (xi1 << 4);
-    }
-}
-
-inline void quantize_f32_q5_0(global const float * x, global block_q5_0 * y) {
-    float amax = 0.0f, vmax = 0.0f;
-    for (int j = 0; j < QK5_0; ++j) {
-        float v = x[j];
-        if (amax < fabs(v)) { amax = fabs(v); vmax = v; }
-    }
-    float d  = vmax / -16.0f;
-    float id = d != 0.0f ? 1.0f/d : 0.0f;
-    y->d = (half)d;
-    uint32_t qh = 0;
-    for (int j = 0; j < QK5_0/2; ++j) {
-        uint8_t xi0 = (uint8_t)clamp((int)(x[j]         * id + 16.5f), 0, 31);
-        uint8_t xi1 = (uint8_t)clamp((int)(x[QK5_0/2+j] * id + 16.5f), 0, 31);
-        y->qs[j] = (xi0 & 0xf) | ((xi1 & 0xf) << 4);
-        qh |= ((uint32_t)(xi0 & 0x10) >> 4) << (j);
-        qh |= ((uint32_t)(xi1 & 0x10) >> 4) << (j + QK5_0/2);
-    }
-    y->qh[0] = (uint8_t)(qh);
-    y->qh[1] = (uint8_t)(qh >> 8);
-    y->qh[2] = (uint8_t)(qh >> 16);
-    y->qh[3] = (uint8_t)(qh >> 24);
-}
-
-inline void quantize_f32_q5_1(global const float * x, global block_q5_1 * y) {
-    float vmin = x[0], vmax = x[0];
-    for (int j = 1; j < QK5_1; ++j) {
-        vmin = fmin(vmin, x[j]);
-        vmax = fmax(vmax, x[j]);
-    }
-    float d  = (vmax - vmin) / 31.0f;
-    float id = d != 0.0f ? 1.0f/d : 0.0f;
-    y->d = (half)d;
-    y->m = (half)vmin;
-    uint32_t qh = 0;
-    for (int j = 0; j < QK5_1/2; ++j) {
-        uint8_t xi0 = (uint8_t)clamp((int)((x[j]         - vmin)*id + 0.5f), 0, 31);
-        uint8_t xi1 = (uint8_t)clamp((int)((x[QK5_1/2+j] - vmin)*id + 0.5f), 0, 31);
-        y->qs[j] = (xi0 & 0xf) | ((xi1 & 0xf) << 4);
-        qh |= ((uint32_t)(xi0 & 0x10) >> 4) << (j);
-        qh |= ((uint32_t)(xi1 & 0x10) >> 4) << (j + QK5_1/2);
-    }
-    y->qh[0] = (uint8_t)(qh);
-    y->qh[1] = (uint8_t)(qh >> 8);
-    y->qh[2] = (uint8_t)(qh >> 16);
-    y->qh[3] = (uint8_t)(qh >> 24);
-}
-
-inline void quantize_f32_q8_0(global const float * x, global block_q8_0 * y) {
+inline void quantize_q4_0_block(global float * x, global uchar * qs, global half * d_out) {
+    // Find the signed value with the largest absolute magnitude (matches ggml ref).
+    float max  = 0.0f;
     float amax = 0.0f;
-    for (int j = 0; j < QK8_0; ++j) {
-        amax = fmax(amax, fabs(x[j]));
-    }
-    float d  = amax / 127.0f;
-    float id = d != 0.0f ? 1.0f/d : 0.0f;
-    y->d = (half)d;
-    for (int j = 0; j < QK8_0; ++j) {
-        y->qs[j] = (int8_t)round(x[j] * id);
-    }
-}
-
-inline void quantize_f32_iq4_nl(global const float * x, global block_iq4_nl * y) {
-    float amax = 0.0f, vmax = 0.0f;
-    for (int j = 0; j < QK4_NL; ++j) {
+    for (int j = 0; j < QK4_0; j++) {
         float v = x[j];
-        if (amax < fabs(v)) { amax = fabs(v); vmax = v; }
+        float a = fabs(v);
+        if (a > amax) {
+            amax = a;
+            max  = v;
+        }
     }
-    float d  = vmax / (float)kvalues_iq4nl[0];
-    float id = d != 0.0f ? 1.0f/d : 0.0f;
-    float sumqx = 0.0f, sumq2 = 0.0f;
-    for (int j = 0; j < QK4_NL/2; ++j) {
-        uint8_t xi0 = (uint8_t)best_index_iq4nl(x[j]          * id);
-        uint8_t xi1 = (uint8_t)best_index_iq4nl(x[QK4_NL/2+j] * id);
-        y->qs[j] = xi0 | (xi1 << 4);
-        float v0 = (float)kvalues_iq4nl[xi0];
-        float v1 = (float)kvalues_iq4nl[xi1];
-        float w0 = x[j]          * x[j];
-        float w1 = x[QK4_NL/2+j] * x[QK4_NL/2+j];
-        sumqx += w0*v0*x[j] + w1*v1*x[QK4_NL/2+j];
-        sumq2 += w0*v0*v0   + w1*v1*v1;
+
+    float d  = max / -8.0f;
+    float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+
+    vstore_half(d, 0, d_out);
+
+    for (int j = 0; j < QK4_0/2; j++) {
+        float x0 = x[j]           * id;
+        float x1 = x[j + QK4_0/2] * id;
+
+        int i0 = (int)(x0 + 8.5f);
+        int i1 = (int)(x1 + 8.5f);
+        if (i0 < 0)  i0 = 0;
+        if (i0 > 15) i0 = 15;
+        if (i1 < 0)  i1 = 0;
+        if (i1 > 15) i1 = 15;
+
+        qs[j] = (uchar)i0 | ((uchar)i1 << 4);
     }
-    y->d = (half)(sumq2 > 0.0f ? sumqx/sumq2 : d);
 }
 
-// --- Kernel generation macros ---
+kernel void kernel_set_rows_q4_0_i64(
+        global char * src0,
+        ulong         offset0,
+        global char * src1,
+        ulong         offset1,
+        global char * dst,
+        ulong         offsetd,
+        int           ne01,
+        ulong         nb01,
+        ulong         nb02,
+        ulong         nb03,
+        uint4         ne11,
+        uint4         ne12,
+        ulong         nb10,
+        ulong         nb11,
+        ulong         nb12,
+        int           nblk0,
+        ulong         nb1,
+        ulong         nb2,
+        ulong         nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst  + offsetd;
 
-#define KERNEL_SET_ROWS_QUANT_IMPL(KERNEL_NAME, IDX_TYPE, BLOCK_TYPE, QK, QUANTIZE_FUNC) \
-kernel void KERNEL_NAME(                                                       \
-        global char * src0,  ulong offset0,                                    \
-        global char * src1,  ulong offset1,                                    \
-        global char * dst,   ulong offsetd,                                    \
-        int ne01, ulong nb01, ulong nb02, ulong nb03,                         \
-        uint4 ne11, uint4 ne12,                                                \
-        ulong nb10, ulong nb11, ulong nb12,                                   \
-        int nblk0, ulong nb1, ulong nb2, ulong nb3                            \
-) {                                                                            \
-    src0 += offset0; src1 += offset1; dst += offsetd;                          \
-    int i03 = get_group_id(2);                                                 \
-    int i02 = get_group_id(1);                                                 \
-    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);            \
-    if (i01 >= ne01) return;                                                   \
-    int i12 = fastmod(i03, ne12);                                              \
-    int i11 = fastmod(i02, ne11);                                              \
-    int i10 = i01;                                                             \
-    IDX_TYPE i1 = ((global IDX_TYPE *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0]; \
-    global float * src_row = (global float *)(src0 + i01*nb01 + i02*nb02 + i03*nb03); \
-    global char  * dst_row = (global char  *)(dst  +  i1*nb1  + i02*nb2  + i03*nb3);  \
-    for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {   \
-        QUANTIZE_FUNC(src_row + ind*(QK), (global BLOCK_TYPE *)(dst_row) + ind); \
-    }                                                                          \
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    int i12 = fastmod(i03, ne12);
+    int i11 = fastmod(i02, ne11);
+
+    int i10 = i01;
+    long i1 = ((global long *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
+
+    global char  * dst_row = (global char  *) (dst  +  i1*nb1  + i02*nb2  + i03*nb3);
+    global float * src_row = (global float *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
+
+    for (int blk = get_local_id(0); blk < nblk0; blk += get_local_size(0)) {
+        global float * x    = src_row + blk * QK4_0;
+        global char  * y    = dst_row + blk * Q4_0_BLOCK_SIZE;
+        global half  * yd   = (global half  *)(y);
+        global uchar * yqs  = (global uchar *)(y + 2);
+
+        quantize_q4_0_block(x, yqs, yd);
+    }
 }
 
-#define KERNEL_SET_ROWS_QUANT(NAME, BLOCK_TYPE, QK, QUANTIZE_FUNC)             \
-    KERNEL_SET_ROWS_QUANT_IMPL(kernel_set_rows_##NAME##_i64, long, BLOCK_TYPE, QK, QUANTIZE_FUNC) \
-    KERNEL_SET_ROWS_QUANT_IMPL(kernel_set_rows_##NAME##_i32, int,  BLOCK_TYPE, QK, QUANTIZE_FUNC)
+kernel void kernel_set_rows_q4_0_i32(
+        global char * src0,
+        ulong         offset0,
+        global char * src1,
+        ulong         offset1,
+        global char * dst,
+        ulong         offsetd,
+        int           ne01,
+        ulong         nb01,
+        ulong         nb02,
+        ulong         nb03,
+        uint4         ne11,
+        uint4         ne12,
+        ulong         nb10,
+        ulong         nb11,
+        ulong         nb12,
+        int           nblk0,
+        ulong         nb1,
+        ulong         nb2,
+        ulong         nb3
+) {
+    src0 = src0 + offset0;
+    src1 = src1 + offset1;
+    dst  = dst  + offsetd;
 
-KERNEL_SET_ROWS_QUANT(q4_0,   block_q4_0,   QK4_0,  quantize_f32_q4_0)
-KERNEL_SET_ROWS_QUANT(q4_1,   block_q4_1,   QK4_1,  quantize_f32_q4_1)
-KERNEL_SET_ROWS_QUANT(q5_0,   block_q5_0,   QK5_0,  quantize_f32_q5_0)
-KERNEL_SET_ROWS_QUANT(q5_1,   block_q5_1,   QK5_1,  quantize_f32_q5_1)
-KERNEL_SET_ROWS_QUANT(q8_0,   block_q8_0,   QK8_0,  quantize_f32_q8_0)
-KERNEL_SET_ROWS_QUANT(iq4_nl, block_iq4_nl, QK4_NL, quantize_f32_iq4_nl)
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
 
-// --- BF16 (element-wise, blck_size = 1) ---
+    if (i01 >= ne01) {
+        return;
+    }
 
-#define KERNEL_SET_ROWS_BF16_IMPL(KERNEL_NAME, IDX_TYPE)                       \
-kernel void KERNEL_NAME(                                                       \
-        global char * src0,  ulong offset0,                                    \
-        global char * src1,  ulong offset1,                                    \
-        global char * dst,   ulong offsetd,                                    \
-        int ne01, ulong nb01, ulong nb02, ulong nb03,                         \
-        uint4 ne11, uint4 ne12,                                                \
-        ulong nb10, ulong nb11, ulong nb12,                                   \
-        int nblk0, ulong nb1, ulong nb2, ulong nb3                            \
-) {                                                                            \
-    src0 += offset0; src1 += offset1; dst += offsetd;                          \
-    int i03 = get_group_id(2);                                                 \
-    int i02 = get_group_id(1);                                                 \
-    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);            \
-    if (i01 >= ne01) return;                                                   \
-    int i12 = fastmod(i03, ne12);                                              \
-    int i11 = fastmod(i02, ne11);                                              \
-    int i10 = i01;                                                             \
-    IDX_TYPE i1 = ((global IDX_TYPE *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0]; \
-    global float  * src_row = (global float  *)(src0 + i01*nb01 + i02*nb02 + i03*nb03); \
-    global ushort * dst_row = (global ushort *)(dst  +  i1*nb1  + i02*nb2  + i03*nb3);  \
-    for (int ind = get_local_id(0); ind < nblk0; ind += get_local_size(0)) {   \
-        dst_row[ind] = float_to_bf16(src_row[ind]);                            \
-    }                                                                          \
+    int i12 = fastmod(i03, ne12);
+    int i11 = fastmod(i02, ne11);
+
+    int i10 = i01;
+    int i1  = ((global int *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
+
+    global char  * dst_row = (global char  *) (dst  +  i1*nb1  + i02*nb2  + i03*nb3);
+    global float * src_row = (global float *) (src0 + i01*nb01 + i02*nb02 + i03*nb03);
+
+    for (int blk = get_local_id(0); blk < nblk0; blk += get_local_size(0)) {
+        global float * x    = src_row + blk * QK4_0;
+        global char  * y    = dst_row + blk * Q4_0_BLOCK_SIZE;
+        global half  * yd   = (global half  *)(y);
+        global uchar * yqs  = (global uchar *)(y + 2);
+
+        quantize_q4_0_block(x, yqs, yd);
+    }
 }
 
-KERNEL_SET_ROWS_BF16_IMPL(kernel_set_rows_bf16_i64, long)
-KERNEL_SET_ROWS_BF16_IMPL(kernel_set_rows_bf16_i32, int)
+// SoA variants for q4_0 dst. Used when the backend has split block_q4_0 records
+// into separate quant (dst_q) and scale (dst_d) sub-buffers — same pattern as
+// the q8_0 SoA variants above.
+//
+// Layout (matches kernel_convert_block_q4_0, the "shuffled" variant):
+//   dst_q: contiguous 16 packed nibbles per block, block i at offset i * 16 bytes.
+//   dst_d: contiguous fp16 scales, block i at offset i * 2 bytes.
+// Nibble layout inside each byte is unchanged from AoS: qs[j] low nibble = element j,
+// qs[j] high nibble = element j+16. kernel_restore_block_q4_0 copies bytes as-is.
+kernel void kernel_set_rows_q4_0_soa_i64(
+        global char * src0,
+        ulong         offset0,
+        global char * src1,
+        ulong         offset1,
+        global char * dst_q,
+        ulong         offset_q,
+        global char * dst_d,
+        ulong         offset_d,
+        int           ne01,
+        ulong         nb01,
+        ulong         nb02,
+        ulong         nb03,
+        uint4         ne11,
+        uint4         ne12,
+        ulong         nb10,
+        ulong         nb11,
+        ulong         nb12,
+        int           nblk0,
+        int           ne1_dst,
+        int           ne2_dst,
+        int           ne3_dst
+) {
+    src0  = src0  + offset0;
+    src1  = src1  + offset1;
+    dst_q = dst_q + offset_q;
+    dst_d = dst_d + offset_d;
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    int i12 = fastmod(i03, ne12);
+    int i11 = fastmod(i02, ne11);
+
+    int i10 = i01;
+    long i1 = ((global long *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
+
+    long row_blk_base = ((long)i03 * ne2_dst * ne1_dst + (long)i02 * ne1_dst + i1) * nblk0;
+
+    global half  * d_row   = (global half  *)(dst_d) + row_blk_base;
+    global uchar * q_row   = (global uchar *)(dst_q) + row_blk_base * (QK4_0/2);
+    global float * src_row = (global float *)(src0 + i01*nb01 + i02*nb02 + i03*nb03);
+
+    for (int blk = get_local_id(0); blk < nblk0; blk += get_local_size(0)) {
+        global float * x    = src_row + blk * QK4_0;
+        global uchar * qs   = q_row   + blk * (QK4_0/2);
+        global half  * d_bk = d_row   + blk;
+
+        quantize_q4_0_block(x, qs, d_bk);
+    }
+}
+
+kernel void kernel_set_rows_q4_0_soa_i32(
+        global char * src0,
+        ulong         offset0,
+        global char * src1,
+        ulong         offset1,
+        global char * dst_q,
+        ulong         offset_q,
+        global char * dst_d,
+        ulong         offset_d,
+        int           ne01,
+        ulong         nb01,
+        ulong         nb02,
+        ulong         nb03,
+        uint4         ne11,
+        uint4         ne12,
+        ulong         nb10,
+        ulong         nb11,
+        ulong         nb12,
+        int           nblk0,
+        int           ne1_dst,
+        int           ne2_dst,
+        int           ne3_dst
+) {
+    src0  = src0  + offset0;
+    src1  = src1  + offset1;
+    dst_q = dst_q + offset_q;
+    dst_d = dst_d + offset_d;
+
+    int i03 = get_group_id(2);
+    int i02 = get_group_id(1);
+    int i01 = get_group_id(0)*get_local_size(1) + get_local_id(1);
+
+    if (i01 >= ne01) {
+        return;
+    }
+
+    int i12 = fastmod(i03, ne12);
+    int i11 = fastmod(i02, ne11);
+
+    int i10 = i01;
+    int i1  = ((global int *)(src1 + i10*nb10 + i11*nb11 + i12*nb12))[0];
+
+    long row_blk_base = ((long)i03 * ne2_dst * ne1_dst + (long)i02 * ne1_dst + i1) * nblk0;
+
+    global half  * d_row   = (global half  *)(dst_d) + row_blk_base;
+    global uchar * q_row   = (global uchar *)(dst_q) + row_blk_base * (QK4_0/2);
+    global float * src_row = (global float *)(src0 + i01*nb01 + i02*nb02 + i03*nb03);
+
+    for (int blk = get_local_id(0); blk < nblk0; blk += get_local_size(0)) {
+        global float * x    = src_row + blk * QK4_0;
+        global uchar * qs   = q_row   + blk * (QK4_0/2);
+        global half  * d_bk = d_row   + blk;
+
+        quantize_q4_0_block(x, qs, d_bk);
+    }
+}

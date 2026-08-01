@@ -67,6 +67,10 @@ struct ggml_opt_context {
     int32_t opt_i              = 0;
     bool    loss_per_datapoint = false;
 
+    // Backward loss scale: the backward is seeded from loss*loss_scale so gradient
+    // magnitudes stay within fp32 range through deep backprop.
+    float   loss_scale         = 1.0f;
+
     ggml_opt_get_optimizer_params get_opt_pars    = nullptr;
     void *                        get_opt_pars_ud = nullptr;
     struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
@@ -347,6 +351,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*loss_scale      =*/ 1.0f,
     };
 }
 
@@ -538,8 +543,15 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     }
     ggml_set_output(opt_ctx->loss);
-    ggml_set_loss(opt_ctx->loss);
-    ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
+
+    struct ggml_tensor * loss_for_backward = opt_ctx->loss;
+    if (opt_ctx->loss_scale != 1.0f) {
+        loss_for_backward = ggml_scale(ctx_results, opt_ctx->loss, opt_ctx->loss_scale);
+        ggml_set_name(loss_for_backward, "loss_backward_scaled");
+        ggml_set_output(loss_for_backward);
+    }
+    ggml_set_loss(loss_for_backward);
+    ggml_build_forward_expand(opt_ctx->gf, loss_for_backward);
 
     if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_MASKED) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
@@ -676,6 +688,8 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+
+    result->loss_scale = params.loss_scale > 0.0f ? params.loss_scale : 1.0f;
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -955,7 +969,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 adamw_par_data[0] = opt_pars.adamw.alpha;
                 adamw_par_data[1] = opt_pars.adamw.beta1;
                 adamw_par_data[2] = opt_pars.adamw.beta2;
-                adamw_par_data[3] = opt_pars.adamw.eps;
+                adamw_par_data[3] = opt_pars.adamw.eps * opt_ctx->loss_scale;
                 adamw_par_data[4] = opt_pars.adamw.wd;
                 adamw_par_data[5] = beta1h;
                 adamw_par_data[6] = beta2h;
@@ -965,8 +979,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 GGML_ASSERT(opt_pars.sgd.wd >= 0.0f);
                 GGML_ASSERT(opt_pars.sgd.wd <= 1.0f);
                 float * sgd = ggml_get_data_f32(opt_ctx->opt_step_params);
-                sgd[0] = opt_pars.sgd.alpha;
-                sgd[1] = opt_pars.sgd.wd;
+                sgd[0] = opt_pars.sgd.alpha / opt_ctx->loss_scale;
+                sgd[1] = opt_pars.sgd.wd * opt_ctx->loss_scale;
             } break;
             default:
                 GGML_ABORT("fatal error");
@@ -1278,6 +1292,7 @@ bool ggml_opt_save_state(ggml_opt_context_t opt_ctx, const char* filename) {
     gguf_set_val_str(gguf_ctx, "general.type", "optimizer");
     gguf_set_val_i64(gguf_ctx, "optimizer.iteration", ggml_opt_get_iter(opt_ctx));
     gguf_set_val_i32(gguf_ctx, "optimizer.n_params", ggml_opt_get_nparams(opt_ctx));
+    gguf_set_val_f32(gguf_ctx, "optimizer.loss_scale", opt_ctx->loss_scale);
 
     int32_t total_params = ggml_opt_get_nparams(opt_ctx);
 
@@ -1348,6 +1363,17 @@ bool ggml_opt_load_tensors(ggml_opt_context_t opt_ctx, const char* filename) {
     int grad_m_loaded = 0, grad_v_loaded = 0;
     const int32_t n_params = ggml_opt_get_nparams(opt_ctx);
 
+    float loss_scale_file = 1.0f;
+    {
+        const int key_idx = gguf_find_key(gguf_context, "optimizer.loss_scale");
+        if (key_idx >= 0) {
+            loss_scale_file = gguf_get_val_f32(gguf_context, key_idx);
+        }
+    }
+    const bool  rescale = loss_scale_file > 0.0f && loss_scale_file != opt_ctx->loss_scale;
+    const float ratio_m = rescale ? opt_ctx->loss_scale / loss_scale_file : 1.0f;
+    const float ratio_v = ratio_m * ratio_m;
+
     for (int i = 0; i < tensor_count; ++i) {
         const char* tensor_name = gguf_get_tensor_name(gguf_context, i);
         if (!tensor_name) continue;
@@ -1360,8 +1386,15 @@ bool ggml_opt_load_tensors(ggml_opt_context_t opt_ctx, const char* filename) {
             struct ggml_tensor* grad_v = ggml_opt_get_grad_v(opt_ctx, param_idx);
 
             if (grad_m && strlen(grad_m->name) > 0 && strcmp(tensor_name, grad_m->name) == 0) {
-                if (ggml_nelements(grad_m) == ggml_nelements(gguf_tensor)) {
+                if (grad_m->type == gguf_tensor->type &&
+                    ggml_nelements(grad_m) == ggml_nelements(gguf_tensor)) {
                     if (grad_m->data) {
+                        if (rescale && gguf_tensor->type == GGML_TYPE_F32) {
+                            float * data = (float *) gguf_tensor->data;
+                            for (int64_t j = 0; j < ggml_nelements(gguf_tensor); ++j) {
+                                data[j] *= ratio_m;
+                            }
+                        }
                         ggml_backend_tensor_set(grad_m, gguf_tensor->data, 0, ggml_nbytes(grad_m));
                         grad_m_loaded++;
                     }
@@ -1370,8 +1403,15 @@ bool ggml_opt_load_tensors(ggml_opt_context_t opt_ctx, const char* filename) {
             }
 
             if (grad_v && strlen(grad_v->name) > 0 && strcmp(tensor_name, grad_v->name) == 0) {
-                if (ggml_nelements(grad_v) == ggml_nelements(gguf_tensor)) {
+                if (grad_v->type == gguf_tensor->type &&
+                    ggml_nelements(grad_v) == ggml_nelements(gguf_tensor)) {
                     if (grad_v->data) {
+                        if (rescale && gguf_tensor->type == GGML_TYPE_F32) {
+                            float * data = (float *) gguf_tensor->data;
+                            for (int64_t j = 0; j < ggml_nelements(gguf_tensor); ++j) {
+                                data[j] *= ratio_v;
+                            }
+                        }
                         ggml_backend_tensor_set(grad_v, gguf_tensor->data, 0, ggml_nbytes(grad_v));
                         grad_v_loaded++;
                     }

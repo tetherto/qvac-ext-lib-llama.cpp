@@ -23,6 +23,8 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
+            llama-kv-cache-dsa.cpp
+            llama-kv-cache-dsv4.cpp
             llama-lora-training.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp

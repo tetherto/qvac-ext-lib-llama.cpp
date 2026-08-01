@@ -331,7 +331,7 @@ struct split_strategy {
             }
             total_size = total_size / 1000 / 1000; // convert to megabytes
             printf("split %05d: n_tensors = %" PRIi64 ", total_size = %zuM\n", i_split + 1, gguf_get_n_tensors(ctx_out), total_size);
-
+            
             if (params.verbose) {
                 for (int i = 0; i < gguf_get_n_tensors(ctx_out); ++i) {
                     const char * t_name = gguf_get_tensor_name(ctx_out, i);
@@ -445,10 +445,10 @@ static void gguf_split(const split_params & split_params) {
     int n_split = strategy.ctx_outs.size();
     strategy.print_info();
 
-    // Write tensor list file
-    strategy.write_tensor_list();
-
     if (!split_params.dry_run) {
+        // Write tensor list file
+        strategy.write_tensor_list();
+
         // write all output splits
         strategy.write();
     }

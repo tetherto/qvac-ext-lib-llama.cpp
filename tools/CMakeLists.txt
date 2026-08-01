@@ -22,8 +22,6 @@ else()
     add_subdirectory(perplexity)
     add_subdirectory(quantize)
     if (LLAMA_BUILD_SERVER AND LLAMA_MTMD)
-        # qvac: ui subdir generates ui.h consumed by server/server-http.cpp; was
-        # missing from this list after the rebase. Must precede `server`.
         add_subdirectory(ui)
         add_subdirectory(cli)
         add_subdirectory(server)
@@ -37,8 +35,8 @@ else()
     if (GGML_RPC)
         add_subdirectory(rpc)
     endif()
-    if (NOT GGML_BACKEND_DL)
-        # these examples use the backends directly and cannot be built with dynamic loading
+    if (NOT GGML_BACKEND_DL AND GGML_CPU)
+        # these tools use backends directly (no dynamic loading) and depend on CPU backend symbols
         add_subdirectory(cvector-generator)
         add_subdirectory(export-lora)
     endif()

@@ -11,7 +11,32 @@ find_package(Vulkan COMPONENTS glslc REQUIRED)
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
 endif()
-find_package(SPIRV-Headers CONFIG REQUIRED)
+# Desktop builds get SPIRV-Headers (and Vulkan-Hpp) from the Vulkan SDK. The
+# Android NDK ships neither, so on Android they are fetched in the ANDROID block
+# below; don't hard-require the system package there.
+find_package(SPIRV-Headers CONFIG QUIET)
+
+set(GGML_VULKAN_SPIRV_HEADERS_OK FALSE)
+if (TARGET SPIRV-Headers::SPIRV-Headers)
+    set(GGML_VULKAN_SPIRV_HEADERS_OK TRUE)
+    get_target_property(_ggml_spirv_incs SPIRV-Headers::SPIRV-Headers INTERFACE_INCLUDE_DIRECTORIES)
+    foreach(_ggml_spirv_inc IN LISTS _ggml_spirv_incs)
+        if (NOT EXISTS "${_ggml_spirv_inc}")
+            message(WARNING "Ignoring SPIRV-Headers package: include dir ${_ggml_spirv_inc} does not exist")
+            set(GGML_VULKAN_SPIRV_HEADERS_OK FALSE)
+        endif()
+    endforeach()
+endif()
+if (NOT ANDROID AND NOT GGML_VULKAN_SPIRV_HEADERS_OK)
+    # Fall back to locating the headers directly; the Vulkan SDK ships them
+    # next to the Vulkan headers.
+    find_path(GGML_VULKAN_SPIRV_INCLUDE_DIR spirv/unified1/spirv.hpp
+        HINTS ${Vulkan_INCLUDE_DIRS} ENV VULKAN_SDK
+        PATH_SUFFIXES include)
+    if (NOT GGML_VULKAN_SPIRV_INCLUDE_DIR)
+        message(FATAL_ERROR "SPIRV-Headers not found: need spirv/unified1/spirv.hpp (install SPIRV-Headers or the Vulkan SDK)")
+    endif()
+endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Parallel build object files
@@ -91,14 +116,12 @@ if (Vulkan_FOUND)
         message(STATUS "VK_NV_cooperative_matrix2 support disabled by GGML_VULKAN_DISABLE_COOPMAT2")
     endif()
 
-    # qvac: only the FlashAttn MMQ shaders reference FaTypeK / FA_TYPE_* spec
-    # constants that weren't ported from upstream b9341 into the qvac fork's
-    # macro-based dispatch. Those specific FA MMQ variants are gated off at the
-    # shader-gen and pipeline-registration sites (search for "qvac: FlashAttn
-    # MMQ"); the rest of the integer-dot family (mul_mat_mat_q8_1,
-    # mul_mat_vec_q8_1, etc.) compiles cleanly and is essential for fast TQ /
-    # quant matmul on Mali. So feature-test integer-dot unconditionally — no
-    # global -DGGML_VULKAN_DISABLE_INTEGER_DOT opt-out needed any more.
+    test_shader_extension_support(
+        "GL_NV_cooperative_matrix_decode_vector"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2_decode_vector.comp"
+        "GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT"
+    )
+
     test_shader_extension_support(
         "GL_EXT_integer_dot_product"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
@@ -112,6 +135,18 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+    if (GGML_VULKAN_SPIRV_HEADERS_OK)
+        # Provides <spirv/unified1/spirv.hpp> on platforms (e.g. Android NDK)
+        # whose Vulkan package does not bundle the SPIRV headers. It is a
+        # header-only dependency needed only to compile ggml-vulkan.cpp, so wrap
+        # it in BUILD_INTERFACE: as a static lib the PRIVATE link would otherwise
+        # leak into the installed ggml-targets export and break downstream
+        # find_package(ggml) on platforms whose Vulkan SDK ships the config
+        # target (e.g. Windows), which never call find_package(SPIRV-Headers).
+        target_link_libraries(ggml-vulkan PRIVATE $<BUILD_INTERFACE:SPIRV-Headers::SPIRV-Headers>)
+    elseif (GGML_VULKAN_SPIRV_INCLUDE_DIR)
+        target_include_directories(ggml-vulkan PRIVATE "${GGML_VULKAN_SPIRV_INCLUDE_DIR}")
+    endif()
     target_include_directories(ggml-vulkan
         PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR}
@@ -119,7 +154,34 @@ if (Vulkan_FOUND)
 
     )
     if (ANDROID)
-        target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
+        # The Android NDK ships only the C Vulkan headers (vulkan/vulkan.h). The
+        # ggml Vulkan backend additionally needs the C++ bindings
+        # (vulkan/vulkan.hpp) and SPIRV-Headers (spirv/unified1/spirv.hpp), which
+        # the NDK does not provide. Fetch pinned, header-only copies so the
+        # Android Vulkan build works out of the box.
+        include(FetchContent)
+        # SOURCE_SUBDIR points at a directory without a CMakeLists.txt so that
+        # FetchContent only downloads the headers and does NOT add_subdirectory()
+        # their projects (Vulkan-Headers would otherwise re-declare the
+        # Vulkan::Headers target already created by find_package(Vulkan)).
+        FetchContent_Declare(
+            vulkan_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_Declare(
+            spirv_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_MakeAvailable(vulkan_headers spirv_headers)
+        target_include_directories(ggml-vulkan PRIVATE
+            "${vulkan_headers_SOURCE_DIR}/include"
+            "${spirv_headers_SOURCE_DIR}/include")
     endif()
 
     if (FORCE_GGML_VK_PERF_LOGGER)
@@ -133,6 +195,9 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_CHECK_RESULTS)
         add_compile_definitions(GGML_VULKAN_CHECK_RESULTS)
+        # the result-checking path computes a CPU reference graph via
+        # ggml_graph_compute_with_ctx(), which is defined in ggml-cpu
+        target_link_libraries(ggml-vulkan PRIVATE ggml-cpu)
     endif()
 
     if (GGML_VULKAN_DEBUG)
@@ -159,6 +224,8 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_RUN_TESTS)
         add_compile_definitions(GGML_VULKAN_RUN_TESTS)
+        # the test path also calls ggml_graph_compute_with_ctx() (ggml-cpu)
+        target_link_libraries(ggml-vulkan PRIVATE ggml-cpu)
     endif()
 
     # Set up toolchain for host compilation whether cross-compiling or not

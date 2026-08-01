@@ -74,7 +74,6 @@ struct IncrementalSplitsTensorLoad {
     /// @brief Lalizy get/allocate a context with enough capacity for all tensors of
     /// same type of an individual split. The context can be used to instantiate the
     /// final model tensors and and attach to them backend buffers.
-    /// @tparam impl The model implementation type where the context will be stored.
     ggml_context * get_model_ctx_for_split_buft(ggml_backend_buffer_type_t buft, uint16_t split) {
         auto key = std::make_pair(buft, split);
         auto it  = ctx_split_map.find(key);

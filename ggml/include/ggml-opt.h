@@ -146,6 +146,11 @@ extern "C" {
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
+
+        // Backward loss scale (default 1.0 = off). The backward is seeded from
+        // loss*loss_scale so gradient magnitudes stay within fp32 range through deep
+        // backprop.
+        float loss_scale;
     };
 
     // get parameters for an optimization context with defaults set where possible

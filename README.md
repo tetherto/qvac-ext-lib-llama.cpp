@@ -3,9 +3,9 @@
 **AI inference and training engine for desktop and mobile platforms.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Based on llama.cpp](https://img.shields.io/badge/based%20on-llama.cpp%20b9341-orange.svg)](https://github.com/ggml-org/llama.cpp)
+[![Based on llama.cpp](https://img.shields.io/badge/based%20on-llama.cpp%20b7248-orange.svg)](https://github.com/ggml-org/llama.cpp)
 
-`qvac-fabric-llm.cpp` is a specialized fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for embedded systems, mobile devices, and enterprise deployment scenarios. It extends the excellent foundation of llama.cpp with additional capabilities focused on low-bit KV-cache quantization, mobile GPU optimization, and flexible integration patterns.
+`qvac-fabric-llm.cpp` is a specialized fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for embedded systems, mobile devices, and enterprise deployment scenarios. It extends the excellent foundation of llama.cpp with additional capabilities focused on memory-based model loading, mobile GPU optimization, and flexible integration patterns.
 
 
 ## Key Features
@@ -64,6 +64,25 @@ The official [microsoft/BitNet](https://github.com/microsoft/BitNet) inference f
 - **Conversion**: HuggingFace-to-GGUF conversion for BitNet model architectures
 - Cooperative matrix (coopmat) support for Vulkan devices that expose the extension
 
+### Memory-Based Model Loading *(exclusive)*
+
+Load models directly from memory buffers instead of the filesystem, enabling deployment in environments where disk access is restricted or unavailable.
+
+- Embedded systems with limited or no filesystem access
+- WebAssembly deployments where models are fetched over the network
+- Encrypted model storage where models are decrypted in memory
+- Streaming scenarios where models arrive over network connections
+
+```cpp
+#include "llama-cpp.h"
+
+std::vector<uint8_t> model_data = /* load from network, decrypt, etc. */;
+auto model = llama_model_load_from_buffer(std::move(model_data), params);
+
+auto model = llama_model_load_from_split_futures(paths, n_paths, context, tensor_list, params);
+llama_model_load_fulfill_split_future(path, context, std::move(streambuf));
+```
+
 ### Mobile GPU Optimization *(exclusive)*
 
 Enhanced GPU support with targeted optimizations for Qualcomm Adreno GPUs.
@@ -120,7 +139,7 @@ For more detailed build instructions, see [docs/build.md](docs/build.md).
 
 qvac-fabric-llm.cpp is a maintained fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The project regularly synchronizes with upstream releases to incorporate improvements, bug fixes, and new model support, while extending the engine with capabilities not present in the upstream project.
 
-**Current upstream baseline:** llama.cpp b9341
+**Current upstream baseline:** llama.cpp b7248
 
 ### Exclusive Features
 
@@ -131,6 +150,7 @@ The following features are developed in qvac-fabric-llm.cpp and are not availabl
 | TurboQuant KV cache quantization | TBQ3_0/TBQ4_0 with QJL correction plus PQ3_0/PQ4_0 Stage 1 formats; CPU quantization/dequantization and Vulkan inference kernels for low-bit KV-cache inference |
 | LoRA fine-tuning | On-device training across CPU, Vulkan, and Metal with SFT, checkpointing, and LR scheduling |
 | BitNet inference and training | TQ2_0 quantization on Vulkan, Metal, and CPU for inference and LoRA fine-tuning; extends [microsoft/BitNet](https://github.com/microsoft/BitNet) beyond its CUDA-only GPU support |
+| Memory-based model loading | Load models from in-memory buffers with split-model and async fulfillment support |
 | Mobile GPU optimization | Adreno 800+ quantized inference (Q4_0, Q8), Adreno-specific Vulkan shader variants, VMA integration |
 
 ### Upstream Compatibility

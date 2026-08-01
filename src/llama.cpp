@@ -52,9 +52,6 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
-// qvac: definition lives in llama-ext.h (transitively included via llama-context.h);
-// the duplicate here was carried over from before that header existed.
-
 static std::vector<llama_device_memory_data> llama_get_device_memory_data(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
         std::vector<llama_device> & devs, uint32_t & hp_ngl, uint32_t & hp_n_ctx_train, uint32_t & hp_n_expert,
@@ -136,11 +133,11 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data(
     }
 
     devs           = model->devices;
-    hp_ngl         = model->hparams.n_layer;
+    hp_ngl         = model->hparams.n_layer_all;
     hp_n_ctx_train = model->hparams.n_ctx_train;
     hp_n_expert    = model->hparams.n_expert;
 
-    llama_memory_breakdown_print(ctx); // goes to debug log
+    llama_get_memory_breakdown(ctx); // goes to debug log
 
     llama_free(ctx);
     llama_model_free(model);
@@ -747,27 +744,6 @@ static void llama_params_fit_impl(
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
-enum llama_params_fit_status llama_params_fit(
-        const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
-        float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins, uint32_t n_ctx_min, enum ggml_log_level log_level) {
-    const int64_t t0_us = llama_time_us();
-    llama_params_fit_status status = LLAMA_PARAMS_FIT_STATUS_SUCCESS;
-    try {
-        llama_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
-        LLAMA_LOG_INFO("%s: successfully fit params to free device memory\n", __func__);
-    } catch (const llama_params_fit_exception & e) {
-        LLAMA_LOG_WARN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
-        status = LLAMA_PARAMS_FIT_STATUS_FAILURE;
-    } catch (const std::runtime_error & e) {
-        LLAMA_LOG_ERROR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
-        status = LLAMA_PARAMS_FIT_STATUS_ERROR;
-    }
-    const int64_t t1_us = llama_time_us();
-    LLAMA_LOG_INFO("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
-    return status;
-}
-
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
     struct llama_sampler_chain_params result = {
         /*.no_perf =*/ true,
@@ -843,121 +819,8 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
-// Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
-static int llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
-        llama_model_loader & ml, FILE * file, llama_model & model, llama_model_params & params) {
-
-    (void) metadata;
-    (void) set_tensor_data;
-    (void) set_tensor_data_ud;
-    (void) file;
-
-    // loading time will be recalculated after the first eval, so
-    // we take page faults deferred by mmap() into consideration
-    model.t_load_us = 0;
-    time_meas tm(model.t_load_us);
-
-    model.t_start_us = tm.t_start_us;
-
-    try {
-        ml.print_info();
-
-        model.hparams.vocab_only = params.vocab_only;
-        model.hparams.no_alloc   = params.no_alloc;
-
-        try {
-            model.load_arch(ml);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model architecture: " + std::string(e.what()));
-        }
-        try {
-            model.load_hparams(ml);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
-        }
-        if (model.arch == LLM_ARCH_CLIP) {
-            throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
-        }
-        try {
-            model.load_vocab(ml);
-        } catch(const std::exception & e) {
-            throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
-        }
-
-        model.load_stats(ml);
-        model.print_info();
-
-        if (params.vocab_only) {
-            LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
-            return 0;
-        }
-
-        if (!model.load_tensors(ml)) {
-            return -2;
-        }
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
-        return -1;
-    }
-
-    return 0;
-}
-
-static struct llama_model * llama_model_load_from_file_impl(
-        struct gguf_context * metadata,
-        llama_model_set_tensor_data_t set_tensor_data,
-        void * set_tensor_data_ud,
-        llama_model_loader& ml,
-        FILE * file,
-        struct llama_model_params params) {
-    {
-        int n_sources_defined = 0;
-        if (metadata != nullptr) {
-            n_sources_defined++;
-        }
-        if (file != nullptr) {
-            n_sources_defined++;
-        }
-        if (n_sources_defined > 1) {
-            LLAMA_LOG_ERROR("%s: at most one of metadata and file may be defined\n", __func__);
-            return nullptr;
-        }
-    }
-    ggml_time_init();
-
-    if (!params.vocab_only && ggml_backend_reg_count() == 0) {
-        LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
-        return nullptr;
-    }
-
-    unsigned cur_percentage = 0;
-    if (params.progress_callback == NULL) {
-        params.progress_callback_user_data = &cur_percentage;
-        params.progress_callback = [](float progress, void * ctx) {
-            unsigned * cur_percentage_p = (unsigned *) ctx;
-            unsigned percentage = (unsigned) (100 * progress);
-            while (percentage > *cur_percentage_p) {
-                *cur_percentage_p = percentage;
-                LLAMA_LOG_CONT(".");
-                if (percentage >= 100) {
-                    LLAMA_LOG_CONT("\n");
-                }
-            }
-            return true;
-        };
-    }
-
-    // qvac: dispatch via llama_model_create so we get the proper
-    // llama_model_<arch> subclass (with its load_arch_hparams / load_arch_tensors
-    // / build_arch_graph overrides). The legacy `new llama_model(params)` here
-    // produced a base instance whose virtual hooks were no-ops, leaving
-    // build_arch_graph to return nullptr for every architecture.
-    llama_model * model = llama_model_create(ml, params);
-    if (model == nullptr) {
-        LLAMA_LOG_ERROR("%s: failed to create model for arch '%s'\n", __func__, ml.get_arch_name().c_str());
-        return nullptr;
-    }
-
+// returns true on success
+static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -967,7 +830,7 @@ static struct llama_model * llama_model_load_from_file_impl(
             }
             if (n_devs == 0) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
-                return nullptr;
+                return false;
             }
             LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
             for (size_t i = 0; i < n_devs; ++i) {
@@ -1005,7 +868,7 @@ static struct llama_model * llama_model_load_from_file_impl(
             }
             if (devs.empty()) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
-                return nullptr;
+                return false;
             }
 
             LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
@@ -1060,7 +923,9 @@ static struct llama_model * llama_model_load_from_file_impl(
                     }
 
                     case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        igpus.push_back({false, dev});
+                        if (igpus.empty()) {
+                            igpus.push_back({false, dev});
+                        }
                         break;
                     case GGML_BACKEND_DEVICE_TYPE_META:
                         GGML_ABORT("fatal error");
@@ -1074,21 +939,21 @@ static struct llama_model * llama_model_load_from_file_impl(
         // add GPUs
         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
 
-        // add integrated GPUs only if no other devices were found
-        if (model->devices.empty()) {
+        // add integrated GPUs only if no discrete GPUs were found
+        // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
+        if (gpus.empty()) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
     }
 
     // if using single GPU mode, remove all except the main GPU
-    if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_NONE && !model->devices.empty()) {
         if (params.main_gpu < 0) {
             model->devices.clear();
         } else {
             if (params.main_gpu >= (int)model->devices.size()) {
                 LLAMA_LOG_ERROR("%s: invalid value for main_gpu: %d (available devices: %zu)\n", __func__, params.main_gpu, model->devices.size());
-                llama_model_free(model);
-                return nullptr;
+                return false;
             }
             llama_device main_gpu = model->devices[params.main_gpu];
             model->devices.clear();
@@ -1105,7 +970,124 @@ static struct llama_model * llama_model_load_from_file_impl(
                 props.memory_free/1024/1024);
     }
 
-    const int status = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, ml, file, *model, params);
+    return true;
+}
+
+// Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
+static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
+        llama_model_loader & ml, FILE * file, llama_model_params & params) {
+    try {
+        // b9310 rebase: Silence compiler warnings about unused variables
+        (void) metadata;
+        (void) set_tensor_data;
+        (void) set_tensor_data_ud;
+        (void) file;
+
+        ml.print_info();
+        std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+
+        bool ok = llama_prepare_model_devices(params, model_ptr.get());
+        if (!ok) {
+            return {-1, nullptr};
+        }
+
+        auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
+        if (model == nullptr) {
+            GGML_ABORT("fatal error: model does not implement llama_model_base");
+        }
+
+        // loading time will be recalculated after the first eval, so
+        // we take page faults deferred by mmap() into consideration
+        model->t_load_us = 0;
+        time_meas tm(model->t_load_us);
+
+        model->t_start_us = tm.t_start_us;
+
+        model->hparams.vocab_only = params.vocab_only;
+        model->hparams.no_alloc   = params.no_alloc;
+
+        try {
+            model->load_hparams(ml);
+        } catch(const std::exception & e) {
+            throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
+        }
+        if (model->arch == LLM_ARCH_CLIP) {
+            throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
+        }
+        try {
+            model->load_vocab(ml);
+        } catch(const std::exception & e) {
+            throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
+        }
+
+        model->load_stats(ml);
+        model->print_info();
+
+        if (params.vocab_only) {
+            LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
+            return {0, model_ptr.release()};
+        }
+
+        if (!model->load_tensors(ml)) {
+            return {-2, nullptr};
+        }
+
+        return {0, model_ptr.release()};
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        return {-1, nullptr};
+    }
+}
+
+static struct llama_model * llama_model_load_from_file_impl(
+        struct gguf_context * metadata,
+        llama_model_set_tensor_data_t set_tensor_data,
+        void * set_tensor_data_ud,
+        bool has_load_input,
+        llama_model_loader & ml,
+        FILE * file,
+        struct llama_model_params params) {
+    {
+        int n_sources_defined = 0;
+        if (metadata != nullptr) {
+            n_sources_defined++;
+        }
+        if (has_load_input) {
+            n_sources_defined++;
+        }
+        if (file != nullptr) {
+            n_sources_defined++;
+        }
+        if (n_sources_defined != 1) {
+            LLAMA_LOG_ERROR("%s: exactly one out metadata, load input, and file must be defined\n", __func__);
+            return nullptr;
+        }
+    }
+    ggml_time_init();
+
+    if (!params.vocab_only && ggml_backend_reg_count() == 0) {
+        LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
+        return nullptr;
+    }
+
+    unsigned cur_percentage = 0;
+    if (params.progress_callback == NULL) {
+        params.progress_callback_user_data = &cur_percentage;
+        params.progress_callback = [](float progress, void * ctx) {
+            unsigned * cur_percentage_p = (unsigned *) ctx;
+            unsigned percentage = (unsigned) (100 * progress);
+            while (percentage > *cur_percentage_p) {
+                *cur_percentage_p = percentage;
+                LLAMA_LOG_CONT(".");
+                if (percentage >= 100) {
+                    LLAMA_LOG_CONT("\n");
+                }
+            }
+            return true;
+        };
+    }
+
+    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, ml, file, params);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -1114,7 +1096,9 @@ static struct llama_model * llama_model_load_from_file_impl(
             LLAMA_LOG_INFO("%s: cancelled model load\n", __func__);
         }
 
-        llama_model_free(model);
+        if (model) {
+            llama_model_free(model);
+        }
         return nullptr;
     }
 
@@ -1141,7 +1125,7 @@ struct llama_model * llama_model_init_from_user(
     llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, loader_input, /*file*/ nullptr,
                           params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
                           params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, ml, /*file*/ nullptr, params);
+    return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, /*has_load_input*/ false, ml, /*file*/ nullptr, params);
 }
 // deprecated
 struct llama_model * llama_load_model_from_file(
@@ -1154,8 +1138,13 @@ struct llama_model * llama_model_load_from_file(
         const char * path_model,
         struct llama_model_params params) {
     std::vector<std::string> splits = {};
-    llama_model_loader ml = create_disk_fileloader(path_model, splits, params);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, /*file*/ nullptr, params);
+    try {
+        llama_model_loader ml = create_disk_fileloader(path_model, splits, params);
+        return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        return nullptr;
+    }
 }
 
 static void override_and_disable_mmap(struct llama_model_params & params) {
@@ -1170,7 +1159,7 @@ struct llama_model * llama_model_load_from_buffer(std::vector<uint8_t> && data, 
     override_and_disable_mmap(params);
     llama_model_loader ml(nullptr, nullptr, nullptr, load_input_variant::buffer_load_input{ streambuf }, nullptr, params.use_mmap, params.use_direct_io,
                           params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, nullptr, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, nullptr, params);
 }
 
 static std::vector<std::string> splits_from_c_paths(const char ** paths, size_t n_paths) {
@@ -1286,8 +1275,13 @@ struct llama_model * llama_model_load_from_splits(
     if (splits.empty()) {
         return nullptr;
     }
-    llama_model_loader ml = create_disk_fileloader(splits.front().c_str(), splits, params);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, /*file*/ nullptr, params);
+    try {
+        llama_model_loader ml = create_disk_fileloader(splits.front().c_str(), splits, params);
+        return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, /*file*/ nullptr, params);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+        return nullptr;
+    }
 }
 
 struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_model_params params) {
@@ -1301,7 +1295,7 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
                           loader_input, file,
                           params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
                           params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, file, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ false, ml, file, params);
 }
 
 struct llama_model * llama_model_load_from_split_futures(const char ** paths, size_t n_paths, const char * context,
@@ -1317,7 +1311,7 @@ struct llama_model * llama_model_load_from_split_futures(const char ** paths, si
     override_and_disable_mmap(params);
     llama_model_loader ml(nullptr, nullptr, nullptr, loader_input, nullptr, params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc,
                           params.kv_overrides, params.tensor_buft_overrides);
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, ml, nullptr, params);
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, /*has_load_input*/ true, ml, nullptr, params);
 }
 
 bool llama_model_load_fulfill_split_future(const char * path, const char * context,
