@@ -37,9 +37,13 @@ concurrency:
   group: release
   queue: max
 
+permissions:
+  contents: read
+
 jobs:
   check-release:
     runs-on: ubuntu-slim
+    permissions: {}
 
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
@@ -110,6 +114,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     permissions:
+      contents: read
       actions: write
 
     steps:
@@ -182,6 +187,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     permissions:
+      contents: read
       actions: write
 
     steps:
@@ -268,6 +274,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     permissions:
+      contents: read
       actions: write
 
     steps:
@@ -439,6 +446,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     permissions:
+      contents: read
       actions: write
 
     outputs:
@@ -556,6 +564,10 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
+
+    permissions:
+      contents: read
+      actions: write
 
     outputs:
       openvino_version: ${{ steps.openvino_version.outputs.value }}
@@ -687,6 +699,7 @@ jobs:
     runs-on: windows-2025-vs2026
 
     permissions:
+      contents: read
       actions: write
 
     strategy:
@@ -755,7 +768,7 @@ jobs:
     runs-on: windows-2025
 
     permissions:
-      actions: write
+      contents: read
 
     env:
       OPENBLAS_VERSION: 0.3.23
@@ -854,6 +867,7 @@ jobs:
     runs-on: windows-2022
 
     permissions:
+      contents: read
       actions: write
 
     strategy:
@@ -939,6 +953,10 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
+
+    permissions:
+      contents: read
+      actions: write
 
     defaults:
       run:
@@ -1059,6 +1077,10 @@ jobs:
 
     runs-on: ubuntu-24.04
 
+    permissions:
+      contents: read
+      actions: write
+
     env:
       ONEAPI_ROOT: /opt/intel/oneapi/
       ONEAPI_INSTALLER_VERSION: "2025.3.3"
@@ -1142,6 +1164,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     permissions:
+      contents: read
       actions: write
 
     strategy:
@@ -1263,6 +1286,7 @@ jobs:
     runs-on: windows-2022
 
     permissions:
+      contents: read
       actions: write
 
     env:

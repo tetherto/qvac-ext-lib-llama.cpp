@@ -46,6 +46,9 @@ env:
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
+permissions:
+  contents: read
+
 jobs:
   # build-cmake-pkg:
     # uses: ./.github/workflows/build-cmake-pkg.yml

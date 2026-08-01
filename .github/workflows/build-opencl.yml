@@ -34,6 +34,9 @@ env:
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
+permissions:
+  contents: read
+
 jobs:
   windows-2025-opencl-adreno:
     runs-on: windows-2025
