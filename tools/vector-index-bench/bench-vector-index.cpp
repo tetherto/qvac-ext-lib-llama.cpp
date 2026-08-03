@@ -802,6 +802,7 @@ DeltaBenchResult run_delta_bench(
 
     result.snapshot_bytes_before = std::filesystem::file_size(snapshot_path);
     result.delta_bytes_before = std::filesystem::file_size(delta_path);
+    const std::vector<uint8_t> dirty_snapshot = read_file_bytes(snapshot_path);
     const std::vector<uint8_t> dirty_delta = read_file_bytes(delta_path);
 
     result.snapshot_load_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
@@ -819,6 +820,7 @@ DeltaBenchResult run_delta_bench(
     std::vector<double> compact_times;
     compact_times.reserve(static_cast<size_t>(cfg.repeats));
     for (int i = 0; i < cfg.repeats; ++i) {
+        write_file_bytes(snapshot_path, dirty_snapshot);
         write_file_bytes(delta_path, dirty_delta);
         const auto t0 = std::chrono::steady_clock::now();
         CHECK(ggml_vec_index_compact_delta(
