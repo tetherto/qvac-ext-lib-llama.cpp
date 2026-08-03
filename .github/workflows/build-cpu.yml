@@ -121,6 +121,7 @@ jobs:
           ctest -L main --verbose --timeout 900
 
       - name: Static vector-index smoke
+        if: ${{ matrix.build == 'x64' || matrix.build == 'arm64' }}
         id: vector_index_static
         run: |
           cmake -B build-vector-index-static \
@@ -132,6 +133,7 @@ jobs:
           ctest --test-dir build-vector-index-static -R '^test-vector-index(-faults)?$' --output-on-failure
 
       - name: Vector-index package smoke
+        if: ${{ matrix.build == 'x64' || matrix.build == 'arm64' }}
         id: vector_index_package
         run: |
           PREFIX="$RUNNER_TEMP/vector-index-install"

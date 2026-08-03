@@ -3,6 +3,7 @@
 #include "ggml-vector-index.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -15,6 +16,12 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -42,6 +49,12 @@ struct BenchConfig {
     int ivf_iters = 4;
     int ivf_nprobe = 4;
     int delete_stride = 2;
+};
+
+enum class ParseResult {
+    ok,
+    help,
+    error,
 };
 
 struct TimedSearch {
@@ -489,8 +502,34 @@ TimedSearch run_simulated_q4_search(
     return result;
 }
 
+uint64_t bench_pid() {
+#ifdef _WIN32
+    return static_cast<uint64_t>(_getpid());
+#else
+    return static_cast<uint64_t>(getpid());
+#endif
+}
+
+std::filesystem::path unique_bench_path(const char * name) {
+    static uint64_t counter = 0;
+    const std::filesystem::path path(name);
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string unique_name =
+        path.stem().string() + "." +
+        std::to_string(bench_pid()) + "." +
+        std::to_string(now) + "." +
+        std::to_string(counter++) +
+        path.extension().string();
+    return std::filesystem::temp_directory_path() / unique_name;
+}
+
+void remove_delta_artifacts(const std::filesystem::path & path) {
+    std::filesystem::remove(path);
+    std::filesystem::remove(path.string() + ".lock");
+}
+
 std::filesystem::path write_index_file(ggml_vec_index_t * idx, const char * name) {
-    const auto path = std::filesystem::temp_directory_path() / name;
+    const auto path = unique_bench_path(name);
     CHECK(ggml_vec_index_write(idx, path.string().c_str()) == GGML_VEC_INDEX_OK);
     return path;
 }
@@ -631,6 +670,10 @@ QualityBenchResult run_quality_bench(
 }
 
 struct DeltaBenchResult {
+    double add_batch_ms = 0.0;
+    double add_batch_us_per_vector = 0.0;
+    double add_single_us_per_op = 0.0;
+    double remove_us_per_op = 0.0;
     double snapshot_load_ms = 0.0;
     double replay_load_ms = 0.0;
     double compact_ms = 0.0;
@@ -667,7 +710,7 @@ DeleteBenchResult run_delete_bench(
         idx, queries, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats).ms;
 
     for (int row = 0; row < cfg.n_vec; row += cfg.delete_stride) {
-        CHECK(ggml_vec_index_remove(idx, ids[static_cast<size_t>(row)]) == 1);
+        CHECK(ggml_vec_index_remove(idx, ids[static_cast<size_t>(row)]) == GGML_VEC_INDEX_OK);
         ++result.deleted;
     }
     result.live = ggml_vec_index_len(idx);
@@ -696,37 +739,67 @@ DeltaBenchResult run_delta_bench(
         const BenchConfig & cfg,
         const char * snapshot_name,
         const char * delta_name) {
-    CHECK(cfg.delta_ops > 0 && cfg.delta_ops * 2 < cfg.n_vec);
+    CHECK(cfg.delta_ops > 0 && cfg.delta_ops <= (cfg.n_vec - 1) / 2);
     const int base_n = cfg.n_vec - cfg.delta_ops;
-    const std::filesystem::path snapshot_path =
-        std::filesystem::temp_directory_path() / snapshot_name;
-    const std::filesystem::path delta_path =
-        std::filesystem::temp_directory_path() / delta_name;
+    const std::filesystem::path snapshot_path = unique_bench_path(snapshot_name);
+    const std::filesystem::path delta_path = unique_bench_path(delta_name);
+    const std::filesystem::path single_delta_path =
+        delta_path.string() + ".single";
     std::filesystem::remove(snapshot_path);
-    std::filesystem::remove(delta_path);
+    remove_delta_artifacts(delta_path);
+    remove_delta_artifacts(single_delta_path);
 
     ggml_vec_index_t * idx = ggml_vec_index_create(cfg.dim, bit_width);
     CHECK(idx != nullptr);
     CHECK(ggml_vec_index_add(idx, vectors.data(), base_n, ids.data()) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_write(idx, snapshot_path.string().c_str()) == GGML_VEC_INDEX_OK);
 
-    for (int i = 0; i < cfg.delta_ops; ++i) {
-        const int row = base_n + i;
+    DeltaBenchResult result;
+    {
+        ggml_vec_index_t * single_idx = ggml_vec_index_load(snapshot_path.string().c_str());
+        CHECK(single_idx != nullptr);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < cfg.delta_ops; ++i) {
+            const int row = base_n + i;
+            CHECK(ggml_vec_index_add_logged(
+                single_idx,
+                vectors.data() + static_cast<size_t>(row) * static_cast<size_t>(cfg.dim),
+                1,
+                ids.data() + row,
+                single_delta_path.string().c_str()) == GGML_VEC_INDEX_OK);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        result.add_single_us_per_op =
+            std::chrono::duration<double, std::micro>(t1 - t0).count() / cfg.delta_ops;
+        ggml_vec_index_free(single_idx);
+        remove_delta_artifacts(single_delta_path);
+    }
+    {
+        const auto t0 = std::chrono::steady_clock::now();
         CHECK(ggml_vec_index_add_logged(
             idx,
-            vectors.data() + static_cast<size_t>(row) * static_cast<size_t>(cfg.dim),
-            1,
-            ids.data() + row,
+            vectors.data() + static_cast<size_t>(base_n) * static_cast<size_t>(cfg.dim),
+            cfg.delta_ops,
+            ids.data() + base_n,
             delta_path.string().c_str()) == GGML_VEC_INDEX_OK);
+        const auto t1 = std::chrono::steady_clock::now();
+        result.add_batch_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        result.add_batch_us_per_vector = result.add_batch_ms * 1000.0 / cfg.delta_ops;
     }
-    for (int i = 0; i < cfg.delta_ops / 2; ++i) {
+    const int remove_ops = cfg.delta_ops / 2;
+    const auto remove_t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < remove_ops; ++i) {
         CHECK(ggml_vec_index_remove_logged(
             idx,
             ids[static_cast<size_t>(i)],
-            delta_path.string().c_str()) == 1);
+            delta_path.string().c_str()) == GGML_VEC_INDEX_OK);
+    }
+    const auto remove_t1 = std::chrono::steady_clock::now();
+    if (remove_ops > 0) {
+        result.remove_us_per_op =
+            std::chrono::duration<double, std::micro>(remove_t1 - remove_t0).count() / remove_ops;
     }
 
-    DeltaBenchResult result;
     result.snapshot_bytes_before = std::filesystem::file_size(snapshot_path);
     result.delta_bytes_before = std::filesystem::file_size(delta_path);
     const std::vector<uint8_t> dirty_delta = read_file_bytes(delta_path);
@@ -743,13 +816,20 @@ DeltaBenchResult run_delta_bench(
         CHECK(loaded != nullptr);
         ggml_vec_index_free(loaded);
     });
-    result.compact_ms = median_time_ms(0, cfg.repeats, [&]() {
+    std::vector<double> compact_times;
+    compact_times.reserve(static_cast<size_t>(cfg.repeats));
+    for (int i = 0; i < cfg.repeats; ++i) {
         write_file_bytes(delta_path, dirty_delta);
+        const auto t0 = std::chrono::steady_clock::now();
         CHECK(ggml_vec_index_compact_delta(
             idx,
             snapshot_path.string().c_str(),
             delta_path.string().c_str()) == GGML_VEC_INDEX_OK);
-    });
+        const auto t1 = std::chrono::steady_clock::now();
+        compact_times.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    std::sort(compact_times.begin(), compact_times.end());
+    result.compact_ms = compact_times[compact_times.size() / 2];
     result.snapshot_bytes_after = std::filesystem::file_size(snapshot_path);
     result.delta_bytes_after = std::filesystem::file_size(delta_path);
     result.post_compact_load_ms = median_time_ms(cfg.warmups, cfg.repeats, [&]() {
@@ -762,14 +842,91 @@ DeltaBenchResult run_delta_bench(
 
     ggml_vec_index_free(idx);
     std::filesystem::remove(snapshot_path);
-    std::filesystem::remove(delta_path);
+    remove_delta_artifacts(delta_path);
     return result;
 }
 
 } // namespace
 
-int main() {
-    const BenchConfig cfg;
+static void print_usage(const char * argv0) {
+    std::printf(
+        "usage: %s [--n-vec N] [--dim N] [--n-query N] [--k N]\n"
+        "       [--warmups N] [--repeats N] [--delta-ops N]\n"
+        "       [--ivf-lists N] [--ivf-iters N] [--ivf-nprobe N]\n"
+        "       [--delete-stride N]\n",
+        argv0);
+}
+
+static bool parse_int_arg(const char * value, int min_value, int & out) {
+    char * end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        parsed < min_value || parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    out = static_cast<int>(parsed);
+    return true;
+}
+
+static ParseResult parse_args(int argc, char ** argv, BenchConfig & cfg) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            return ParseResult::help;
+        }
+        auto read_int = [&](int min_value, int & out) {
+            if (i + 1 >= argc || !parse_int_arg(argv[++i], min_value, out)) {
+                std::fprintf(stderr, "invalid value for %s\n", arg.c_str());
+                return false;
+            }
+            return true;
+        };
+        if (arg == "--n-vec") {
+            if (!read_int(1, cfg.n_vec)) { return ParseResult::error; }
+        } else if (arg == "--dim") {
+            if (!read_int(1, cfg.dim)) { return ParseResult::error; }
+        } else if (arg == "--n-query") {
+            if (!read_int(1, cfg.n_query)) { return ParseResult::error; }
+        } else if (arg == "--k") {
+            if (!read_int(1, cfg.k)) { return ParseResult::error; }
+        } else if (arg == "--warmups") {
+            if (!read_int(0, cfg.warmups)) { return ParseResult::error; }
+        } else if (arg == "--repeats") {
+            if (!read_int(1, cfg.repeats)) { return ParseResult::error; }
+        } else if (arg == "--delta-ops") {
+            if (!read_int(1, cfg.delta_ops)) { return ParseResult::error; }
+        } else if (arg == "--ivf-lists") {
+            if (!read_int(1, cfg.ivf_lists)) { return ParseResult::error; }
+        } else if (arg == "--ivf-iters") {
+            if (!read_int(0, cfg.ivf_iters)) { return ParseResult::error; }
+        } else if (arg == "--ivf-nprobe") {
+            if (!read_int(1, cfg.ivf_nprobe)) { return ParseResult::error; }
+        } else if (arg == "--delete-stride") {
+            if (!read_int(1, cfg.delete_stride)) { return ParseResult::error; }
+        } else {
+            std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
+            return ParseResult::error;
+        }
+    }
+    if (cfg.delta_ops > (cfg.n_vec - 1) / 2) {
+        std::fprintf(stderr, "--delta-ops must be less than half of --n-vec\n");
+        return ParseResult::error;
+    }
+    return ParseResult::ok;
+}
+
+int main(int argc, char ** argv) {
+    BenchConfig cfg;
+    const ParseResult parse_result = parse_args(argc, argv, cfg);
+    if (parse_result == ParseResult::help) {
+        print_usage(argv[0]);
+        return 0;
+    }
+    if (parse_result == ParseResult::error) {
+        print_usage(argv[0]);
+        return 1;
+    }
 
     std::vector<float> vectors = make_normalized_vectors(cfg.n_vec, cfg.dim, 0xdeadbeef);
     std::vector<float> queries = make_normalized_vectors(cfg.n_query, cfg.dim, 0xc001d00d);
@@ -985,7 +1142,7 @@ int main() {
         static_cast<size_t>(cfg.n_vec) * sizeof(float) +
         static_cast<size_t>(cfg.n_vec) * sizeof(uint64_t);
 
-    std::printf("bench-vector-index\n");
+    std::printf("llama-vector-index-bench\n");
     std::printf("  q8 kernel=%s\n", q8_kernel_name());
     std::printf("  q4 kernel=%s\n", q4_kernel_name());
     std::printf("  n_vec=%d dim=%d n_query=%d k=%d warmups=%d repeats=%d\n",
@@ -1049,6 +1206,12 @@ int main() {
             q4_filtered[i].ms / q4_prepared_filtered[i].ms);
     }
     std::printf(
+        "  delta append f32:  batch=%.3f ms batch=%.3f us/vector single_add=%.3f us/op remove=%.3f us/op\n",
+        f32_delta.add_batch_ms,
+        f32_delta.add_batch_us_per_vector,
+        f32_delta.add_single_us_per_op,
+        f32_delta.remove_us_per_op);
+    std::printf(
         "  delta load f32:    snapshot=%.3f ms replay=%.3f ms compact=%.3f ms post_compact=%.3f ms\n",
         f32_delta.snapshot_load_ms,
         f32_delta.replay_load_ms,
@@ -1061,6 +1224,12 @@ int main() {
         static_cast<unsigned long long>(f32_delta.snapshot_bytes_after),
         static_cast<unsigned long long>(f32_delta.delta_bytes_after));
     std::printf(
+        "  delta append q8:   batch=%.3f ms batch=%.3f us/vector single_add=%.3f us/op remove=%.3f us/op\n",
+        q8_delta.add_batch_ms,
+        q8_delta.add_batch_us_per_vector,
+        q8_delta.add_single_us_per_op,
+        q8_delta.remove_us_per_op);
+    std::printf(
         "  delta load q8:     snapshot=%.3f ms replay=%.3f ms compact=%.3f ms post_compact=%.3f ms\n",
         q8_delta.snapshot_load_ms,
         q8_delta.replay_load_ms,
@@ -1072,6 +1241,12 @@ int main() {
         static_cast<unsigned long long>(q8_delta.delta_bytes_before),
         static_cast<unsigned long long>(q8_delta.snapshot_bytes_after),
         static_cast<unsigned long long>(q8_delta.delta_bytes_after));
+    std::printf(
+        "  delta append q4:   batch=%.3f ms batch=%.3f us/vector single_add=%.3f us/op remove=%.3f us/op\n",
+        q4_delta.add_batch_ms,
+        q4_delta.add_batch_us_per_vector,
+        q4_delta.add_single_us_per_op,
+        q4_delta.remove_us_per_op);
     std::printf(
         "  delta load q4:     snapshot=%.3f ms replay=%.3f ms compact=%.3f ms post_compact=%.3f ms\n",
         q4_delta.snapshot_load_ms,
