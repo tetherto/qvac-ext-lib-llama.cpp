@@ -303,6 +303,7 @@ void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void    ggml_vec_index_test_set_truncate_fail(int fail);
 void    ggml_vec_index_test_set_parent_fsync_fail(int fail);
+void    ggml_vec_index_test_set_parent_fsync_fail_after(int64_t count);
 void    ggml_vec_index_test_set_delta_append_wait_target(int target);
 int     ggml_vec_index_test_get_delta_append_waiters(void);
 void    ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
@@ -311,6 +312,12 @@ void    ggml_vec_index_test_reset_delta_tail_scan_count(void);
 int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
 void    ggml_vec_index_test_reset_state_crc_scan_count(void);
 int64_t ggml_vec_index_test_get_state_crc_scan_count(void);
+void    ggml_vec_index_test_reset_delta_max_read_size(void);
+size_t  ggml_vec_index_test_get_delta_max_read_size(void);
+void    ggml_vec_index_test_reset_mmap_count_reject_count(void);
+int64_t ggml_vec_index_test_get_mmap_count_reject_count(void);
+void    ggml_vec_index_test_reset_load_count_reject_count(void);
+int64_t ggml_vec_index_test_get_load_count_reject_count(void);
 int     ggml_vec_index_test_get_load_with_delta_waiters(void);
 }
 #endif
@@ -319,6 +326,7 @@ void test_maybe_throw_bad_alloc();
 bool test_consume_write_bytes(size_t n);
 void test_wait_after_delta_validate();
 void test_wait_after_load_with_delta_snapshot();
+void test_record_delta_read_size(size_t size);
 
 bool is_supported_bit_width(int bit_width);
 bool is_valid_id(uint64_t id);
@@ -356,6 +364,9 @@ bool has_vector_storage(const ggml_vec_index & idx);
 int q4_decode(uint8_t nibble);
 void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale);
 void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale);
+float quantization_scale(float max_abs, float divisor);
+void quantize_q8_values(const float * src, int8_t * dst, size_t n, float scale);
+void quantize_q4_values(const float * src, uint8_t * dst, size_t offset, size_t n, float scale);
 void rollback_appended_slots_unlocked(
     ggml_vec_index_t * idx,
     size_t base_slot,
