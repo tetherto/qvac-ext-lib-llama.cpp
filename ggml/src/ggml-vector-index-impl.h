@@ -31,6 +31,12 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#define GGML_VEC_INDEX_USE_NEON 1
+#else
+#define GGML_VEC_INDEX_USE_NEON 0
+#endif
+
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/file.h>

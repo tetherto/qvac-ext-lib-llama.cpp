@@ -76,11 +76,12 @@ constexpr int kDim = 4;
 constexpr uint32_t kFloatParityMaxUlpDiff = 4;
 constexpr uint32_t kTqplusScoreMaxUlpDiff = 8;
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
-constexpr bool kIsX86ForTest = true;
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr bool kTurboVecInterleavedBlockLayout = true;
 #else
-constexpr bool kIsX86ForTest = false;
+constexpr bool kTurboVecInterleavedBlockLayout = false;
 #endif
+constexpr bool kTurboVecSupported = sizeof(size_t) >= 8;
 
 #include "turbovec-golden-q2.inc"
 #include "turbovec-golden-q4.inc"
@@ -1953,7 +1954,7 @@ struct TvimSection {
     size_t size = 0;
 };
 
-struct TurbovecTvimLayout {
+struct TurboVecTvimLayout {
     int dim = 0;
     int n = 0;
     TvimSection qparams;
@@ -1963,7 +1964,7 @@ struct TurbovecTvimLayout {
     TvimSection checksum;
 };
 
-TurbovecTvimLayout parse_turbovec_tvim_layout(const std::vector<uint8_t> & bytes, int bits) {
+TurboVecTvimLayout parse_turbovec_tvim_layout(const std::vector<uint8_t> & bytes, int bits) {
     CHECK(bits == 2 || bits == 4);
     CHECK(bytes.size() >= 32 + 16);
     CHECK(bytes[0] == 'T' && bytes[1] == 'V' && bytes[2] == 'P' && bytes[3] == 'I');
@@ -1972,7 +1973,7 @@ TurbovecTvimLayout parse_turbovec_tvim_layout(const std::vector<uint8_t> & bytes
     CHECK(bytes[6] == static_cast<uint8_t>(bits == 2 ? 5 : 4));
     CHECK((bytes[7] & 1) != 0);
 
-    TurbovecTvimLayout layout;
+    TurboVecTvimLayout layout;
     layout.dim = static_cast<int>(read_u32_le_from(bytes.data() + 8));
     layout.n = static_cast<int>(read_u32_le_from(bytes.data() + 12));
     const size_t qparam_bytes = read_u32_le_from(bytes.data() + 20);
@@ -2119,7 +2120,7 @@ void check_turbovec_numeric_helper_parity() {
     }
 }
 
-void check_tqplus_rust_parity(
+void check_tqplus_deterministic_layout(
         int bits,
         uint64_t expected_codes_hash,
         uint64_t expected_scales_hash,
@@ -2143,8 +2144,8 @@ void check_tqplus_rust_parity(
     CHECK(index != nullptr);
     CHECK(ggml_vec_index_add(index, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
     const uint64_t expected_blocked_hash = bits == 2 ?
-        (kIsX86ForTest ? UINT64_C(0xcf52dbd26452d0c9) : UINT64_C(0x481ee4411871b4cd)) :
-        (kIsX86ForTest ? UINT64_C(0x480945c9f53b88b9) : UINT64_C(0x001f1478c8b61a63));
+        (kTurboVecInterleavedBlockLayout ? UINT64_C(0xcf52dbd26452d0c9) : UINT64_C(0x481ee4411871b4cd)) :
+        (kTurboVecInterleavedBlockLayout ? UINT64_C(0x480945c9f53b88b9) : UINT64_C(0x001f1478c8b61a63));
     CHECK(turbovec_blocked_hash_for_test(index) == expected_blocked_hash);
     const std::string path =
         (std::filesystem::temp_directory_path() /
@@ -2336,7 +2337,6 @@ void check_turbovec_blocked_scalar_scores(int bits, int dim, int n, int n_querie
         scalar, queries.data(), n_queries, n, scalar_scores.data(), scalar_ids.data()) ==
         GGML_VEC_INDEX_OK);
 
-    const float tolerance = static_cast<float>(dim) * (bits == 2 ? 0.0045f : 0.0025f);
     std::vector<float> blocked_by_row(static_cast<size_t>(n));
     std::vector<float> scalar_by_row(static_cast<size_t>(n));
     for (int query = 0; query < n_queries; ++query) {
@@ -2356,6 +2356,9 @@ void check_turbovec_blocked_scalar_scores(int bits, int dim, int n, int n_querie
             const float scalar_score = scalar_by_row[static_cast<size_t>(row)];
             CHECK(std::isfinite(blocked_score));
             CHECK(std::isfinite(scalar_score));
+            const float tolerance = std::max(
+                1e-4f * std::fabs(scalar_score),
+                1e-4f);
             const float drift = std::fabs(blocked_score - scalar_score);
             if (!(drift <= tolerance)) {
                 std::fprintf(
@@ -2434,8 +2437,6 @@ float score_for_id(
 
 void check_loaded_blocked_scores_match_scalar(
         const std::string & path,
-        int bits,
-        int dim,
         const std::vector<float> & queries,
         int n_queries,
         const std::vector<uint64_t> & live_ids) {
@@ -2459,7 +2460,6 @@ void check_loaded_blocked_scores_match_scalar(
         scalar, queries.data(), n_queries, n_live, scalar_scores.data(), scalar_ids.data()) ==
         GGML_VEC_INDEX_OK);
 
-    const float tolerance = static_cast<float>(dim) * (bits == 2 ? 0.0045f : 0.0025f);
     for (int query = 0; query < n_queries; ++query) {
         const size_t base = static_cast<size_t>(query) * n_live;
         std::vector<uint64_t> blocked_row(
@@ -2479,6 +2479,9 @@ void check_loaded_blocked_scores_match_scalar(
             const float scalar_score = score_for_id(scalar_row, scalar_score_row, id);
             CHECK(std::isfinite(blocked_score));
             CHECK(std::isfinite(scalar_score));
+            const float tolerance = std::max(
+                1e-4f * std::fabs(scalar_score),
+                1e-4f);
             CHECK(std::fabs(blocked_score - scalar_score) <= tolerance);
         }
     }
@@ -2525,7 +2528,7 @@ void check_turbovec_mutation_cache_regression(int bits) {
 
     CHECK(ggml_vec_index_write(tv, initial_path.c_str()) == GGML_VEC_INDEX_OK);
     const std::vector<uint8_t> initial_bytes = read_file_bytes(initial_path);
-    const TurbovecTvimLayout initial_layout =
+    const TurboVecTvimLayout initial_layout =
         parse_turbovec_tvim_layout(initial_bytes, bits);
     const uint64_t initial_calibration_hash =
         section_hash(initial_bytes, initial_layout.calibration);
@@ -2590,7 +2593,7 @@ void check_turbovec_mutation_cache_regression(int bits) {
 
     CHECK(ggml_vec_index_write(tv, final_path.c_str()) == GGML_VEC_INDEX_OK);
     const std::vector<uint8_t> final_bytes = read_file_bytes(final_path);
-    const TurbovecTvimLayout final_layout = parse_turbovec_tvim_layout(final_bytes, bits);
+    const TurboVecTvimLayout final_layout = parse_turbovec_tvim_layout(final_bytes, bits);
     CHECK(section_hash(final_bytes, final_layout.calibration) == initial_calibration_hash);
 
     auto * loaded = ggml_vec_index_load(final_path.c_str());
@@ -2628,7 +2631,7 @@ void check_turbovec_mutation_cache_regression(int bits) {
         queries.data() + static_cast<size_t>(2) * dim,
         vectors.data() + static_cast<size_t>(n_initial) * dim,
         static_cast<size_t>(dim) * sizeof(float));
-    check_loaded_blocked_scores_match_scalar(final_path, bits, dim, queries, 3, live_ids);
+    check_loaded_blocked_scores_match_scalar(final_path, queries, 3, live_ids);
 
     ggml_vec_index_free(loaded);
     ggml_vec_index_free(tv);
@@ -2666,7 +2669,7 @@ void check_turbovec_v3_corruption_rejected(int bits) {
     CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK);
 
     const std::vector<uint8_t> bytes = read_file_bytes(path);
-    const TurbovecTvimLayout layout = parse_turbovec_tvim_layout(bytes, bits);
+    const TurboVecTvimLayout layout = parse_turbovec_tvim_layout(bytes, bits);
     expect_corrupt_load_fails(path, corrupt_path, [layout](std::vector<uint8_t> & corrupt) {
         corrupt[layout.qparams.offset] ^= 0x01;
     });
@@ -2686,6 +2689,202 @@ void check_turbovec_v3_corruption_rejected(int bits) {
     ggml_vec_index_free(tv);
     std::filesystem::remove(path);
     std::filesystem::remove(corrupt_path);
+}
+
+void check_turbovec_zero_scale_and_legacy_calibration(int bits) {
+    constexpr int dim = 64;
+    CHECK(bits == 2 || bits == 4);
+
+    std::vector<float> zero(static_cast<size_t>(dim), 0.0f);
+    std::vector<float> query(static_cast<size_t>(dim), 0.0f);
+    for (int i = 0; i < dim; ++i) {
+        query[static_cast<size_t>(i)] =
+            static_cast<float>(std::sin(0.07 * static_cast<double>(i + 1)));
+    }
+    const uint64_t zero_id = static_cast<uint64_t>(620000 + bits);
+    auto * tv = bits == 2 ?
+        ggml_vec_index_create_turbovec_q2(dim) :
+        ggml_vec_index_create_turbovec_q4(dim);
+    CHECK(tv != nullptr);
+    CHECK(ggml_vec_index_add(tv, zero.data(), 1, &zero_id) == GGML_VEC_INDEX_OK);
+
+    const std::string path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-turbovec-zero-scale-q" + std::to_string(bits) + ".tvim")).string();
+    const std::string legacy_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-turbovec-zero-calibration-q" + std::to_string(bits) + ".tvim")).string();
+    const std::string roundtrip_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-turbovec-zero-calibration-roundtrip-q" + std::to_string(bits) + ".tvim")).string();
+    std::filesystem::remove(path);
+    std::filesystem::remove(legacy_path);
+    std::filesystem::remove(roundtrip_path);
+
+    CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+    const std::vector<uint8_t> bytes = read_file_bytes(path);
+    const TurboVecTvimLayout layout = parse_turbovec_tvim_layout(bytes, bits);
+    CHECK(read_u32_le_from(bytes.data() + layout.qparams.offset) == 0);
+
+    auto * loaded = ggml_vec_index_load(path.c_str());
+    CHECK(loaded != nullptr);
+    std::array<float, 1> scores{};
+    std::array<uint64_t, 1> out{};
+    CHECK(ggml_vec_index_search(loaded, query.data(), 1, 1, scores.data(), out.data()) ==
+          GGML_VEC_INDEX_OK);
+    CHECK(out[0] == zero_id);
+    CHECK(scores[0] == 0.0f);
+
+    std::vector<uint8_t> legacy = bytes;
+    write_u32_le_at(legacy, 28, 0);
+    legacy.erase(
+        legacy.begin() + static_cast<std::ptrdiff_t>(layout.calibration.offset),
+        legacy.begin() + static_cast<std::ptrdiff_t>(layout.calibration.offset + layout.calibration.size));
+    const size_t legacy_qparams_offset = 32;
+    const size_t legacy_vectors_offset = legacy_qparams_offset + layout.qparams.size;
+    const size_t legacy_ids_offset = legacy_vectors_offset + layout.vectors.size;
+    const size_t legacy_checksum_offset = legacy_ids_offset + layout.ids.size;
+    CHECK(legacy_checksum_offset + layout.checksum.size == legacy.size());
+    write_u32_le_at(
+        legacy,
+        legacy_checksum_offset,
+        crc32c_update(0xffffffffu, legacy.data(), 32) ^ 0xffffffffu);
+    write_u32_le_at(
+        legacy,
+        legacy_checksum_offset + 4,
+        crc32c_update(0xffffffffu, legacy.data() + legacy_qparams_offset, layout.qparams.size) ^
+            0xffffffffu);
+    write_u32_le_at(
+        legacy,
+        legacy_checksum_offset + 8,
+        crc32c_update(0xffffffffu, legacy.data() + legacy_vectors_offset, layout.vectors.size) ^
+            0xffffffffu);
+    write_u32_le_at(
+        legacy,
+        legacy_checksum_offset + 12,
+        crc32c_update(0xffffffffu, legacy.data() + legacy_ids_offset, layout.ids.size) ^
+            0xffffffffu);
+    write_file_bytes(legacy_path, legacy);
+
+    auto * legacy_loaded = ggml_vec_index_load(legacy_path.c_str());
+    CHECK(legacy_loaded != nullptr);
+    CHECK(ggml_vec_index_search(legacy_loaded, query.data(), 1, 1, scores.data(), out.data()) ==
+          GGML_VEC_INDEX_OK);
+    CHECK(out[0] == zero_id);
+    CHECK(scores[0] == 0.0f);
+
+    std::vector<float> added(static_cast<size_t>(dim), 0.0f);
+    added[0] = 1.0f;
+    added[1] = 0.5f;
+    const uint64_t added_id = static_cast<uint64_t>(621000 + bits);
+    CHECK(ggml_vec_index_add(legacy_loaded, added.data(), 1, &added_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(legacy_loaded, roundtrip_path.c_str()) == GGML_VEC_INDEX_OK);
+    const std::vector<uint8_t> roundtrip = read_file_bytes(roundtrip_path);
+    const TurboVecTvimLayout roundtrip_layout = parse_turbovec_tvim_layout(roundtrip, bits);
+    CHECK(roundtrip_layout.calibration.size == 2 * static_cast<size_t>(dim) * sizeof(float));
+
+    CHECK(ggml_vec_index_search(legacy_loaded, added.data(), 1, 1, scores.data(), out.data()) ==
+          GGML_VEC_INDEX_OK);
+    CHECK(out[0] == added_id);
+
+    auto * roundtrip_loaded = ggml_vec_index_load(roundtrip_path.c_str());
+    CHECK(roundtrip_loaded != nullptr);
+    CHECK(ggml_vec_index_contains(roundtrip_loaded, zero_id) == 1);
+    CHECK(ggml_vec_index_contains(roundtrip_loaded, added_id) == 1);
+    CHECK(ggml_vec_index_search(roundtrip_loaded, added.data(), 1, 1, scores.data(), out.data()) ==
+          GGML_VEC_INDEX_OK);
+    CHECK(out[0] == added_id);
+    std::array<float, 2> roundtrip_scores{};
+    std::array<uint64_t, 2> roundtrip_ids{};
+    CHECK(ggml_vec_index_search(
+        roundtrip_loaded,
+        query.data(),
+        1,
+        2,
+        roundtrip_scores.data(),
+        roundtrip_ids.data()) == GGML_VEC_INDEX_OK);
+    const size_t zero_position = roundtrip_ids[0] == zero_id ? 0 : 1;
+    CHECK(roundtrip_ids[zero_position] == zero_id);
+    CHECK(roundtrip_scores[zero_position] == 0.0f);
+
+    ggml_vec_index_free(roundtrip_loaded);
+    ggml_vec_index_free(legacy_loaded);
+    ggml_vec_index_free(loaded);
+    ggml_vec_index_free(tv);
+    std::filesystem::remove(path);
+    std::filesystem::remove(legacy_path);
+    std::filesystem::remove(roundtrip_path);
+}
+
+void check_quantized_partial_replay_rollback(int bit_width) {
+    CHECK(bit_width == 4 || bit_width == 8);
+    const std::string suffix = std::to_string(bit_width);
+    const std::string snapshot_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-quantized-replay-base-q" + suffix + ".tvim")).string();
+    const std::string delta_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-quantized-replay-q" + suffix + ".tvid")).string();
+    const std::string rollback_path =
+        (std::filesystem::temp_directory_path() /
+         ("ggml-vector-index-quantized-replay-rollback-q" + suffix + ".tvim")).string();
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_path + ".lock");
+    std::filesystem::remove(rollback_path);
+
+    const std::array<float, kDim * 4> vectors = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+    const std::array<uint64_t, 4> ids = {
+        static_cast<uint64_t>(630000 + bit_width * 10),
+        static_cast<uint64_t>(630001 + bit_width * 10),
+        static_cast<uint64_t>(630002 + bit_width * 10),
+        static_cast<uint64_t>(630003 + bit_width * 10),
+    };
+
+    auto * writer = ggml_vec_index_create(kDim, bit_width);
+    CHECK(writer != nullptr);
+    CHECK(ggml_vec_index_add(writer, vectors.data(), 2, ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(writer, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_add_logged(
+        writer, vectors.data() + 2 * kDim, 1, ids.data() + 2, delta_path.c_str()) ==
+        GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_remove_logged(writer, ids[0], delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(writer);
+
+    std::vector<uint8_t> corrupt = read_file_bytes(delta_path);
+    const size_t first_record_offset = delta_log_header_size(corrupt);
+    const size_t second_record_offset =
+        first_record_offset +
+        delta_record_header_size(corrupt) +
+        static_cast<size_t>(read_u64_le_at(corrupt, first_record_offset + 8));
+    CHECK(second_record_offset + delta_record_header_size(corrupt) <= corrupt.size());
+    corrupt[delta_record_state_offset(corrupt, second_record_offset)] ^= 1;
+    refresh_delta_record_crc(corrupt, second_record_offset);
+    write_file_bytes(delta_path, corrupt);
+
+    auto * stale = ggml_vec_index_load(snapshot_path.c_str());
+    CHECK(stale != nullptr);
+    CHECK(ggml_vec_index_add_logged(
+        stale, vectors.data() + 3 * kDim, 1, ids.data() + 3, delta_path.c_str()) ==
+        GGML_VEC_INDEX_E_IO);
+    CHECK(ggml_vec_index_len(stale) == 2);
+    CHECK(ggml_vec_index_contains(stale, ids[0]) == 1);
+    CHECK(ggml_vec_index_contains(stale, ids[1]) == 1);
+    CHECK(ggml_vec_index_contains(stale, ids[2]) == 0);
+    CHECK(ggml_vec_index_contains(stale, ids[3]) == 0);
+    CHECK(ggml_vec_index_write(stale, rollback_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(read_file_bytes(rollback_path) == read_file_bytes(snapshot_path));
+
+    ggml_vec_index_free(stale);
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_path + ".lock");
+    std::filesystem::remove(rollback_path);
 }
 
 }  // namespace
@@ -2709,6 +2908,12 @@ int main() {
     CHECK(ggml_vec_index_create_turbovec_q4(0) == nullptr);
     CHECK(ggml_vec_index_create_turbovec_q4(kDim) == nullptr);
     CHECK(ggml_vec_index_create_turbovec_q4(65544) == nullptr);
+    if (!kTurboVecSupported) {
+        CHECK(ggml_vec_index_create_turbovec_q2(65536) == nullptr);
+        CHECK(ggml_vec_index_create_turbovec_q4(65536) == nullptr);
+    }
+
+    if (kTurboVecSupported) {
     auto * max_dim_q2 = ggml_vec_index_create_turbovec_q2(65536);
     CHECK(max_dim_q2 != nullptr);
     ggml_vec_index_free(max_dim_q2);
@@ -2874,8 +3079,15 @@ int main() {
     check_turbovec_blocked_scalar_scores(2, 128, 1000, 2);
     check_turbovec_blocked_scalar_scores(4, 128, 1000, 2);
     for (const int bit_width : { 2, 4 }) {
-        CHECK(turbovec_avx2_lut_block_matches_scalar_for_test(bit_width, 128) == 1);
-        CHECK(turbovec_avx2_lut_block_matches_scalar_for_test(bit_width, 256) == 1);
+        for (const int dim : { 128, 256 }) {
+            const int avx2_status =
+                turbovec_avx2_lut_block_matches_scalar_for_test(bit_width, dim);
+            if (avx2_status < 0) {
+                std::printf("SKIP TurboVec AVX2-LUT parity bits=%d dim=%d\n", bit_width, dim);
+            } else {
+                CHECK(avx2_status == 1);
+            }
+        }
     }
 
     // Sparse filters score only touched TurboVec blocks and preserve the exact
@@ -3165,6 +3377,7 @@ int main() {
     for (const int bit_width : { 2, 4 }) {
         check_turbovec_mutation_cache_regression(bit_width);
         check_turbovec_v3_corruption_rejected(bit_width);
+        check_turbovec_zero_scale_and_legacy_calibration(bit_width);
     }
 
     check_turbovec_numeric_helper_parity();
@@ -3252,18 +3465,19 @@ int main() {
         kTurboVecGoldenDim256Q4RustCalibCount,
         kTurboVecGoldenDim256Q4TopK);
 
-    check_tqplus_rust_parity(
+    check_tqplus_deterministic_layout(
         2,
         UINT64_C(0xc4140782241d45eb),
-        kIsX86ForTest ? UINT64_C(0xd3fddb8414b86e7e) : UINT64_C(0x07b1e4792dc7ab14),
-        kIsX86ForTest ? UINT64_C(0x59a98122f0fcce5d) : UINT64_C(0x2fe473aa8d8ef2b2),
-        kIsX86ForTest ? UINT64_C(0x97be27042c380428) : UINT64_C(0x68e2ee49c3a5d29c));
-    check_tqplus_rust_parity(
+        UINT64_C(0xb111cd7d1dded99f),
+        UINT64_C(0x3b8289e6bc6c026e),
+        UINT64_C(0x09481a1adb4e3fe4));
+    check_tqplus_deterministic_layout(
         4,
         UINT64_C(0x2c4e8e9e2a991e21),
-        kIsX86ForTest ? UINT64_C(0xa0daf630c68a203c) : UINT64_C(0xe820eefd4297666f),
-        kIsX86ForTest ? UINT64_C(0x59a98122f0fcce5d) : UINT64_C(0x2fe473aa8d8ef2b2),
-        kIsX86ForTest ? UINT64_C(0x97be27042c380428) : UINT64_C(0x68e2ee49c3a5d29c));
+        UINT64_C(0x140caf9a5c52a967),
+        UINT64_C(0x3b8289e6bc6c026e),
+        UINT64_C(0x09481a1adb4e3fe4));
+    }
 
     auto * idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
     CHECK(idx != nullptr);
@@ -4453,6 +4667,9 @@ int main() {
     check_not_durable_status();
 #endif
 
+    check_quantized_partial_replay_rollback(4);
+    check_quantized_partial_replay_rollback(8);
+
     // Incremental persistence: replay add/remove deltas on top of a snapshot.
     {
         const std::string snapshot_path =
@@ -4479,6 +4696,9 @@ int main() {
         const std::string delta_bound_write_path =
             (std::filesystem::temp_directory_path() /
              "ggml-vector-index-delta-bound-write.tvim").string();
+        const std::string replay_failure_write_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-delta-replay-failure-write.tvim").string();
         const std::string alternate_delta_path =
             (std::filesystem::temp_directory_path() /
              "ggml-vector-index-delta-alternate.tvid").string();
@@ -4492,6 +4712,7 @@ int main() {
         std::filesystem::remove(diverged_delta_path);
         std::filesystem::remove(diverged_delta_path + ".lock");
         std::filesystem::remove(delta_bound_write_path);
+        std::filesystem::remove(replay_failure_write_path);
         std::filesystem::remove(alternate_delta_path);
         std::filesystem::remove(alternate_delta_path + ".lock");
 
@@ -4615,12 +4836,95 @@ int main() {
         CHECK(ggml_vec_index_len(corrupt_stale_writer) == 2);
         CHECK(ggml_vec_index_contains(corrupt_stale_writer, delta_id) == 0);
         CHECK(ggml_vec_index_contains(corrupt_stale_writer, corrupt_stale_id) == 0);
+        CHECK(ggml_vec_index_contains(corrupt_stale_writer, ids[0]) == 1);
+        CHECK(ggml_vec_index_contains(corrupt_stale_writer, ids[1]) == 1);
+        CHECK(ggml_vec_index_write(corrupt_stale_writer, replay_failure_write_path.c_str()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(read_file_bytes(replay_failure_write_path) == read_file_bytes(snapshot_path));
+        std::filesystem::remove(replay_failure_write_path);
+        const uint64_t replay_failure_plain_id = (1ULL << 41) + 13ULL;
+        CHECK(ggml_vec_index_add(
+            corrupt_stale_writer,
+            seeds[3].data(),
+            1,
+            &replay_failure_plain_id) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_contains(corrupt_stale_writer, replay_failure_plain_id) == 1);
+        CHECK(ggml_vec_index_write(corrupt_stale_writer, replay_failure_write_path.c_str()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(std::filesystem::exists(replay_failure_write_path));
+        std::filesystem::remove(replay_failure_write_path);
         ggml_vec_index_free(corrupt_stale_writer);
 
         auto * corrupt_delta_loaded = ggml_vec_index_load_with_delta(
             snapshot_path.c_str(), corrupt_delta_path.c_str());
         CHECK(corrupt_delta_loaded == nullptr);
         ggml_vec_index_free(corrupt_delta_loaded);
+
+        write_file_bytes(corrupt_delta_path, corrupt_delta);
+        auto * retry_stale_writer = ggml_vec_index_load(snapshot_path.c_str());
+        CHECK(retry_stale_writer != nullptr);
+        const uint64_t retry_stale_id = (1ULL << 41) + 15ULL;
+        CHECK(ggml_vec_index_add_logged(
+            retry_stale_writer,
+            seeds[3].data(),
+            1,
+            &retry_stale_id,
+            corrupt_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+        write_file_bytes(corrupt_delta_path, read_file_bytes(delta_path));
+        CHECK(ggml_vec_index_add_logged(
+            retry_stale_writer,
+            seeds[3].data(),
+            1,
+            &retry_stale_id,
+            corrupt_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_contains(retry_stale_writer, delta_id) == 1);
+        CHECK(ggml_vec_index_contains(retry_stale_writer, retry_stale_id) == 1);
+        ggml_vec_index_free(retry_stale_writer);
+
+        corrupt_delta_loaded = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), corrupt_delta_path.c_str());
+        CHECK(corrupt_delta_loaded != nullptr);
+        CHECK(ggml_vec_index_contains(corrupt_delta_loaded, retry_stale_id) == 1);
+        ggml_vec_index_free(corrupt_delta_loaded);
+
+        std::vector<uint8_t> corrupt_second_record_delta = read_file_bytes(delta_path);
+        const size_t second_record_offset =
+            first_record_offset +
+            delta_record_header_size(corrupt_second_record_delta) +
+            static_cast<size_t>(read_u64_le_at(corrupt_second_record_delta, first_record_offset + 8));
+        CHECK(second_record_offset + 16 < corrupt_second_record_delta.size());
+        corrupt_second_record_delta[
+            delta_record_state_offset(corrupt_second_record_delta, second_record_offset)] ^= 1;
+        refresh_delta_record_crc(corrupt_second_record_delta, second_record_offset);
+        write_file_bytes(corrupt_delta_path, corrupt_second_record_delta);
+        auto * partial_stale_writer = ggml_vec_index_load(snapshot_path.c_str());
+        CHECK(partial_stale_writer != nullptr);
+        const uint64_t partial_stale_id = (1ULL << 41) + 14ULL;
+        CHECK(ggml_vec_index_add_logged(
+            partial_stale_writer,
+            seeds[3].data(),
+            1,
+            &partial_stale_id,
+            corrupt_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+        CHECK(ggml_vec_index_len(partial_stale_writer) == 2);
+        CHECK(ggml_vec_index_contains(partial_stale_writer, delta_id) == 0);
+        CHECK(ggml_vec_index_contains(partial_stale_writer, partial_stale_id) == 0);
+        CHECK(ggml_vec_index_contains(partial_stale_writer, ids[0]) == 1);
+        CHECK(ggml_vec_index_contains(partial_stale_writer, ids[1]) == 1);
+        CHECK(ggml_vec_index_write(partial_stale_writer, replay_failure_write_path.c_str()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(read_file_bytes(replay_failure_write_path) == read_file_bytes(snapshot_path));
+        std::filesystem::remove(replay_failure_write_path);
+        CHECK(ggml_vec_index_add(
+            partial_stale_writer,
+            seeds[3].data(),
+            1,
+            &partial_stale_id) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(partial_stale_writer, replay_failure_write_path.c_str()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(std::filesystem::exists(replay_failure_write_path));
+        std::filesystem::remove(replay_failure_write_path);
+        ggml_vec_index_free(partial_stale_writer);
 
         std::vector<uint8_t> corrupt_payload_size_delta = read_file_bytes(delta_path);
         const size_t corrupt_payload_size_record_offset =

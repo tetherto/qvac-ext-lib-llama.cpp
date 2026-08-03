@@ -2,22 +2,15 @@
 
 #include "ggml-vector-index-impl.h"
 
-#if defined(__APPLE__) && defined(GGML_USE_ACCELERATE)
-#include <Accelerate/Accelerate.h>
-#endif
-
-#if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#if GGML_VEC_INDEX_USE_NEON
 #include <arm_neon.h>
-#define GGML_VEC_INDEX_TV_USE_NEON 1
-#else
-#define GGML_VEC_INDEX_TV_USE_NEON 0
 #endif
 
 namespace {
 
 constexpr int kTurboVecDimMultiple = 8;
 constexpr int kTurboVecScoreBlock = 32;
-#if GGML_VEC_INDEX_TV_USE_NEON
+#if GGML_VEC_INDEX_USE_NEON
 constexpr int kTurboVecFlushEvery = 256;
 #endif
 constexpr uint64_t kTurboVecRotationSeed = 42;
@@ -339,8 +332,12 @@ static std::shared_ptr<const std::vector<float>> turbovec_rotation(int dim) {
     return rotation;
 }
 
-static void apply_turbovec_rotation(const float * src, float * dst, int dim, bool transpose) {
-    const std::shared_ptr<const std::vector<float>> rotation = turbovec_rotation(dim);
+static void apply_turbovec_rotation_with_matrix(
+        const float * matrix,
+        const float * src,
+        float * dst,
+        int dim,
+        bool transpose) {
     const size_t dim_sz = static_cast<size_t>(dim);
     for (int row = 0; row < dim; ++row) {
         float sum = 0.0f;
@@ -348,68 +345,36 @@ static void apply_turbovec_rotation(const float * src, float * dst, int dim, boo
             const size_t matrix_index = transpose ?
                 static_cast<size_t>(column) * dim_sz + static_cast<size_t>(row) :
                 static_cast<size_t>(row) * dim_sz + static_cast<size_t>(column);
-            sum = std::fma((*rotation)[matrix_index], src[static_cast<size_t>(column)], sum);
+            sum = std::fma(matrix[matrix_index], src[static_cast<size_t>(column)], sum);
         }
         dst[static_cast<size_t>(row)] = sum;
     }
 }
 
-static void apply_turbovec_rotation_batch(const float * src, float * dst, int n, int dim) {
-#if defined(__APPLE__) && defined(GGML_USE_ACCELERATE)
+static void apply_turbovec_rotation(const float * src, float * dst, int dim, bool transpose) {
     const std::shared_ptr<const std::vector<float>> rotation = turbovec_rotation(dim);
-    cblas_sgemm(
-        CblasRowMajor,
-        CblasNoTrans,
-        CblasTrans,
-        n,
-        dim,
-        dim,
-        1.0f,
-        src,
-        dim,
-        rotation->data(),
-        dim,
-        0.0f,
-        dst,
-        dim);
-#else
+    apply_turbovec_rotation_with_matrix(rotation->data(), src, dst, dim, transpose);
+}
+
+static void apply_turbovec_rotation_batch(const float * src, float * dst, int n, int dim) {
+    const std::shared_ptr<const std::vector<float>> rotation = turbovec_rotation(dim);
     for (int row = 0; row < n; ++row) {
-        apply_turbovec_rotation(
+        apply_turbovec_rotation_with_matrix(
+            rotation->data(),
             src + static_cast<size_t>(row) * static_cast<size_t>(dim),
             dst + static_cast<size_t>(row) * static_cast<size_t>(dim),
             dim,
             false);
     }
-#endif
 }
 
 static double vector_norm(const float * values, int dim) {
-#if GGML_VEC_INDEX_TV_USE_NEON
-    const int chunks = dim / 4;
-    float32x4_t acc = vdupq_n_f32(0.0f);
-    for (int chunk = 0; chunk < chunks; ++chunk) {
-        const float32x4_t value = vld1q_f32(values + chunk * 4);
-        acc = vfmaq_f32(acc, value, value);
-    }
-    float sum = vaddvq_f32(acc);
-    for (int i = chunks * 4; i < dim; ++i) {
-        sum += values[i] * values[i];
-    }
-#else
-    float sum = 0.0f;
-    for (int i = 0; i < dim; ++i) {
-        sum += values[i] * values[i];
-    }
-#endif
-    if (std::isfinite(sum)) {
-        return static_cast<double>(std::sqrt(sum));
-    }
-    double sum_f64 = 0.0;
+    double sum = 0.0;
     for (int i = 0; i < dim; ++i) {
         const double value = static_cast<double>(values[i]);
-        sum_f64 += value * value;
+        sum += value * value;
     }
-    return std::sqrt(sum_f64);
+    return std::sqrt(sum);
 }
 
 static float float_score_from_double_local(double score) {
@@ -747,7 +712,7 @@ static uint8_t turbovec_group_code_byte(const uint8_t * row, int group, int bits
 
 #if defined(_MSC_VER)
 __declspec(noinline)
-#else
+#elif defined(__GNUC__) || defined(__clang__)
 __attribute__((noinline))
 #endif
 static float turbovec_lut_product(float lhs, float rhs) {
@@ -856,7 +821,7 @@ static float dot_turbovec_lut_row(
     return float_score_from_double_local(score);
 }
 
-#if GGML_VEC_INDEX_TV_USE_NEON
+#if GGML_VEC_INDEX_USE_NEON
 static float horizontal_sum_local(float32x4_t v) {
 #if defined(__aarch64__)
     return vaddvq_f32(v);
@@ -1262,7 +1227,7 @@ void score_turbovec_lut_block(
     const size_t valid_lanes =
         std::min(static_cast<size_t>(kTurboVecScoreBlock), n_vectors - base_vector);
 
-#if GGML_VEC_INDEX_TV_USE_NEON
+#if GGML_VEC_INDEX_USE_NEON
     const uint8x16_t nibble_mask = vdupq_n_u8(0x0f);
     const float32x4_t scale_v = vdupq_n_f32(lut_scale);
     float32x4_t float_accum[8];
@@ -1412,6 +1377,9 @@ void quantize_turbovec_batch(
     std::vector<float> rotated(n_sz * dim_sz);
     apply_turbovec_rotation_batch(unit.data(), rotated.data(), n, dim);
 
+    if (tqplus_shift.empty() != tqplus_scale.empty()) {
+        throw std::invalid_argument("invalid TurboVec TQ+ calibration");
+    }
     if (tqplus_shift.empty()) {
         tqplus_shift.assign(dim_sz, 0.0f);
         tqplus_scale.assign(dim_sz, 1.0f);
@@ -1454,6 +1422,8 @@ void quantize_turbovec_batch(
     if (tqplus_shift.size() != dim_sz || tqplus_scale.size() != dim_sz) {
         throw std::invalid_argument("invalid TurboVec TQ+ calibration");
     }
+    const float * shift = tqplus_shift.data();
+    const float * calibration_scale = tqplus_scale.data();
 
     std::memset(dst, 0, n_sz * row_bytes);
     for (int row = 0; row < n; ++row) {
@@ -1463,27 +1433,30 @@ void quantize_turbovec_batch(
         for (int column = 0; column < dim; ++column) {
             const size_t coordinate = static_cast<size_t>(column);
             const float calibrated =
-                (rotated_row[coordinate] + tqplus_shift[coordinate]) *
-                tqplus_scale[coordinate];
+                (rotated_row[coordinate] + shift[coordinate]) *
+                calibration_scale[coordinate];
             const uint8_t code =
                 turbovec_quantize_val(calibrated, codebook.boundaries.data(), bits);
             turbovec_set_bitplane_code(packed_row, column, bits, dim, code);
             const float inverse_calibration_scale =
-                1.0f / tqplus_scale[coordinate];
+                1.0f / calibration_scale[coordinate];
             const double centroid_original =
                 static_cast<double>(codebook.centroids[code]) *
                     static_cast<double>(inverse_calibration_scale) -
-                static_cast<double>(tqplus_shift[coordinate]);
+                static_cast<double>(shift[coordinate]);
             inner += static_cast<double>(rotated_row[coordinate]) * centroid_original;
         }
-        const double denom = std::max(inner, 1e-10);
+        if (!(inner > 1e-10)) {
+            scales[static_cast<size_t>(row)] = 0.0f;
+            continue;
+        }
         const float scale =
             static_cast<float>(norms[static_cast<size_t>(row)]) /
-            static_cast<float>(denom);
+            static_cast<float>(inner);
         if (std::isfinite(scale)) {
             scales[static_cast<size_t>(row)] = scale;
         } else {
-            const double scale_f64 = norms[static_cast<size_t>(row)] / denom;
+            const double scale_f64 = norms[static_cast<size_t>(row)] / inner;
             if (!std::isfinite(scale_f64) || scale_f64 > static_cast<double>(FLT_MAX)) {
                 throw std::invalid_argument("invalid TurboVec vector scale");
             }
