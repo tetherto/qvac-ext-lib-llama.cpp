@@ -159,18 +159,6 @@ void test_record_delta_read_size(size_t size) {
     while (current < size && !g_test_delta_max_read_size.compare_exchange_weak(current, size)) {
     }
 }
-#else
-void test_maybe_throw_bad_alloc() {}
-
-bool test_consume_write_bytes(size_t) {
-    return true;
-}
-
-void test_wait_after_delta_validate() {}
-
-void test_wait_after_load_with_delta_snapshot() {}
-
-void test_record_delta_read_size(size_t) {}
 #endif
 
 inline bool write_bytes(std::FILE * f, const void * data, size_t size) {
