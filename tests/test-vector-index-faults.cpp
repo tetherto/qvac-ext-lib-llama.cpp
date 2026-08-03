@@ -13,7 +13,9 @@
 #include <thread>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -125,28 +127,149 @@ bool wait_for_path(const std::string & path, int timeout_ms) {
     return std::filesystem::exists(path);
 }
 
-std::string shell_quote(const std::string & value) {
 #ifdef _WIN32
-    std::string quoted = "\"";
-    for (char c : value) {
-        if (c == '"' || c == '\\') {
-            quoted.push_back('\\');
-        }
-        quoted.push_back(c);
+std::wstring utf8_to_wide_checked(const std::string & value) {
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), -1, nullptr, 0);
+    CHECK(size > 0);
+    std::vector<wchar_t> buffer(static_cast<size_t>(size));
+    CHECK(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), -1, buffer.data(), size) == size);
+    return std::wstring(buffer.data());
+}
+
+std::wstring windows_quote_arg(const std::wstring & value) {
+    if (!value.empty() && value.find_first_of(L" \t\"") == std::wstring::npos) {
+        return value;
     }
-    quoted.push_back('"');
-    return quoted;
-#else
-    std::string quoted = "'";
-    for (char c : value) {
-        if (c == '\'') {
-            quoted += "'\\''";
+
+    std::wstring quoted = L"\"";
+    size_t backslashes = 0;
+    for (wchar_t c : value) {
+        if (c == L'\\') {
+            ++backslashes;
+        } else if (c == L'"') {
+            quoted.append(backslashes * 2 + 1, L'\\');
+            quoted.push_back(c);
+            backslashes = 0;
         } else {
+            quoted.append(backslashes, L'\\');
+            backslashes = 0;
             quoted.push_back(c);
         }
     }
-    quoted.push_back('\'');
+    quoted.append(backslashes * 2, L'\\');
+    quoted.push_back(L'"');
     return quoted;
+}
+#endif
+
+std::string delta_writer_description(
+        const std::string & snapshot_path,
+        const std::string & delta_path,
+        const std::string & start_path,
+        const std::string & ready_path,
+        uint64_t id) {
+    return "snapshot=" + snapshot_path +
+        " delta=" + delta_path +
+        " start=" + start_path +
+        " ready=" + ready_path +
+        " id=" + std::to_string(id);
+}
+
+#ifdef _WIN32
+using DeltaWriterProcess = PROCESS_INFORMATION;
+#else
+using DeltaWriterProcess = pid_t;
+#endif
+
+DeltaWriterProcess spawn_delta_writer_process(
+        const char * self_path,
+        const std::string & snapshot_path,
+        const std::string & delta_path,
+        const std::string & start_path,
+        const std::string & ready_path,
+        uint64_t id) {
+    const std::string id_arg = std::to_string(id);
+#ifdef _WIN32
+    const std::vector<std::wstring> args = {
+        utf8_to_wide_checked(self_path),
+        L"--delta-writer",
+        utf8_to_wide_checked(snapshot_path),
+        utf8_to_wide_checked(delta_path),
+        utf8_to_wide_checked(start_path),
+        utf8_to_wide_checked(ready_path),
+        utf8_to_wide_checked(id_arg),
+    };
+    std::wstring command_line;
+    for (const std::wstring & arg : args) {
+        if (!command_line.empty()) {
+            command_line.push_back(L' ');
+        }
+        command_line += windows_quote_arg(arg);
+    }
+    std::vector<wchar_t> mutable_command_line(command_line.begin(), command_line.end());
+    mutable_command_line.push_back(L'\0');
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process = {};
+    CHECK(CreateProcessW(
+        nullptr,
+        mutable_command_line.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        0,
+        nullptr,
+        nullptr,
+        &startup,
+        &process) != 0);
+    CloseHandle(process.hThread);
+    process.hThread = nullptr;
+    return process;
+#else
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        execl(
+            self_path,
+            self_path,
+            "--delta-writer",
+            snapshot_path.c_str(),
+            delta_path.c_str(),
+            start_path.c_str(),
+            ready_path.c_str(),
+            id_arg.c_str(),
+            static_cast<char *>(nullptr));
+        _exit(127);
+    }
+    return pid;
+#endif
+}
+
+int wait_delta_writer_process(DeltaWriterProcess process) {
+#ifdef _WIN32
+    if (WaitForSingleObject(process.hProcess, INFINITE) != WAIT_OBJECT_0) {
+        CloseHandle(process.hProcess);
+        return -1;
+    }
+    DWORD exit_code = 0;
+    if (GetExitCodeProcess(process.hProcess, &exit_code) == 0) {
+        CloseHandle(process.hProcess);
+        return -1;
+    }
+    CloseHandle(process.hProcess);
+    return static_cast<int>(exit_code);
+#else
+    int status = 0;
+    while (waitpid(process, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        return -1;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return -1;
 #endif
 }
 
@@ -179,64 +302,6 @@ int run_delta_writer_child(
     ggml_vec_index_free(idx);
     return status == GGML_VEC_INDEX_OK ? 0 : 4;
 }
-
-std::string delta_writer_command(
-        const char * self_path,
-        const std::string & snapshot_path,
-        const std::string & delta_path,
-        const std::string & start_path,
-        const std::string & ready_path,
-        uint64_t id) {
-    return shell_quote(self_path) +
-        " --delta-writer " +
-        shell_quote(snapshot_path) + " " +
-        shell_quote(delta_path) + " " +
-        shell_quote(start_path) + " " +
-        shell_quote(ready_path) + " " +
-        std::to_string(id);
-}
-
-#ifndef _WIN32
-pid_t spawn_delta_writer_process(
-        const char * self_path,
-        const std::string & snapshot_path,
-        const std::string & delta_path,
-        const std::string & start_path,
-        const std::string & ready_path,
-        uint64_t id) {
-    const std::string id_arg = std::to_string(id);
-    const pid_t pid = fork();
-    CHECK(pid >= 0);
-    if (pid == 0) {
-        execl(
-            self_path,
-            self_path,
-            "--delta-writer",
-            snapshot_path.c_str(),
-            delta_path.c_str(),
-            start_path.c_str(),
-            ready_path.c_str(),
-            id_arg.c_str(),
-            static_cast<char *>(nullptr));
-        _exit(127);
-    }
-    return pid;
-}
-
-int wait_delta_writer_process(pid_t pid) {
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
-        return -1;
-    }
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    return -1;
-}
-#endif
 
 void test_hardlink_delta_appends() {
     constexpr int dim = 4;
@@ -368,50 +433,30 @@ void test_cross_process_delta_appends(const char * self_path, bool use_hardlink_
         second_delta_path = alias_path;
     }
 
-    const std::string command_a = delta_writer_command(
-        self_path, snapshot_path, delta_path, start_path, ready_path_a, child_id_a);
-    const std::string command_b = delta_writer_command(
-        self_path, snapshot_path, second_delta_path, start_path, ready_path_b, child_id_b);
     int status_a = -1;
     int status_b = -1;
-#ifndef _WIN32
-    const pid_t pid_a = spawn_delta_writer_process(
+    const DeltaWriterProcess process_a = spawn_delta_writer_process(
         self_path, snapshot_path, delta_path, start_path, ready_path_a, child_id_a);
-    const pid_t pid_b = spawn_delta_writer_process(
+    const DeltaWriterProcess process_b = spawn_delta_writer_process(
         self_path, snapshot_path, second_delta_path, start_path, ready_path_b, child_id_b);
     const bool ready =
         wait_for_path(ready_path_a, 5000) &&
         wait_for_path(ready_path_b, 5000);
     write_marker_file(start_path);
-    status_a = wait_delta_writer_process(pid_a);
-    status_b = wait_delta_writer_process(pid_b);
-#else
-    std::thread process_a([&]() {
-        status_a = std::system(command_a.c_str());
-    });
-    std::thread process_b([&]() {
-        status_b = std::system(command_b.c_str());
-    });
-
-    const bool ready =
-        wait_for_path(ready_path_a, 5000) &&
-        wait_for_path(ready_path_b, 5000);
-    write_marker_file(start_path);
-    process_a.join();
-    process_b.join();
-#endif
+    status_a = wait_delta_writer_process(process_a);
+    status_b = wait_delta_writer_process(process_b);
 
     if (!ready ||
         !((status_a == 0 && status_b == 4) ||
           (status_a == 4 && status_b == 0))) {
         std::fprintf(
             stderr,
-            "cross-process delta append failed: ready=%d status_a=%d status_b=%d\ncmd_a=%s\ncmd_b=%s\n",
+            "cross-process delta append failed: ready=%d status_a=%d status_b=%d\nchild_a: %s\nchild_b: %s\n",
             ready ? 1 : 0,
             status_a,
             status_b,
-            command_a.c_str(),
-            command_b.c_str());
+            delta_writer_description(snapshot_path, delta_path, start_path, ready_path_a, child_id_a).c_str(),
+            delta_writer_description(snapshot_path, second_delta_path, start_path, ready_path_b, child_id_b).c_str());
     }
     CHECK(ready);
     CHECK((status_a == 0 && status_b == 4) ||
@@ -598,6 +643,91 @@ void test_delta_append_fault_windows() {
     std::filesystem::remove(snapshot_path);
     std::filesystem::remove(delta_path);
     std::filesystem::remove(delta_path + ".lock");
+}
+
+void test_compact_delta_rejects_symlinks() {
+#ifndef _WIN32
+    constexpr int dim = 4;
+    const std::array<float, 8> base_vectors = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+    };
+    const std::array<uint64_t, 2> base_ids = { 1401, 1402 };
+    const std::array<float, 4> logged_vector = { 0.0f, 0.0f, 1.0f, 0.0f };
+    const std::array<float, 4> extra_vector = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+    const std::string snapshot_path =
+        unique_temp_path("ggml-vector-index-symlink-compact-base.tvim");
+    const std::string snapshot_link =
+        unique_temp_path("ggml-vector-index-symlink-compact-base-link.tvim");
+    const std::string delta_path =
+        unique_temp_path("ggml-vector-index-symlink-compact-log.tvid");
+    const std::string delta_link =
+        unique_temp_path("ggml-vector-index-symlink-compact-log-link.tvid");
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(snapshot_link);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_link);
+    std::filesystem::remove(delta_path + ".lock");
+    std::filesystem::remove(delta_link + ".lock");
+
+    auto * idx = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(idx, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+    const std::vector<uint8_t> old_snapshot = read_file_bytes(snapshot_path);
+
+    const uint64_t logged_id = 1403;
+    CHECK(ggml_vec_index_add_logged(
+        idx, logged_vector.data(), 1, &logged_id, delta_path.c_str()) == GGML_VEC_INDEX_OK);
+
+    std::error_code symlink_ec;
+    std::filesystem::create_symlink(snapshot_path, snapshot_link, symlink_ec);
+    if (symlink_ec) {
+        ggml_vec_index_free(idx);
+        std::filesystem::remove(snapshot_path);
+        std::filesystem::remove(delta_path);
+        std::filesystem::remove(delta_path + ".lock");
+        return;
+    }
+    std::filesystem::create_symlink(delta_path, delta_link, symlink_ec);
+    if (symlink_ec) {
+        ggml_vec_index_free(idx);
+        std::filesystem::remove(snapshot_path);
+        std::filesystem::remove(snapshot_link);
+        std::filesystem::remove(delta_path);
+        std::filesystem::remove(delta_path + ".lock");
+        return;
+    }
+
+    CHECK(ggml_vec_index_compact_delta(
+        idx, snapshot_link.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(read_file_bytes(snapshot_path) == old_snapshot);
+    CHECK(std::filesystem::is_symlink(std::filesystem::symlink_status(snapshot_link)));
+
+    CHECK(ggml_vec_index_compact_delta(
+        idx, snapshot_path.c_str(), delta_link.c_str()) == GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(read_file_bytes(snapshot_path) == old_snapshot);
+    CHECK(std::filesystem::is_symlink(std::filesystem::symlink_status(delta_link)));
+
+    const uint64_t extra_id = 1404;
+    CHECK(ggml_vec_index_add_logged(
+        idx, extra_vector.data(), 1, &extra_id, delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    auto * replayed = ggml_vec_index_load_with_delta(snapshot_path.c_str(), delta_path.c_str());
+    CHECK(replayed != nullptr);
+    CHECK(ggml_vec_index_len(replayed) == 4);
+    CHECK(ggml_vec_index_contains(replayed, logged_id) == 1);
+    CHECK(ggml_vec_index_contains(replayed, extra_id) == 1);
+
+    ggml_vec_index_free(replayed);
+    ggml_vec_index_free(idx);
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(snapshot_link);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_link);
+    std::filesystem::remove(delta_path + ".lock");
+    std::filesystem::remove(delta_link + ".lock");
+#endif
 }
 
 } // namespace
@@ -1169,6 +1299,7 @@ int main(int argc, char ** argv) {
     test_quantized_logged_faults(/*bit_width=*/8);
     test_quantized_logged_faults(/*bit_width=*/4);
     test_delta_append_fault_windows();
+    test_compact_delta_rejects_symlinks();
 
     const std::string shared_snapshot_path =
         unique_temp_path("ggml-vector-index-shared-delta-base.tvim");

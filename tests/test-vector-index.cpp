@@ -1522,6 +1522,24 @@ void check_delta_log_tail_recovery() {
     CHECK(ggml_vec_index_compact_delta(mmap, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
           GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_contains(mmap, base_id) == 1);
+    {
+        temp_file       snapshot_alias(".tvim.alias");
+        std::error_code ec;
+        std::filesystem::create_hard_link(snapshot.path, snapshot_alias.path, ec);
+        if (!ec) {
+            CHECK(std::filesystem::equivalent(snapshot.path, snapshot_alias.path, ec));
+            CHECK(!ec);
+            CHECK(ggml_vec_index_write(mmap, snapshot_alias.path.string().c_str()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_compact_delta(
+                      mmap, snapshot_alias.path.string().c_str(), delta.path.string().c_str()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            std::filesystem::remove(snapshot_alias.path, ec);
+        } else {
+            CHECK(ec == std::errc::operation_not_supported || ec == std::errc::function_not_supported ||
+                  ec == std::errc::permission_denied);
+        }
+    }
     ggml_vec_index_free(mmap);
 
     CHECK(ggml_vec_index_compact_delta(base, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
