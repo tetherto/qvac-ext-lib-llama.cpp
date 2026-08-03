@@ -113,7 +113,9 @@ inline constexpr size_t   kTvidRecordOffState     = 20;
 inline constexpr size_t   kTvidRecordOffWide      = 24;
 inline constexpr size_t   kMaxIndexLen    = static_cast<size_t>(std::numeric_limits<int>::max());
 inline constexpr uint64_t kMaxSnapshotBytes = UINT64_C(1) << 32;
-inline constexpr int      kTurboVecMaxDim = 65536;
+// Current TurboVec rotation builds a dense dim x dim QR matrix.
+inline constexpr int      kTurboVecMaxDim = 1024;
+inline constexpr int      kTurboVecMaxSerializedDim = 65536;
 inline constexpr float    kTurboVecMaxInputMagnitude = 1e16f;
 
 static_assert(sizeof(float) == sizeof(uint32_t), "ggml-vector-index requires float32");
@@ -417,6 +419,8 @@ void quantize_q8_values(const float * src, int8_t * dst, size_t n, float scale);
 void quantize_q4_values(const float * src, uint8_t * dst, size_t offset, size_t n, float scale);
 bool turbovec_q2_supported_dim(int dim);
 bool turbovec_q4_supported_dim(int dim);
+bool turbovec_serialized_dim_supported(int dim);
+ggml_vec_index_t * ggml_vec_index_create_turbovec_for_load(int dim, int bit_width);
 void turbovec_retain_rotation(int dim);
 void turbovec_release_rotation(int dim) noexcept;
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -545,6 +549,11 @@ DeltaStateWide index_state_wide_after_remove(const ggml_vec_index & idx, uint64_
 
 DeltaStateKind delta_state_kind_for_format(DeltaLogFormat format);
 DeltaLogFormat delta_log_format_for_append(const char * path, const DeltaLogLock * lock = nullptr);
+bool prepare_delta_log_format_for_append_unlocked(
+    ggml_vec_index_t * idx,
+    const char * delta_path,
+    DeltaLogLock & lock,
+    DeltaLogFormat & format);
 uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_kind);
 DeltaStateWide current_delta_state_wide(const ggml_vec_index & idx);
 void invalidate_delta_tail_cache(ggml_vec_index & idx) noexcept;

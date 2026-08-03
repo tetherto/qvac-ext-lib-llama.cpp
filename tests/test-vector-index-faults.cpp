@@ -1056,6 +1056,18 @@ int main(int argc, char ** argv) {
     CHECK(stale_filter != nullptr);
     CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/1)
           == GGML_VEC_INDEX_OK);
+    {
+        const std::array<uint8_t, 8> torn_header = {
+            'T', 'V', 'D', 'L',
+            4, 32, 0, 0,
+        };
+        std::ofstream delta(delta_path, std::ios::binary | std::ios::trunc);
+        CHECK(delta.good());
+        delta.write(
+            reinterpret_cast<const char *>(torn_header.data()),
+            static_cast<std::streamsize>(torn_header.size()));
+        CHECK(delta.good());
+    }
     CHECK(ggml_vec_index_add_logged(
         idx, logged_vector.data(), 1, &logged_id, delta_path.c_str()) ==
         GGML_VEC_INDEX_OK);

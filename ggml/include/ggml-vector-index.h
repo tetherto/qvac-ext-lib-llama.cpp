@@ -81,10 +81,10 @@ GGML_API ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width);
 // q4/q8 modes created by `ggml_vec_index_create`: vectors are normalized,
 // rotated, quantized with Lloyd-Max q2 codebooks, and searched against rotated
 // queries. This implementation requires a 64-bit target,
-// `0 < dim <= 65536 && dim % 8 == 0`, and supports add/search/filter/IVF plus
+// `0 < dim <= 1024 && dim % 8 == 0`, and supports add/search/filter/IVF plus
 // regular snapshot write/load. TurboVec materializes a dense `dim x dim`
-// rotation matrix on first use, so very large accepted dimensions may return
-// GGML_VEC_INDEX_E_OOM from add/search.
+// rotation matrix on first use. Snapshots from earlier releases with larger
+// dimensions can be loaded and rewritten, but add/search/IVF are unsupported.
 // `ggml_vec_index_prepare` is best-effort and does not report allocation status.
 // mmap loading and logged mutations are reserved for later format work.
 GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
@@ -93,10 +93,10 @@ GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim);
 // `bit_width=4` mode created by `ggml_vec_index_create`: vectors are normalized,
 // rotated, quantized with Lloyd-Max q4 codebooks, and searched against rotated
 // queries. This implementation requires a 64-bit target,
-// `0 < dim <= 65536 && dim % 8 == 0`, and supports add/search/filter/IVF plus
+// `0 < dim <= 1024 && dim % 8 == 0`, and supports add/search/filter/IVF plus
 // regular snapshot write/load. TurboVec materializes a dense `dim x dim`
-// rotation matrix on first use, so very large accepted dimensions may return
-// GGML_VEC_INDEX_E_OOM from add/search.
+// rotation matrix on first use. Snapshots from earlier releases with larger
+// dimensions can be loaded and rewritten, but add/search/IVF are unsupported.
 // `ggml_vec_index_prepare` is best-effort and does not report allocation status.
 // mmap loading and logged mutations are reserved for later format work.
 GGML_API ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim);
@@ -143,6 +143,8 @@ GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 // log. If another handle or process appends to the same log, stale writers are
 // caught up when possible; otherwise they are rejected and must reload with
 // `ggml_vec_index_load_with_delta` before appending again.
+// A successful catch-up remains applied even if the requested mutation then
+// returns an error such as GGML_VEC_INDEX_E_DUPLICATE or E_NOT_FOUND.
 // Cross-process protection relies on cooperative OS file locks. Store delta
 // logs on local filesystems and do not modify `.tvid` files outside this API.
 // If an append error occurs after a complete replayable record is observed, the
