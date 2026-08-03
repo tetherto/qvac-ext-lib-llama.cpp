@@ -21,6 +21,7 @@
 extern "C" void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 extern "C" void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 extern "C" void ggml_vec_index_test_set_truncate_fail(int fail);
+extern "C" void ggml_vec_index_test_set_data_fsync_fail(int fail);
 extern "C" void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 extern "C" void ggml_vec_index_test_set_delta_append_wait_target(int target);
 extern "C" int ggml_vec_index_test_get_delta_append_waiters(void);
@@ -57,6 +58,7 @@ void reset_fault_hooks() {
     ggml_vec_index_test_set_oom_countdown(-1);
     ggml_vec_index_test_set_write_fail_after(-1);
     ggml_vec_index_test_set_truncate_fail(0);
+    ggml_vec_index_test_set_data_fsync_fail(0);
     ggml_vec_index_test_set_parent_fsync_fail(0);
     ggml_vec_index_test_set_delta_append_wait_target(0);
     ggml_vec_index_test_set_load_with_delta_pause_ms(0);
@@ -525,6 +527,79 @@ void test_quantized_logged_faults(int bit_width) {
     std::filesystem::remove(delta_path + ".lock");
 }
 
+void test_delta_append_fault_windows() {
+    constexpr int dim = 4;
+    const std::array<float, 8> base_vectors = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+    };
+    const std::array<uint64_t, 2> base_ids = { 1301, 1302 };
+    const std::array<float, 4> logged_vector = { 0.0f, 0.0f, 1.0f, 0.0f };
+    const std::array<float, 4> extra_vector = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+    const std::string snapshot_path =
+        unique_temp_path("ggml-vector-index-append-window-base.tvim");
+    const std::string delta_path =
+        unique_temp_path("ggml-vector-index-append-window-log.tvid");
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_path + ".lock");
+
+    auto * idx = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(idx, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+
+    const uint64_t logged_id = 1303;
+    CHECK(ggml_vec_index_add_logged(
+        idx, logged_vector.data(), 1, &logged_id, delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    const std::vector<uint8_t> old_delta = read_file_bytes(delta_path);
+
+    const uint64_t torn_payload_id = 1304;
+    ggml_vec_index_test_set_write_fail_after(56);
+    CHECK(ggml_vec_index_add_logged(
+        idx, extra_vector.data(), 1, &torn_payload_id, delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(idx, torn_payload_id) == 0);
+    CHECK(read_file_bytes(delta_path) == old_delta);
+
+    ggml_vec_index_test_set_write_fail_after(56);
+    ggml_vec_index_test_set_truncate_fail(1);
+    CHECK(ggml_vec_index_add_logged(
+        idx, extra_vector.data(), 1, &torn_payload_id, delta_path.c_str()) == GGML_VEC_INDEX_E_INTERNAL);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(idx, torn_payload_id) == 0);
+    CHECK(std::filesystem::file_size(delta_path) > old_delta.size());
+
+    auto * torn_replayed = ggml_vec_index_load_with_delta(snapshot_path.c_str(), delta_path.c_str());
+    CHECK(torn_replayed != nullptr);
+    CHECK(ggml_vec_index_contains(torn_replayed, torn_payload_id) == 0);
+    ggml_vec_index_free(torn_replayed);
+
+    const uint64_t healed_id = 1305;
+    CHECK(ggml_vec_index_add_logged(
+        idx, extra_vector.data(), 1, &healed_id, delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_contains(idx, healed_id) == 1);
+
+    const uint64_t data_fsync_id = 1306;
+    ggml_vec_index_test_set_data_fsync_fail(1);
+    ggml_vec_index_test_set_truncate_fail(1);
+    CHECK(ggml_vec_index_add_logged(
+        idx, extra_vector.data(), 1, &data_fsync_id, delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(idx, data_fsync_id) == 1);
+
+    auto * data_fsync_replayed = ggml_vec_index_load_with_delta(snapshot_path.c_str(), delta_path.c_str());
+    CHECK(data_fsync_replayed != nullptr);
+    CHECK(ggml_vec_index_contains(data_fsync_replayed, data_fsync_id) == 1);
+    ggml_vec_index_free(data_fsync_replayed);
+
+    ggml_vec_index_free(idx);
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_path + ".lock");
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -670,6 +745,40 @@ int main(int argc, char ** argv) {
         ggml_vec_index_free(parent_fsync_idx);
         std::filesystem::remove(parent_fsync_path);
     }
+    {
+        const std::string tail_cache_snapshot_path =
+            unique_temp_path("ggml-vector-index-tail-cache-oom-base.tvim");
+        const std::string tail_cache_delta_path =
+            unique_temp_path("ggml-vector-index-tail-cache-oom-log.tvid");
+        std::filesystem::remove(tail_cache_snapshot_path);
+        std::filesystem::remove(tail_cache_delta_path);
+        std::filesystem::remove(tail_cache_delta_path + ".lock");
+
+        auto * tail_cache_idx = ggml_vec_index_create(dim, /*bit_width=*/32);
+        CHECK(tail_cache_idx != nullptr);
+        CHECK(ggml_vec_index_add(
+            tail_cache_idx, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(tail_cache_idx, tail_cache_snapshot_path.c_str()) ==
+              GGML_VEC_INDEX_OK);
+
+        const uint64_t tail_cache_id = 303;
+        ggml_vec_index_test_set_oom_countdown(3);
+        CHECK(ggml_vec_index_add_logged(
+            tail_cache_idx, extra_vector.data(), 1,
+            &tail_cache_id, tail_cache_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+        reset_fault_hooks();
+        CHECK(ggml_vec_index_contains(tail_cache_idx, tail_cache_id) == 1);
+
+        auto * tail_cache_replayed = ggml_vec_index_load_with_delta(
+            tail_cache_snapshot_path.c_str(), tail_cache_delta_path.c_str());
+        CHECK(tail_cache_replayed != nullptr);
+        CHECK(ggml_vec_index_contains(tail_cache_replayed, tail_cache_id) == 1);
+        ggml_vec_index_free(tail_cache_replayed);
+        ggml_vec_index_free(tail_cache_idx);
+        std::filesystem::remove(tail_cache_snapshot_path);
+        std::filesystem::remove(tail_cache_delta_path);
+        std::filesystem::remove(tail_cache_delta_path + ".lock");
+    }
 
     CHECK(ggml_vec_index_write(idx, path.c_str()) == GGML_VEC_INDEX_OK);
     const std::string delta_path =
@@ -708,6 +817,13 @@ int main(int argc, char ** argv) {
         logged_scores.data(), logged_out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
     ggml_vec_index_filter_free(stale_filter);
     const std::vector<uint8_t> old_delta = read_file_bytes(delta_path);
+    const std::string wrong_delta_path =
+        unique_temp_path("ggml-vector-index-wrong-zero-log.tvid");
+    CHECK(ggml_vec_index_add_logged(idx, nullptr, 0, nullptr, wrong_delta_path.c_str()) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(ggml_vec_index_add_logged(idx, nullptr, 0, nullptr, delta_path.c_str()) ==
+          GGML_VEC_INDEX_OK);
+    std::filesystem::remove(wrong_delta_path);
 
     auto * rollback_filter = ggml_vec_index_filter_create(idx, &allowed_id, 1);
     CHECK(rollback_filter != nullptr);
@@ -742,7 +858,7 @@ int main(int argc, char ** argv) {
     ggml_vec_index_test_set_truncate_fail(1);
     CHECK(ggml_vec_index_add_logged(
         idx, extra_vector.data(), 1, &committed_add_id, delta_path.c_str()) ==
-        GGML_VEC_INDEX_OK);
+        GGML_VEC_INDEX_E_NOT_DURABLE);
     reset_fault_hooks();
     CHECK(ggml_vec_index_contains(idx, committed_add_id) == 1);
     CHECK(ggml_vec_index_len(idx) == 5);
@@ -768,7 +884,7 @@ int main(int argc, char ** argv) {
           == GGML_VEC_INDEX_OK);
     ggml_vec_index_test_set_parent_fsync_fail(1);
     ggml_vec_index_test_set_truncate_fail(1);
-    CHECK(ggml_vec_index_remove_logged(idx, logged_id, delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_remove_logged(idx, logged_id, delta_path.c_str()) == GGML_VEC_INDEX_E_NOT_DURABLE);
     reset_fault_hooks();
     CHECK(ggml_vec_index_contains(idx, logged_id) == 0);
     CHECK(ggml_vec_index_len(idx) == 4);
@@ -801,7 +917,7 @@ int main(int argc, char ** argv) {
     CHECK(ggml_vec_index_add_logged(
         committed_base, extra_vector.data(), 1,
         &committed_replay_id, committed_add_delta_path.c_str()) ==
-        GGML_VEC_INDEX_OK);
+        GGML_VEC_INDEX_E_NOT_DURABLE);
     reset_fault_hooks();
     CHECK(ggml_vec_index_contains(committed_base, committed_replay_id) == 1);
     auto * committed_replayed = ggml_vec_index_load_with_delta(
@@ -1052,6 +1168,7 @@ int main(int argc, char ** argv) {
 
     test_quantized_logged_faults(/*bit_width=*/8);
     test_quantized_logged_faults(/*bit_width=*/4);
+    test_delta_append_fault_windows();
 
     const std::string shared_snapshot_path =
         unique_temp_path("ggml-vector-index-shared-delta-base.tvim");
