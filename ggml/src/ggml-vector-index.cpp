@@ -72,6 +72,24 @@ bool checked_add_size(size_t a, size_t b, size_t & out) {
     return true;
 }
 
+size_t grow_capacity(size_t current, size_t required, size_t max_capacity) {
+    if (current >= required) {
+        return current;
+    }
+
+    size_t grown = current == 0 ? required : current + current / 2;
+    if (grown < current || grown < required) {
+        grown = required;
+    }
+    return std::min(grown, max_capacity);
+}
+
+bool can_insert_without_rehash(const std::unordered_map<uint64_t, size_t> & map, size_t n) {
+    const long double bucket_capacity =
+        static_cast<long double>(map.bucket_count()) * static_cast<long double>(map.max_load_factor());
+    return static_cast<long double>(n) <= bucket_capacity;
+}
+
 bool all_finite(const float * values, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(values[i])) {
@@ -523,9 +541,21 @@ int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, con
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
-        idx->data.reserve(new_slots * dim_sz);
-        idx->slot_to_id.reserve(new_slots);
-        idx->id_to_slot.reserve(new_slots);
+        const size_t max_slots = std::min(static_cast<size_t>(std::numeric_limits<int>::max()),
+                                          std::numeric_limits<size_t>::max() / dim_sz);
+        const size_t current_slots = std::min(idx->slot_to_id.capacity(), idx->data.capacity() / dim_sz);
+        const size_t target_slots  = grow_capacity(current_slots, new_slots, max_slots);
+        const size_t target_values = target_slots * dim_sz;
+
+        if (idx->data.capacity() < target_values) {
+            idx->data.reserve(target_values);
+        }
+        if (idx->slot_to_id.capacity() < target_slots) {
+            idx->slot_to_id.reserve(target_slots);
+        }
+        if (!can_insert_without_rehash(idx->id_to_slot, new_slots)) {
+            idx->id_to_slot.reserve(target_slots);
+        }
 
         idx->data.insert(idx->data.end(), vectors, vectors + value_count);
         resized = true;
