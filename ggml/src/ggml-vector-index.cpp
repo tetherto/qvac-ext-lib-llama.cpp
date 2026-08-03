@@ -817,6 +817,7 @@ int ggml_vec_index_add_logged(
         const DeltaStateWide added_state_wide = current_delta_state_wide(*idx);
         const DeltaAppendResult append_result = append_delta_record_locked(
             *idx,
+            delta_lock,
             delta_path,
             format,
             kTvidOpAdd,
@@ -935,6 +936,7 @@ int ggml_vec_index_remove_logged(
         const DeltaStateWide post_remove_wide = index_state_wide_after_remove(*idx, id);
         const DeltaAppendResult append_result = append_delta_record_locked(
             *idx,
+            delta_lock,
             delta_path,
             format,
             kTvidOpRemove,

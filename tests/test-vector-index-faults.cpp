@@ -658,7 +658,7 @@ int main(int argc, char ** argv) {
             GGML_VEC_INDEX_OK);
         ggml_vec_index_test_set_parent_fsync_fail(1);
         CHECK(ggml_vec_index_write(parent_fsync_idx, parent_fsync_path.c_str()) ==
-              GGML_VEC_INDEX_E_IO);
+              GGML_VEC_INDEX_E_NOT_DURABLE);
         reset_fault_hooks();
         CHECK(read_file_bytes(parent_fsync_path) != before_parent_fsync);
 
