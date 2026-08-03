@@ -167,7 +167,9 @@ bool x86_cpu_has_avx2() {
     __cpuidex(regs, 1, 0);
     constexpr int kOsxsave = 1 << 27;
     constexpr int kAvx = 1 << 28;
+    constexpr int kFma = 1 << 12;
     if ((regs[2] & (kOsxsave | kAvx)) != (kOsxsave | kAvx) ||
+        (regs[2] & kFma) == 0 ||
         (_xgetbv(0) & 0x6) != 0x6) {
         return false;
     }
@@ -176,7 +178,7 @@ bool x86_cpu_has_avx2() {
 #elif (defined(__GNUC__) || defined(__clang__)) && \
       (defined(__x86_64__) || defined(__i386__))
     __builtin_cpu_init();
-    return __builtin_cpu_supports("avx2");
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #else
     return false;
 #endif
@@ -199,6 +201,15 @@ const char * q8_kernel_name() {
 
 const char * q4_kernel_name() {
     return quantized_kernel_name();
+}
+
+const char * turbovec_kernel_name() {
+#if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && \
+      (defined(_M_X64) || defined(__x86_64__))
+    return x86_cpu_has_avx2() ? "avx2-lut" : "scalar-lut";
+#else
+    return "scalar-lut";
+#endif
 }
 
 ggml_vec_index_t * create_index_mode(int mode, int dim) {
@@ -1284,6 +1295,7 @@ int main(int argc, char ** argv) {
     std::printf("llama-vector-index-bench\n");
     std::printf("  q8 kernel=%s\n", q8_kernel_name());
     std::printf("  q4 kernel=%s\n", q4_kernel_name());
+    std::printf("  turbovec kernel=%s\n", turbovec_kernel_name());
     std::printf("  n_vec=%d dim=%d n_query=%d k=%d warmups=%d repeats=%d\n",
         cfg.n_vec, cfg.dim, cfg.n_query, cfg.k, cfg.warmups, cfg.repeats);
     std::printf("  estimated memory: f32=%zu bytes q8=%zu bytes q4=%zu bytes tvq2=%zu bytes tvq4=%zu bytes q8/f32=%.3f q4/f32=%.3f tvq2/f32=%.3f tvq4/f32=%.3f\n",
