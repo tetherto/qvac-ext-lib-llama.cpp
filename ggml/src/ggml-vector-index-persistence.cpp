@@ -325,6 +325,28 @@ static bool q8_code_is_valid(int8_t code, float scale) {
            quantized_value_is_valid(static_cast<double>(code), scale);
 }
 
+static bool turbovec_tqplus_scale_is_valid(float scale, size_t dim) {
+    if (!std::isfinite(scale) || scale <= 0.0f || dim == 0) {
+        return false;
+    }
+    const double dim_d = static_cast<double>(dim);
+    const double max_rotated = dim_d * static_cast<double>(kTurboVecMaxInputMagnitude);
+    const double min_scale =
+        max_rotated * dim_d / static_cast<double>(std::numeric_limits<float>::max());
+    return static_cast<double>(scale) >= min_scale;
+}
+
+static bool turbovec_tqplus_shift_is_valid(float shift, size_t dim) {
+    if (!std::isfinite(shift) || dim == 0) {
+        return false;
+    }
+    const double dim_d = static_cast<double>(dim);
+    const double max_rotated = dim_d * static_cast<double>(kTurboVecMaxInputMagnitude);
+    const double max_abs_shift =
+        static_cast<double>(std::numeric_limits<float>::max()) / (dim_d * max_rotated);
+    return std::fabs(static_cast<double>(shift)) <= max_abs_shift;
+}
+
 bool all_finite_abs_less_than(const float * values, size_t n, float max_abs) {
     for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(values[i]) || std::fabs(values[i]) >= max_abs) {
@@ -2287,19 +2309,40 @@ static void update_delta_tail_cache(
     }
 }
 
-DeltaLogFormat delta_log_format_for_append(const char * path, const DeltaLogLock * lock) {
+static bool delta_log_format_for_append_checked_impl(
+        const char * path,
+        const DeltaLogLock * lock,
+        DeltaLogFormat & format) {
     try {
         DeltaReadStream f;
         bool            exists = false;
         uint64_t        size   = 0;
-        if (!open_delta_read_stream(path, lock, f, exists, size) || !exists || size == 0) {
-            return DeltaLogFormat::v4;
+        if (!open_delta_read_stream(path, lock, f, exists, size)) {
+            return false;
+        }
+        if (!exists || size == 0) {
+            format = DeltaLogFormat::v4;
+            return true;
         }
         uint8_t header[kTvidHeaderSize] = {};
-        const size_t   header_read             = f.read(header, sizeof(header));
-        DeltaLogFormat format = DeltaLogFormat::v4;
-        if (header_read == sizeof(header) && std::memcmp(header + kTvidOffMagic, kTvidMagic, 4) == 0 &&
-            delta_log_format_from_version(header[kTvidOffVersion], format)) {
+        const size_t header_read = f.read(header, sizeof(header));
+        if (header_read > kTvidOffVersion &&
+            std::memcmp(header + kTvidOffMagic, kTvidMagic, 4) == 0 &&
+            delta_log_format_from_version(header[kTvidOffVersion], format) &&
+            size >= delta_header_size_for_format(format)) {
+            return true;
+        }
+    } catch (const std::bad_alloc &) {
+        throw;
+    } catch (...) {
+    }
+    return false;
+}
+
+DeltaLogFormat delta_log_format_for_append(const char * path, const DeltaLogLock * lock) {
+    DeltaLogFormat format = DeltaLogFormat::v4;
+    try {
+        if (delta_log_format_for_append_checked_impl(path, lock, format)) {
             return format;
         }
     } catch (...) {
@@ -2396,6 +2439,22 @@ static bool validate_delta_header(const char *           path,
         base_wide = {};
     }
     return true;
+}
+
+bool prepare_delta_log_format_for_append_unlocked(
+        ggml_vec_index_t * idx,
+        const char * delta_path,
+        DeltaLogLock & lock,
+        DeltaLogFormat & format) {
+    if (idx == nullptr) {
+        return false;
+    }
+    uint64_t size = 0;
+    uint32_t base_crc = 0;
+    DeltaStateWide base_wide;
+    DeltaStateKind state_kind = DeltaStateKind::wide_state;
+    return validate_delta_header(
+        delta_path, *idx, size, format, state_kind, base_crc, base_wide, &lock);
 }
 
 static bool inspect_delta_log_tail(const char *           path,
@@ -3336,7 +3395,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         uint32_t expected_turbovec_q4_qparam_bytes = 0;
         if (serialized_turbovec_q2) {
             const int dim_i = static_cast<int>(dim_le);
-            if (!turbovec_q2_supported_dim(dim_i)) {
+            if (!turbovec_serialized_dim_supported(dim_i)) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
             const size_t scale_bytes = turbovec_q2_scale_count(static_cast<size_t>(dim_i)) *
@@ -3348,7 +3407,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         }
         if (serialized_turbovec_q4) {
             const int dim_i = static_cast<int>(dim_le);
-            if (!turbovec_q4_supported_dim(dim_i)) {
+            if (!turbovec_serialized_dim_supported(dim_i)) {
                 return load_fail(GGML_VEC_INDEX_E_IO);
             }
             const size_t scale_bytes = turbovec_q4_scale_count(static_cast<size_t>(dim_i)) *
@@ -3461,9 +3520,9 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
 
         std::unique_ptr<ggml_vec_index_t, decltype(&ggml_vec_index_free)> idx(
             serialized_turbovec_q2 ?
-                ggml_vec_index_create_turbovec_q2(dim) :
+                ggml_vec_index_create_turbovec_for_load(dim, 2) :
                 serialized_turbovec_q4 ?
-                ggml_vec_index_create_turbovec_q4(dim) :
+                ggml_vec_index_create_turbovec_for_load(dim, 4) :
                 ggml_vec_index_create(dim, bit_width),
             ggml_vec_index_free);
         if (idx == nullptr) {
@@ -3641,6 +3700,16 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                     !read_calibration(idx->turbovec_tqplus_scale, true)) {
                     return load_fail(GGML_VEC_INDEX_E_IO);
                 }
+                for (float value : idx->turbovec_tqplus_shift) {
+                    if (!turbovec_tqplus_shift_is_valid(value, dim_sz)) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                }
+                for (float value : idx->turbovec_tqplus_scale) {
+                    if (!turbovec_tqplus_scale_is_valid(value, dim_sz)) {
+                        return load_fail(GGML_VEC_INDEX_E_IO);
+                    }
+                }
             } else if (version == kTvimVersionV3 &&
                        (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) &&
                        n != 0) {
@@ -3758,7 +3827,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
             }
         }
 
-        if (is_turbovec_q2(*idx)) {
+        if (is_turbovec_q2(*idx) && turbovec_q2_supported_dim(dim)) {
             repack_turbovec_codes(
                 idx->turbovec_q2_data.data(),
                 n,
@@ -3766,7 +3835,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
                 dim,
                 idx->turbovec_blocked_data,
                 idx->turbovec_blocked_n_blocks);
-        } else if (is_turbovec_q4(*idx)) {
+        } else if (is_turbovec_q4(*idx) && turbovec_q4_supported_dim(dim)) {
             repack_turbovec_codes(
                 idx->turbovec_q4_data.data(),
                 n,
@@ -4651,7 +4720,9 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path, const Del
     }
     const uint32_t snapshot_crc = current_delta_state(*idx, state_kind);
     const DeltaStateWide snapshot_wide = current_delta_state_wide(*idx);
-    const bool     apply_records   = delta_state_matches(state_kind, snapshot_crc, snapshot_wide, base_crc, base_wide);
+    bool apply_records = delta_state_matches(state_kind, snapshot_crc, snapshot_wide, base_crc, base_wide);
+    bool found_snapshot_state = apply_records;
+    bool applied_records = false;
     uint32_t last_state_crc = base_crc;
     DeltaStateWide last_state_wide = base_wide;
     const DeltaReplayNearestRounding rounding_guard;
@@ -4731,6 +4802,7 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path, const Del
                     return false;
                 }
             }
+            applied_records = true;
             if (state_kind != DeltaStateKind::legacy_crc) {
                 if (!delta_state_matches(state_kind, current_delta_state(*idx, state_kind),
                                          current_delta_state_wide(*idx), state_crc, state_wide)) {
@@ -4740,12 +4812,22 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path, const Del
             if (!f.seek(offset)) {
                 return false;
             }
+        } else if (delta_state_matches(state_kind, snapshot_crc, snapshot_wide, state_crc, state_wide)) {
+            found_snapshot_state = true;
+            apply_records = true;
         }
         last_state_crc = state_crc;
         last_state_wide = state_wide;
     }
 
-    if (apply_records) {
+    if (found_snapshot_state) {
+        if (!applied_records &&
+            !delta_state_matches(state_kind, base_crc, base_wide, snapshot_crc, snapshot_wide)) {
+            idx->delta_log_rebase_pending = true;
+            idx->delta_log_rebase_crc = snapshot_crc;
+            idx->delta_log_rebase_wide = snapshot_wide;
+            idx->delta_log_rebase_state_kind = delta_state_kind_cache_value(state_kind);
+        }
         return delta_state_matches(state_kind, current_delta_state(*idx, state_kind), current_delta_state_wide(*idx),
                                    last_state_crc, last_state_wide);
     }
@@ -4768,6 +4850,7 @@ struct DeltaReplaySnapshot {
     uint32_t delta_log_rebase_crc = 0;
     DeltaStateWide delta_log_rebase_wide;
     int delta_log_rebase_state_kind = 0;
+    DeltaTailCache delta_tail_cache;
     uint64_t state_hash_xor = 0;
     uint64_t state_hash_sum = 0;
     uint64_t state_hash_sum_rot = 0;
@@ -4795,6 +4878,7 @@ struct DeltaReplaySnapshot {
         delta_log_rebase_crc(idx.delta_log_rebase_crc),
         delta_log_rebase_wide(idx.delta_log_rebase_wide),
         delta_log_rebase_state_kind(idx.delta_log_rebase_state_kind),
+        delta_tail_cache(idx.delta_tail_cache),
         state_hash_xor(idx.state_hash_xor),
         state_hash_sum(idx.state_hash_sum),
         state_hash_sum_rot(idx.state_hash_sum_rot),
@@ -4832,6 +4916,16 @@ struct DeltaReplaySnapshot {
         idx.delta_log_rebase_crc = delta_log_rebase_crc;
         idx.delta_log_rebase_wide = delta_log_rebase_wide;
         idx.delta_log_rebase_state_kind = delta_log_rebase_state_kind;
+        idx.delta_tail_cache.valid = delta_tail_cache.valid;
+        idx.delta_tail_cache.path_key.swap(delta_tail_cache.path_key);
+        idx.delta_tail_cache.state_kind = delta_tail_cache.state_kind;
+        idx.delta_tail_cache.tail_crc = delta_tail_cache.tail_crc;
+        idx.delta_tail_cache.tail_record_crc = delta_tail_cache.tail_record_crc;
+        idx.delta_tail_cache.tail_wide = delta_tail_cache.tail_wide;
+        idx.delta_tail_cache.tail_record_offset = delta_tail_cache.tail_record_offset;
+        idx.delta_tail_cache.tail_crc_offset = delta_tail_cache.tail_crc_offset;
+        idx.delta_tail_cache.complete_size = delta_tail_cache.complete_size;
+        idx.delta_tail_cache.stamp = delta_tail_cache.stamp;
         idx.state_hash_xor = state_hash_xor;
         idx.state_hash_sum = state_hash_sum;
         idx.state_hash_sum_rot = state_hash_sum_rot;
@@ -4849,7 +4943,6 @@ struct DeltaReplaySnapshot {
         idx.ivf_n_lists = ivf_n_lists;
         idx.ivf_centroids.swap(ivf_centroids);
         idx.ivf_lists.swap(ivf_lists);
-        invalidate_delta_tail_cache(idx);
     }
 };
 
@@ -4906,14 +4999,6 @@ bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path, 
     DeltaStateKind state_kind = DeltaStateKind::wide_state;
     if (!validate_delta_header(
             delta_path, *idx, size, format, state_kind, base_crc, base_wide, &lock)) {
-        return false;
-    }
-    if (!delta_state_matches(
-            state_kind,
-            current_delta_state(*idx, state_kind),
-            current_delta_state_wide(*idx),
-            base_crc,
-            base_wide)) {
         return false;
     }
     if (size != 0) {
