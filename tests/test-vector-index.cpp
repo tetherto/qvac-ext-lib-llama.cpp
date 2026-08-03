@@ -1798,31 +1798,44 @@ void check_delta_log_tail_recovery() {
     };
     const uint64_t base_id = 9301ULL;
 
-    temp_file snapshot(".tvim");
-    temp_file delta(".tvid");
-    auto *    base = ggml_vec_index_create(kDim, /*bit_width=*/32);
+    const std::filesystem::path snapshot_path =
+        std::filesystem::temp_directory_path() / "ggml-vector-index-tail-recovery.tvim";
+    const std::filesystem::path delta_path =
+        std::filesystem::temp_directory_path() / "ggml-vector-index-tail-recovery.tvid";
+    const std::string snapshot = snapshot_path.string();
+    const std::string delta = delta_path.string();
+    auto remove_delta_artifacts = [](const std::filesystem::path & path) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        std::filesystem::remove(path.string() + ".lock", ec);
+    };
+    std::error_code cleanup_ec;
+    std::filesystem::remove(snapshot_path, cleanup_ec);
+    remove_delta_artifacts(delta_path);
+
+    auto * base = ggml_vec_index_create(kDim, /*bit_width=*/32);
     CHECK(base != nullptr);
     CHECK(ggml_vec_index_add(base, base_vec.data(), 1, &base_id) == GGML_VEC_INDEX_OK);
-    CHECK(ggml_vec_index_write(base, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(base, snapshot.c_str()) == GGML_VEC_INDEX_OK);
 
-    auto * mmap = ggml_vec_index_load_mmap(snapshot.path.string().c_str());
+    auto * mmap = ggml_vec_index_load_mmap(snapshot.c_str());
     CHECK(mmap != nullptr);
-    CHECK(ggml_vec_index_compact_delta(mmap, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
-          GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(ggml_vec_index_compact_delta(mmap, snapshot.c_str(), delta.c_str()) == GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_contains(mmap, base_id) == 1);
     {
-        temp_file       snapshot_alias(".tvim.alias");
+        const std::filesystem::path snapshot_alias_path = snapshot_path.string() + ".alias";
+        const std::string           snapshot_alias      = snapshot_alias_path.string();
         std::error_code ec;
-        std::filesystem::create_hard_link(snapshot.path, snapshot_alias.path, ec);
+        std::filesystem::remove(snapshot_alias_path, ec);
+        ec.clear();
+        std::filesystem::create_hard_link(snapshot_path, snapshot_alias_path, ec);
         if (!ec) {
-            CHECK(std::filesystem::equivalent(snapshot.path, snapshot_alias.path, ec));
+            CHECK(std::filesystem::equivalent(snapshot_path, snapshot_alias_path, ec));
             CHECK(!ec);
-            CHECK(ggml_vec_index_write(mmap, snapshot_alias.path.string().c_str()) ==
+            CHECK(ggml_vec_index_write(mmap, snapshot_alias.c_str()) == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_compact_delta(mmap, snapshot_alias.c_str(), delta.c_str()) ==
                   GGML_VEC_INDEX_E_INVALID_ARG);
-            CHECK(ggml_vec_index_compact_delta(
-                      mmap, snapshot_alias.path.string().c_str(), delta.path.string().c_str()) ==
-                  GGML_VEC_INDEX_E_INVALID_ARG);
-            std::filesystem::remove(snapshot_alias.path, ec);
+            std::filesystem::remove(snapshot_alias_path, ec);
         } else {
             CHECK(ec == std::errc::operation_not_supported || ec == std::errc::function_not_supported ||
                   ec == std::errc::permission_denied);
@@ -1830,22 +1843,23 @@ void check_delta_log_tail_recovery() {
     }
     ggml_vec_index_free(mmap);
 
-    CHECK(ggml_vec_index_compact_delta(base, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
-          GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_compact_delta(base, snapshot.c_str(), delta.c_str()) == GGML_VEC_INDEX_OK);
     {
-        temp_file       delta_alias(".tvid.alias");
+        const std::filesystem::path delta_alias_path = delta_path.string() + ".alias";
+        const std::string           delta_alias      = delta_alias_path.string();
         std::error_code ec;
-        std::filesystem::create_hard_link(delta.path, delta_alias.path, ec);
+        std::filesystem::remove(delta_alias_path, ec);
+        ec.clear();
+        std::filesystem::create_hard_link(delta_path, delta_alias_path, ec);
         if (!ec) {
-            CHECK(std::filesystem::equivalent(delta.path, delta_alias.path, ec));
+            CHECK(std::filesystem::equivalent(delta_path, delta_alias_path, ec));
             CHECK(!ec);
-            CHECK(ggml_vec_index_compact_delta(base, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
-                  GGML_VEC_INDEX_OK);
-            CHECK(std::filesystem::equivalent(delta.path, delta_alias.path, ec));
+            CHECK(ggml_vec_index_compact_delta(base, snapshot.c_str(), delta.c_str()) == GGML_VEC_INDEX_OK);
+            CHECK(std::filesystem::equivalent(delta_path, delta_alias_path, ec));
             CHECK(!ec);
-            CHECK(read_bytes(delta_alias.path) == read_bytes(delta.path));
-            CHECK(read_bytes(delta_alias.path).size() == 48);
-            std::filesystem::remove(delta_alias.path, ec);
+            CHECK(read_file_bytes(delta_alias) == read_file_bytes(delta));
+            CHECK(read_file_bytes(delta_alias).size() == 48);
+            std::filesystem::remove(delta_alias_path, ec);
         } else {
             CHECK(ec == std::errc::operation_not_supported || ec == std::errc::function_not_supported ||
                   ec == std::errc::permission_denied);
@@ -1854,29 +1868,28 @@ void check_delta_log_tail_recovery() {
     ggml_vec_index_free(base);
 
 #ifndef _WIN32
-    std::filesystem::path lock_path = delta.path;
+    std::filesystem::path lock_path = delta_path;
     lock_path += ".lock";
     std::filesystem::permissions(lock_path, std::filesystem::perms::owner_read, std::filesystem::perm_options::replace);
     auto * read_only_lock_loaded =
-        ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+        ggml_vec_index_load_with_delta(snapshot.c_str(), delta.c_str());
     CHECK(read_only_lock_loaded != nullptr);
     ggml_vec_index_free(read_only_lock_loaded);
     std::filesystem::permissions(lock_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
                                  std::filesystem::perm_options::replace);
 #endif
 
-    std::vector<uint8_t> corrupted_delta = read_bytes(delta.path);
+    std::vector<uint8_t> corrupted_delta = read_file_bytes(delta);
     CHECK(corrupted_delta.size() >= 48);
     corrupted_delta.resize(corrupted_delta.size() + 56, 0);
-    write_bytes(delta.path, corrupted_delta);
+    write_file_bytes(delta, corrupted_delta);
 
-    auto * loaded = ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+    auto * loaded = ggml_vec_index_load_with_delta(snapshot.c_str(), delta.c_str());
     CHECK(loaded != nullptr);
     CHECK(ggml_vec_index_len(loaded) == 1);
     CHECK(ggml_vec_index_contains(loaded, base_id) == 1);
-    CHECK(ggml_vec_index_compact_delta(loaded, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
-          GGML_VEC_INDEX_OK);
-    CHECK(read_bytes(delta.path).size() == 48);
+    CHECK(ggml_vec_index_compact_delta(loaded, snapshot.c_str(), delta.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(read_file_bytes(delta).size() == 48);
     ggml_vec_index_free(loaded);
 
     const std::array<float, kDim> added_vec = {
@@ -1886,54 +1899,44 @@ void check_delta_log_tail_recovery() {
         0.0f,
     };
     const uint64_t added_id = 9302ULL;
-    std::vector<uint8_t> add_payload;
-    append_u64_le(add_payload, added_id);
-    for (float value : added_vec) {
-        append_f32_le(add_payload, value);
-    }
-    std::vector<float> after_add_vectors(base_vec.begin(), base_vec.end());
-    after_add_vectors.insert(after_add_vectors.end(), added_vec.begin(), added_vec.end());
-    const std::vector<uint64_t> after_add_ids = { base_id, added_id };
-    std::vector<uint8_t> add_log = { 'T', 'V', 'D', 'L', 4, 32, 0, 0 };
-    append_u32_le(add_log, kDim);
-    append_u32_le(add_log, 0);
-    append_wide_state(add_log, f32_wide_state(std::vector<float>(base_vec.begin(), base_vec.end()), { base_id }, kDim));
-    append_v4_delta_record(add_log,
-                           /*op=*/1,
-                           /*n=*/1, add_payload, f32_wide_state(after_add_vectors, after_add_ids, kDim));
+    auto * add_idx = ggml_vec_index_load(snapshot.c_str());
+    CHECK(add_idx != nullptr);
+    CHECK(ggml_vec_index_add_logged(add_idx, added_vec.data(), 1, &added_id, delta.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(add_idx);
+    std::vector<uint8_t> add_log = read_file_bytes(delta);
     add_log.resize(add_log.size() + 56, 0);
-    write_bytes(delta.path, add_log);
+    write_file_bytes(delta, add_log);
 
-    loaded = ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+    loaded = ggml_vec_index_load_with_delta(snapshot.c_str(), delta.c_str());
     CHECK(loaded != nullptr);
     CHECK(ggml_vec_index_contains(loaded, base_id) == 1);
     CHECK(ggml_vec_index_contains(loaded, added_id) == 1);
-    CHECK(ggml_vec_index_compact_delta(loaded, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
-          GGML_VEC_INDEX_OK);
-    CHECK(read_bytes(delta.path).size() == 48);
+    CHECK(ggml_vec_index_compact_delta(loaded, snapshot.c_str(), delta.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(read_file_bytes(delta).size() == 48);
     ggml_vec_index_free(loaded);
 
-    auto * compacted = ggml_vec_index_load(snapshot.path.string().c_str());
+    auto * compacted = ggml_vec_index_load(snapshot.c_str());
     CHECK(compacted != nullptr);
     CHECK(ggml_vec_index_contains(compacted, base_id) == 1);
     CHECK(ggml_vec_index_contains(compacted, added_id) == 1);
     ggml_vec_index_free(compacted);
 
-    write_bytes(delta.path, { 'T', 'V', 'D' });
-    loaded = ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+    write_file_bytes(delta, { 'T', 'V', 'D' });
+    loaded = ggml_vec_index_load_with_delta(snapshot.c_str(), delta.c_str());
     CHECK(loaded != nullptr);
     CHECK(ggml_vec_index_len(loaded) == 2);
     CHECK(ggml_vec_index_contains(loaded, base_id) == 1);
     CHECK(ggml_vec_index_contains(loaded, added_id) == 1);
-    CHECK(ggml_vec_index_compact_delta(loaded, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
-          GGML_VEC_INDEX_OK);
-    CHECK(read_bytes(delta.path).size() == 48);
+    CHECK(ggml_vec_index_compact_delta(loaded, snapshot.c_str(), delta.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(read_file_bytes(delta).size() == 48);
     ggml_vec_index_free(loaded);
 
     std::error_code       ec;
-    std::filesystem::path lock_path_to_remove = delta.path;
+    std::filesystem::path lock_path_to_remove = delta_path;
     lock_path_to_remove += ".lock";
     std::filesystem::remove(lock_path_to_remove, ec);
+    std::filesystem::remove(snapshot_path, ec);
+    remove_delta_artifacts(delta_path);
 }
 
 uint64_t fnv1a_bytes(const uint8_t * values, size_t size) {
@@ -3272,7 +3275,8 @@ int main() {
     CHECK(std::strcmp(ggml_vec_index_error_to_string(GGML_VEC_INDEX_E_NOT_DURABLE), "not durable") == 0);
     ggml_vec_index_prepare(idx);
 
-    // Zero-row adds are valid no-ops and must not create delta artifacts.
+    // Zero-row plain adds are valid no-ops. Logged zero-row adds still obey
+    // the current delta start policy and must not create artifacts.
     {
         const std::array<float, kDim> vector = {
             1.0f, 0.0f, 0.0f, 0.0f,
@@ -3398,10 +3402,10 @@ int main() {
         std::filesystem::remove(zero_delta_path + ".lock");
         CHECK(ggml_vec_index_add_logged(
             idx, vector.data(), /*n=*/0, &id, zero_delta_path.c_str()) ==
-            GGML_VEC_INDEX_OK);
+            GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_add_logged(
             idx, nullptr, /*n=*/0, nullptr, zero_delta_path.c_str()) ==
-            GGML_VEC_INDEX_OK);
+            GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_len(idx) == 0);
         CHECK(!std::filesystem::exists(zero_delta_path));
         std::filesystem::remove(zero_delta_path + ".lock");
