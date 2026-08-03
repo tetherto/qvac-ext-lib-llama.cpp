@@ -755,6 +755,10 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
         if (idx == nullptr || n_lists <= 0 || n_iter < 0) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
+        if ((is_turbovec_q2(*idx) && !turbovec_q2_supported_dim(idx->dim)) ||
+            (is_turbovec_q4(*idx) && !turbovec_q4_supported_dim(idx->dim))) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
 
         const size_t n_slots = idx->slot_to_id.size();
         const size_t n_live = active_count(*idx);
@@ -883,6 +887,10 @@ static int ggml_vec_index_search_impl(
     try {
         std::shared_lock<std::shared_mutex> lock(idx->mutex);
         const int dim = idx->dim;
+        if ((is_turbovec_q2(*idx) && !turbovec_q2_supported_dim(dim)) ||
+            (is_turbovec_q4(*idx) && !turbovec_q4_supported_dim(dim))) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         const size_t n_q_sz = static_cast<size_t>(n_q);
         const size_t k_sz   = static_cast<size_t>(k);
         const size_t dim_sz = static_cast<size_t>(dim);
@@ -1051,6 +1059,10 @@ int ggml_vec_index_search_ivf(
     try {
         std::shared_lock<std::shared_mutex> lock(idx->mutex);
         const int dim = idx->dim;
+        if ((is_turbovec_q2(*idx) && !turbovec_q2_supported_dim(dim)) ||
+            (is_turbovec_q4(*idx) && !turbovec_q4_supported_dim(dim))) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         const size_t n_q_sz = static_cast<size_t>(n_q);
         const size_t k_sz = static_cast<size_t>(k);
         const size_t dim_sz = static_cast<size_t>(dim);

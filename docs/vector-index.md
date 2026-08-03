@@ -104,13 +104,14 @@ delete/compact operations, and snapshot round trips.
 
 `ggml_vec_index_create_turbovec_q2` and `ggml_vec_index_create_turbovec_q4`
 create separate TurboQuant q2/q4 modes on 64-bit targets for positive
-dimensions up to 65536 that are multiples of 8. They store Lloyd-Max q2/q4
+dimensions up to 1024 that are multiples of 8. They store Lloyd-Max q2/q4
 codes in Rust-style bit-plane rows with one score-correction scale per vector.
 Vectors and queries use a deterministic dense full-dimension Gaussian QR
 rotation before LUT scoring. The rotation is materialized as a dense `dim x dim`
-matrix on first use; very large accepted dimensions are format-valid, but
-add/search can return
-`GGML_VEC_INDEX_E_OOM` if the rotation state cannot be allocated.
+matrix on first use, so the current dense implementation rejects larger
+dimensions for new indexes. Snapshots created by earlier releases with larger
+dimensions can still be loaded and rewritten, but add, search, and IVF
+operations return `GGML_VEC_INDEX_E_INVALID_ARG`.
 `ggml_vec_index_prepare` is best-effort and does not report allocation status.
 The first non-empty add fits TQ+ per-coordinate calibration when it contains at least
 1000 vectors, then reuses that calibration for later adds. TurboVec snapshots
@@ -209,10 +210,13 @@ vectors when interchange is needed.
 
 Delta logs are bound to the state of the snapshot they extend. Use one evolving
 writer handle for a given snapshot and delta path pair. If another handle or
-process writes to the same log, stale writers must reload from snapshot plus
-delta before appending again. A bound handle rejects logged mutations or
-compaction with a different delta path. Loading validates each replayed record
-against its stored post-state identity.
+process writes to the same log, stale writers catch up automatically when their
+current state matches a committed intermediate log state. Otherwise, reload
+from snapshot plus delta before appending again. A bound handle rejects logged
+mutations or compaction with a different delta path. A successful catch-up
+remains applied if the requested mutation then returns a duplicate or not-found
+error. Loading validates each replayed record against its stored post-state
+identity.
 
 Cross-process append protection uses cooperative OS file locks. Keep `.tvid`
 delta logs on local filesystems with reliable locking, and do not edit or append

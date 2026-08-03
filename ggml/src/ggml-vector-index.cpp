@@ -323,9 +323,15 @@ ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width) {
     }
 }
 
-ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim) {
+static ggml_vec_index_t * ggml_vec_index_create_turbovec_impl(
+        int dim,
+        int bit_width,
+        bool serialized_compatibility) {
     try {
-        if (!turbovec_q2_supported_dim(dim)) {
+        const bool supported = serialized_compatibility ?
+            turbovec_serialized_dim_supported(dim) :
+            (bit_width == 2 ? turbovec_q2_supported_dim(dim) : turbovec_q4_supported_dim(dim));
+        if (!supported || (bit_width != 2 && bit_width != 4)) {
             return nullptr;
         }
         auto * idx = new (std::nothrow) ggml_vec_index();
@@ -333,8 +339,9 @@ ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim) {
             return nullptr;
         }
         idx->dim = dim;
-        idx->bit_width = 2;
-        idx->turbovec_q2 = true;
+        idx->bit_width = bit_width;
+        idx->turbovec_q2 = bit_width == 2;
+        idx->turbovec_q4 = bit_width == 4;
         idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
         if (idx->filter_cookie == 0) {
             idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
@@ -351,32 +358,16 @@ ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim) {
     }
 }
 
+ggml_vec_index_t * ggml_vec_index_create_turbovec_q2(int dim) {
+    return ggml_vec_index_create_turbovec_impl(dim, 2, false);
+}
+
 ggml_vec_index_t * ggml_vec_index_create_turbovec_q4(int dim) {
-    try {
-        if (!turbovec_q4_supported_dim(dim)) {
-            return nullptr;
-        }
-        auto * idx = new (std::nothrow) ggml_vec_index();
-        if (idx == nullptr) {
-            return nullptr;
-        }
-        idx->dim = dim;
-        idx->bit_width = 4;
-        idx->turbovec_q4 = true;
-        idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
-        if (idx->filter_cookie == 0) {
-            idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
-        }
-        try {
-            turbovec_retain_rotation(dim);
-        } catch (...) {
-            delete idx;
-            return nullptr;
-        }
-        return idx;
-    } catch (...) {
-        return nullptr;
-    }
+    return ggml_vec_index_create_turbovec_impl(dim, 4, false);
+}
+
+ggml_vec_index_t * ggml_vec_index_create_turbovec_for_load(int dim, int bit_width) {
+    return ggml_vec_index_create_turbovec_impl(dim, bit_width, true);
 }
 
 void ggml_vec_index_free(ggml_vec_index_t * idx) {
@@ -463,6 +454,10 @@ int ggml_vec_index_add_unlocked(
         }
         if (n == 0) {
             return GGML_VEC_INDEX_OK;
+        }
+        if ((is_turbovec_q2(*idx) && !turbovec_q2_supported_dim(idx->dim)) ||
+            (is_turbovec_q4(*idx) && !turbovec_q4_supported_dim(idx->dim))) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (vectors == nullptr || ids == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -822,13 +817,15 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
                 new_id_to_slot.emplace(idx->slot_to_id[slot], out_slot);
                 ++out_slot;
             }
-            repack_turbovec_codes(
-                new_data.data(),
-                n_live,
-                2,
-                idx->dim,
-                new_turbovec_blocked_data,
-                new_turbovec_blocked_n_blocks);
+            if (turbovec_q2_supported_dim(idx->dim)) {
+                repack_turbovec_codes(
+                    new_data.data(),
+                    n_live,
+                    2,
+                    idx->dim,
+                    new_turbovec_blocked_data,
+                    new_turbovec_blocked_n_blocks);
+            }
             idx->turbovec_q2_data.swap(new_data);
             idx->turbovec_q2_scale.swap(new_scales);
             idx->turbovec_blocked_data.swap(new_turbovec_blocked_data);
@@ -857,13 +854,15 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
                 new_id_to_slot.emplace(idx->slot_to_id[slot], out_slot);
                 ++out_slot;
             }
-            repack_turbovec_codes(
-                new_data.data(),
-                n_live,
-                4,
-                idx->dim,
-                new_turbovec_blocked_data,
-                new_turbovec_blocked_n_blocks);
+            if (turbovec_q4_supported_dim(idx->dim)) {
+                repack_turbovec_codes(
+                    new_data.data(),
+                    n_live,
+                    4,
+                    idx->dim,
+                    new_turbovec_blocked_data,
+                    new_turbovec_blocked_n_blocks);
+            }
             idx->turbovec_q4_data.swap(new_data);
             idx->turbovec_q4_scale.swap(new_scales);
             idx->turbovec_blocked_data.swap(new_turbovec_blocked_data);
@@ -1031,6 +1030,15 @@ int ggml_vec_index_add_logged(
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
+        DeltaLogFormat format = DeltaLogFormat::v4;
+        if (!prepare_delta_log_format_for_append_unlocked(idx, delta_path, delta_lock, format)) {
+            discard_prepared_path();
+            return GGML_VEC_INDEX_E_IO;
+        }
+        if (format == DeltaLogFormat::v1 || format == DeltaLogFormat::v2 || format == DeltaLogFormat::v3) {
+            discard_prepared_path();
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock)) {
             if (!replay_delta_log_unlocked(idx, delta_path, delta_lock)) {
                 discard_prepared_path();
@@ -1048,11 +1056,6 @@ int ggml_vec_index_add_logged(
 
         std::string delta_path_key;
         if (!prepare_delta_log_binding(*idx, delta_path, delta_path_key)) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        const DeltaLogFormat format = delta_log_format_for_append(delta_path, &delta_lock);
-        if (format == DeltaLogFormat::v1 || format == DeltaLogFormat::v2 || format == DeltaLogFormat::v3) {
-            discard_prepared_path();
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         const DeltaStateKind state_kind = delta_state_kind_for_format(format);
@@ -1202,6 +1205,15 @@ int ggml_vec_index_remove_logged(
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
+        DeltaLogFormat format = DeltaLogFormat::v4;
+        if (!prepare_delta_log_format_for_append_unlocked(idx, delta_path, delta_lock, format)) {
+            discard_prepared_path();
+            return GGML_VEC_INDEX_E_IO;
+        }
+        if (format == DeltaLogFormat::v1 || format == DeltaLogFormat::v2 || format == DeltaLogFormat::v3) {
+            discard_prepared_path();
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock)) {
             if (!replay_delta_log_unlocked(idx, delta_path, delta_lock)) {
                 discard_prepared_path();
@@ -1220,11 +1232,6 @@ int ggml_vec_index_remove_logged(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         const std::vector<uint8_t> payload = build_remove_delta_payload(id);
-        const DeltaLogFormat format = delta_log_format_for_append(delta_path, &delta_lock);
-        if (format == DeltaLogFormat::v1 || format == DeltaLogFormat::v2 || format == DeltaLogFormat::v3) {
-            discard_prepared_path();
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
         const DeltaStateKind state_kind = delta_state_kind_for_format(format);
         const uint32_t base_crc = current_delta_state(*idx, state_kind);
         const DeltaStateWide base_wide = current_delta_state_wide(*idx);
@@ -1302,9 +1309,9 @@ void ggml_vec_index_prepare(ggml_vec_index_t * idx) {
     }
     try {
         std::shared_lock<std::shared_mutex> lock(idx->mutex);
-        if (is_turbovec_q2(*idx)) {
+        if (is_turbovec_q2(*idx) && turbovec_q2_supported_dim(idx->dim)) {
             prepare_turbovec(2, idx->dim);
-        } else if (is_turbovec_q4(*idx)) {
+        } else if (is_turbovec_q4(*idx) && turbovec_q4_supported_dim(idx->dim)) {
             prepare_turbovec(4, idx->dim);
         }
     } catch (...) {

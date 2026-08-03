@@ -358,6 +358,7 @@ static void apply_turbovec_rotation(const float * src, float * dst, int dim, boo
 
 static void apply_turbovec_rotation_batch(const float * src, float * dst, int n, int dim) {
     const std::shared_ptr<const std::vector<float>> rotation = turbovec_rotation(dim);
+    // TQ+ calibration is persisted; keep this reduction order backend-independent.
     for (int row = 0; row < n; ++row) {
         apply_turbovec_rotation_with_matrix(
             rotation->data(),
@@ -387,11 +388,38 @@ static float float_score_from_double_local(double score) {
     return static_cast<float>(score);
 }
 
-// Local subset of statrs 0.17.1 used by Rust turbovec v0.9.0 through
-// statrs::distribution::Beta. These helpers derive TQ+ theoretical quantiles
-// and Lloyd-Max codebooks; they do not sample rotation vectors.
-// https://docs.rs/statrs/0.17.1/src/statrs/function/gamma.rs.html
-// https://docs.rs/statrs/0.17.1/src/statrs/function/beta.rs.html
+/*
+ * Local subset derived from statrs 0.17.1, used by Rust turbovec v0.9.0
+ * through statrs::distribution::Beta. These helpers derive TQ+ theoretical
+ * quantiles and Lloyd-Max codebooks; they do not sample rotation vectors.
+ *
+ * Upstream sources:
+ * https://docs.rs/statrs/0.17.1/src/statrs/function/gamma.rs.html
+ * https://docs.rs/statrs/0.17.1/src/statrs/function/beta.rs.html
+ * https://docs.rs/statrs/0.17.1/src/statrs/distribution/mod.rs.html
+ *
+ * MIT License
+ *
+ * Copyright (c) 2016 Michael Ma
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 static double statrs_ln_gamma(double x) {
     static constexpr double coefficients[] = {
         2.48574089138753565546e-5,
@@ -535,10 +563,10 @@ static double beta_pdf_01(double x, double a) {
         return 0.0;
     }
     if (a > 80.0) {
-        return std::exp(
-            (a - 1.0) * std::log(x) +
-            (a - 1.0) * std::log(1.0 - x) -
-            (statrs_ln_gamma(a) + statrs_ln_gamma(a) - statrs_ln_gamma(2.0 * a)));
+        const double aa = statrs_ln_gamma(2.0 * a) - statrs_ln_gamma(a) - statrs_ln_gamma(a);
+        const double bb = (a - 1.0) * std::log(x);
+        const double cc = (a - 1.0) * std::log(1.0 - x);
+        return std::exp(aa + bb + cc);
     }
     const double beta_normalizer =
         statrs_gamma(2.0 * a) / (statrs_gamma(a) * statrs_gamma(a));
@@ -842,6 +870,11 @@ bool turbovec_q2_supported_dim(int dim) {
 bool turbovec_q4_supported_dim(int dim) {
     return sizeof(size_t) >= 8 &&
         dim > 0 && dim <= kTurboVecMaxDim && dim % kTurboVecDimMultiple == 0;
+}
+
+bool turbovec_serialized_dim_supported(int dim) {
+    return sizeof(size_t) >= 8 &&
+        dim > 0 && dim <= kTurboVecMaxSerializedDim && dim % kTurboVecDimMultiple == 0;
 }
 
 void turbovec_retain_rotation(int dim) {
