@@ -1031,10 +1031,14 @@ int ggml_vec_index_add_logged(
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
-        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock) &&
-            !replay_delta_log_unlocked(idx, delta_path, delta_lock)) {
-            discard_prepared_path();
-            return GGML_VEC_INDEX_E_IO;
+        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock)) {
+            if (!replay_delta_log_unlocked(idx, delta_path, delta_lock)) {
+                discard_prepared_path();
+                return GGML_VEC_INDEX_E_IO;
+            }
+            idx->delta_log_start_allowed = false;
+            idx->delta_log_bound = true;
+            invalidate_delta_tail_cache(*idx);
         }
         const int duplicate_status = check_logged_add_duplicates(idx, n, ids);
         if (duplicate_status != GGML_VEC_INDEX_OK) {
@@ -1198,10 +1202,14 @@ int ggml_vec_index_remove_logged(
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
-        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock) &&
-            !replay_delta_log_unlocked(idx, delta_path, delta_lock)) {
-            discard_prepared_path();
-            return GGML_VEC_INDEX_E_IO;
+        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock)) {
+            if (!replay_delta_log_unlocked(idx, delta_path, delta_lock)) {
+                discard_prepared_path();
+                return GGML_VEC_INDEX_E_IO;
+            }
+            idx->delta_log_start_allowed = false;
+            idx->delta_log_bound = true;
+            invalidate_delta_tail_cache(*idx);
         }
         if (idx->id_to_slot.count(id) == 0) {
             discard_prepared_path();

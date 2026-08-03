@@ -2,11 +2,8 @@
 
 #include "ggml-vector-index-impl.h"
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#if GGML_VEC_INDEX_USE_NEON
 #include <arm_neon.h>
-#define GGML_VEC_INDEX_USE_NEON 1
-#else
-#define GGML_VEC_INDEX_USE_NEON 0
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -253,26 +250,14 @@ bool cpu_has_avx2() {
     __cpuidex(regs, 1, 0);
     constexpr int kOsxsave = 1 << 27;
     constexpr int kAvx = 1 << 28;
+    constexpr int kFma = 1 << 12;
     if ((regs[2] & (kOsxsave | kAvx)) != (kOsxsave | kAvx) ||
+        (regs[2] & kFma) == 0 ||
         (_xgetbv(0) & 0x6) != 0x6) {
         return false;
     }
     __cpuidex(regs, 7, 0);
     return (regs[1] & (1 << 5)) != 0;
-#elif defined(__GNUC__) || defined(__clang__)
-    __builtin_cpu_init();
-    return __builtin_cpu_supports("avx2");
-#else
-    return false;
-#endif
-}
-
-bool cpu_has_avx2_fma() {
-#if defined(_MSC_VER)
-    int regs[4] = {};
-    __cpuidex(regs, 1, 0);
-    constexpr int kFma = 1 << 12;
-    return cpu_has_avx2() && (regs[2] & kFma) != 0;
 #elif defined(__GNUC__) || defined(__clang__)
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
@@ -442,6 +427,11 @@ void search_one(
     double                   max_query,
     std::vector<ScoreId>   & heap,
     std::vector<ScoreId>   & drained,
+    std::vector<float>     & rotated_query_scratch,
+    std::vector<float>     & calibrated_query_scratch,
+    std::vector<uint8_t>   & turbovec_lut_scratch,
+    std::vector<float>     & turbovec_scores_scratch,
+    std::vector<uint8_t>   & allowed_blocks_scratch,
     const std::vector<size_t> * allowed_slots = nullptr,
     const float * pre_rotated_turbovec_query = nullptr) {
 
@@ -450,6 +440,11 @@ void search_one(
     test_maybe_throw_bad_alloc();
     heap.clear();
     drained.clear();
+    rotated_query_scratch.clear();
+    calibrated_query_scratch.clear();
+    turbovec_lut_scratch.clear();
+    turbovec_scores_scratch.clear();
+    allowed_blocks_scratch.clear();
     const size_t candidate_hint = allowed_slots != nullptr ?
         std::min(allowed_slots->size(), n_slots) :
         active_count(idx);
@@ -457,10 +452,10 @@ void search_one(
         std::min(static_cast<size_t>(k), candidate_hint);
     heap.reserve(heap_capacity);
     const float * score_query = query;
-    std::vector<float> rotated_query;
-    std::vector<float> calibrated_query;
-    std::vector<uint8_t> turbovec_lut;
-    std::vector<float> turbovec_scores;
+    std::vector<float> & rotated_query = rotated_query_scratch;
+    std::vector<float> & calibrated_query = calibrated_query_scratch;
+    std::vector<uint8_t> & turbovec_lut = turbovec_lut_scratch;
+    std::vector<float> & turbovec_scores = turbovec_scores_scratch;
     float turbovec_lut_scale = 1.0f;
     float turbovec_lut_bias = 0.0f;
     if (is_turbovec_q2(idx) || is_turbovec_q4(idx)) {
@@ -500,7 +495,7 @@ void search_one(
             idx.turbovec_blocked_n_blocks * n_byte_groups * 32;
         if (idx.turbovec_blocked_data.size() == expected_blocked_bytes &&
             idx.turbovec_blocked_n_blocks == (n_slots + 31) / 32) {
-            std::vector<uint8_t> allowed_blocks;
+            std::vector<uint8_t> & allowed_blocks = allowed_blocks_scratch;
             if (allowed_slots != nullptr || active_count(idx) != n_slots) {
                 allowed_blocks.assign(idx.turbovec_blocked_n_blocks, 0);
                 if (allowed_slots != nullptr) {
@@ -524,7 +519,7 @@ void search_one(
                 idx.turbovec_q4_scale.data();
             std::array<float, 32> block_scores{};
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
-            static const bool has_turbovec_avx2 = cpu_has_avx2_fma();
+            static const bool has_turbovec_avx2 = cpu_has_avx2();
 #endif
             for (size_t block = 0; block < idx.turbovec_blocked_n_blocks; ++block) {
                 if (!allowed_blocks.empty() && allowed_blocks[block] == 0) {
@@ -674,7 +669,7 @@ int64_t turbovec_block_score_call_count_for_test(void) {
 
 int turbovec_avx2_available_for_test() {
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
-    return cpu_has_avx2_fma() ? 1 : 0;
+    return cpu_has_avx2() ? 1 : 0;
 #else
     return 0;
 #endif
@@ -685,8 +680,8 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim) {
         return 0;
     }
 #if defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL) && !GGML_VEC_INDEX_USE_NEON && GGML_VEC_INDEX_TURBOVEC_AVX2_LAYOUT
-    if (!cpu_has_avx2_fma()) {
-        return 1;
+    if (!cpu_has_avx2()) {
+        return -1;
     }
     constexpr size_t block_size = 32;
     const size_t n_byte_groups = static_cast<size_t>(dim) / static_cast<size_t>(8 / bits);
@@ -709,7 +704,6 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim) {
     constexpr float lut_bias = -1.25f;
     std::array<float, block_size> scalar_scores{};
     std::array<float, block_size> avx2_scores{};
-    const float tolerance = 0.002f * static_cast<float>(std::max(dim, 1));
     for (size_t block = 0; block < n_blocks; ++block) {
         score_turbovec_lut_block(
             lut.data(),
@@ -738,6 +732,9 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim) {
             if (std::isfinite(scalar_score) != std::isfinite(avx2_score)) {
                 return 0;
             }
+            const float tolerance = std::max(
+                1e-4f * std::fabs(scalar_score),
+                1e-4f);
             if (std::isfinite(scalar_score) &&
                 std::fabs(scalar_score - avx2_score) > tolerance) {
                 return 0;
@@ -748,7 +745,7 @@ int turbovec_avx2_lut_block_matches_scalar_for_test(int bits, int dim) {
 #else
     (void) bits;
     (void) dim;
-    return 1;
+    return -1;
 #endif
 }
 #endif
@@ -921,6 +918,11 @@ static int ggml_vec_index_search_impl(
 
         std::vector<ScoreId> heap;
         std::vector<ScoreId> drained;
+        std::vector<float> rotated_query_scratch;
+        std::vector<float> calibrated_query_scratch;
+        std::vector<uint8_t> turbovec_lut_scratch;
+        std::vector<float> turbovec_scores_scratch;
+        std::vector<uint8_t> allowed_blocks_scratch;
         std::vector<float> rotated_turbovec_queries;
         if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
             rotated_turbovec_queries.resize(n_q_sz * dim_sz);
@@ -942,6 +944,11 @@ static int ggml_vec_index_search_impl(
                 max_query,
                 heap,
                 drained,
+                rotated_query_scratch,
+                calibrated_query_scratch,
+                turbovec_lut_scratch,
+                turbovec_scores_scratch,
+                allowed_blocks_scratch,
                 allowed_ptr,
                 rotated_turbovec_queries.empty() ?
                     nullptr :
@@ -1079,6 +1086,20 @@ int ggml_vec_index_search_ivf(
         std::vector<size_t> candidate_slots;
         std::vector<ScoreId> heap;
         std::vector<ScoreId> drained;
+        std::vector<float> rotated_query_scratch;
+        std::vector<float> calibrated_query_scratch;
+        std::vector<uint8_t> turbovec_lut_scratch;
+        std::vector<float> turbovec_scores_scratch;
+        std::vector<uint8_t> allowed_blocks_scratch;
+        std::vector<float> rotated_turbovec_queries;
+        if (is_turbovec_q2(*idx) || is_turbovec_q4(*idx)) {
+            rotated_turbovec_queries.resize(n_q_sz * dim_sz);
+            rotate_turbovec_queries(
+                queries,
+                rotated_turbovec_queries.data(),
+                n_q,
+                dim);
+        }
         centroid_scores.reserve(static_cast<size_t>(std::max(idx->ivf_n_lists, 0)));
         selected_lists.reserve(static_cast<size_t>(probe_count));
         for (int q = 0; q < n_q; ++q) {
@@ -1087,10 +1108,27 @@ int ggml_vec_index_search_ivf(
             uint64_t * ids = out_ids + static_cast<size_t>(q) * k_sz;
             const double max_query = query_max_abs_values.empty() ?
                 0.0 : query_max_abs_values[static_cast<size_t>(q)];
+            const float * pre_rotated_turbovec_query = rotated_turbovec_queries.empty() ?
+                nullptr : rotated_turbovec_queries.data() + static_cast<size_t>(q) * dim_sz;
 
             if (idx->ivf_n_lists == 0) {
                 const std::vector<size_t> empty_slots;
-                search_one(*idx, query, k, scores, ids, max_query, heap, drained, &empty_slots);
+                search_one(
+                    *idx,
+                    query,
+                    k,
+                    scores,
+                    ids,
+                    max_query,
+                    heap,
+                    drained,
+                    rotated_query_scratch,
+                    calibrated_query_scratch,
+                    turbovec_lut_scratch,
+                    turbovec_scores_scratch,
+                    allowed_blocks_scratch,
+                    &empty_slots,
+                    pre_rotated_turbovec_query);
                 continue;
             }
 
@@ -1130,7 +1168,22 @@ int ggml_vec_index_search_ivf(
                 const auto & list = idx->ivf_lists[list_id];
                 candidate_slots.insert(candidate_slots.end(), list.begin(), list.end());
             }
-            search_one(*idx, query, k, scores, ids, max_query, heap, drained, &candidate_slots);
+            search_one(
+                *idx,
+                query,
+                k,
+                scores,
+                ids,
+                max_query,
+                heap,
+                drained,
+                rotated_query_scratch,
+                calibrated_query_scratch,
+                turbovec_lut_scratch,
+                turbovec_scores_scratch,
+                allowed_blocks_scratch,
+                &candidate_slots,
+                pre_rotated_turbovec_query);
         }
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {

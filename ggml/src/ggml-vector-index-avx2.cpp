@@ -90,9 +90,6 @@ double dot_q4_avx2(const float * query, const uint8_t * codes, float scale, int 
     return acc;
 }
 
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((target("avx2,fma")))
-#endif
 void score_turbovec_lut_block_avx2(
         const uint8_t * lut,
         float lut_scale,

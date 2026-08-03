@@ -337,6 +337,8 @@ GGML_API int ggml_vec_index_dim(const ggml_vec_index_t * idx);
 GGML_API int ggml_vec_index_bit_width(const ggml_vec_index_t * idx);
 
 // File format (.tvim versions 2 and 3, all little-endian):
+// "TQ+" here is the TurboVec per-coordinate calibration scheme, unrelated to
+// ggml tensor types GGML_TYPE_TQ1_0 and GGML_TYPE_TQ2_0.
 //
 //   offset  size   field
 //   ------  -----  -------------------------------------------------------
