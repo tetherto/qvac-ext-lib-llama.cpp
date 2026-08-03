@@ -1,5 +1,5 @@
 if (TARGET ggml-vector-index)
-    set(TARGET bench-vector-index)
+    set(TARGET llama-vector-index-bench)
 
     add_executable(${TARGET} bench-vector-index.cpp)
     target_compile_features(${TARGET} PRIVATE cxx_std_17)

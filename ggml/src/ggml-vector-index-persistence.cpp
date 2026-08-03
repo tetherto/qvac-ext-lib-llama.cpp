@@ -62,6 +62,7 @@ MappedFile::~MappedFile() {
 std::atomic<int64_t> g_test_oom_countdown{ -1 };
 std::atomic<int64_t> g_test_write_fail_after{ -1 };
 std::atomic<bool> g_test_truncate_fail{ false };
+std::atomic<bool> g_test_data_fsync_fail{ false };
 std::atomic<bool> g_test_parent_fsync_fail{ false };
 std::atomic<int64_t> g_test_parent_fsync_fail_after{ -1 };
 std::atomic<int> g_test_delta_append_wait_target{ 0 };
@@ -553,6 +554,11 @@ static bool flush_and_sync(std::FILE * stream) {
     if (std::fflush(stream) != 0) {
         return false;
     }
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    if (g_test_data_fsync_fail.load()) {
+        return false;
+    }
+#endif
 #ifdef _WIN32
     return _commit(_fileno(stream)) == 0;
 #elif defined(__APPLE__)
@@ -620,6 +626,10 @@ void ggml_vec_index_test_set_write_fail_after(int64_t bytes) {
 
 void ggml_vec_index_test_set_truncate_fail(int fail) {
     g_test_truncate_fail.store(fail != 0);
+}
+
+void ggml_vec_index_test_set_data_fsync_fail(int fail) {
+    g_test_data_fsync_fail.store(fail != 0);
 }
 
 void ggml_vec_index_test_set_parent_fsync_fail(int fail) {
@@ -1978,24 +1988,29 @@ static void update_delta_tail_cache(ggml_vec_index &       idx,
                                     uint64_t               tail_crc_offset    = 0,
                                     uint32_t               tail_record_crc    = 0,
                                     const DeltaLogLock *   lock               = nullptr) {
-    std::string path_key;
-    DeltaFileStamp stamp;
-    const bool     have_stamp = lock != nullptr ? lock->data_file_stamp(stamp) : delta_file_stamp(path, stamp);
-    if (!delta_log_path_key(path, path_key) || !have_stamp) {
-        invalidate_delta_tail_cache(idx);
-        return;
-    }
+    try {
+        std::string path_key;
+        DeltaFileStamp stamp;
+        const bool     have_stamp = lock != nullptr ? lock->data_file_stamp(stamp) : delta_file_stamp(path, stamp);
+        if (!delta_log_path_key(path, path_key) || !have_stamp) {
+            invalidate_delta_tail_cache(idx);
+            return;
+        }
 
-    idx.delta_tail_cache.valid = true;
-    idx.delta_tail_cache.path_key = path_key;
-    idx.delta_tail_cache.state_kind = delta_state_kind_cache_value(state_kind);
-    idx.delta_tail_cache.tail_crc = tail_crc;
-    idx.delta_tail_cache.tail_record_crc    = tail_record_crc;
-    idx.delta_tail_cache.tail_wide = tail_wide;
-    idx.delta_tail_cache.tail_record_offset = tail_record_offset;
-    idx.delta_tail_cache.tail_crc_offset    = tail_crc_offset;
-    idx.delta_tail_cache.complete_size = stamp.size;
-    idx.delta_tail_cache.stamp = stamp;
+        test_maybe_throw_bad_alloc();
+        idx.delta_tail_cache.valid = true;
+        idx.delta_tail_cache.path_key = path_key;
+        idx.delta_tail_cache.state_kind = delta_state_kind_cache_value(state_kind);
+        idx.delta_tail_cache.tail_crc = tail_crc;
+        idx.delta_tail_cache.tail_record_crc    = tail_record_crc;
+        idx.delta_tail_cache.tail_wide = tail_wide;
+        idx.delta_tail_cache.tail_record_offset = tail_record_offset;
+        idx.delta_tail_cache.tail_crc_offset    = tail_crc_offset;
+        idx.delta_tail_cache.complete_size = stamp.size;
+        idx.delta_tail_cache.stamp = stamp;
+    } catch (...) {
+        invalidate_delta_tail_cache(idx);
+    }
 }
 
 DeltaLogFormat delta_log_format_for_append(const char * path, const DeltaLogLock * lock) {
@@ -2404,13 +2419,15 @@ DeltaAppendResult append_delta_record_locked(ggml_vec_index &             idx,
     record_crc_offset = record_start + kTvidRecordOffCrc;
     record_crc_value  = crc ^ 0xffffffffu;
 
-    if (!write_bytes(f, record, record_size) || (!payload.empty() && !write_bytes(f, payload.data(), payload.size())) ||
-        !flush_and_sync(f)) {
+    if (!write_bytes(f, record, record_size) || (!payload.empty() && !write_bytes(f, payload.data(), payload.size()))) {
+        return fail_io();
+    }
+    if (!flush_and_sync(f)) {
         return fail_io();
     }
     const int close_result = std::fclose(f);
     f = nullptr;
-    if (close_result != 0 || !fsync_parent_dir(delta_path) || !lock.path_matches_data_file(delta_path)) {
+    if (close_result != 0 || !lock.path_matches_data_file(delta_path)) {
         const bool truncated = lock.truncate_data_file(delta_path, old_size);
         const bool record_complete =
             !truncated && delta_log_ends_at_state(delta_path, idx, state_kind, state_crc, state_wide, &lock);
@@ -2423,11 +2440,28 @@ DeltaAppendResult append_delta_record_locked(ggml_vec_index &             idx,
         return {
             truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_INTERNAL,
             record_complete,
+            true,
+        };
+    }
+    if (!fsync_parent_dir(delta_path)) {
+        const bool truncated = lock.truncate_data_file(delta_path, old_size);
+        const bool record_complete =
+            !truncated && delta_log_ends_at_state(delta_path, idx, state_kind, state_crc, state_wide, &lock);
+        if (record_complete) {
+            update_delta_tail_cache(idx, delta_path, state_kind, state_crc, state_wide, record_start, record_crc_offset,
+                                    record_crc_value, &lock);
+        } else if (truncated) {
+            invalidate_delta_tail_cache(idx);
+        }
+        return {
+            truncated ? GGML_VEC_INDEX_E_IO : GGML_VEC_INDEX_E_NOT_DURABLE,
+            record_complete,
+            true,
         };
     }
     update_delta_tail_cache(idx, delta_path, state_kind, state_crc, state_wide, record_start, record_crc_offset,
                             record_crc_value, &lock);
-    return { GGML_VEC_INDEX_OK, true };
+    return { GGML_VEC_INDEX_OK, true, true };
 }
 
 static int write_empty_delta_log_unlocked(

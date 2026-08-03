@@ -249,6 +249,7 @@ enum class DeltaLogFormat {
 struct DeltaAppendResult {
     int status = GGML_VEC_INDEX_OK;
     bool record_complete = false;
+    bool data_synced = false;
 };
 
 class DeltaLogLock {
@@ -302,6 +303,7 @@ extern "C" {
 void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void    ggml_vec_index_test_set_truncate_fail(int fail);
+void    ggml_vec_index_test_set_data_fsync_fail(int fail);
 void    ggml_vec_index_test_set_parent_fsync_fail(int fail);
 void    ggml_vec_index_test_set_parent_fsync_fail_after(int64_t count);
 void    ggml_vec_index_test_set_delta_append_wait_target(int target);
