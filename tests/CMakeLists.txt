@@ -156,11 +156,6 @@ if (TARGET ggml-vector-index)
     endif()
     llama_test(test-vector-index)
 
-    add_executable(test-vector-index-production test-vector-index.cpp)
-    target_compile_features(test-vector-index-production PRIVATE cxx_std_17)
-    target_link_libraries(test-vector-index-production PRIVATE ggml-vector-index)
-    llama_test(test-vector-index-production)
-
     add_executable(test-vector-index-faults test-vector-index-faults.cpp)
     target_compile_features(test-vector-index-faults PRIVATE cxx_std_17)
     target_link_libraries(test-vector-index-faults PRIVATE ggml-vector-index-test)

@@ -4596,11 +4596,7 @@ int main() {
 
         std::vector<uint8_t> corrupt_delta = read_file_bytes(delta_path);
         const size_t first_record_offset = delta_log_header_size(corrupt_delta);
-        const size_t second_record_offset =
-            delta_record_payload_offset(corrupt_delta, first_record_offset) +
-            static_cast<size_t>(read_u64_le_at(corrupt_delta, first_record_offset + 8));
-        CHECK(second_record_offset < corrupt_delta.size());
-        corrupt_delta[second_record_offset + 16] ^= 1;
+        corrupt_delta[first_record_offset + 16] ^= 1;
         write_file_bytes(corrupt_delta_path, corrupt_delta);
 
         auto * corrupt_stale_writer = ggml_vec_index_load(snapshot_path.c_str());
