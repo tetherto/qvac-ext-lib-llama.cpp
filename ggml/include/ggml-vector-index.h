@@ -51,6 +51,7 @@ enum ggml_vec_index_error {
     GGML_VEC_INDEX_E_OOM         = -4,
     GGML_VEC_INDEX_E_INTERNAL    = -5,
     GGML_VEC_INDEX_E_NOT_FOUND   = -6,
+    GGML_VEC_INDEX_E_NOT_DURABLE = -10,
 };
 
 // Lifecycle.
@@ -109,8 +110,10 @@ GGML_API int ggml_vec_index_search(const ggml_vec_index_t * idx,
                                    uint64_t *               out_ids);
 
 // Persistence. Format is .tvim version 1; see bottom of this header. Write
-// replaces `path` through a same-directory temporary file so a failed write
-// does not truncate an existing snapshot.
+// replaces `path` through a same-directory temporary file so a pre-rename
+// failure does not truncate an existing snapshot. Returns
+// GGML_VEC_INDEX_E_NOT_DURABLE if the replacement is visible but syncing its
+// parent directory fails.
 GGML_API int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path);
 
 // Returns NULL on I/O, format, or validation failure. Detailed load errors are

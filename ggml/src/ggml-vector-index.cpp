@@ -177,15 +177,48 @@ struct file_closer {
     }
 };
 
-bool replace_file(const std::filesystem::path & tmp_path, const std::filesystem::path & dst_path) {
+#ifndef _WIN32
+bool sync_parent_directory(const std::filesystem::path & path) {
+    std::filesystem::path dir_path = path.parent_path();
+    if (dir_path.empty()) {
+        dir_path = ".";
+    }
+
+#ifdef O_DIRECTORY
+    const int fd = open(dir_path.c_str(), O_RDONLY | O_DIRECTORY);
+#else
+    const int fd = open(dir_path.c_str(), O_RDONLY);
+#endif
+    if (fd == -1) {
+        return false;
+    }
+
+    const bool sync_ok = fsync(fd) == 0;
+    close(fd);
+    return sync_ok;
+}
+#endif
+
+enum class replace_result {
+    success,
+    failure,
+    not_durable,
+};
+
+replace_result replace_file(const std::filesystem::path & tmp_path, const std::filesystem::path & dst_path) {
 #ifdef _WIN32
     const std::wstring tmp_native = tmp_path.wstring();
     const std::wstring dst_native = dst_path.wstring();
-    return MoveFileExW(tmp_native.c_str(), dst_native.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    return MoveFileExW(tmp_native.c_str(), dst_native.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0
+               ? replace_result::success
+               : replace_result::failure;
 #else
     std::error_code ec;
     std::filesystem::rename(tmp_path, dst_path, ec);
-    return !ec;
+    if (ec) {
+        return replace_result::failure;
+    }
+    return sync_parent_directory(dst_path) ? replace_result::success : replace_result::not_durable;
 #endif
 }
 
@@ -815,6 +848,9 @@ int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path) {
         if (!set_snapshot_permissions(f.get(), dst_path)) {
             return fail_io();
         }
+        if (fsync(fileno(f.get())) != 0) {
+            return fail_io();
+        }
 #endif
         std::FILE * raw_file = f.release();
         if (std::fclose(raw_file) != 0) {
@@ -827,10 +863,14 @@ int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path) {
         }
 #endif
 
-        if (!replace_file(tmp_path, dst_path)) {
+        const replace_result replace_status = replace_file(tmp_path, dst_path);
+        if (replace_status == replace_result::failure) {
             return GGML_VEC_INDEX_E_IO;
         }
         tmp_guard.dismiss();
+        if (replace_status == replace_result::not_durable) {
+            return GGML_VEC_INDEX_E_NOT_DURABLE;
+        }
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
