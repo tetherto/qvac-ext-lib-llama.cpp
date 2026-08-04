@@ -12,7 +12,7 @@ extern "C" {
 // major version offset (+100) from upstream's so mismatched peers are
 // rejected at the HELLO handshake instead of misdecoding graphs. The
 // HELLO fields are uint8_t on the wire, so the value must stay <= 255.
-#define RPC_PROTO_MAJOR_VERSION    105
+#define RPC_PROTO_MAJOR_VERSION    106
 #define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    0
 
