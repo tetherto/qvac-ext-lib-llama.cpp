@@ -42,15 +42,6 @@ bool is_valid_id(uint64_t id) {
     return id != UINT64_MAX;
 }
 
-bool all_finite(const float * values, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(values[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
 uint32_t float_to_u32(float value) {
     uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
