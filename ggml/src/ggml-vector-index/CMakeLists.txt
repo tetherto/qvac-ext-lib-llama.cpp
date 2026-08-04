@@ -83,6 +83,21 @@ set_target_properties(ggml-vector-index PROPERTIES
 
 target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)
 
+set(GGML_VECTOR_INDEX_PC_MATH_LIBS "")
+if (DEFINED MATH_LIBRARY)
+    target_link_libraries(ggml-vector-index PRIVATE ${MATH_LIBRARY})
+    foreach(lib IN LISTS MATH_LIBRARY)
+        if (lib MATCHES "^-" OR IS_ABSOLUTE "${lib}")
+            list(APPEND GGML_VECTOR_INDEX_PC_MATH_LIBS "${lib}")
+        else()
+            list(APPEND GGML_VECTOR_INDEX_PC_MATH_LIBS "-l${lib}")
+        endif()
+    endforeach()
+elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
+    target_link_libraries(ggml-vector-index PRIVATE m)
+    list(APPEND GGML_VECTOR_INDEX_PC_MATH_LIBS "-lm")
+endif()
+
 if (LLAMA_BUILD_TESTS)
     target_compile_definitions(ggml-vector-index PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
 endif()
@@ -98,6 +113,9 @@ foreach(lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
         list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "-l${lib}")
     endif()
 endforeach()
+if (GGML_VECTOR_INDEX_PC_MATH_LIBS)
+    list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST ${GGML_VECTOR_INDEX_PC_MATH_LIBS})
+endif()
 string(JOIN " " GGML_VECTOR_INDEX_PRIVATE_LIBS ${GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST})
 
 configure_file(
