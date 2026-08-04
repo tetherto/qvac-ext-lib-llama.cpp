@@ -4402,6 +4402,9 @@ int ggml_vec_index_compact_delta(ggml_vec_index_t * idx, const char * snapshot_p
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        if (idx->delta_log_reload_required) {
+            return GGML_VEC_INDEX_E_IO;
+        }
         if (idx->read_only_mmap) {
             rebuild_state_hash(*idx);
             if (!idx->mapped_source_path.empty() &&
