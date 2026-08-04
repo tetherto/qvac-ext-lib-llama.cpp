@@ -47,7 +47,7 @@ size_t vector_bytes(const ggml_vec_index & idx) {
     return n * dim_sz * sizeof(float);
 }
 
-size_t grow_capacity(size_t current, size_t required, size_t max_capacity) {
+static size_t grow_capacity(size_t current, size_t required, size_t max_capacity) {
     if (current >= required) {
         return current;
     }
@@ -59,7 +59,7 @@ size_t grow_capacity(size_t current, size_t required, size_t max_capacity) {
     return std::min(grown, max_capacity);
 }
 
-bool can_insert_without_rehash(const std::unordered_map<uint64_t, size_t> & map, size_t n) {
+static bool can_insert_without_rehash(const std::unordered_map<uint64_t, size_t> & map, size_t n) {
     const long double bucket_capacity =
         static_cast<long double>(map.bucket_count()) * static_cast<long double>(map.max_load_factor());
     return static_cast<long double>(n) <= bucket_capacity;
