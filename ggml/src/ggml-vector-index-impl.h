@@ -189,6 +189,7 @@ struct ggml_vec_index {
     bool           read_only_mmap          = false;
     bool           delta_log_start_allowed = false;
     bool           delta_log_bound         = false;
+    bool           delta_log_reload_required = false;
     std::string bound_delta_log_path_key;
     bool delta_log_rebase_pending = false;
     uint32_t delta_log_rebase_crc = 0;
