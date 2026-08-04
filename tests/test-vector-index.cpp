@@ -40,7 +40,22 @@
 #endif
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
-extern "C" void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
+extern "C" {
+void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
+void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
+void    ggml_vec_index_test_set_parent_fsync_fail(int fail);
+void    ggml_vec_index_test_set_parent_fsync_fail_after(int64_t count);
+void    ggml_vec_index_test_set_load_with_delta_block(int block);
+int     ggml_vec_index_test_get_load_with_delta_waiters(void);
+void    ggml_vec_index_test_reset_state_crc_scan_count(void);
+int64_t ggml_vec_index_test_get_state_crc_scan_count(void);
+void    ggml_vec_index_test_reset_delta_max_read_size(void);
+size_t  ggml_vec_index_test_get_delta_max_read_size(void);
+void    ggml_vec_index_test_reset_mmap_count_reject_count(void);
+int64_t ggml_vec_index_test_get_mmap_count_reject_count(void);
+void    ggml_vec_index_test_reset_load_count_reject_count(void);
+int64_t ggml_vec_index_test_get_load_count_reject_count(void);
+}
 uint64_t turbovec_rotation_hash_for_test(int dim);
 size_t turbovec_rotation_cache_bytes_for_test(void);
 uint64_t turbovec_query_rotation_hash_for_test(
@@ -1850,6 +1865,872 @@ void expect_corrupt_load_fails(
     ggml_vec_index_free(bad);
     std::filesystem::remove(corrupt_path);
 }
+
+struct temp_file {
+    explicit temp_file(const char * suffix) {
+        static uint64_t counter = 0;
+        path = std::filesystem::temp_directory_path() /
+            ("ggml-vector-index-pr2d-" + std::to_string(counter++) + suffix);
+        std::filesystem::remove(path);
+    }
+
+    ~temp_file() { std::filesystem::remove(path); }
+
+    std::filesystem::path path;
+};
+
+void write_bytes(const std::filesystem::path & path, const std::vector<uint8_t> & bytes) {
+    write_file_bytes(path.string(), bytes);
+}
+
+std::vector<uint8_t> read_bytes(const std::filesystem::path & path) {
+    return read_file_bytes(path.string());
+}
+
+void write_sparse_bytes(const std::filesystem::path & path, const std::vector<uint8_t> & prefix, uint64_t size) {
+    CHECK(size >= prefix.size());
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    CHECK(f.is_open());
+    if (!prefix.empty()) {
+        f.write(reinterpret_cast<const char *>(prefix.data()), static_cast<std::streamsize>(prefix.size()));
+    }
+    if (size > prefix.size()) {
+        f.seekp(static_cast<std::streamoff>(size - 1));
+        const char zero = 0;
+        f.write(&zero, 1);
+    }
+    CHECK(static_cast<bool>(f));
+}
+
+void put_u32_le(std::vector<uint8_t> & bytes, size_t offset, uint32_t value) {
+    write_u32_le_at(bytes, offset, value);
+}
+
+uint32_t crc32c_u32(uint32_t crc, uint32_t value) {
+    return crc32c_update_u32(crc, value);
+}
+
+uint32_t crc32c_u64(uint32_t crc, uint64_t value) {
+    return crc32c_update_u64(crc, value);
+}
+
+uint32_t f32_state_crc(int dim, const std::vector<float> & vectors, const std::vector<uint64_t> & ids) {
+    return legacy_state_crc32c_f32(dim, vectors, ids);
+}
+
+uint32_t f32_state_token(const std::vector<float> & vectors, const std::vector<uint64_t> & ids, int dim) {
+    return f32_state_token_for(dim, vectors, ids);
+}
+
+uint64_t encoded_slot_state_hash(uint64_t id, float scale, const std::vector<uint8_t> & codes) {
+    uint32_t crc0 = 0xffffffffu;
+    uint32_t crc1 = 0x82f63b78u;
+    crc0 = crc32c_update_u64(crc0, id);
+    crc1 = crc32c_update_u64(crc1, id ^ 0xa5a5a5a5a5a5a5a5ull);
+    const uint32_t scale_bits = float_bits(scale);
+    crc0 = crc32c_update_u32(crc0, scale_bits);
+    crc1 = crc32c_update_u32(crc1, scale_bits ^ 0xa5a5a5a5u);
+    crc0 = crc32c_update(crc0, codes.data(), codes.size());
+    crc1 = crc32c_update(crc1, codes.data(), codes.size());
+    return (static_cast<uint64_t>(crc0 ^ 0xffffffffu) << 32) |
+        static_cast<uint64_t>(crc1 ^ 0xffffffffu);
+}
+
+std::array<uint64_t, 4> wide_state_from_hashes(std::initializer_list<uint64_t> hashes) {
+    uint64_t hash_xor = 0;
+    uint64_t hash_sum = 0;
+    uint64_t hash_sum_rot = 0;
+    for (uint64_t hash : hashes) {
+        hash_xor ^= hash;
+        hash_sum += hash;
+        hash_sum_rot += rotl64(hash, 17);
+    }
+    return { static_cast<uint64_t>(hashes.size()), hash_xor, hash_sum, hash_sum_rot };
+}
+
+uint32_t encoded_state_token(const std::array<uint64_t, 4> & state, int dim, int bit_width) {
+    uint32_t crc = 0xffffffffu;
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(dim));
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(bit_width));
+    crc = crc32c_update_u32(crc, bit_width == 4 ? 3u : 2u);
+    for (uint64_t value : state) {
+        crc = crc32c_update_u64(crc, value);
+    }
+    return crc ^ 0xffffffffu;
+}
+
+uint32_t encoded_state_crc(
+        int dim,
+        int bit_width,
+        const std::vector<float> & scales,
+        const std::vector<std::vector<uint8_t>> & rows,
+        const std::vector<uint64_t> & ids) {
+    CHECK(scales.size() == rows.size());
+    CHECK(rows.size() == ids.size());
+    uint32_t crc = 0xffffffffu;
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(dim));
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(bit_width));
+    crc = crc32c_update_u32(crc, bit_width == 4 ? 3u : 2u);
+    crc = crc32c_update_u64(crc, static_cast<uint64_t>(ids.size()));
+    for (float scale : scales) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &scale, sizeof(bits));
+        crc = crc32c_update_u32(crc, bits);
+    }
+    for (const auto & row : rows) {
+        crc = crc32c_update(crc, row.data(), row.size());
+    }
+    for (uint64_t id : ids) {
+        crc = crc32c_update_u64(crc, id);
+    }
+    return crc ^ 0xffffffffu;
+}
+
+std::array<uint64_t, 4> f32_wide_state(
+        const std::vector<float> & vectors,
+        const std::vector<uint64_t> & ids,
+        int dim) {
+    CHECK(vectors.size() == ids.size() * static_cast<size_t>(dim));
+    uint64_t hash_xor = 0;
+    uint64_t hash_sum = 0;
+    uint64_t hash_sum_rot = 0;
+    const size_t dim_sz = static_cast<size_t>(dim);
+    for (size_t row = 0; row < ids.size(); ++row) {
+        const std::vector<float> vector(
+            vectors.begin() + static_cast<std::ptrdiff_t>(row * dim_sz),
+            vectors.begin() + static_cast<std::ptrdiff_t>((row + 1) * dim_sz));
+        const uint64_t hash = slot_state_hash_f32(ids[row], vector);
+        hash_xor ^= hash;
+        hash_sum += hash;
+        hash_sum_rot += rotl64(hash, 17);
+    }
+    return { static_cast<uint64_t>(ids.size()), hash_xor, hash_sum, hash_sum_rot };
+}
+
+void append_wide_state(std::vector<uint8_t> & bytes, const std::array<uint64_t, 4> & state) {
+    for (uint64_t value : state) {
+        append_u64_le(bytes, value);
+    }
+}
+
+void append_v1_delta_record(
+        std::vector<uint8_t> & bytes,
+        uint8_t op,
+        uint32_t n,
+        const std::vector<uint8_t> & payload,
+        uint32_t post_state) {
+    const size_t record_offset = bytes.size();
+    bytes.push_back(op);
+    bytes.insert(bytes.end(), { 0, 0, 0 });
+    append_u32_le(bytes, n);
+    append_u64_le(bytes, payload.size());
+    append_u32_le(bytes, 0);
+    append_u32_le(bytes, post_state);
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    refresh_delta_record_crc(bytes, record_offset);
+}
+
+void append_v4_delta_record(
+        std::vector<uint8_t> & bytes,
+        uint8_t op,
+        uint32_t n,
+        const std::vector<uint8_t> & payload,
+        const std::array<uint64_t, 4> & post_state) {
+    const size_t record_offset = bytes.size();
+    bytes.push_back(op);
+    bytes.insert(bytes.end(), { 0, 0, 0 });
+    append_u32_le(bytes, n);
+    append_u64_le(bytes, payload.size());
+    append_u32_le(bytes, 0);
+    append_u32_le(bytes, 0);
+    append_wide_state(bytes, post_state);
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    refresh_delta_record_crc(bytes, record_offset);
+}
+
+void check_committed_delta_replay() {
+    const std::vector<float> base_vector = {
+        1.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+    };
+    const std::vector<float> added_vector = {
+        0.0f,
+        1.0f,
+        0.0f,
+        0.0f,
+    };
+    const uint64_t base_id  = 9251ULL;
+    const uint64_t added_id = 9252ULL;
+
+    temp_file snapshot(".tvim");
+    auto *    base = ggml_vec_index_create(kDim, /*bit_width=*/32);
+    CHECK(base != nullptr);
+    CHECK(ggml_vec_index_add(base, base_vector.data(), 1, &base_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(base, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(base);
+
+    const std::vector<float> after_add_vectors = {
+        1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+    };
+    const std::vector<uint64_t> after_add_ids        = { base_id, added_id };
+    const std::vector<float>    after_remove_vectors = added_vector;
+    const std::vector<uint64_t> after_remove_ids     = { added_id };
+
+    std::vector<uint8_t> add_payload;
+    append_u64_le(add_payload, added_id);
+    for (float value : added_vector) {
+        append_f32_le(add_payload, value);
+    }
+    std::vector<uint8_t> remove_payload;
+    append_u64_le(remove_payload, base_id);
+
+    for (int version : { 1, 2, 3, 4 }) {
+        std::vector<uint8_t> log = { 'T', 'V', 'D', 'L', static_cast<uint8_t>(version), 32, 0, 0 };
+        append_u32_le(log, kDim);
+        if (version != 4) {
+            const auto state_value = [&](const std::vector<float> & vectors, const std::vector<uint64_t> & ids) {
+                return version == 1 ? f32_state_crc(kDim, vectors, ids) : f32_state_token(vectors, ids, kDim);
+            };
+            append_u32_le(log, state_value(base_vector, { base_id }));
+            append_v1_delta_record(log,
+                                   /*op=*/1,
+                                   /*n=*/1, add_payload, state_value(after_add_vectors, after_add_ids));
+            append_v1_delta_record(log,
+                                   /*op=*/2,
+                                   /*n=*/1, remove_payload, state_value(after_remove_vectors, after_remove_ids));
+        } else {
+            append_u32_le(log, 0);
+            append_wide_state(log, f32_wide_state(base_vector, { base_id }, kDim));
+            append_v4_delta_record(log,
+                                   /*op=*/1,
+                                   /*n=*/1, add_payload, f32_wide_state(after_add_vectors, after_add_ids, kDim));
+            append_v4_delta_record(log,
+                                   /*op=*/2,
+                                   /*n=*/1, remove_payload,
+                                   f32_wide_state(after_remove_vectors, after_remove_ids, kDim));
+        }
+
+        temp_file delta(".tvid");
+        write_bytes(delta.path, log);
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        if (version == 1) {
+            ggml_vec_index_test_reset_state_crc_scan_count();
+        }
+#endif
+        ggml_vec_index_t * loaded = nullptr;
+        const int load_status =
+            ggml_vec_index_load_with_delta_ex(snapshot.path.string().c_str(), delta.path.string().c_str(), &loaded);
+        if (load_status != GGML_VEC_INDEX_OK) {
+            std::fprintf(stderr, "FAIL committed delta replay v%d status=%d\n", version, load_status);
+        }
+        CHECK(load_status == GGML_VEC_INDEX_OK);
+        CHECK(loaded != nullptr);
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        if (version == 1) {
+            CHECK(ggml_vec_index_test_get_state_crc_scan_count() == 2);
+        }
+#endif
+        CHECK(ggml_vec_index_len(loaded) == 1);
+        CHECK(ggml_vec_index_contains(loaded, base_id) == 0);
+        CHECK(ggml_vec_index_contains(loaded, added_id) == 1);
+        std::array<float, 1>    scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(loaded, added_vector.data(), 1, 1, scores.data(), out_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == added_id);
+        ggml_vec_index_free(loaded);
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+        if (version == 4) {
+            temp_file race_delta(".tvid");
+            write_bytes(race_delta.path, log);
+            const std::filesystem::path moved_path = race_delta.path.string() + ".moved";
+            ggml_vec_index_t *          raced      = nullptr;
+            ggml_vec_index_test_set_load_with_delta_block(1);
+            std::thread loader([&]() {
+                raced =
+                    ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), race_delta.path.string().c_str());
+            });
+            const auto  deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (ggml_vec_index_test_get_load_with_delta_waiters() == 0 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            if (ggml_vec_index_test_get_load_with_delta_waiters() == 0) {
+                ggml_vec_index_test_set_load_with_delta_block(0);
+                loader.join();
+                CHECK(false);
+            }
+            std::filesystem::rename(race_delta.path, moved_path);
+            write_bytes(race_delta.path, { 'T', 'V', 'D', 'L' });
+            ggml_vec_index_test_set_load_with_delta_block(0);
+            loader.join();
+            CHECK(raced == nullptr);
+            std::error_code ec;
+            std::filesystem::remove(moved_path, ec);
+        }
+#endif
+    }
+}
+
+void check_quantized_committed_delta_replay(int bit_width) {
+    const std::array<float, kDim> base_vector = {
+        1.0f,
+        0.25f,
+        -0.5f,
+        0.75f,
+    };
+    std::array<float, kDim> added_vector = {
+        -0.25f,
+        1.0f,
+        0.5f,
+        -0.75f,
+    };
+    if (bit_width == 8) {
+        added_vector = {
+            FLT_MAX,
+            0.0f,
+            0.0f,
+            0.0f,
+        };
+    }
+    const uint64_t base_id  = 9271ULL + static_cast<uint64_t>(bit_width);
+    const uint64_t added_id = 9281ULL + static_cast<uint64_t>(bit_width);
+
+    temp_file snapshot(".tvim");
+    auto *    base = ggml_vec_index_create(kDim, bit_width);
+    CHECK(base != nullptr);
+    CHECK(ggml_vec_index_add(base, base_vector.data(), 1, &base_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(base, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(base);
+
+    temp_file added_snapshot(".tvim");
+    auto *    added = ggml_vec_index_create(kDim, bit_width);
+    CHECK(added != nullptr);
+    CHECK(ggml_vec_index_add(added, added_vector.data(), 1, &added_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(added, added_snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(added);
+
+    struct encoded_row {
+        float                scale = 0.0f;
+        std::vector<uint8_t> codes;
+    };
+
+    const auto read_row = [&](const std::filesystem::path & path) {
+        const std::vector<uint8_t> bytes     = read_bytes(path);
+        const size_t               row_bytes = bit_width == 4 ? (static_cast<size_t>(kDim) + 1) / 2 : kDim;
+        CHECK(bytes.size() >= 36 + row_bytes);
+        uint32_t scale_bits = 0;
+        for (int i = 0; i < 4; ++i) {
+            scale_bits |= static_cast<uint32_t>(bytes[32 + static_cast<size_t>(i)]) << (8 * i);
+        }
+        encoded_row row;
+        std::memcpy(&row.scale, &scale_bits, sizeof(row.scale));
+        row.codes.assign(bytes.begin() + 36, bytes.begin() + static_cast<std::ptrdiff_t>(36 + row_bytes));
+        return row;
+    };
+    const encoded_row base_row    = read_row(snapshot.path);
+    const encoded_row added_row   = read_row(added_snapshot.path);
+    const uint64_t    base_hash   = encoded_slot_state_hash(base_id, base_row.scale, base_row.codes);
+    const uint64_t    added_hash  = encoded_slot_state_hash(added_id, added_row.scale, added_row.codes);
+    const auto        base_wide   = wide_state_from_hashes({ base_hash });
+    const auto        add_wide    = wide_state_from_hashes({ base_hash, added_hash });
+    const auto        remove_wide = wide_state_from_hashes({ added_hash });
+    const auto        state_token = [&](const std::array<uint64_t, 4> & state) {
+        uint32_t crc = 0xffffffffu;
+        crc          = crc32c_u32(crc, kDim);
+        crc          = crc32c_u32(crc, static_cast<uint32_t>(bit_width));
+        crc          = crc32c_u32(crc, bit_width == 4 ? 3 : 2);
+        for (uint64_t value : state) {
+            crc = crc32c_u64(crc, value);
+        }
+        return crc ^ 0xffffffffu;
+    };
+    const auto state_crc = [&](const std::vector<const encoded_row *> & rows, const std::vector<uint64_t> & ids) {
+        CHECK(rows.size() == ids.size());
+        uint32_t crc = 0xffffffffu;
+        crc          = crc32c_u32(crc, kDim);
+        crc          = crc32c_u32(crc, static_cast<uint32_t>(bit_width));
+        crc          = crc32c_u32(crc, bit_width == 4 ? 3 : 2);
+        crc          = crc32c_u64(crc, rows.size());
+        for (const encoded_row * row : rows) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &row->scale, sizeof(bits));
+            crc = crc32c_u32(crc, bits);
+        }
+        for (const encoded_row * row : rows) {
+            crc = crc32c_update(crc, row->codes.data(), row->codes.size());
+        }
+        for (uint64_t id : ids) {
+            crc = crc32c_u64(crc, id);
+        }
+        return crc ^ 0xffffffffu;
+    };
+    const uint32_t base_crc   = state_crc({ &base_row }, { base_id });
+    const uint32_t add_crc    = state_crc({ &base_row, &added_row }, { base_id, added_id });
+    const uint32_t remove_crc = state_crc({ &added_row }, { added_id });
+
+    for (int version : { 1, 2, 3, 4 }) {
+        std::vector<uint8_t> log = {
+            'T', 'V', 'D', 'L', static_cast<uint8_t>(version), static_cast<uint8_t>(bit_width), 0, 0,
+        };
+        append_u32_le(log, kDim);
+        if (version == 4) {
+            append_u32_le(log, 0);
+            append_wide_state(log, base_wide);
+        } else {
+            append_u32_le(log, version == 1 ? base_crc : state_token(base_wide));
+        }
+
+        std::vector<uint8_t> add_payload;
+        append_u64_le(add_payload, added_id);
+        if (version <= 2) {
+            for (float value : added_vector) {
+                append_f32_le(add_payload, value);
+            }
+        } else {
+            append_f32_le(add_payload, added_row.scale);
+            add_payload.insert(add_payload.end(), added_row.codes.begin(), added_row.codes.end());
+        }
+        std::vector<uint8_t> remove_payload;
+        append_u64_le(remove_payload, base_id);
+        if (version == 4) {
+            append_v4_delta_record(log,
+                                   /*op=*/1,
+                                   /*n=*/1, add_payload, add_wide);
+            append_v4_delta_record(log,
+                                   /*op=*/2,
+                                   /*n=*/1, remove_payload, remove_wide);
+        } else {
+            append_v1_delta_record(log,
+                                   /*op=*/1,
+                                   /*n=*/1, add_payload, version == 1 ? add_crc : state_token(add_wide));
+            append_v1_delta_record(log,
+                                   /*op=*/2,
+                                   /*n=*/1, remove_payload, version == 1 ? remove_crc : state_token(remove_wide));
+        }
+
+        temp_file delta(".tvid");
+        write_bytes(delta.path, log);
+        auto * loaded = ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_len(loaded) == 1);
+        CHECK(ggml_vec_index_contains(loaded, base_id) == 0);
+        CHECK(ggml_vec_index_contains(loaded, added_id) == 1);
+        std::array<float, 1>    scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(loaded, added_vector.data(), 1, 1, scores.data(), out_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == added_id);
+        ggml_vec_index_free(loaded);
+    }
+}
+
+void check_delta_log_rejects_oversized_payload_header() {
+    const std::array<float, kDim> base_vec = {
+        1.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+    };
+    const uint64_t base_id = 9351ULL;
+
+    temp_file snapshot(".tvim");
+    temp_file delta(".tvid");
+    auto *    base = ggml_vec_index_create(kDim, /*bit_width=*/32);
+    CHECK(base != nullptr);
+    CHECK(ggml_vec_index_add(base, base_vec.data(), 1, &base_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(base, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+
+    std::vector<uint8_t> log = { 'T', 'V', 'D', 'L', 4, 32, 0, 0 };
+    append_u32_le(log, kDim);
+    append_u32_le(log, 0);
+    append_wide_state(log, f32_wide_state(std::vector<float>(base_vec.begin(), base_vec.end()), { base_id }, kDim));
+
+    constexpr uint64_t oversized_payload = 1ull << 20;
+    const size_t       record_offset      = log.size();
+    log.insert(log.end(), { 1, 0, 0, 0 });
+    append_u32_le(log, 1);
+    append_u64_le(log, oversized_payload);
+    append_u32_le(log, 0);
+    append_u32_le(log, 0);
+    append_wide_state(log, f32_wide_state(std::vector<float>(base_vec.begin(), base_vec.end()), { base_id }, kDim));
+    uint32_t crc = crc32c_update(0xffffffffu, log.data() + record_offset, 16);
+    crc          = crc32c_update(crc, log.data() + record_offset + 24, 32);
+    std::array<uint8_t, 64 * 1024> zeros{};
+    for (uint64_t offset = 0; offset < oversized_payload; offset += zeros.size()) {
+        const size_t chunk = static_cast<size_t>(std::min<uint64_t>(zeros.size(), oversized_payload - offset));
+        crc = crc32c_update(crc, zeros.data(), chunk);
+    }
+    put_u32_le(log, record_offset + 16, crc ^ 0xffffffffu);
+    write_sparse_bytes(delta.path, log, log.size() + oversized_payload);
+
+    CHECK(ggml_vec_index_compact_delta(base, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
+          GGML_VEC_INDEX_E_IO);
+    ggml_vec_index_free(base);
+    CHECK(ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str()) == nullptr);
+
+    std::error_code       ec;
+    std::filesystem::path lock_path = delta.path;
+    lock_path += ".lock";
+    std::filesystem::remove(lock_path, ec);
+}
+
+void check_delta_log_corrupt_final_header_recovery() {
+    const std::array<float, kDim> base_vec = {
+        1.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+    };
+    const std::array<float, kDim> added_vec = {
+        0.0f,
+        1.0f,
+        0.0f,
+        0.0f,
+    };
+    const uint64_t base_id  = 9361ULL;
+    const uint64_t added_id = 9362ULL;
+
+    temp_file snapshot(".tvim");
+    temp_file delta(".tvid");
+    auto *    base = ggml_vec_index_create(kDim, /*bit_width=*/32);
+    CHECK(base != nullptr);
+    CHECK(ggml_vec_index_add(base, base_vec.data(), 1, &base_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(base, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+
+    std::vector<uint8_t> payload;
+    append_u64_le(payload, added_id);
+    for (float value : added_vec) {
+        append_f32_le(payload, value);
+    }
+    std::vector<float> after_vectors(base_vec.begin(), base_vec.end());
+    after_vectors.insert(after_vectors.end(), added_vec.begin(), added_vec.end());
+    const std::vector<uint64_t> after_ids = { base_id, added_id };
+    std::vector<uint8_t> good = { 'T', 'V', 'D', 'L', 4, 32, 0, 0 };
+    append_u32_le(good, kDim);
+    append_u32_le(good, 0);
+    append_wide_state(good, f32_wide_state(std::vector<float>(base_vec.begin(), base_vec.end()), { base_id }, kDim));
+    const size_t record_offset = good.size();
+    append_v4_delta_record(good, /*op=*/1, /*n=*/1, payload, f32_wide_state(after_vectors, after_ids, kDim));
+
+    for (int field : { 0, 1, 2 }) {
+        std::vector<uint8_t> corrupt = good;
+        if (field == 0) {
+            corrupt[record_offset + 4] ^= 1;
+        } else if (field == 1) {
+            corrupt[record_offset + 8] += 1;
+        } else {
+            corrupt[record_offset + 8] -= 1;
+        }
+        write_bytes(delta.path, corrupt);
+        auto * loaded = ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_len(loaded) == 1);
+        CHECK(ggml_vec_index_contains(loaded, base_id) == 1);
+        CHECK(ggml_vec_index_contains(loaded, added_id) == 0);
+        CHECK(ggml_vec_index_compact_delta(loaded, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
+              GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(loaded);
+    }
+    ggml_vec_index_free(base);
+
+    std::error_code       ec;
+    std::filesystem::path lock_path = delta.path;
+    lock_path += ".lock";
+    std::filesystem::remove(lock_path, ec);
+}
+
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+void check_delta_replay_is_chunked() {
+    constexpr int n = 20000;
+    const std::array<float, kDim> base_vec = {
+        1.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+    };
+    const uint64_t base_id = 9371ULL;
+
+    temp_file snapshot(".tvim");
+    temp_file delta(".tvid");
+    auto *    idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, base_vec.data(), 1, &base_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(idx, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(idx);
+
+    std::vector<float>    vectors(static_cast<size_t>(n) * kDim, 0.0f);
+    std::vector<uint64_t> ids(n);
+    for (int i = 0; i < n; ++i) {
+        vectors[static_cast<size_t>(i) * kDim + static_cast<size_t>(i % kDim)] = 1.0f;
+        ids[static_cast<size_t>(i)] = 100000ULL + static_cast<uint64_t>(i);
+    }
+    std::vector<uint8_t> payload;
+    payload.reserve(ids.size() * sizeof(uint64_t) + vectors.size() * sizeof(uint32_t));
+    for (uint64_t id : ids) {
+        append_u64_le(payload, id);
+    }
+    for (float value : vectors) {
+        append_f32_le(payload, value);
+    }
+    std::vector<float> all_vectors(base_vec.begin(), base_vec.end());
+    all_vectors.insert(all_vectors.end(), vectors.begin(), vectors.end());
+    std::vector<uint64_t> all_ids = { base_id };
+    all_ids.insert(all_ids.end(), ids.begin(), ids.end());
+    std::vector<uint8_t> log = { 'T', 'V', 'D', 'L', 4, 32, 0, 0 };
+    append_u32_le(log, kDim);
+    append_u32_le(log, 0);
+    append_wide_state(log, f32_wide_state(std::vector<float>(base_vec.begin(), base_vec.end()), { base_id }, kDim));
+    append_v4_delta_record(log, /*op=*/1, static_cast<uint32_t>(n), payload,
+                           f32_wide_state(all_vectors, all_ids, kDim));
+    write_bytes(delta.path, log);
+
+    for (int64_t countdown : { int64_t{ 1 }, int64_t{ 2 } }) {
+        ggml_vec_index_test_set_oom_countdown(countdown);
+        ggml_vec_index_t * failed = nullptr;
+        const int status =
+            ggml_vec_index_load_with_delta_ex(snapshot.path.string().c_str(), delta.path.string().c_str(), &failed);
+        ggml_vec_index_test_set_oom_countdown(-1);
+        CHECK(status == GGML_VEC_INDEX_E_OOM);
+        CHECK(failed == nullptr);
+    }
+
+    ggml_vec_index_test_reset_delta_max_read_size();
+    auto * loaded = ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+    CHECK(loaded != nullptr);
+    CHECK(ggml_vec_index_len(loaded) == n + 1);
+    CHECK(ggml_vec_index_test_get_delta_max_read_size() <= 64 * 1024);
+    ggml_vec_index_free(loaded);
+
+    std::error_code       ec;
+    std::filesystem::path lock_path = delta.path;
+    lock_path += ".lock";
+    std::filesystem::remove(lock_path, ec);
+}
+
+void check_large_row_delta_replay_is_chunked() {
+    {
+        constexpr int dim = 20000;
+        const uint64_t id = 9381ULL;
+        std::vector<float> vector(dim, 0.0f);
+        vector[0] = 1.0f;
+
+        temp_file snapshot(".tvim");
+        temp_file delta(".tvid");
+        auto *    idx = ggml_vec_index_create(dim, /*bit_width=*/32);
+        CHECK(idx != nullptr);
+        CHECK(ggml_vec_index_write(idx, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(idx);
+
+        std::vector<uint8_t> payload;
+        append_u64_le(payload, id);
+        for (float value : vector) {
+            append_f32_le(payload, value);
+        }
+        std::vector<uint8_t> log = { 'T', 'V', 'D', 'L', 4, 32, 0, 0 };
+        append_u32_le(log, dim);
+        append_u32_le(log, 0);
+        append_wide_state(log, f32_wide_state({}, {}, dim));
+        append_v4_delta_record(log, /*op=*/1, /*n=*/1, payload, f32_wide_state(vector, { id }, dim));
+        write_bytes(delta.path, log);
+
+        for (int64_t countdown : { int64_t{ 1 }, int64_t{ 2 } }) {
+            ggml_vec_index_test_set_oom_countdown(countdown);
+            ggml_vec_index_t * failed = nullptr;
+            const int status =
+                ggml_vec_index_load_with_delta_ex(snapshot.path.string().c_str(), delta.path.string().c_str(), &failed);
+            ggml_vec_index_test_set_oom_countdown(-1);
+            CHECK(status == GGML_VEC_INDEX_E_OOM);
+            CHECK(failed == nullptr);
+        }
+
+        ggml_vec_index_test_reset_delta_max_read_size();
+        auto * loaded = ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_len(loaded) == 1);
+        CHECK(ggml_vec_index_contains(loaded, id) == 1);
+        CHECK(ggml_vec_index_test_get_delta_max_read_size() <= 64 * 1024);
+        ggml_vec_index_free(loaded);
+
+        std::error_code       ec;
+        std::filesystem::path lock_path = delta.path;
+        lock_path += ".lock";
+        std::filesystem::remove(lock_path, ec);
+    }
+
+    for (int bit_width : { 4, 8 }) {
+        const int      dim = bit_width == 4 ? 140000 : 70000;
+        const uint64_t id  = 9390ULL + static_cast<uint64_t>(bit_width);
+        std::vector<float> vector(dim, 0.0f);
+        for (int i = 0; i < dim; ++i) {
+            vector[static_cast<size_t>(i)] = static_cast<float>((i % 15) - 7) / 7.0f;
+        }
+
+        temp_file encoded_snapshot(".tvim");
+        auto *    encoded = ggml_vec_index_create(dim, bit_width);
+        CHECK(encoded != nullptr);
+        CHECK(ggml_vec_index_add(encoded, vector.data(), 1, &id) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(encoded, encoded_snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(encoded);
+        const std::vector<uint8_t> encoded_bytes = read_bytes(encoded_snapshot.path);
+        const size_t row_bytes = bit_width == 4 ? (static_cast<size_t>(dim) + 1) / 2 : static_cast<size_t>(dim);
+        uint32_t     scale_bits = 0;
+        for (int i = 0; i < 4; ++i) {
+            scale_bits |= static_cast<uint32_t>(encoded_bytes[32 + static_cast<size_t>(i)]) << (8 * i);
+        }
+        float scale = 0.0f;
+        std::memcpy(&scale, &scale_bits, sizeof(scale));
+        const std::vector<uint8_t> codes(
+            encoded_bytes.begin() + 36, encoded_bytes.begin() + static_cast<std::ptrdiff_t>(36 + row_bytes));
+        const auto empty_state = wide_state_from_hashes({});
+        const auto row_state = wide_state_from_hashes({ encoded_slot_state_hash(id, scale, codes) });
+        const uint32_t empty_crc = encoded_state_crc(dim, bit_width, {}, {}, {});
+        const uint32_t row_crc = encoded_state_crc(dim, bit_width, { scale }, { codes }, { id });
+
+        temp_file snapshot(".tvim");
+        auto *    empty = ggml_vec_index_create(dim, bit_width);
+        CHECK(empty != nullptr);
+        CHECK(ggml_vec_index_write(empty, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(empty);
+
+        for (int version : { 1, 2, 3, 4 }) {
+            temp_file delta(".tvid");
+            std::vector<uint8_t> log = {
+                'T', 'V', 'D', 'L', static_cast<uint8_t>(version), static_cast<uint8_t>(bit_width), 0, 0,
+            };
+            append_u32_le(log, static_cast<uint32_t>(dim));
+            if (version == 4) {
+                append_u32_le(log, 0);
+                append_wide_state(log, empty_state);
+            } else {
+                append_u32_le(log, version == 1 ? empty_crc : encoded_state_token(empty_state, dim, bit_width));
+            }
+            const size_t record_offset = log.size();
+
+            std::vector<uint8_t> payload;
+            append_u64_le(payload, id);
+            if (version <= 2) {
+                for (float value : vector) {
+                    append_f32_le(payload, value);
+                }
+            } else {
+                append_f32_le(payload, scale);
+                payload.insert(payload.end(), codes.begin(), codes.end());
+            }
+            if (version == 4) {
+                append_v4_delta_record(log, /*op=*/1, /*n=*/1, payload, row_state);
+            } else {
+                append_v1_delta_record(log, /*op=*/1, /*n=*/1, payload,
+                                       version == 1 ? row_crc : encoded_state_token(row_state, dim, bit_width));
+            }
+            write_bytes(delta.path, log);
+
+            if (version == 1) {
+                temp_file corrupt_delta(".tvid");
+                std::vector<uint8_t> corrupt = log;
+                corrupt[record_offset + 8] -= 1;
+                write_bytes(corrupt_delta.path, corrupt);
+                auto * recovered =
+                    ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), corrupt_delta.path.string().c_str());
+                CHECK(recovered != nullptr);
+                CHECK(ggml_vec_index_len(recovered) == 0);
+                ggml_vec_index_free(recovered);
+                std::error_code       corrupt_ec;
+                std::filesystem::path corrupt_lock = corrupt_delta.path;
+                corrupt_lock += ".lock";
+                std::filesystem::remove(corrupt_lock, corrupt_ec);
+            }
+
+            for (int64_t countdown : { int64_t{ 1 }, int64_t{ 2 } }) {
+                ggml_vec_index_test_set_oom_countdown(countdown);
+                ggml_vec_index_t * failed = nullptr;
+                const int status = ggml_vec_index_load_with_delta_ex(
+                    snapshot.path.string().c_str(), delta.path.string().c_str(), &failed);
+                ggml_vec_index_test_set_oom_countdown(-1);
+                CHECK(status == GGML_VEC_INDEX_E_OOM);
+                CHECK(failed == nullptr);
+            }
+
+            ggml_vec_index_test_reset_delta_max_read_size();
+            auto * loaded =
+                ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+            CHECK(loaded != nullptr);
+            CHECK(ggml_vec_index_len(loaded) == 1);
+            CHECK(ggml_vec_index_contains(loaded, id) == 1);
+            CHECK(ggml_vec_index_test_get_delta_max_read_size() <= 64 * 1024);
+            ggml_vec_index_free(loaded);
+
+            if (version == 2) {
+                for (int rounding_mode : { FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO }) {
+                    temp_file rounded_snapshot(".tvim");
+                    const int saved_rounding = std::fegetround();
+                    CHECK(std::fesetround(rounding_mode) == 0);
+                    auto * rounded =
+                        ggml_vec_index_load_with_delta(snapshot.path.string().c_str(), delta.path.string().c_str());
+                    CHECK(rounded != nullptr);
+                    CHECK(std::fegetround() == rounding_mode);
+                    CHECK(std::fesetround(saved_rounding) == 0);
+                    CHECK(ggml_vec_index_compact_delta(
+                              rounded, rounded_snapshot.path.string().c_str(), delta.path.string().c_str()) ==
+                          GGML_VEC_INDEX_OK);
+                    CHECK(read_bytes(rounded_snapshot.path) == encoded_bytes);
+                    ggml_vec_index_free(rounded);
+                    write_bytes(delta.path, log);
+                }
+            }
+
+            std::error_code       ec;
+            std::filesystem::path lock_path = delta.path;
+            lock_path += ".lock";
+            std::filesystem::remove(lock_path, ec);
+        }
+    }
+}
+
+void check_not_durable_status() {
+    const std::array<float, kDim> vector = {
+        1.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+    };
+    const uint64_t id = 9401ULL;
+
+    temp_file snapshot(".tvim");
+    temp_file delta(".tvid");
+    auto *    idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vector.data(), 1, &id) == GGML_VEC_INDEX_OK);
+
+    ggml_vec_index_test_set_parent_fsync_fail(1);
+    const int write_status = ggml_vec_index_write(idx, snapshot.path.string().c_str());
+    ggml_vec_index_test_set_parent_fsync_fail(0);
+    CHECK(write_status == GGML_VEC_INDEX_E_NOT_DURABLE);
+    CHECK(std::string(ggml_vec_index_error_to_string(write_status)) == "not durable");
+
+    auto * loaded = ggml_vec_index_load(snapshot.path.string().c_str());
+    CHECK(loaded != nullptr);
+    CHECK(ggml_vec_index_contains(loaded, id) == 1);
+    ggml_vec_index_free(loaded);
+
+    CHECK(ggml_vec_index_compact_delta(idx, snapshot.path.string().c_str(), delta.path.string().c_str()) ==
+          GGML_VEC_INDEX_OK);
+    ggml_vec_index_test_set_parent_fsync_fail_after(1);
+    const int compact_status =
+        ggml_vec_index_compact_delta(idx, snapshot.path.string().c_str(), delta.path.string().c_str());
+    ggml_vec_index_test_set_parent_fsync_fail_after(-1);
+    CHECK(compact_status == GGML_VEC_INDEX_E_PARTIAL_COMPACT);
+    ggml_vec_index_free(idx);
+
+    std::error_code       ec;
+    std::filesystem::path lock_path = delta.path;
+    lock_path += ".lock";
+    std::filesystem::remove(lock_path, ec);
+}
+#endif
 
 void check_delta_log_tail_recovery() {
     const std::array<float, kDim> base_vec = {
