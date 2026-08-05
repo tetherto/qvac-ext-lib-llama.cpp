@@ -62,6 +62,10 @@ uint64_t turbovec_query_rotation_hash_for_test(
     const float * queries,
     int n_queries,
     int dim);
+double turbovec_query_rotation_max_abs_diff_for_test(
+    const float * queries,
+    int n_queries,
+    int dim);
 uint64_t turbovec_lut_hash_for_test(
     const float * query,
     const float * tqplus_shift,
@@ -3468,7 +3472,17 @@ float tqplus_golden_value(int row, int column) {
 }
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
-void check_turbovec_blocked_scalar_scores(int bits, int dim, int n, int n_queries) {
+void check_turbovec_blocked_scalar_scores(
+        int bits,
+        int dim,
+        int n,
+        int n_queries,
+        int n_scalar_queries = -1) {
+    if (n_scalar_queries < 0) {
+        n_scalar_queries = n_queries;
+    }
+    CHECK(n_scalar_queries >= 0);
+    CHECK(n_scalar_queries <= n_queries);
     auto * blocked = bits == 2 ?
         ggml_vec_index_create_turbovec_q2(dim) :
         ggml_vec_index_create_turbovec_q4(dim);
@@ -3512,20 +3526,25 @@ void check_turbovec_blocked_scalar_scores(int bits, int dim, int n, int n_querie
                     0.11 * std::cos(0.083 * (x + y)));
         }
     }
+    CHECK(turbovec_query_rotation_max_abs_diff_for_test(
+        queries.data(), n_queries, dim) <= 1e-5);
 
     std::vector<float> blocked_scores(static_cast<size_t>(n_queries) * n);
-    std::vector<float> scalar_scores(static_cast<size_t>(n_queries) * n);
+    std::vector<float> scalar_scores(static_cast<size_t>(n_scalar_queries) * n);
     std::vector<uint64_t> blocked_ids(static_cast<size_t>(n_queries) * n);
-    std::vector<uint64_t> scalar_ids(static_cast<size_t>(n_queries) * n);
+    std::vector<uint64_t> scalar_ids(static_cast<size_t>(n_scalar_queries) * n);
     CHECK(ggml_vec_index_search(
         blocked, queries.data(), n_queries, n, blocked_scores.data(), blocked_ids.data()) ==
         GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_search(
-        scalar, queries.data(), n_queries, n, scalar_scores.data(), scalar_ids.data()) ==
+        scalar, queries.data(), n_scalar_queries, n, scalar_scores.data(), scalar_ids.data()) ==
         GGML_VEC_INDEX_OK);
 
     std::vector<float> blocked_by_row(static_cast<size_t>(n));
     std::vector<float> scalar_by_row(static_cast<size_t>(n));
+    std::vector<float> single_scores(static_cast<size_t>(n));
+    std::vector<uint64_t> single_ids(static_cast<size_t>(n));
+    std::vector<float> single_by_row(static_cast<size_t>(n));
     for (int query = 0; query < n_queries; ++query) {
         std::fill(blocked_by_row.begin(), blocked_by_row.end(), std::numeric_limits<float>::quiet_NaN());
         std::fill(scalar_by_row.begin(), scalar_by_row.end(), std::numeric_limits<float>::quiet_NaN());
@@ -3533,38 +3552,135 @@ void check_turbovec_blocked_scalar_scores(int bits, int dim, int n, int n_querie
             const size_t offset = static_cast<size_t>(query) * n + static_cast<size_t>(rank);
             CHECK(blocked_ids[offset] >= id_base);
             CHECK(blocked_ids[offset] < id_base + static_cast<uint64_t>(n));
-            CHECK(scalar_ids[offset] >= id_base);
-            CHECK(scalar_ids[offset] < id_base + static_cast<uint64_t>(n));
             blocked_by_row[static_cast<size_t>(blocked_ids[offset] - id_base)] = blocked_scores[offset];
-            scalar_by_row[static_cast<size_t>(scalar_ids[offset] - id_base)] = scalar_scores[offset];
+            if (query < n_scalar_queries) {
+                CHECK(scalar_ids[offset] >= id_base);
+                CHECK(scalar_ids[offset] < id_base + static_cast<uint64_t>(n));
+                scalar_by_row[static_cast<size_t>(scalar_ids[offset] - id_base)] = scalar_scores[offset];
+            }
+        }
+        CHECK(ggml_vec_index_search(
+            blocked,
+            queries.data() + static_cast<size_t>(query) * dim,
+            1,
+            n,
+            single_scores.data(),
+            single_ids.data()) == GGML_VEC_INDEX_OK);
+        std::fill(single_by_row.begin(), single_by_row.end(), std::numeric_limits<float>::quiet_NaN());
+        for (int rank = 0; rank < n; ++rank) {
+            CHECK(single_ids[static_cast<size_t>(rank)] >= id_base);
+            CHECK(single_ids[static_cast<size_t>(rank)] < id_base + static_cast<uint64_t>(n));
+            single_by_row[static_cast<size_t>(single_ids[static_cast<size_t>(rank)] - id_base)] =
+                single_scores[static_cast<size_t>(rank)];
         }
         for (int row = 0; row < n; ++row) {
             const float blocked_score = blocked_by_row[static_cast<size_t>(row)];
-            const float scalar_score = scalar_by_row[static_cast<size_t>(row)];
+            const float single_score = single_by_row[static_cast<size_t>(row)];
             CHECK(std::isfinite(blocked_score));
-            CHECK(std::isfinite(scalar_score));
-            const float tolerance = std::max(
-                1e-4f * std::fabs(scalar_score),
-                1e-4f);
-            const float drift = std::fabs(blocked_score - scalar_score);
-            if (!(drift <= tolerance)) {
-                std::fprintf(
-                    stderr,
-                    "FAIL TurboVec q%d blocked/scalar drift: dim=%d n=%d query=%d row=%d drift=%g tolerance=%g\n",
-                    bits,
-                    dim,
-                    n,
-                    query,
-                    row,
-                    static_cast<double>(drift),
-                    static_cast<double>(tolerance));
-                std::exit(1);
+            CHECK(float_bits(blocked_score) == float_bits(single_score));
+            if (query < n_scalar_queries) {
+                const float scalar_score = scalar_by_row[static_cast<size_t>(row)];
+                CHECK(std::isfinite(scalar_score));
+                const float tolerance = std::max(
+                    1e-4f * std::fabs(scalar_score),
+                    1e-4f);
+                const float drift = std::fabs(blocked_score - scalar_score);
+                if (!(drift <= tolerance)) {
+                    std::fprintf(
+                        stderr,
+                        "FAIL TurboVec q%d blocked/scalar drift: dim=%d n=%d query=%d row=%d drift=%g tolerance=%g\n",
+                        bits,
+                        dim,
+                        n,
+                        query,
+                        row,
+                        static_cast<double>(drift),
+                        static_cast<double>(tolerance));
+                    std::exit(1);
+                }
             }
         }
     }
 
     ggml_vec_index_free(scalar);
     ggml_vec_index_free(blocked);
+}
+
+void check_turbovec_fused_batch_scores(int bits) {
+    constexpr int dim = 256;
+    constexpr int n = 2048;
+    constexpr int n_queries = 17;
+    constexpr int k = 10;
+    auto * index = bits == 2 ?
+        ggml_vec_index_create_turbovec_q2(dim) :
+        ggml_vec_index_create_turbovec_q4(dim);
+    CHECK(index != nullptr);
+
+    std::vector<uint64_t> ids(static_cast<size_t>(n));
+    std::vector<float> vectors(static_cast<size_t>(n) * dim);
+    for (int row = 0; row < n; ++row) {
+        ids[static_cast<size_t>(row)] = static_cast<uint64_t>(40000 + row);
+        for (int col = 0; col < dim; ++col) {
+            const double x = static_cast<double>(row + 1);
+            const double y = static_cast<double>(col + 3);
+            vectors[static_cast<size_t>(row) * dim + static_cast<size_t>(col)] =
+                static_cast<float>(
+                    0.55 * std::sin(0.013 * x * y + 0.17) +
+                    0.35 * std::cos(0.019 * (x + 5.0) * (y + 1.0)) +
+                    0.10 * std::sin(0.071 * (x + y)));
+        }
+    }
+    CHECK(ggml_vec_index_add(index, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+
+    std::vector<float> queries(static_cast<size_t>(n_queries) * dim);
+    for (int row = 0; row < n_queries; ++row) {
+        for (int col = 0; col < dim; ++col) {
+            const double x = static_cast<double>(row + 2);
+            const double y = static_cast<double>(col + 7);
+            queries[static_cast<size_t>(row) * dim + static_cast<size_t>(col)] =
+                static_cast<float>(
+                    0.48 * std::cos(0.023 * x * y + 0.31) +
+                    0.41 * std::sin(0.037 * (x + 3.0) * (y + 2.0)) +
+                    0.11 * std::cos(0.083 * (x + y)));
+        }
+    }
+
+    std::vector<float> batch_scores(static_cast<size_t>(n_queries) * k);
+    std::vector<uint64_t> batch_ids(static_cast<size_t>(n_queries) * k);
+    turbovec_reset_block_score_call_count_for_test();
+    CHECK(ggml_vec_index_search(
+        index,
+        queries.data(),
+        n_queries,
+        k,
+        batch_scores.data(),
+        batch_ids.data()) == GGML_VEC_INDEX_OK);
+#if defined(__aarch64__) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+    const int64_t n_blocks = (n + 31) / 32;
+    const int64_t expected_calls =
+        (n_queries / 4 + n_queries % 4) * n_blocks;
+    CHECK(turbovec_block_score_call_count_for_test() == expected_calls);
+#endif
+
+    std::array<float, k> single_scores{};
+    std::array<uint64_t, k> single_ids{};
+    for (int query = 0; query < n_queries; ++query) {
+        CHECK(ggml_vec_index_search(
+            index,
+            queries.data() + static_cast<size_t>(query) * dim,
+            1,
+            k,
+            single_scores.data(),
+            single_ids.data()) == GGML_VEC_INDEX_OK);
+        for (int rank = 0; rank < k; ++rank) {
+            const size_t offset =
+                static_cast<size_t>(query) * k + static_cast<size_t>(rank);
+            CHECK(batch_ids[offset] == single_ids[static_cast<size_t>(rank)]);
+            CHECK(float_bits(batch_scores[offset]) ==
+                float_bits(single_scores[static_cast<size_t>(rank)]));
+        }
+    }
+    ggml_vec_index_free(index);
 }
 #endif
 
@@ -4232,9 +4348,10 @@ int main(int argc, char ** argv) {
             }
 
             for (const int bit_width : { 2, 4 }) {
-                check_turbovec_blocked_scalar_scores(bit_width, 128, 17, 3);
-                check_turbovec_blocked_scalar_scores(bit_width, 128, 33, 3);
-                check_turbovec_blocked_scalar_scores(bit_width, 256, 65, 2);
+                check_turbovec_blocked_scalar_scores(bit_width, 128, 17, 4);
+                check_turbovec_blocked_scalar_scores(bit_width, 128, 33, 5);
+                check_turbovec_blocked_scalar_scores(bit_width, 256, 65, 17, 8);
+                check_turbovec_fused_batch_scores(bit_width);
                 check_turbovec_oversized_snapshot_compatibility(bit_width);
             }
             check_turbovec_blocked_scalar_scores(2, 128, 1000, 2);
