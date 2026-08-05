@@ -228,6 +228,7 @@ void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
         scale = 1.0f;
         return;
     }
+    const ScopedNearestRounding rounding_guard;
     const size_t dim_sz = static_cast<size_t>(dim);
 
     float max_abs = 0.0f;
@@ -250,6 +251,7 @@ void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale) {
         scale = 1.0f;
         return;
     }
+    const ScopedNearestRounding rounding_guard;
 
     float max_abs = 0.0f;
     for (int i = 0; i < dim; ++i) {
