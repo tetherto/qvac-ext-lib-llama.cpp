@@ -910,6 +910,12 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->props.use_residency_sets = true;
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
             dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
+#if TARGET_OS_IPHONE
+            // Re-enable explicitly with GGML_METAL_RESIDENCY_ENABLE.
+            if (getenv("GGML_METAL_RESIDENCY_ENABLE") == nil) {
+                dev->props.use_residency_sets = false;
+            }
+#endif
 #endif
 
             dev->props.use_shared_buffers = dev->props.has_unified_memory;
