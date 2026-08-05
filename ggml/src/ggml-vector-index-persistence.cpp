@@ -2,6 +2,30 @@
 
 #include "ggml-vector-index-impl.h"
 
+#include <array>
+#include <cfenv>
+
+class DeltaReplayNearestRounding {
+public:
+    DeltaReplayNearestRounding() : saved_rounding(std::fegetround()) {
+        if (saved_rounding != FE_TONEAREST && saved_rounding != -1) {
+            std::fesetround(FE_TONEAREST);
+        }
+    }
+
+    ~DeltaReplayNearestRounding() {
+        if (saved_rounding != FE_TONEAREST && saved_rounding != -1) {
+            std::fesetround(saved_rounding);
+        }
+    }
+
+    DeltaReplayNearestRounding(const DeltaReplayNearestRounding &) = delete;
+    DeltaReplayNearestRounding & operator=(const DeltaReplayNearestRounding &) = delete;
+
+private:
+    int saved_rounding = FE_TONEAREST;
+};
+
 static void close_mapped_file(MappedFile & mapped) {
 #ifdef _WIN32
     if (mapped.data != nullptr) {
@@ -4049,6 +4073,7 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path, const Del
     const bool     apply_records   = delta_state_matches(state_kind, snapshot_crc, snapshot_wide, base_crc, base_wide);
     uint32_t last_state_crc = base_crc;
     DeltaStateWide last_state_wide = base_wide;
+    const DeltaReplayNearestRounding rounding_guard;
 
     uint64_t offset = header_size;
     while (offset < file_size) {
