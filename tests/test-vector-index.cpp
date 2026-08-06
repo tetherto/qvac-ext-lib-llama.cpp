@@ -3730,6 +3730,67 @@ void check_ivf_contains(
     CHECK(std::find(out.begin(), out.end(), expected_id) != out.end());
 }
 
+void check_turbovec_rounding_mode_persistence(int bits) {
+    constexpr int dim = 136;
+    constexpr int n = 1000;
+    constexpr int k = 4;
+    CHECK(bits == 2 || bits == 4);
+    const int saved_rounding = std::fegetround();
+    CHECK(saved_rounding != -1);
+
+    std::vector<float> vectors(static_cast<size_t>(n) * dim);
+    fill_turbovec_regression_vectors(vectors, n, dim);
+    std::vector<uint64_t> ids(static_cast<size_t>(n));
+    for (int row = 0; row < n; ++row) {
+        ids[static_cast<size_t>(row)] = static_cast<uint64_t>(700000 + bits * 10000 + row);
+    }
+
+    struct RoundingSnapshot {
+        std::vector<uint8_t> bytes;
+        std::array<float, 4> scores;
+        std::array<uint64_t, 4> ids;
+    };
+
+    auto make_snapshot = [&](int rounding_mode, const char * suffix) {
+        const std::string path =
+            (std::filesystem::temp_directory_path() /
+             ("ggml-vector-index-turbovec-rounding-q" + std::to_string(bits) + "-" +
+              suffix + ".tvim")).string();
+        std::filesystem::remove(path);
+
+        CHECK(std::fesetround(rounding_mode) == 0);
+        auto * tv = bits == 2 ?
+            ggml_vec_index_create_turbovec_q2(dim) :
+            ggml_vec_index_create_turbovec_q4(dim);
+        CHECK(tv != nullptr);
+        ggml_vec_index_prepare(tv);
+        CHECK(ggml_vec_index_add(tv, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(tv, path.c_str()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(tv);
+        CHECK(std::fesetround(saved_rounding) == 0);
+
+        RoundingSnapshot snapshot;
+        snapshot.bytes = read_file_bytes(path);
+        auto * loaded = ggml_vec_index_load(path.c_str());
+        CHECK(loaded != nullptr);
+        CHECK(ggml_vec_index_search(
+            loaded, vectors.data(), 1, k, snapshot.scores.data(), snapshot.ids.data()) ==
+            GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(loaded);
+        std::filesystem::remove(path);
+        return snapshot;
+    };
+
+    const RoundingSnapshot downward = make_snapshot(FE_DOWNWARD, "downward");
+    const RoundingSnapshot upward = make_snapshot(FE_UPWARD, "upward");
+    CHECK(downward.bytes == upward.bytes);
+    CHECK(downward.ids == upward.ids);
+    for (size_t i = 0; i < downward.scores.size(); ++i) {
+        CHECK(float_bits(downward.scores[i]) == float_bits(upward.scores[i]));
+    }
+    CHECK(std::fesetround(saved_rounding) == 0);
+}
+
 float score_for_id(
         const std::vector<uint64_t> & ids,
         const std::vector<float> & scores,
@@ -4367,6 +4428,7 @@ int main(int argc, char ** argv) {
                     }
                 }
                 check_turbovec_mutation_cache_regression(bit_width);
+                check_turbovec_rounding_mode_persistence(bit_width);
             }
             check_turbovec_incremental_block_repacking();
             check_turbovec_sparse_filter_block_selection();
