@@ -7,10 +7,7 @@ on:
       - master
     paths: [
       '.github/workflows/build-cpu.yml',
-      # Disable. There are some modifications in the fork
-      # so that ggml dynamic builds work with vcpkg.
-      # '.github/workflows/build-cmake-pkg.yml',
-      '.github/workflows/build-linux-cross.yml',
+      '.github/workflows/build-cmake-pkg.yml',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -23,10 +20,7 @@ on:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-cpu.yml',
-      # Disable. There are some modifications in the fork
-      # so that ggml dynamic builds work with vcpkg.
-      # '.github/workflows/build-cmake-pkg.yml',
-      '.github/workflows/build-linux-cross.yml',
+      '.github/workflows/build-cmake-pkg.yml',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -47,8 +41,8 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
-  # build-cmake-pkg:
-    # uses: ./.github/workflows/build-cmake-pkg.yml
+  build-cmake-pkg:
+    uses: ./.github/workflows/build-cmake-pkg.yml
 
   ubuntu:
     strategy:
@@ -66,17 +60,10 @@ jobs:
         id: checkout
         uses: actions/checkout@v6
 
-      - name: CPU feature hash
-        id: cpu_info
-        run: |
-          CPU_HASH=$(echo | gcc -march=native -dM -E - 2>/dev/null | sort | md5sum | cut -d' ' -f1)
-          echo "cpu_hash=${CPU_HASH}" >> "$GITHUB_OUTPUT"
-          echo "CPU feature hash: ${CPU_HASH}"
-
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: cpu-${{ matrix.os }}-${{ steps.cpu_info.outputs.cpu_hash }}
+          key: cpu-${{ matrix.os }}
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 

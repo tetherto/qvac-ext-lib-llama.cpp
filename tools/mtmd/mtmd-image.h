@@ -15,8 +15,6 @@ struct mtmd_image_preproc_out {
     clip_image_f32 overview; // overview image (downscaled image)
     int grid_x = 0;
     int grid_y = 0;
-    // when true, entries[0] is an overview thumbnail and entries[1..] are the grid_x*grid_y tiles
-    bool overview_in_entries = false;
 
     void append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized = true);
     void append(const clip_hparams & hparams, const std::vector<clip_image_u8> & imgs, bool normalized = true);
@@ -122,20 +120,6 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
 struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
-    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
-};
-
-// Qwen3VL tiling preprocessor: splits image into an NxM grid of equal-size tiles
-// (tile size = hparams.image_size), packed row-major into the batch. Falls back to
-// dyn_size when the image fits in one tile.
-struct mtmd_image_preprocessor_qwen3vl : mtmd_image_preprocessor {
-    int max_tiles;
-
-    mtmd_image_preprocessor_qwen3vl(const clip_ctx * ctx)
-        : mtmd_image_preprocessor(ctx),
-          max_tiles(hparams.preproc_max_tiles > 0 ? hparams.preproc_max_tiles : 4) {
-        GGML_ASSERT(clip_get_tile_mode(ctx) != CLIP_IMAGE_TILE_MODE_DISABLED);
-    }
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 };
 

@@ -628,4 +628,3 @@ struct clip_model {
 };
 
 const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx);
-clip_image_tile_mode clip_get_tile_mode(const struct clip_ctx * ctx);

@@ -67,10 +67,6 @@ int ggml_metal_op_pool_2d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_id        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_dsv4_hc_comb      (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_dsv4_hc_pre       (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_dsv4_hc_post      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
@@ -98,18 +94,6 @@ int ggml_metal_op_tri               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_count_equal       (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_out_prod          (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_silu_back         (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_soft_max_back     (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_rms_norm_back     (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_gelu_back         (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_sigmoid_back      (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_l2_norm_back      (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_mul_mat_id_back_a (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_mul_mat_id_back_b (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_ssm_conv_back_sx  (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_ssm_conv_back_c   (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx);
 
 #ifdef __cplusplus
 }
