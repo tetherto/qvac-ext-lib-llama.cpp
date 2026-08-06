@@ -56,7 +56,7 @@ inline double dot(const float * a, const float * b, int dim) {
     return acc;
 }
 
-inline float dot_f32_fast(const float * a, const float * b, int dim) {
+inline double dot_f32_fast(const float * a, const float * b, int dim) {
     float acc0 = 0.0f;
     float acc1 = 0.0f;
     float acc2 = 0.0f;
@@ -72,19 +72,19 @@ inline float dot_f32_fast(const float * a, const float * b, int dim) {
     for (; i < dim; ++i) {
         acc += a[i] * b[i];
     }
-    return std::isfinite(acc) ? acc : float_score_from_double(dot(a, b, dim));
+    return std::isfinite(acc) ? static_cast<double>(acc) : dot(a, b, dim);
 }
 
-inline float dot_q8_scalar(const float * query, const int8_t * codes, float scale, int dim) {
+inline double dot_q8_scalar(const float * query, const int8_t * codes, float scale, int dim) {
     double acc = 0.0;
     for (int i = 0; i < dim; ++i) {
         const double value = static_cast<double>(codes[i]) * static_cast<double>(scale);
         acc += static_cast<double>(query[i]) * value;
     }
-    return float_score_from_double(acc);
+    return acc;
 }
 
-inline float dot_q4_scalar(const float * query, const uint8_t * codes, float scale, int dim) {
+inline double dot_q4_scalar(const float * query, const uint8_t * codes, float scale, int dim) {
     double acc = 0.0;
     for (int i = 0; i < dim; ++i) {
         const uint8_t byte   = codes[static_cast<size_t>(i) / 2];
@@ -92,7 +92,7 @@ inline float dot_q4_scalar(const float * query, const uint8_t * codes, float sca
         const double  value  = static_cast<double>(q4_decode(nibble)) * static_cast<double>(scale);
         acc += static_cast<double>(query[i]) * value;
     }
-    return float_score_from_double(acc);
+    return acc;
 }
 
 inline bool quantized_dot_float_path_is_safe(
@@ -237,7 +237,7 @@ bool cpu_has_avx2() {
 
 #endif
 
-inline float dot_q8(const float * query, const int8_t * codes, float scale, int dim, double max_query) {
+inline double dot_q8(const float * query, const int8_t * codes, float scale, int dim, double max_query) {
     if (dim < 8) {
         return dot_q8_scalar(query, codes, scale, dim);
     }
@@ -246,12 +246,12 @@ inline float dot_q8(const float * query, const int8_t * codes, float scale, int 
         return dot_q8_scalar(query, codes, scale, dim);
     }
     const float score = dot_q8_neon(query, codes, scale, dim);
-    return std::isfinite(score) ? score : dot_q8_scalar(query, codes, scale, dim);
+    return std::isfinite(score) ? static_cast<double>(score) : dot_q8_scalar(query, codes, scale, dim);
 #elif defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
     static const bool has_avx2 = cpu_has_avx2();
     if (has_avx2 && quantized_dot_float_path_is_safe(max_query, dim, scale, 127.0f)) {
         const float score = ggml_vec_index_detail::dot_q8_avx2(query, codes, scale, dim);
-        return std::isfinite(score) ? score : dot_q8_scalar(query, codes, scale, dim);
+        return std::isfinite(score) ? static_cast<double>(score) : dot_q8_scalar(query, codes, scale, dim);
     }
     return dot_q8_scalar(query, codes, scale, dim);
 #else
@@ -260,7 +260,7 @@ inline float dot_q8(const float * query, const int8_t * codes, float scale, int 
 #endif
 }
 
-inline float dot_q4(const float * query, const uint8_t * codes, float scale, int dim, double max_query) {
+inline double dot_q4(const float * query, const uint8_t * codes, float scale, int dim, double max_query) {
     if (dim < 16) {
         return dot_q4_scalar(query, codes, scale, dim);
     }
@@ -269,12 +269,12 @@ inline float dot_q4(const float * query, const uint8_t * codes, float scale, int
         return dot_q4_scalar(query, codes, scale, dim);
     }
     const float score = dot_q4_neon(query, codes, scale, dim);
-    return std::isfinite(score) ? score : dot_q4_scalar(query, codes, scale, dim);
+    return std::isfinite(score) ? static_cast<double>(score) : dot_q4_scalar(query, codes, scale, dim);
 #elif defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
     static const bool has_avx2 = cpu_has_avx2();
     if (has_avx2 && quantized_dot_float_path_is_safe(max_query, dim, scale, 7.0f)) {
         const float score = ggml_vec_index_detail::dot_q4_avx2(query, codes, scale, dim);
-        return std::isfinite(score) ? score : dot_q4_scalar(query, codes, scale, dim);
+        return std::isfinite(score) ? static_cast<double>(score) : dot_q4_scalar(query, codes, scale, dim);
     }
     return dot_q4_scalar(query, codes, scale, dim);
 #else
@@ -326,9 +326,9 @@ void decode_slot_to_f32(const ggml_vec_index_t & idx, size_t slot, float * dst) 
 
 size_t best_centroid(const float * query, const std::vector<float> & centroids, int n_lists, int dim) {
     size_t best       = 0;
-    float  best_score = -FLT_MAX;
+    double best_score = -std::numeric_limits<double>::infinity();
     for (int list = 0; list < n_lists; ++list) {
-        const float s = dot_f32_fast(query, centroids.data() + static_cast<size_t>(list) * dim, dim);
+        const double s = dot_f32_fast(query, centroids.data() + static_cast<size_t>(list) * dim, dim);
         if (s > best_score) {
             best_score = s;
             best       = static_cast<size_t>(list);
@@ -775,7 +775,7 @@ int ggml_vec_index_search_ivf(
                 if (idx->ivf_lists[static_cast<size_t>(list)].empty()) {
                     continue;
                 }
-                const float score =
+                const double score =
                     dot_f32_fast(query, idx->ivf_centroids.data() + static_cast<size_t>(list) * dim_sz, dim);
                 centroid_scores.push_back({ score, static_cast<uint64_t>(list) });
             }
