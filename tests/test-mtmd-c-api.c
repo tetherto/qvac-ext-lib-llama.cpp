@@ -53,7 +53,6 @@ int main(void) {
             size_t ny = pos.y + 1;
             const char * id = mtmd_image_tokens_get_id(image_tokens);
             assert(n_tokens > 0);
-            assert(pos.t == 0);
             assert(nx > 0);
             assert(ny > 0);
             assert(id != NULL);

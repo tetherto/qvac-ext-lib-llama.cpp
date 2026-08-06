@@ -48,15 +48,7 @@ describe('MCPService', () => {
 
 		await controller.fetch(config.url, { method: 'POST', body: '{}' });
 		expect(logs).toHaveLength(2);
-		expect(
-			logs.map((log) => {
-				const details = log.details as {
-					request?: { url?: string };
-					response?: { url?: string };
-				};
-				return details.request?.url ?? details.response?.url;
-			})
-		).toEqual(['https://example.com/mcp', 'https://example.com/mcp']);
+		expect(logs.every((log) => log.message.includes('https://example.com/mcp'))).toBe(true);
 
 		controller.disable();
 		await controller.fetch(config.url, { method: 'POST', body: '{}' });

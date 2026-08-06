@@ -1,4 +1,3 @@
-#if false
 import SwiftUI
 
 struct InputButton: View {
@@ -128,15 +127,5 @@ struct InputButton: View {
                 status = FileManager.default.fileExists(atPath: fileURL.path) ? "downloaded" : "download"
             }
         }
-    }
-}
-#endif
-
-import SwiftUI
-
-@available(*, deprecated, message: "Use ModelURLInputRow instead.")
-struct InputButton: View {
-    var body: some View {
-        EmptyView()
     }
 }

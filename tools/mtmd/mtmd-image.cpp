@@ -1,9 +1,7 @@
 #include "mtmd-image.h"
 
 #include <algorithm>
-#include <cstring>
 #include <cmath>
-#include <limits>
 #include <vector>
 
 void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
@@ -839,23 +837,6 @@ clip_image_size mtmd_image_preprocessor_llava_uhd::get_refine_size(const clip_im
     return refine_size;
 }
 
-// Pick the grid from `candidates` whose log(width/height) is closest to `target_log_ratio`.
-// Strict-less keeps the first candidate on ties, so callers control tie-breaking via ordering.
-// Shared by the log-ratio tilers (llava_uhd, qwen3vl); lfm2 deliberately uses a different
-// (linear ratio diff + area) metric and is not routed through here.
-static clip_image_size pick_grid_by_log_ratio(const std::vector<clip_image_size> & candidates, const float target_log_ratio) {
-    clip_image_size best_grid{1, 1};
-    float min_error = std::numeric_limits<float>::infinity();
-    for (const auto & grid : candidates) {
-        const float error = std::abs(target_log_ratio - std::log(1.0f * grid.width / grid.height));
-        if (error < min_error) {
-            min_error = error;
-            best_grid = grid;
-        }
-    }
-    return best_grid;
-}
-
 clip_image_size mtmd_image_preprocessor_llava_uhd::get_best_grid(const int max_slice_nums, const int multiple, const float log_ratio) {
     std::vector<int> candidate_split_grids_nums;
     for (int i : {multiple - 1, multiple, multiple + 1}) {
@@ -876,7 +857,16 @@ clip_image_size mtmd_image_preprocessor_llava_uhd::get_best_grid(const int max_s
         }
     }
 
-    return pick_grid_by_log_ratio(candidate_grids, log_ratio);
+    clip_image_size best_grid{1, 1};
+    float min_error = std::numeric_limits<float>::infinity();
+    for (const auto& grid : candidate_grids) {
+        float error = std::abs(log_ratio - std::log(1.0 * grid.width / grid.height));
+        if (error < min_error) {
+            best_grid = grid;
+            min_error = error;
+        }
+    }
+    return best_grid;
 }
 
 //
@@ -895,165 +885,30 @@ mtmd_image_preproc_out mtmd_image_preprocessor_fixed_size::preprocess(const clip
     return output;
 }
 
-// Resize to [min_pixels, max_pixels] with aspect ratio preserved, aligned to `align_px`, single f32 output.
-static mtmd_image_preproc_out preprocess_dyn_size_aligned(
-        const clip_image_u8 & img,
-        const clip_hparams & hparams,
-        const int align_px) {
-    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
-    GGML_ASSERT(align_px > 0);
-    clip_image_u8 resized_image;
-    const clip_image_size img_size = img.get_size();
-    const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
-        img_size,
-        align_px,
-        hparams.image_min_pixels,
-        hparams.image_max_pixels);
-    img_tool::resize(img, resized_image, target_size,
-                     hparams.image_resize_algo,
-                     hparams.image_resize_pad,
-                     hparams.image_pad_color);
-    mtmd_image_preproc_out output;
-    output.append(hparams, resized_image, true);
-    return output;
-}
-
-static int dyn_size_align_px(const clip_hparams & hparams) {
-    // the original pixtral model doesn't have n_merge
-    const int cur_merge = hparams.n_merge == 0 ? 1 : hparams.n_merge;
-    return hparams.patch_size * cur_merge;
-}
-
 //
 // mtmd_image_preprocessor_dyn_size
 //
 
 mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_image_u8 & img) {
-    return preprocess_dyn_size_aligned(img, hparams, dyn_size_align_px(hparams));
-}
-
-//
-// mtmd_image_preprocessor_qwen3vl
-//
-
-mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::preprocess(const clip_image_u8 & img) {
+    GGML_ASSERT(hparams.image_min_pixels > 0 && hparams.image_max_pixels > 0);
+    clip_image_u8 resized_image;
+    const clip_image_size original_size = img.get_size();
+    // the original pixtral model doesn't have n_merge
+    const int cur_merge = hparams.n_merge;
+    const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
+        original_size,
+        hparams.patch_size * cur_merge,
+        hparams.image_min_pixels,
+        hparams.image_max_pixels);
+    img_tool::resize(img, resized_image, target_size,
+                        hparams.image_resize_algo,
+                        hparams.image_resize_pad,
+                        hparams.image_pad_color);
     mtmd_image_preproc_out output;
-
-    // Tile size comes from the model's image_size (e.g. 768 for Qwen3VL-2B, patch_size=16).
-    const int tile_px = hparams.image_size;
-    GGML_ASSERT(tile_px > 0 && "image_size not set in model hparams");
-
-    GGML_ASSERT(hparams.patch_size > 0);
-    // Guard the log-ratio division below; the public API asserts this in mtmd.cpp, but a direct
-    // caller (fuzz harness, unit test, malformed upload reaching this path) could reach here with
-    // a zero-dimension image. Fail this one image gracefully instead of aborting the whole process.
-    const clip_image_size img_size = img.get_size();
-    if (img_size.width <= 0 || img_size.height <= 0) {
-        LOG_ERR("%s: image has zero dimension (%dx%d)\n", __func__, img_size.width, img_size.height);
-        return output;
-    }
-
-    // Select the grid (n_col × n_row, n_col*n_row <= max_tiles, excluding 1×1) that:
-    //   1. downscales the image in both dimensions (upscaling gains no detail)
-    //   2. maximises tile count (more tiles = more spatial detail preserved)
-    //   3. among equal tile counts, minimises log-ratio error (less stretch distortion)
-    // If no grid downscales, fall back to dyn_size (single-tile at native resolution).
-    const float img_log_ratio = std::log((float)img_size.width / (float)img_size.height);
-
-    struct grid_cand { int col, row; float ratio_err; };
-    std::vector<grid_cand> fitting;
-    // candidate count is sum_{col} floor(max_tiles/col) ≈ max_tiles*ln(max_tiles), not max_tiles²;
-    // a small reserve avoids the early reallocations without over-allocating at large max_tiles.
-    fitting.reserve((size_t)(max_tiles * std::log((float)std::max(max_tiles, 2))));
-    for (int col = 1; col <= max_tiles; col++) {
-        for (int row = 1; col * row <= max_tiles; row++) {
-            if (col == 1 && row == 1) { continue; } // 1×1 == dyn_size below
-            if (col * tile_px <= img_size.width && row * tile_px <= img_size.height) {
-                const float err = std::abs(img_log_ratio - std::log((float)col / (float)row));
-                fitting.push_back({col, row, err});
-            }
-        }
-    }
-    if (fitting.empty()) {
-        LOG_INF("%s: %dx%d fits no tile grid (tile_px=%d, max_tiles=%d) — using dyn_size\n",
-                __func__, img_size.width, img_size.height, tile_px, max_tiles);
-        output = preprocess_dyn_size_aligned(img, hparams, dyn_size_align_px(hparams));
-        // grid_x/grid_y left at 0 → single-tile path; tokenizer treats this as 1×1
-        return output;
-    }
-
-    // Tolerance band: find the best (minimum) ratio error, then allow any candidate within
-    // TOLERANCE of it to compete on tile count. This prevents a high-tile-count grid from
-    // winning when a near-perfect-ratio lower-tile-count grid exists (e.g. 2×2 over 2×1
-    // for a 2:1 image, which would squash the image 2× in one dimension).
-    static constexpr float RATIO_ERR_TOLERANCE = 0.2f;
-    const float best_ratio_err = std::min_element(fitting.begin(), fitting.end(),
-        [](const grid_cand & a, const grid_cand & b) { return a.ratio_err < b.ratio_err; })->ratio_err;
-    const float eligible_threshold = best_ratio_err + RATIO_ERR_TOLERANCE;
-
-    auto best = std::min_element(fitting.begin(), fitting.end(), [eligible_threshold](const grid_cand & a, const grid_cand & b) {
-        const bool ea = a.ratio_err <= eligible_threshold;
-        const bool eb = b.ratio_err <= eligible_threshold;
-        if (ea != eb) { return ea; }        // eligible always beats ineligible
-        const int ta = a.col * a.row;
-        const int tb = b.col * b.row;
-        if (ta != tb) { return ta > tb; }   // more tiles first
-        return a.ratio_err < b.ratio_err;   // then closer ratio
-    });
-
-    const int use_col = best->col;
-    const int use_row = best->row;
-    LOG_INF("%s: %dx%d — selected %dx%d grid (%d tiles, ratio_err=%.3f)\n",
-            __func__, img_size.width, img_size.height, use_col, use_row, use_col * use_row, best->ratio_err);
-    const int target_w = use_col * tile_px;
-    const int target_h = use_row * tile_px;
-
-    // Resize to the tile canvas by stretching. With aspect-ratio-aware grid selection the chosen
-    // grid's ratio is close to the image's ratio, so the residual stretch is small.
-    // pad=false avoids black bars that confuse the model in tile inputs.
-    clip_image_u8 resized;
-    img_tool::resize(img, resized, {target_w, target_h},
-                     hparams.image_resize_algo,
-                     /* pad */ PAD_NONE,
-                     hparams.image_pad_color);
-
-    // Split into use_col × use_row tiles, packed row-major into the batch.
-    clip_image_u8 tile_u8;
-
-    for (int tr = 0; tr < use_row; tr++) {
-        for (int tc = 0; tc < use_col; tc++) {
-            const int src_x0 = tc * tile_px;
-            const int src_y0 = tr * tile_px;
-            img_tool::crop(resized, tile_u8, src_x0, src_y0, tile_px, tile_px);
-
-            clip_image_f32 tile_f32;
-            tile_f32.from_u8(tile_u8);
-            tile_f32.normalize(hparams.image_mean, hparams.image_std);
-            output.entries.push_back(std::move(tile_f32));
-        }
-    }
-
-    // LLaVA-style global overview (thumbnail): a downscaled full image (tile_px x tile_px) prepended
-    // as entries[0]. It carries the whole image uncut, so text split across a tile seam stays
-    // readable; on DocVQA this recovers seam-truncated text for a sizeable ANLS gain. Encoded as a
-    // separate 1x1 chunk in mtmd.cpp; the tiles are untouched (no resolution cost to them).
-    {
-        clip_image_u8 thumb_u8;
-        img_tool::resize(img, thumb_u8, {tile_px, tile_px},
-                         hparams.image_resize_algo,
-                         /* pad */ PAD_NONE,
-                         hparams.image_pad_color);
-        clip_image_f32 thumb_f32;
-        thumb_f32.from_u8(thumb_u8);
-        thumb_f32.normalize(hparams.image_mean, hparams.image_std);
-        output.entries.insert(output.entries.begin(), std::move(thumb_f32));
-        output.overview_in_entries = true;
-    }
-
-    output.grid_x = use_col;
-    output.grid_y = use_row;
+    output.append(hparams, resized_image, true);
     return output;
 }
+
 //
 // mtmd_image_preprocessor_longest_edge
 //

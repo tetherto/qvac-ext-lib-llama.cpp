@@ -41,9 +41,7 @@ configure_file(${TEMPLATE_FILE} ${OUTPUT_FILE})
 set(TARGET llama-common-base)
 add_library(${TARGET} STATIC ${OUTPUT_FILE})
 
-target_include_directories(${TARGET} PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}/common>)
+target_include_directories(${TARGET} PUBLIC .)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -55,82 +53,67 @@ endif()
 
 set(TARGET llama-common)
 
-set(${TARGET}_HEADERS
+add_library(${TARGET}
+    arg.cpp
     arg.h
     base64.hpp
-    chat-auto-parser.h
-    chat-peg-parser.h
-    chat.h
-    common.h
-    console.h
-    debug.h
-    download.h
-    finetune.h
-    fit.h   # qvac: declarations for the fit helpers (memory_breakdown_print, get_device_memory_data)
-    hf-cache.h
-    http.h
-    imatrix-loader.h
-    json-schema-to-grammar.h
-    log.h
-    ngram-cache.h
-    ngram-map.h
-    ngram-mod.h
-    peg-parser.h
-    preset.h
-    reasoning-budget.h
-    sampling.h
-    speculative.h
-    unicode.h
-)
-
-set(${TARGET}_JINJA_HEADERS
-    jinja/caps.h
-    jinja/lexer.h
-    jinja/parser.h
-    jinja/runtime.h
-    jinja/string.h
-    jinja/utils.h
-    jinja/value.h
-)
-
-list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
-list(TRANSFORM ${TARGET}_JINJA_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
-
-add_library(${TARGET} STATIC
-    arg.cpp
     chat-auto-parser-generator.cpp
     chat-auto-parser-helpers.cpp
+    chat-auto-parser.h
     chat-diff-analyzer.cpp
     chat-peg-parser.cpp
+    chat-peg-parser.h
     chat.cpp
+    chat.h
     common.cpp
+    common.h
     console.cpp
+    console.h
     debug.cpp
+    debug.h
     download.cpp
-    finetune.cpp
+    download.h
     fit.cpp
+    fit.h
     hf-cache.cpp
+    hf-cache.h
+    http.h
     imatrix-loader.cpp
+    imatrix-loader.h
     json-schema-to-grammar.cpp
     llguidance.cpp
     log.cpp
+    log.h
     ngram-cache.cpp
+    ngram-cache.h
     ngram-map.cpp
+    ngram-map.h
     ngram-mod.cpp
+    ngram-mod.h
     peg-parser.cpp
+    peg-parser.h
     preset.cpp
+    preset.h
     reasoning-budget.cpp
+    reasoning-budget.h
     sampling.cpp
+    sampling.h
     speculative.cpp
+    speculative.h
     unicode.cpp
+    unicode.h
     jinja/lexer.cpp
+    jinja/lexer.h
     jinja/parser.cpp
+    jinja/parser.h
     jinja/runtime.cpp
+    jinja/runtime.h
     jinja/value.cpp
+    jinja/value.h
     jinja/string.cpp
+    jinja/string.h
     jinja/caps.cpp
-    ${${TARGET}_HEADERS}
-    ${${TARGET}_JINJA_HEADERS}
+    jinja/caps.h
     )
 
 set_target_properties(${TARGET} PROPERTIES
@@ -139,9 +122,8 @@ set_target_properties(${TARGET} PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${${TARGET}_HEADERS}")
-install(FILES ${${TARGET}_JINJA_HEADERS}
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llama/common/jinja)
+target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -185,42 +167,4 @@ if (LLAMA_LLGUIDANCE)
     endif()
 endif()
 
-target_include_directories(
-  ${TARGET}
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}$<SEMICOLON>${CMAKE_CURRENT_SOURCE_DIR}/../vendor>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-
-target_compile_features   (${TARGET} PUBLIC cxx_std_17)
-target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
-
-# qvac: rebase onto upstream b9341 renamed the common target to `llama-common`.
-# Keep both names addressable so qvac-side CMakeLists (target `common`) and
-# upstream/example/tool CMakeLists (target `llama-common`) both link.
-if (NOT TARGET llama-common)
-    add_library(llama-common ALIAS ${TARGET})
-endif()
-
-
-#
-# copy the license files
-#
-
-# Check if running in GitHub Actions
-if (DEFINED ENV{GITHUB_ACTIONS} AND "$ENV{GITHUB_ACTIONS}" STREQUAL "true")
-    message(STATUS "Running inside GitHub Actions - copying license files")
-
-    # Copy all files from licenses/ to build/bin/
-    file(GLOB LICENSE_FILES "${CMAKE_SOURCE_DIR}/licenses/*")
-    foreach(LICENSE_FILE ${LICENSE_FILES})
-        get_filename_component(FILENAME ${LICENSE_FILE} NAME)
-        add_custom_command(
-            POST_BUILD
-            TARGET ${TARGET}
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${LICENSE_FILE}"
-                "$<TARGET_FILE_DIR:llama>/${FILENAME}"
-            COMMENT "Copying ${FILENAME} to ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
-        message(STATUS "Copying ${LICENSE_FILE} to ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${FILENAME}")
-    endforeach()
-endif()
+target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
