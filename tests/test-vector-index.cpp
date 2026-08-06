@@ -673,9 +673,12 @@ void check_filtered_and_ivf_search(int bit_width) {
           GGML_VEC_INDEX_E_INVALID_ARG);
     ggml_vec_index_filter_free(nullptr);
 
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_search_ivf(idx, query, 1, 1, 1, scores.data(), out_ids.data()) ==
           GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/4, /*n_iter=*/4) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_search_ivf(idx, query, 1, 1, 0, scores.data(), out_ids.data()) ==
           GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_search_ivf(idx, query, 1, 1, -1, scores.data(), out_ids.data()) ==
@@ -709,6 +712,8 @@ void check_filtered_and_ivf_search(int bit_width) {
     CHECK(ggml_vec_index_add(idx, added_vector.data(), 1, &added_id) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_search_prepared_filtered(idx, stale_after_add, query, 1, 2, scores.data(), out_ids.data()) ==
           GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_search_ivf(idx, query, 1, 1, 1, scores.data(), out_ids.data()) ==
           GGML_VEC_INDEX_E_INVALID_ARG);
     ggml_vec_index_filter_free(stale_after_add);
@@ -719,6 +724,8 @@ void check_filtered_and_ivf_search(int bit_width) {
     CHECK(ggml_vec_index_remove(idx, added_id) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_search_prepared_filtered(idx, stale_after_remove, query, 1, 2, scores.data(),
                                                   out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_search_ivf(idx, query, 1, 1, 1, scores.data(), out_ids.data()) ==
           GGML_VEC_INDEX_E_INVALID_ARG);
     ggml_vec_index_filter_free(stale_after_remove);
@@ -739,6 +746,8 @@ void check_filtered_and_ivf_search(int bit_width) {
     CHECK(ggml_vec_index_compact(idx) == GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_search_prepared_filtered(idx, stale_after_compact, query, 1, 2, scores.data(),
                                                   out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_search_ivf(idx, query, 1, 1, 1, scores.data(), out_ids.data()) ==
           GGML_VEC_INDEX_E_INVALID_ARG);
     ggml_vec_index_filter_free(stale_after_compact);
