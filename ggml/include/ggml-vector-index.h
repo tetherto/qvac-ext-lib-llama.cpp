@@ -10,10 +10,12 @@
 //
 // Threading: read-only APIs on the same handle can run concurrently. Mutations,
 // persistence writes, compaction, and IVF builds are serialized with reads and
-// with each other. The caller must still keep the handle alive for the duration
-// of every API call. Prepared filter handles must also remain alive for the
-// full duration of any `ggml_vec_index_search_prepared_filtered` call using
-// them; do not free a filter concurrently with a search that uses it.
+// with each other. Writer fairness and bounded mutation latency are not
+// guaranteed while concurrent readers continue to arrive. The caller must
+// still keep the handle alive for the duration of every API call. Prepared
+// filter handles must also remain alive for the full duration of any
+// `ggml_vec_index_search_prepared_filtered` call using them; do not free a
+// filter concurrently with a search that uses it.
 //
 // Endianness: persistence format is fixed little-endian. Stream loaders decode
 // fields into host values; mmap loading requires a little-endian host.
