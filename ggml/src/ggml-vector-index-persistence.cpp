@@ -1,6 +1,6 @@
 // ggml-vector-index-persistence.cpp - f32 snapshot shim for early search split.
 
-#include "ggml-vector-index-internal.h"
+#include "ggml-vector-index-impl.h"
 
 MappedFile::~MappedFile() = default;
 
@@ -492,7 +492,6 @@ int ggml_vec_index_load_ex(const char * path, ggml_vec_index_t ** out) {
         if (end_off < 0) {
             return GGML_VEC_INDEX_E_IO;
         }
-        const uint64_t file_size = static_cast<uint64_t>(end_off);
         f.seekg(0, std::ios::beg);
         if (!f) {
             return GGML_VEC_INDEX_E_IO;
