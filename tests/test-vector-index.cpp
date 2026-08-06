@@ -293,6 +293,37 @@ void check_quantized_small_dim_tie_order(int bit_width) {
     ggml_vec_index_free(idx);
 }
 
+void check_quantized_overflow_topk_order(int bit_width) {
+    constexpr int dim = 1;
+    constexpr int k   = 2;
+
+    const std::array<float, dim * 2> vectors = {
+        1.5f,
+        2.0f,
+    };
+    const std::array<uint64_t, 2> ids = {
+        920001ULL,
+        920002ULL,
+    };
+    const std::array<float, dim> query = {
+        FLT_MAX,
+    };
+
+    auto * idx = ggml_vec_index_create(dim, bit_width);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vectors.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+
+    std::array<float, k>    scores{};
+    std::array<uint64_t, k> out_ids{};
+    CHECK(ggml_vec_index_search(idx, query.data(), 1, k, scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(out_ids[0] == ids[1]);
+    CHECK(out_ids[1] == ids[0]);
+    CHECK(scores[0] == FLT_MAX);
+    CHECK(scores[1] == FLT_MAX);
+
+    ggml_vec_index_free(idx);
+}
+
 void check_ivf_full_probe_recall(int bit_width) {
     constexpr int dim     = 6;
     constexpr int n       = 12;
@@ -340,6 +371,35 @@ void check_ivf_full_probe_recall(int bit_width) {
         CHECK(ivf_ids[i] == exact_ids[i]);
         CHECK(std::fabs(ivf_scores[i] - exact_scores[i]) <= 1e-5f * std::max(1.0f, std::fabs(exact_scores[i])));
     }
+
+    ggml_vec_index_free(idx);
+}
+
+void check_f32_ivf_extreme_centroid_routing() {
+    constexpr int dim = 1;
+
+    const std::array<float, dim * 2> vectors = {
+        1.5f,
+        2.0f,
+    };
+    const std::array<uint64_t, 2> ids   = { 8500ULL, 8501ULL };
+    const std::array<float, dim>  query = { FLT_MAX };
+
+    auto * idx = ggml_vec_index_create(dim, 32);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vectors.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/0) == GGML_VEC_INDEX_OK);
+
+    std::array<float, 1>    exact_score{};
+    std::array<uint64_t, 1> exact_id{};
+    std::array<float, 1>    ivf_score{};
+    std::array<uint64_t, 1> ivf_id{};
+    CHECK(ggml_vec_index_search(idx, query.data(), 1, 1, exact_score.data(), exact_id.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, query.data(), 1, 1, 1, ivf_score.data(), ivf_id.data()) == GGML_VEC_INDEX_OK);
+    CHECK(exact_id[0] == ids[1]);
+    CHECK(ivf_id[0] == exact_id[0]);
+    CHECK(exact_score[0] == FLT_MAX);
+    CHECK(ivf_score[0] == FLT_MAX);
 
     ggml_vec_index_free(idx);
 }
@@ -1072,10 +1132,13 @@ int main() {
     check_quantized_reference(4);
     check_quantized_small_dim_tie_order(8);
     check_quantized_small_dim_tie_order(4);
+    check_quantized_overflow_topk_order(8);
+    check_quantized_overflow_topk_order(4);
 
     for (int bit_width : { 32, 8, 4 }) {
         check_ivf_full_probe_recall(bit_width);
     }
+    check_f32_ivf_extreme_centroid_routing();
     check_ivf_centroid_overflow_fallback();
     check_q8_ivf_extreme_centroid_routing();
 
