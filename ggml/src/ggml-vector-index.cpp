@@ -833,7 +833,8 @@ int ggml_vec_index_add_logged(
             added_state_wide,
             payload);
         if (append_result.status != GGML_VEC_INDEX_OK) {
-            if (append_result.status == GGML_VEC_INDEX_E_NOT_DURABLE) {
+            if (append_result.status == GGML_VEC_INDEX_E_NOT_DURABLE ||
+                (append_result.record_complete && !append_result.data_synced)) {
                 idx->delta_log_reload_required = true;
             }
             if (append_result.record_complete) {
@@ -966,7 +967,8 @@ int ggml_vec_index_remove_logged(
             post_remove_wide,
             payload);
         if (append_result.status != GGML_VEC_INDEX_OK) {
-            if (append_result.status == GGML_VEC_INDEX_E_NOT_DURABLE) {
+            if (append_result.status == GGML_VEC_INDEX_E_NOT_DURABLE ||
+                (append_result.record_complete && !append_result.data_synced)) {
                 idx->delta_log_reload_required = true;
             }
             if (append_result.record_complete) {
