@@ -47,6 +47,27 @@ struct TurboVecRotationCacheEntry {
     std::shared_ptr<const std::vector<float>> strong;
 };
 
+class ScopedNearestRounding {
+public:
+    ScopedNearestRounding() : saved_rounding(std::fegetround()) {
+        if (saved_rounding != FE_TONEAREST && saved_rounding != -1) {
+            std::fesetround(FE_TONEAREST);
+        }
+    }
+
+    ~ScopedNearestRounding() {
+        if (saved_rounding != FE_TONEAREST && saved_rounding != -1) {
+            std::fesetround(saved_rounding);
+        }
+    }
+
+    ScopedNearestRounding(const ScopedNearestRounding &) = delete;
+    ScopedNearestRounding & operator=(const ScopedNearestRounding &) = delete;
+
+private:
+    int saved_rounding = FE_TONEAREST;
+};
+
 struct ChaCha8 {
     uint32_t key[8] = {};
     uint64_t counter = 0;
@@ -224,6 +245,7 @@ static double sample_standard_normal_ziggurat(ChaCha8 & rng) {
 }
 
 static std::vector<float> make_turbovec_rotation(int dim) {
+    const ScopedNearestRounding rounding_guard;
     const size_t dim_sz = static_cast<size_t>(dim);
     std::vector<double> matrix(dim_sz * dim_sz);
     ChaCha8 rng;
@@ -683,6 +705,7 @@ static double adaptive_simpson(const Fn & f, double a, double b, double tol, int
 }
 
 static TurboVecCodebook make_turbovec_codebook(int bits, int dim) {
+    const ScopedNearestRounding rounding_guard;
     const double a = (static_cast<double>(dim) - 1.0) * 0.5;
     const int n_levels = 1 << bits;
     const double std_dev = std::sqrt(2.0 * a / ((2.0 * a + 1.0) * 4.0 * a));
@@ -1115,7 +1138,8 @@ uint64_t turbovec_lut_hash_for_test(
     }
     std::vector<float> rotated(static_cast<size_t>(n_queries) * static_cast<size_t>(dim));
     std::vector<float> calibrated(static_cast<size_t>(dim));
-    rotate_turbovec_queries(query, rotated.data(), n_queries, dim);
+    // Parity fixtures use scalar rotation hashes, independent of backend reduction order.
+    apply_turbovec_rotation_batch(query, rotated.data(), n_queries, dim);
     double bias_correction = 0.0;
     for (int coordinate = 0; coordinate < dim; ++coordinate) {
         const size_t i = static_cast<size_t>(coordinate);
@@ -1603,6 +1627,7 @@ void quantize_turbovec_batch(
         int dim,
         std::vector<float> & tqplus_shift,
         std::vector<float> & tqplus_scale) {
+    const ScopedNearestRounding rounding_guard;
     const size_t dim_sz = static_cast<size_t>(dim);
     const size_t n_sz = static_cast<size_t>(n);
     const size_t row_bytes = static_cast<size_t>(bits) * (dim_sz / 8);
