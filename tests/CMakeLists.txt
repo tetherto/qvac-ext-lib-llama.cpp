@@ -10,7 +10,7 @@ function(llama_build source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
-    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common llama-common-test)
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
@@ -105,7 +105,7 @@ function(llama_build_and_test source)
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
-    target_link_libraries(${TEST_TARGET} PRIVATE llama-common)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama-common llama-common-test)
 
     add_test(
         NAME ${TEST_TARGET}
@@ -209,14 +209,21 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
-    llama_test(
-        test-recurrent-state-rollback
-        LABEL main
-        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
+    # WebGPU excludes QWEN35 in arch_supported() (test-llama-archs.cpp)
+    if (NOT GGML_WEBGPU)
+        llama_test(
+            test-recurrent-state-rollback
+            LABEL main
+            ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+        )
+        set_tests_properties(test-recurrent-state-rollback PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endif()
+    llama_build_and_test(test-kv-cells.cpp)
+    target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-kv-cache.cpp)
+    target_include_directories(test-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
@@ -257,6 +264,9 @@ set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+
+llama_build(test-multi-instance-repro.cpp)
+
 llama_build_and_test(test-arg-parser.cpp)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
@@ -265,7 +275,24 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
-llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
+# Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
+# GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
+# path on hardware that only exposes one native subgroup size. Auto-skips when no
+# GPU backend is available.
+llama_build_and_test(test-copy-tbq-subgroups.cpp)
+
+# QVAC-21914: ggml-opencl flash-attention q-chunking parity vs the CPU
+# backend. Unconditional and self-skipping at runtime when no OpenCL device is
+# present (like test-copy-tbq-subgroups above), so it exercises chunking
+# wherever OpenCL exists (Adreno devices, desktop OpenCL, PoCL). Does not link
+# mtmd, so it is intentionally outside the LLAMA_MTMD block below.
+llama_build_and_test(test-opencl-fa-chunking.cpp)
+
+llama_build_and_test(test-model-load-cancel.cpp       LABEL "model")
+llama_build_and_test(test-model-load-disk.cpp         LABEL "model")
+llama_build_and_test(test-model-load-memory.cpp       LABEL "model")
+target_include_directories(test-model-load-memory PRIVATE ${PROJECT_SOURCE_DIR}/common_test)
+llama_build_and_test(test-model-load-memory-split.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 
@@ -278,20 +305,34 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Test sequence token-count memory API
+llama_build_and_test(test-memory-seq-token-count.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-memory-seq-token-count PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
+    target_include_directories(test-quantize-fns PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
 endif()
 
 # libmtmd
-set(LLAMA_TEST_NAME test-mtmd-c-api)
-llama_build_and_test(test-mtmd-c-api.c)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
-unset(LLAMA_TEST_NAME)
+if (LLAMA_MTMD)
+    set(LLAMA_TEST_NAME test-mtmd-c-api)
+    llama_build_and_test(test-mtmd-c-api.c)
+    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+    unset(LLAMA_TEST_NAME)
+
+    # QVAC-21914: clip flash-attention AUTO budget arithmetic (pure CPU).
+    set(LLAMA_TEST_NAME test-clip-fa-cutoff)
+    llama_build_and_test(test-clip-fa-cutoff.cpp)
+    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+    target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    unset(LLAMA_TEST_NAME)
+endif()
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

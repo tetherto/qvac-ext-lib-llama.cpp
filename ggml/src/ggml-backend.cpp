@@ -1,5 +1,6 @@
 // Note: porting this file to C++ is a work in progress
 
+#include <cstdio>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -1012,6 +1013,11 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // Invariants the inlined hash-set bitset accesses below assume; observed NULL on iOS
+    // (iPhone 17 Gemma 4 mtmd path) crashing at ggml_bitset_get's ldr [used + idx*4].
+    GGML_ASSERT(sched->hash_set.used != NULL);
+    GGML_ASSERT(sched->hash_set.keys != NULL);
+
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1737,7 +1743,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
 
+#ifndef FORCE_GGML_VK_PERF_LOGGER
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
+#else
+    GGML_SCHED_DEBUG = "2";
+#endif
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
 
     sched->debug_realloc = 0;
@@ -1847,6 +1857,10 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+    // size > 0 but used == NULL means the hash_set was freed or never (re-)initialised;
+    // catch that before split_graph dereferences `used` via the inlined bitset accesses.
+    GGML_ASSERT(sched->hash_set.used != NULL);
+    GGML_ASSERT(sched->hash_set.keys != NULL);
 
     ggml_backend_sched_synchronize(sched);
 
@@ -1990,6 +2004,35 @@ enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
 }
 
 enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr) {
+    // Diagnostic logging before the GGML_ASSERTs - the bare assert lines strip away the
+    // offending tensor's identity and the addr/size geometry, which makes iOS Heavy9-Gemma4
+    // aborts (CLIP image-encode graph allocation) impossible to triage from a crash report.
+    const bool bad_tensor = (tensor == NULL) ||
+                            (tensor->buffer != NULL) ||
+                            (tensor->data   != NULL) ||
+                            (tensor->view_src != NULL);
+    void * buf_base          = bad_tensor ? NULL : ggml_backend_buffer_get_base(buffer);
+    const size_t buf_size    = bad_tensor ? 0    : ggml_backend_buffer_get_size(buffer);
+    const size_t alloc_size  = bad_tensor ? 0    : ggml_backend_buffer_get_alloc_size(buffer, tensor);
+    const bool is_meta       = bad_tensor ? false : ggml_backend_buffer_is_meta(buffer);
+    const bool bad_addr_lo   = !bad_tensor && (addr < buf_base);
+    const bool bad_addr_hi   = !bad_tensor && !is_meta &&
+                               ((char *) addr + alloc_size > (char *) buf_base + buf_size);
+    if (bad_tensor || bad_addr_lo || bad_addr_hi) {
+        GGML_LOG_ERROR(
+            "%s: precondition violation: tensor=%p name=%s op=%s buffer=%p data=%p view_src=%s | "
+            "buf=%p buf_base=%p buf_size=%zu addr=%p alloc_size=%zu is_meta=%d "
+            "(bad_tensor=%d bad_addr_lo=%d bad_addr_hi=%d)\n",
+            __func__,
+            (void *) tensor,
+            tensor ? tensor->name : "(null)",
+            tensor ? ggml_op_name(tensor->op) : "(null)",
+            tensor ? (void *) tensor->buffer : NULL,
+            tensor ? tensor->data : NULL,
+            (tensor && tensor->view_src) ? tensor->view_src->name : "(null)",
+            (void *) buffer, buf_base, buf_size, addr, alloc_size, is_meta ? 1 : 0,
+            bad_tensor ? 1 : 0, bad_addr_lo ? 1 : 0, bad_addr_hi ? 1 : 0);
+    }
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->buffer == NULL);
     GGML_ASSERT(tensor->data == NULL);
