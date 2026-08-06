@@ -4,7 +4,9 @@
 // public C API.
 
 #include "ggml-vector-index.h"
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
 #include "ggml-vector-index-impl.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -28,7 +30,9 @@
 #    include <unistd.h>
 #endif
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
+#endif
 
 namespace {
 
@@ -527,6 +531,7 @@ int main() {
         CHECK(ggml_vec_index_len(idx) == 0);
     }
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
     // Byte-span arithmetic is checked independently of the host word size so
     // 64-bit CI still covers the overflow boundary used by 32-bit builds.
     {
@@ -536,6 +541,7 @@ int main() {
         CHECK(ggml_vec_index_detail::can_address_array(max_size / sizeof(uint64_t), sizeof(uint64_t)));
         CHECK(!ggml_vec_index_detail::can_address_array(max_size / sizeof(uint64_t) + 1, sizeof(uint64_t)));
     }
+#endif
 
     // Reject array shapes whose byte spans cannot be represented on 32-bit targets.
     if (sizeof(size_t) == sizeof(uint32_t)) {
@@ -556,12 +562,14 @@ int main() {
         ggml_vec_index_free(output_idx);
     }
 
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
     // The documented oversized-index example exceeds the v1 persistence limit.
     {
         constexpr size_t n   = 262144;
         constexpr size_t dim = 4096;
         CHECK(snapshot_write_v1_preflight(n, dim) == GGML_VEC_INDEX_E_INVALID_ARG);
     }
+#endif
 
     // Zero-query prepared-filter calls still validate filter ownership and staleness.
     {
@@ -998,6 +1006,7 @@ int main() {
         const std::filesystem::path bad_path       = missing_parent / "snapshot.tvim";
         CHECK(ggml_vec_index_write(idx, bad_path.string().c_str()) == GGML_VEC_INDEX_E_IO);
     }
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
     {
         auto * empty_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
         CHECK(empty_idx != nullptr);
@@ -1013,6 +1022,7 @@ int main() {
         CHECK(read_bytes(snapshot.path) == before);
         CHECK(!has_snapshot_tmp(snapshot.path));
     }
+#endif
     auto * preserved = ggml_vec_index_load(path.c_str());
     CHECK(preserved != nullptr);
     CHECK(ggml_vec_index_len(preserved) == 3);

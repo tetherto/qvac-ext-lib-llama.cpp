@@ -99,7 +99,21 @@ elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
 endif()
 
 if (LLAMA_BUILD_TESTS)
-    target_compile_definitions(ggml-vector-index PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+    add_library(ggml-vector-index-test STATIC ${GGML_VECTOR_INDEX_SOURCES})
+    target_compile_features(ggml-vector-index-test PRIVATE cxx_std_17)
+    target_compile_definitions(ggml-vector-index-test PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+    target_include_directories(
+        ggml-vector-index-test
+        PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../../include)
+    if (GGML_VECTOR_INDEX_AVX2_FLAG)
+        target_compile_definitions(ggml-vector-index-test PRIVATE GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
+    endif()
+    target_link_libraries(ggml-vector-index-test PRIVATE Threads::Threads)
+    if (DEFINED MATH_LIBRARY)
+        target_link_libraries(ggml-vector-index-test PRIVATE ${MATH_LIBRARY})
+    elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
+        target_link_libraries(ggml-vector-index-test PRIVATE m)
+    endif()
 endif()
 
 install(
