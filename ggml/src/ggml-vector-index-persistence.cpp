@@ -265,7 +265,22 @@ static bool flush_file_to_disk(std::FILE * f) {
     return fd >= 0 && _commit(fd) == 0;
 #else
     const int fd = fileno(f);
-    return fd >= 0 && fsync(fd) == 0;
+    if (fd < 0) {
+        return false;
+    }
+#if defined(__APPLE__) && defined(F_FULLFSYNC)
+    int result;
+    do {
+        result = fcntl(fd, F_FULLFSYNC);
+    } while (result != 0 && errno == EINTR);
+    if (result == 0) {
+        return true;
+    }
+    if (errno != ENOTSUP && errno != ENOTTY && errno != EINVAL) {
+        return false;
+    }
+#endif
+    return fsync(fd) == 0;
 #endif
 }
 
