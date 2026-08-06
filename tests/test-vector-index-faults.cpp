@@ -677,10 +677,29 @@ void test_delta_append_fault_windows() {
         idx, extra_vector.data(), 1, &data_fsync_id, delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
     reset_fault_hooks();
     CHECK(ggml_vec_index_contains(idx, data_fsync_id) == 1);
+    const uint64_t blocked_after_data_fsync_id = 1307;
+    CHECK(ggml_vec_index_add_logged(
+        idx, extra_vector.data(), 1, &blocked_after_data_fsync_id, delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+    CHECK(ggml_vec_index_contains(idx, blocked_after_data_fsync_id) == 0);
+    CHECK(ggml_vec_index_remove_logged(idx, logged_id, delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+    CHECK(ggml_vec_index_contains(idx, logged_id) == 1);
+    CHECK(ggml_vec_index_compact_delta(idx, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
 
     auto * data_fsync_replayed = ggml_vec_index_load_with_delta(snapshot_path.c_str(), delta_path.c_str());
     CHECK(data_fsync_replayed != nullptr);
     CHECK(ggml_vec_index_contains(data_fsync_replayed, data_fsync_id) == 1);
+    ggml_vec_index_test_set_data_fsync_fail(1);
+    ggml_vec_index_test_set_truncate_fail(1);
+    CHECK(ggml_vec_index_remove_logged(data_fsync_replayed, data_fsync_id, delta_path.c_str()) ==
+          GGML_VEC_INDEX_E_IO);
+    reset_fault_hooks();
+    CHECK(ggml_vec_index_contains(data_fsync_replayed, data_fsync_id) == 0);
+    CHECK(ggml_vec_index_add_logged(
+        data_fsync_replayed, extra_vector.data(), 1, &blocked_after_data_fsync_id, delta_path.c_str()) ==
+          GGML_VEC_INDEX_E_IO);
+    CHECK(ggml_vec_index_contains(data_fsync_replayed, blocked_after_data_fsync_id) == 0);
+    CHECK(ggml_vec_index_compact_delta(
+        data_fsync_replayed, snapshot_path.c_str(), delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
     ggml_vec_index_free(data_fsync_replayed);
 
     ggml_vec_index_free(idx);
