@@ -9,13 +9,15 @@
 #  include <windows.h>
 #  include <winsock2.h>
 #else
-#  include <arpa/inet.h>
-#  include <sys/socket.h>
-#  include <sys/types.h>
-#  include <netinet/in.h>
-#  include <netinet/tcp.h>
-#  include <netdb.h>
-#  include <unistd.h>
+#    include <arpa/inet.h>
+#    include <netdb.h>
+#    include <netinet/in.h>
+#    include <netinet/tcp.h>
+#    include <poll.h>
+#    include <sys/select.h>
+#    include <sys/socket.h>
+#    include <sys/types.h>
+#    include <unistd.h>
 #endif
 #include <cstdlib>
 #include <mutex>
@@ -23,10 +25,7 @@
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
-#  include <time.h>
-#  ifndef _WIN32
-#    include <poll.h>
-#  endif
+#    include <time.h>
 #endif // GGML_RPC_RDMA
 
 #ifdef _WIN32
@@ -43,7 +42,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 #ifdef GGML_RPC_RDMA
 static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
-static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
+static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 x 256 KiB = 6 MiB
 static constexpr size_t RDMA_GID_SIZE = 16;            // RoCE GID / IB GID is always 16 bytes
 using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 
@@ -57,7 +56,7 @@ struct rdma_conn {
     void          * tx_buf = nullptr;
     struct ibv_mr * tx_mr  = nullptr;
 
-    void          * rx_buf = nullptr; // RDMA_RX_DEPTH × RDMA_CHUNK contiguous
+    void          * rx_buf = nullptr; // RDMA_RX_DEPTH x RDMA_CHUNK contiguous
     struct ibv_mr * rx_mr  = nullptr;
     int             rx_head = 0;
 
@@ -247,7 +246,7 @@ bool socket_t::impl::rdma_probe() {
                 found_version = IBV_GID_TYPE_ROCE_V1;
             }
         } else {
-            // Explicit GID index from GGML_RDMA_GID — fetch its type for logging.
+            // Explicit GID index from GGML_RDMA_GID - fetch its type for logging.
             ibv_gid_entry entry = {};
             if (ibv_query_gid_ex(ctx, ib_port, found_gid, &entry, 0) == 0) {
                 found_version = entry.gid_type;
@@ -556,6 +555,23 @@ bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
 }
 
+bool socket_t::set_timeout(int timeout_ms) {
+#ifdef _WIN32
+    DWORD timeout = timeout_ms < 0 ? 0 : (DWORD) timeout_ms;
+    int   recv_ok = setsockopt(pimpl->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &timeout, sizeof(timeout));
+    int   send_ok = setsockopt(pimpl->fd, SOL_SOCKET, SO_SNDTIMEO, (const char *) &timeout, sizeof(timeout));
+#else
+    struct timeval timeout = {};
+    if (timeout_ms >= 0) {
+        timeout.tv_sec  = timeout_ms / 1000;
+        timeout.tv_usec = (timeout_ms % 1000) * 1000;
+    }
+    int recv_ok = setsockopt(pimpl->fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    int send_ok = setsockopt(pimpl->fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+    return recv_ok == 0 && send_ok == 0;
+}
+
 void socket_t::get_caps(uint8_t * local_caps) {
     return pimpl->get_caps(local_caps);
 }
@@ -585,7 +601,25 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
-socket_ptr socket_t::accept() {
+socket_ptr socket_t::accept(int timeout_ms) {
+    if (timeout_ms >= 0) {
+#ifdef _WIN32
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(pimpl->fd, &read_fds);
+        struct timeval timeout = {
+            timeout_ms / 1000,
+            (timeout_ms % 1000) * 1000,
+        };
+        int ready = select((int) pimpl->fd + 1, &read_fds, nullptr, nullptr, &timeout);
+#else
+        struct pollfd pfd   = { pimpl->fd, POLLIN, 0 };
+        int           ready = poll(&pfd, 1, timeout_ms);
+#endif
+        if (ready <= 0) {
+            return nullptr;
+        }
+    }
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;
