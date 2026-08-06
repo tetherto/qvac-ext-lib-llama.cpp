@@ -5,9 +5,6 @@
 // C API.
 
 #include "ggml-vector-index.h"
-#ifdef GGML_VEC_INDEX_TEST_HOOKS
-#include "ggml-vector-index-impl.h"
-#endif
 
 #include <algorithm>
 #include <array>
@@ -41,6 +38,7 @@
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
+int     ggml_vec_index_test_can_address_array(size_t count, size_t element_size);
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void    ggml_vec_index_test_set_parent_fsync_fail(int fail);
@@ -56,6 +54,7 @@ int64_t ggml_vec_index_test_get_mmap_count_reject_count(void);
 void    ggml_vec_index_test_reset_load_count_reject_count(void);
 int64_t ggml_vec_index_test_get_load_count_reject_count(void);
 }
+int snapshot_write_v1_preflight(size_t n, size_t dim);
 uint64_t turbovec_rotation_hash_for_test(int dim);
 size_t turbovec_rotation_cache_bytes_for_test(void);
 uint64_t turbovec_query_rotation_hash_for_test(
@@ -473,6 +472,19 @@ void append_file_bytes(const std::string & path, const std::vector<uint8_t> & by
         f.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     }
     CHECK(static_cast<bool>(f));
+}
+
+bool has_snapshot_tmp(const std::filesystem::path & path) {
+    const std::filesystem::path parent = path.parent_path();
+    const std::string prefix = path.filename().string() + ".tmp.";
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(parent, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.compare(0, prefix.size(), prefix) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void append_u32_le(std::vector<uint8_t> & bytes, uint32_t value) {
@@ -5113,10 +5125,10 @@ int main(int argc, char ** argv) {
     // 64-bit CI still covers the overflow boundary used by 32-bit builds.
     {
         constexpr size_t max_size = std::numeric_limits<size_t>::max();
-        CHECK(ggml_vec_index_detail::can_address_array(max_size / sizeof(float), sizeof(float)));
-        CHECK(!ggml_vec_index_detail::can_address_array(max_size / sizeof(float) + 1, sizeof(float)));
-        CHECK(ggml_vec_index_detail::can_address_array(max_size / sizeof(uint64_t), sizeof(uint64_t)));
-        CHECK(!ggml_vec_index_detail::can_address_array(max_size / sizeof(uint64_t) + 1, sizeof(uint64_t)));
+        CHECK(ggml_vec_index_test_can_address_array(max_size / sizeof(float), sizeof(float)) == 1);
+        CHECK(ggml_vec_index_test_can_address_array(max_size / sizeof(float) + 1, sizeof(float)) == 0);
+        CHECK(ggml_vec_index_test_can_address_array(max_size / sizeof(uint64_t), sizeof(uint64_t)) == 1);
+        CHECK(ggml_vec_index_test_can_address_array(max_size / sizeof(uint64_t) + 1, sizeof(uint64_t)) == 0);
     }
 #endif
 
@@ -5801,7 +5813,8 @@ int main(int argc, char ** argv) {
     CHECK((persisted_stat.st_mode & 0777) == 0600);
 #endif
     {
-        const std::filesystem::path missing_parent = temp_path(".missing-dir");
+        const std::filesystem::path missing_parent =
+            std::filesystem::temp_directory_path() / "ggml-vector-index-missing-dir";
         const std::filesystem::path bad_path       = missing_parent / "snapshot.tvim";
         CHECK(ggml_vec_index_write(idx, bad_path.string().c_str()) == GGML_VEC_INDEX_E_IO);
     }

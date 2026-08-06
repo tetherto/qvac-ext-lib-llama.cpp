@@ -664,6 +664,10 @@ static bool rename_overwrite(const TempFile & temp, const char * dst) {
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
+int ggml_vec_index_test_can_address_array(size_t count, size_t element_size) {
+    return can_address_array(count, element_size) ? 1 : 0;
+}
+
 void ggml_vec_index_test_set_oom_countdown(int64_t countdown) {
     g_test_oom_countdown.store(countdown);
 }
