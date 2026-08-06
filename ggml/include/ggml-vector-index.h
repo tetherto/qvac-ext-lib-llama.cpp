@@ -109,9 +109,10 @@ GGML_API int ggml_vec_index_search(const ggml_vec_index_t * idx,
                                    float *                  out_scores,
                                    uint64_t *               out_ids);
 
-// Persistence. Format is .tvim version 1; see bottom of this header. Write
-// replaces `path` through a same-directory temporary file so a pre-rename
-// failure does not truncate an existing snapshot. Returns
+// Persistence. Format is .tvim version 1; see bottom of this header. V1
+// snapshots are limited to 4 GiB serialized size; larger indexes are rejected
+// by write and load. Write replaces `path` through a same-directory temporary
+// file so a pre-rename failure does not truncate an existing snapshot. Returns
 // GGML_VEC_INDEX_E_NOT_DURABLE if the replacement is visible but syncing its
 // parent directory fails.
 GGML_API int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path);
