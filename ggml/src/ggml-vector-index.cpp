@@ -10,6 +10,7 @@
 // the storage layout and kernel without touching the C API.
 
 #include "ggml-vector-index.h"
+#include "ggml-vector-index-impl.h"
 
 #include <algorithm>
 #include <atomic>
@@ -48,29 +49,17 @@
 
 namespace {
 
+using ggml_vec_index_detail::checked_mul_size;
+using ggml_vec_index_detail::kTvimHeaderSize;
+using ggml_vec_index_detail::snapshot_write_preflight;
+using ggml_vec_index_detail::supported_snapshot_size;
+
 constexpr uint8_t  kTvimMagic[4]   = { 'T', 'V', 'P', 'I' };
 constexpr uint8_t  kTvimVersion    = 1;
-constexpr size_t   kTvimHeaderSize = 16;
 constexpr uint64_t kPaddingId      = UINT64_MAX;
 
 static_assert(sizeof(float) == sizeof(uint32_t) && std::numeric_limits<float>::is_iec559,
               "ggml-vector-index requires IEEE 754 float32");
-
-bool checked_mul_size(size_t a, size_t b, size_t & out) {
-    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
-        return false;
-    }
-    out = a * b;
-    return true;
-}
-
-bool checked_add_size(size_t a, size_t b, size_t & out) {
-    if (b > std::numeric_limits<size_t>::max() - a) {
-        return false;
-    }
-    out = a + b;
-    return true;
-}
 
 size_t grow_capacity(size_t current, size_t required, size_t max_capacity) {
     if (current >= required) {
@@ -118,18 +107,6 @@ float float_score_from_double(double score) {
 double rank_score_from_double(double score) {
     return std::isnan(score) ? -std::numeric_limits<double>::infinity() : score;
 }
-
-bool expected_snapshot_size(size_t n, size_t dim, size_t & expected) {
-    size_t values        = 0;
-    size_t vector_bytes  = 0;
-    size_t id_bytes      = 0;
-    size_t payload_bytes = 0;
-    return checked_mul_size(n, dim, values) && checked_mul_size(values, sizeof(float), vector_bytes) &&
-           checked_mul_size(n, sizeof(uint64_t), id_bytes) && checked_add_size(vector_bytes, id_bytes, payload_bytes) &&
-           checked_add_size(kTvimHeaderSize, payload_bytes, expected);
-}
-
-constexpr uint64_t kMaxSnapshotBytes = UINT64_C(1) << 32;
 
 uint64_t process_id() {
 #ifdef _WIN32
@@ -787,17 +764,11 @@ int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path) {
         if (idx == nullptr || path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (idx->slot_to_id.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
-            idx->slot_to_id.size() > std::numeric_limits<uint32_t>::max()) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
         const size_t n      = idx->slot_to_id.size();
         const size_t dim_sz = static_cast<size_t>(idx->dim);
-        if (dim_sz != 0 && n > std::numeric_limits<size_t>::max() / dim_sz) {
-            return GGML_VEC_INDEX_E_INTERNAL;
-        }
-        if (idx->data.size() != n * dim_sz) {
-            return GGML_VEC_INDEX_E_INTERNAL;
+        const int    preflight_status = snapshot_write_preflight(n, dim_sz, idx->data.size());
+        if (preflight_status != GGML_VEC_INDEX_OK) {
+            return preflight_status;
         }
 
         const std::filesystem::path dst_path(path);
@@ -931,8 +902,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         const size_t dim_sz        = static_cast<size_t>(dim);
         const size_t n             = static_cast<size_t>(n_le);
         size_t       expected_size = 0;
-        if (!expected_snapshot_size(n, dim_sz, expected_size) ||
-            static_cast<uint64_t>(expected_size) > kMaxSnapshotBytes || file_size != expected_size) {
+        if (!supported_snapshot_size(n, dim_sz, expected_size) || file_size != expected_size) {
             return nullptr;
         }
 
