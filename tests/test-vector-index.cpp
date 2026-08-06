@@ -4,6 +4,7 @@
 // public C API.
 
 #include "ggml-vector-index.h"
+#include "ggml-vector-index-impl.h"
 
 #include <algorithm>
 #include <array>
@@ -188,6 +189,16 @@ int main() {
         CHECK(ggml_vec_index_bit_width(nullptr) == 0);
         ggml_vec_index_prepare(nullptr);
         CHECK(ggml_vec_index_len(idx) == 0);
+    }
+
+    // The documented oversized-index example exceeds the v1 persistence limit.
+    {
+        constexpr size_t n   = 262144;
+        constexpr size_t dim = 4096;
+        size_t           data_size = 0;
+        CHECK(ggml_vec_index_detail::checked_mul_size(n, dim, data_size));
+        CHECK(ggml_vec_index_detail::snapshot_write_preflight(n, dim, data_size) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
     }
 
     // Empty indexes return only sentinel-padded search results.
