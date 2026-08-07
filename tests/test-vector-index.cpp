@@ -5560,30 +5560,31 @@ int main(int argc, char ** argv) {
             concurrent_mutation, rows.data(), n_rows, row_ids.data()) ==
             GGML_VEC_INDEX_OK);
 
-        std::atomic<int> ready{ 0 };
-        std::atomic<bool> start{ false };
-        std::atomic<bool> done{ false };
-        std::atomic<int> failures{ 0 };
+        std::atomic<int>         ready{ 0 };
+        std::atomic<int>         read_count{ 0 };
+        std::atomic<bool>        start{ false };
+        std::atomic<bool>        writer_pending{ false };
+        std::atomic<bool>        writer_done{ false };
+        std::atomic<int>         failures{ 0 };
         std::vector<std::thread> readers;
         for (int t = 0; t < 4; ++t) {
             readers.emplace_back([&, t]() {
-                const float * query =
-                    rows.data() + static_cast<size_t>(t % n_rows) * kDim;
-                std::array<float, 3> scores{};
+                const float *           query = rows.data() + static_cast<size_t>(t % n_rows) * kDim;
+                std::array<float, 3>    scores{};
                 std::array<uint64_t, 3> out_ids{};
                 ready.fetch_add(1);
                 while (!start.load()) {
                     std::this_thread::yield();
                 }
-                while (!done.load()) {
-                    if (ggml_vec_index_search(
-                            concurrent_mutation, query, 1, /*k=*/3,
-                            scores.data(), out_ids.data()) != GGML_VEC_INDEX_OK) {
+                while (!writer_pending.load()) {
+                    if (ggml_vec_index_search(concurrent_mutation, query, 1, /*k=*/3, scores.data(), out_ids.data()) !=
+                        GGML_VEC_INDEX_OK) {
                         failures.fetch_add(1);
                     }
                     if (ggml_vec_index_len(concurrent_mutation) < n_rows) {
                         failures.fetch_add(1);
                     }
+                    read_count.fetch_add(1);
                 }
             });
         }
@@ -5592,19 +5593,37 @@ int main(int argc, char ** argv) {
             std::this_thread::yield();
         }
         start.store(true);
-        for (int iter = 0; iter < 100; ++iter) {
-            const std::vector<float> v = normalize({
-                0.25f,
-                static_cast<float>((iter % 7) - 3),
-                1.0f,
-                -0.5f,
-            });
-            const uint64_t id = static_cast<uint64_t>(10000 + iter);
-            CHECK(ggml_vec_index_add(concurrent_mutation, v.data(), 1, &id)
-                  == GGML_VEC_INDEX_OK);
-            CHECK(ggml_vec_index_remove(concurrent_mutation, id) == GGML_VEC_INDEX_OK);
+        const auto read_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (read_count.load() < 32 && std::chrono::steady_clock::now() < read_deadline) {
+            std::this_thread::yield();
         }
-        done.store(true);
+        CHECK(read_count.load() >= 32);
+
+        std::thread writer([&]() {
+            writer_pending.store(true);
+            for (int iter = 0; iter < 100; ++iter) {
+                const std::vector<float> v  = normalize({
+                    0.25f,
+                    static_cast<float>((iter % 7) - 3),
+                    1.0f,
+                    -0.5f,
+                });
+                const uint64_t           id = static_cast<uint64_t>(10000 + iter);
+                if (ggml_vec_index_add(concurrent_mutation, v.data(), 1, &id) != GGML_VEC_INDEX_OK ||
+                    ggml_vec_index_remove(concurrent_mutation, id) != GGML_VEC_INDEX_OK) {
+                    failures.fetch_add(1);
+                    break;
+                }
+            }
+            writer_done.store(true);
+        });
+
+        const auto writer_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!writer_done.load() && std::chrono::steady_clock::now() < writer_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(writer_done.load());
+        writer.join();
         for (std::thread & reader : readers) {
             reader.join();
         }
