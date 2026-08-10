@@ -1091,8 +1091,6 @@ bool filesystem_paths_equal(const char * lhs, const char * rhs) {
         if (lhs_exists != rhs_exists) {
             return false;
         }
-    } else {
-        return false;
     }
 
     std::error_code lhs_ec;
@@ -1170,7 +1168,8 @@ bool bind_delta_log_path(ggml_vec_index & idx, const char * delta_path) {
         idx.bound_delta_log_path_key.swap(path_key);
         return true;
     }
-    return idx.bound_delta_log_path_key == path_key;
+    return idx.bound_delta_log_path_key == path_key ||
+           filesystem_paths_equal(idx.bound_delta_log_path_key.c_str(), delta_path);
 }
 
 static bool delta_file_stamp(const char * path, DeltaFileStamp & stamp) {
@@ -4301,7 +4300,10 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path, const Del
 
 } // namespace
 
-bool delta_log_matches_index_unlocked(const ggml_vec_index_t * idx, const char * delta_path) {
+bool delta_log_matches_index_unlocked(
+        const ggml_vec_index_t * idx,
+        const char * delta_path,
+        DeltaLogLock * lock) {
     try {
         if (idx == nullptr || !idx->state_hash_valid) {
             return false;
@@ -4311,7 +4313,7 @@ bool delta_log_matches_index_unlocked(const ggml_vec_index_t * idx, const char *
         DeltaStateWide base_wide;
         DeltaLogFormat format     = DeltaLogFormat::v4;
         DeltaStateKind state_kind = DeltaStateKind::wide_state;
-        if (!validate_delta_header(delta_path, *idx, size, format, state_kind, base_crc, base_wide)) {
+        if (!validate_delta_header(delta_path, *idx, size, format, state_kind, base_crc, base_wide, lock)) {
             return false;
         }
         const uint32_t       current_crc  = current_delta_state(*idx, state_kind);
@@ -4322,8 +4324,8 @@ bool delta_log_matches_index_unlocked(const ggml_vec_index_t * idx, const char *
         uint32_t       tail_crc = 0;
         DeltaStateWide tail_wide;
         uint64_t       complete_size = 0;
-        if (!get_cached_delta_tail(*idx, delta_path, state_kind, size, tail_crc, tail_wide, complete_size) &&
-            !inspect_delta_log_tail(delta_path, *idx, tail_crc, tail_wide, complete_size)) {
+        if (!get_cached_delta_tail(*idx, delta_path, state_kind, size, tail_crc, tail_wide, complete_size, lock) &&
+            !inspect_delta_log_tail(delta_path, *idx, tail_crc, tail_wide, complete_size, lock)) {
             return false;
         }
         // A torn trailing record is tolerated here; append heals it before
