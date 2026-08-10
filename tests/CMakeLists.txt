@@ -319,6 +319,10 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+if (GGML_RPC)
+    llama_build_and_test(test-rpc.cpp)
+    set_tests_properties(test-rpc PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
 
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
 # GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
