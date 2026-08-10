@@ -1302,6 +1302,17 @@ void check_committed_delta_replay() {
         CHECK(ggml_vec_index_search(loaded, added_vector.data(), 1, 1, scores.data(), out_ids.data()) ==
               GGML_VEC_INDEX_OK);
         CHECK(out_ids[0] == added_id);
+
+        const uint64_t rejected_id = 9253ULL;
+        temp_file     rejected_snapshot(".tvim");
+        CHECK(ggml_vec_index_add(loaded, base_vector.data(), 1, &rejected_id) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove(loaded, added_id) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_compact(loaded) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_write(loaded, rejected_snapshot.path.string().c_str()) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_len(loaded) == 1);
+        CHECK(ggml_vec_index_contains(loaded, added_id) == 1);
         ggml_vec_index_free(loaded);
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -2634,6 +2645,19 @@ int main() {
     auto * preserved = ggml_vec_index_load(path.c_str());
     CHECK(preserved != nullptr);
     CHECK(ggml_vec_index_len(preserved) == 3);
+    auto * mapped = ggml_vec_index_load_mmap(path.c_str());
+    CHECK(mapped != nullptr);
+    std::array<float, 3>    preserved_scores{};
+    std::array<uint64_t, 3> preserved_ids{};
+    std::array<float, 3>    mapped_scores{};
+    std::array<uint64_t, 3> mapped_ids{};
+    CHECK(ggml_vec_index_search(
+              preserved, seeds[0].data(), 1, 3, preserved_scores.data(), preserved_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search(mapped, seeds[0].data(), 1, 3, mapped_scores.data(), mapped_ids.data()) ==
+          GGML_VEC_INDEX_OK);
+    CHECK(mapped_ids == preserved_ids);
+    CHECK(mapped_scores == preserved_scores);
+    ggml_vec_index_free(mapped);
     ggml_vec_index_free(preserved);
 
 #ifndef _WIN32
@@ -2805,6 +2829,22 @@ int main() {
         CHECK(out_ids[0] == ids[0]);
         CHECK(ggml_vec_index_add(q4_mmap, seeds[0].data(), 1, &ids[0]) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_write(q4_mmap, q4_file.path.string().c_str()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        {
+            temp_file       symlink_file(".tvim.link");
+            std::error_code ec;
+            std::filesystem::create_symlink(q4_file.path, symlink_file.path, ec);
+            if (!ec) {
+                auto * symlink_mmap = ggml_vec_index_load_mmap(symlink_file.path.string().c_str());
+                CHECK(symlink_mmap != nullptr);
+                CHECK(ggml_vec_index_search(
+                          symlink_mmap, seeds[0].data(), 1, 1, scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                CHECK(out_ids[0] == ids[0]);
+                ggml_vec_index_free(symlink_mmap);
+            } else {
+                CHECK(ec == std::errc::operation_not_supported || ec == std::errc::function_not_supported ||
+                      ec == std::errc::permission_denied);
+            }
+        }
 
         for (auto * handle : { q4_loaded, q4_mmap }) {
             std::array<float, 4>    after_scores{};
@@ -2899,6 +2939,10 @@ int main() {
             /*n=*/0, {}, {});
         bytes[5] = 8;
         write_bytes(empty_legacy_q8.path, bytes);
+        ggml_vec_index_t * mapped_legacy = nullptr;
+        CHECK(ggml_vec_index_load_mmap_ex(empty_legacy_q8.path.string().c_str(), &mapped_legacy) ==
+              GGML_VEC_INDEX_E_BAD_VERSION);
+        CHECK(mapped_legacy == nullptr);
         auto * loaded_empty_q8 = ggml_vec_index_load(empty_legacy_q8.path.string().c_str());
         CHECK(loaded_empty_q8 != nullptr);
         CHECK(ggml_vec_index_bit_width(loaded_empty_q8) == 8);

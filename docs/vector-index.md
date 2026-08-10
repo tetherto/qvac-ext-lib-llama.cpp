@@ -120,9 +120,10 @@ scales, vector bytes, and CRC32C checksums for accidental corruption detection.
 The loader still accepts legacy v1 f32 snapshots; legacy `bit_width=8` files
 are quantized to q8 on load.
 
-`ggml_vec_index_load_mmap` maps the vector section read-only and copies ids and
-scales into memory. mmap-loaded handles allow search and IVF preparation, but
-reject content mutations. Mmap loading requires a little-endian host because
+`ggml_vec_index_load_mmap` maps the vector section of a version 2 snapshot
+read-only and copies ids and scales into memory. Legacy v1 snapshots require
+`ggml_vec_index_load`. Mmap-loaded handles allow search and IVF preparation,
+but reject content mutations. Mmap loading requires a little-endian host because
 mapped vector bytes are read directly; use `ggml_vec_index_load` on big-endian
 hosts. On POSIX, the snapshot filesystem must support `flock`.
 
@@ -130,3 +131,7 @@ Delta logs use `.tvid`. Legacy v1 delta logs use a full-index CRC32C state
 field. Replay validates every record CRC and checks the full legacy state once
 at the committed tail. Newer logs use rolling state tokens, and v4 logs store
 the full rolling state in each record.
+
+An index loaded with `ggml_vec_index_load_with_delta` is bound to that delta
+log. Plain `add`, `remove`, `compact`, and snapshot `write` operations return
+`GGML_VEC_INDEX_E_INVALID_ARG` on the bound handle.
