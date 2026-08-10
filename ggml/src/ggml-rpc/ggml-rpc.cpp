@@ -481,8 +481,11 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
     result.id = reinterpret_cast<uint64_t>(tensor);
     result.type = tensor->type;
-    if (tensor->buffer && ggml_backend_buffer_is_rpc(tensor->buffer)) {
-        ggml_backend_buffer_t buffer = tensor->buffer;
+    ggml_backend_buffer_t buffer = tensor->buffer;
+    if (buffer && tensor->data && ggml_backend_buffer_is_multi_buffer(buffer)) {
+        buffer = ggml_backend_multi_buffer_get_buffer(buffer, tensor->data);
+    }
+    if (buffer && ggml_backend_buffer_is_rpc(buffer)) {
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         result.buffer = ctx != nullptr ? ctx->remote_ptr : 0;
         result.data = reinterpret_cast<uint64_t>(tensor->data);
@@ -1231,6 +1234,16 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
         result->buffer = nullptr;
     }
+    if (result->buffer && ggml_nelements(result) > 0 && ggml_backend_buffer_is_multi_buffer(result->buffer)) {
+        ggml_backend_buffer_t sub_buffer =
+            ggml_backend_multi_buffer_get_buffer(result->buffer, reinterpret_cast<const void *>(tensor->data));
+        if (sub_buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] tensor '%s' data 0x%" PRIx64 " is not in the multi-buffer\n",
+                           __func__, tensor->name, tensor->data);
+            return nullptr;
+        }
+        result->buffer = sub_buffer;
+    }
 
     if (result->buffer && ggml_nelements(result) > 0) {
         // require that the tensor data does not go beyond the buffer end
@@ -1888,20 +1901,17 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     };
 
-    // wait for the pending subgraph that produced this partial
-    ggml_backend_synchronize(backend);
-
     ggml_tensor * t_wire_send = nullptr;
     ggml_tensor * t_wire_recv = nullptr;
+    ggml_tensor * t_send      = t_dst;
     if (wire_bf16) {
         t_wire_send = new_scratch_tensor(GGML_TYPE_BF16, 0);
         t_wire_recv = new_scratch_tensor(GGML_TYPE_BF16, ne*2);
         compute_nodes(new_cpy_node(t_dst, t_wire_send), nullptr);
-        ggml_backend_synchronize(backend);
-        ggml_backend_tensor_get(t_wire_send, state.send_buf.data(), 0, wire_bytes);
-    } else {
-        ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
+        t_send = t_wire_send;
     }
+    ggml_backend_tensor_get_async(backend, t_send, state.send_buf.data(), 0, wire_bytes);
+    ggml_backend_synchronize(backend);
 
     // rank 0 sends first, rank 1 receives first, so large payloads cannot deadlock
     if (state.rank == 0) {
