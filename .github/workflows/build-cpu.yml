@@ -211,7 +211,7 @@ jobs:
           cmake --install build-vector-index-package-static
           PREFIX="$STATIC_PREFIX" \
             CONSUMER_DIR=vector-index-consumer-static \
-            LIBDIR=lib/x86_64-linux-gnu \
+            LIBDIR="$STATIC_LIBDIR" \
             PKG_CONFIG_STATIC=1 \
             bash scripts/vector-index-package-smoke.sh
 

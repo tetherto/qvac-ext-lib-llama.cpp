@@ -771,7 +771,7 @@ int ggml_vec_index_add_logged(
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
-        if (!delta_log_matches_index_unlocked(idx, delta_path)) {
+        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock)) {
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
@@ -781,7 +781,7 @@ int ggml_vec_index_add_logged(
             return duplicate_status;
         }
 
-        const DeltaLogFormat format = delta_log_format_for_append(delta_path);
+        const DeltaLogFormat format = delta_log_format_for_append(delta_path, &delta_lock);
         if (format == DeltaLogFormat::v1 || format == DeltaLogFormat::v2 || format == DeltaLogFormat::v3) {
             discard_prepared_path();
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -932,7 +932,7 @@ int ggml_vec_index_remove_logged(
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
-        if (!delta_log_matches_index_unlocked(idx, delta_path)) {
+        if (!delta_log_matches_index_unlocked(idx, delta_path, &delta_lock)) {
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
@@ -941,7 +941,7 @@ int ggml_vec_index_remove_logged(
             return GGML_VEC_INDEX_E_NOT_FOUND;
         }
         const std::vector<uint8_t> payload = build_remove_delta_payload(id);
-        const DeltaLogFormat format = delta_log_format_for_append(delta_path);
+        const DeltaLogFormat format = delta_log_format_for_append(delta_path, &delta_lock);
         if (format == DeltaLogFormat::v1 || format == DeltaLogFormat::v2 || format == DeltaLogFormat::v3) {
             discard_prepared_path();
             return GGML_VEC_INDEX_E_INVALID_ARG;
