@@ -5025,7 +5025,7 @@ bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path, 
         restore_failed_replay();
         throw;
     }
-    if (!replayed || !delta_log_matches_index_unlocked(idx, delta_path)) {
+    if (!replayed || !delta_log_matches_index_unlocked(idx, delta_path, &lock)) {
         restore_failed_replay();
         return false;
     }
