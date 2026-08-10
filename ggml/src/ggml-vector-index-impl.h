@@ -27,6 +27,11 @@ inline bool checked_add_size(size_t a, size_t b, size_t & out) {
     return true;
 }
 
+inline bool can_address_array(size_t count, size_t element_size) {
+    size_t bytes = 0;
+    return checked_mul_size(count, element_size, bytes);
+}
+
 inline bool expected_snapshot_size(size_t n, size_t dim, size_t & expected) {
     size_t values        = 0;
     size_t vector_bytes  = 0;
