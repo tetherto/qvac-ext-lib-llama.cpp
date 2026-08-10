@@ -297,6 +297,37 @@ void check_quantized_small_dim_tie_order(int bit_width) {
     ggml_vec_index_free(idx);
 }
 
+void check_quantized_simd_near_tie_order(int bit_width) {
+    constexpr int dim = 16;
+    constexpr int k   = 2;
+
+    std::array<float, dim * 2> vectors{};
+    const int max_code = bit_width == 8 ? 127 : 7;
+    vectors[0]       = 1.0f;
+    vectors[dim]     = 1.0f;
+    vectors[dim + 1] = 1.0f / static_cast<float>(max_code);
+
+    const std::array<uint64_t, 2> ids = {
+        915001ULL,
+        915002ULL,
+    };
+    std::array<float, dim> query{};
+    query[0] = 1.0f;
+    query[1] = 2.0e-7f;
+
+    auto * idx = ggml_vec_index_create(dim, bit_width);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_add(idx, vectors.data(), static_cast<int>(ids.size()), ids.data()) == GGML_VEC_INDEX_OK);
+
+    std::array<float, k>    scores{};
+    std::array<uint64_t, k> out_ids{};
+    CHECK(ggml_vec_index_search(idx, query.data(), 1, k, scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(out_ids[0] == ids[1]);
+    CHECK(out_ids[1] == ids[0]);
+
+    ggml_vec_index_free(idx);
+}
+
 void check_quantized_overflow_topk_order(int bit_width) {
     constexpr int dim = 1;
     constexpr int k   = 2;
@@ -463,6 +494,42 @@ void check_q8_ivf_extreme_centroid_routing() {
     ggml_vec_index_free(idx);
 }
 
+void check_ivf_empty_batch_state_validation() {
+    constexpr int dim = 2;
+
+    auto * idx = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(idx != nullptr);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
+
+    const std::array<float, dim> first_vector = { 1.0f, 0.0f };
+    const uint64_t first_id = 930001ULL;
+    CHECK(ggml_vec_index_add(idx, first_vector.data(), 1, &first_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
+
+    CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/1, /*n_iter=*/0) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) == GGML_VEC_INDEX_OK);
+
+    const std::array<float, dim> second_vector = { 0.0f, 1.0f };
+    const uint64_t second_id = 930002ULL;
+    CHECK(ggml_vec_index_add(idx, second_vector.data(), 1, &second_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
+
+    CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/2, /*n_iter=*/0) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_remove(idx, second_id) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
+
+    CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/1, /*n_iter=*/0) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_compact(idx) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_search_ivf(idx, nullptr, 0, 1, 1, nullptr, nullptr) ==
+          GGML_VEC_INDEX_E_INVALID_ARG);
+
+    ggml_vec_index_free(idx);
+}
+
 }  // namespace
 
 int main() {
@@ -473,6 +540,7 @@ int main() {
     CHECK(ggml_vec_index_bit_width(idx) == 32);
     CHECK(ggml_vec_index_create(0, /*bit_width=*/32) == nullptr);
     CHECK(ggml_vec_index_create(kDim, /*bit_width=*/31) == nullptr);
+    CHECK(std::strcmp(ggml_vec_index_error_to_string(GGML_VEC_INDEX_E_NOT_DURABLE), "not durable") == 0);
 
     // Public APIs reject invalid arguments without mutating the index.
     {
@@ -1022,6 +1090,27 @@ int main() {
         CHECK(read_bytes(snapshot.path) == before);
         CHECK(!has_snapshot_tmp(snapshot.path));
     }
+    {
+        auto * empty_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(empty_idx != nullptr);
+        temp_file snapshot(".tvim");
+        CHECK(ggml_vec_index_write(empty_idx, snapshot.path.string().c_str()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(empty_idx);
+
+        ggml_vec_index_test_set_parent_fsync_fail(1);
+        const int rc = ggml_vec_index_write(idx, snapshot.path.string().c_str());
+        ggml_vec_index_test_set_parent_fsync_fail(0);
+        CHECK(rc == GGML_VEC_INDEX_E_NOT_DURABLE);
+        CHECK(!has_snapshot_tmp(snapshot.path));
+
+        auto * replaced = ggml_vec_index_load(snapshot.path.string().c_str());
+        CHECK(replaced != nullptr);
+        CHECK(ggml_vec_index_len(replaced) == ggml_vec_index_len(idx));
+        CHECK(ggml_vec_index_contains(replaced, ids[0]) == 1);
+        CHECK(ggml_vec_index_contains(replaced, ids[2]) == 1);
+        CHECK(ggml_vec_index_contains(replaced, ids[3]) == 1);
+        ggml_vec_index_free(replaced);
+    }
 #endif
     auto * preserved = ggml_vec_index_load(path.c_str());
     CHECK(preserved != nullptr);
@@ -1142,6 +1231,8 @@ int main() {
     check_quantized_reference(4);
     check_quantized_small_dim_tie_order(8);
     check_quantized_small_dim_tie_order(4);
+    check_quantized_simd_near_tie_order(8);
+    check_quantized_simd_near_tie_order(4);
     check_quantized_overflow_topk_order(8);
     check_quantized_overflow_topk_order(4);
 
@@ -1151,6 +1242,7 @@ int main() {
     check_f32_ivf_extreme_centroid_routing();
     check_ivf_centroid_overflow_fallback();
     check_q8_ivf_extreme_centroid_routing();
+    check_ivf_empty_batch_state_validation();
 
     // Malformed snapshots are rejected before allocating from untrusted counts.
     {
@@ -1272,6 +1364,9 @@ int main() {
                                                 0.0f,
                                             },
                                             { 321ULL, 321ULL }));
+        ggml_vec_index_t * duplicate_out = nullptr;
+        CHECK(ggml_vec_index_load_ex(duplicate_ids.path.string().c_str(), &duplicate_out) == GGML_VEC_INDEX_E_IO);
+        CHECK(duplicate_out == nullptr);
         CHECK(ggml_vec_index_load(duplicate_ids.path.string().c_str()) == nullptr);
     }
     {

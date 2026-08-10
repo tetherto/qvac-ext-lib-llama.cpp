@@ -134,55 +134,71 @@ bool validate_queries_and_maybe_max_abs(
     return true;
 }
 
-#if GGML_VEC_INDEX_USE_NEON
+#if GGML_VEC_INDEX_USE_NEON && defined(__aarch64__)
 
-inline float horizontal_sum(float32x4_t v) {
-#    if defined(__aarch64__)
-    return vaddvq_f32(v);
-#    else
-    const float32x2_t sum2 = vadd_f32(vget_low_f32(v), vget_high_f32(v));
-    return vget_lane_f32(vpadd_f32(sum2, sum2), 0);
-#    endif
+inline double horizontal_sum(float64x2_t v) {
+    return vaddvq_f64(v);
 }
 
-inline float dot_q8_neon(const float * query, const int8_t * codes, float scale, int dim) {
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
+inline void dot_q8_neon_accum(
+        const float * query,
+        int16x8_t codes,
+        float64x2_t scale,
+        float64x2_t & acc0,
+        float64x2_t & acc1,
+        float64x2_t & acc2,
+        float64x2_t & acc3) {
+    const int32x4_t q32_lo = vmovl_s16(vget_low_s16(codes));
+    const int32x4_t q32_hi = vmovl_s16(vget_high_s16(codes));
+    const float32x4_t qf_lo = vcvtq_f32_s32(q32_lo);
+    const float32x4_t qf_hi = vcvtq_f32_s32(q32_hi);
+    const float64x2_t q0 = vmulq_f64(vcvt_f64_f32(vget_low_f32(qf_lo)), scale);
+    const float64x2_t q1 = vmulq_f64(vcvt_f64_f32(vget_high_f32(qf_lo)), scale);
+    const float64x2_t q2 = vmulq_f64(vcvt_f64_f32(vget_low_f32(qf_hi)), scale);
+    const float64x2_t q3 = vmulq_f64(vcvt_f64_f32(vget_high_f32(qf_hi)), scale);
+    acc0 = vmlaq_f64(acc0, vcvt_f64_f32(vld1_f32(query)), q0);
+    acc1 = vmlaq_f64(acc1, vcvt_f64_f32(vld1_f32(query + 2)), q1);
+    acc2 = vmlaq_f64(acc2, vcvt_f64_f32(vld1_f32(query + 4)), q2);
+    acc3 = vmlaq_f64(acc3, vcvt_f64_f32(vld1_f32(query + 6)), q3);
+}
+
+inline double dot_q8_neon(const float * query, const int8_t * codes, float scale, int dim) {
+    const float64x2_t scale_v = vdupq_n_f64(static_cast<double>(scale));
+    float64x2_t acc0 = vdupq_n_f64(0.0);
+    float64x2_t acc1 = vdupq_n_f64(0.0);
+    float64x2_t acc2 = vdupq_n_f64(0.0);
+    float64x2_t acc3 = vdupq_n_f64(0.0);
 
     int i = 0;
     for (; i + 8 <= dim; i += 8) {
-        const int16x8_t   q16 = vmovl_s8(vld1_s8(codes + i));
-        const float32x4_t q0  = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
-        const float32x4_t q1  = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))), scale);
-        acc0                  = vmlaq_f32(acc0, vld1q_f32(query + i), q0);
-        acc1                  = vmlaq_f32(acc1, vld1q_f32(query + i + 4), q1);
+        dot_q8_neon_accum(query + i, vmovl_s8(vld1_s8(codes + i)), scale_v, acc0, acc1, acc2, acc3);
     }
 
-    double acc = static_cast<double>(horizontal_sum(acc0)) + static_cast<double>(horizontal_sum(acc1));
+    double acc = horizontal_sum(acc0) + horizontal_sum(acc1) + horizontal_sum(acc2) + horizontal_sum(acc3);
     for (; i < dim; ++i) {
         const double value = static_cast<double>(codes[i]) * static_cast<double>(scale);
         acc += static_cast<double>(query[i]) * value;
     }
-    return float_score_from_double(acc);
+    return acc;
 }
 
 inline void dot_q4_neon_accum8(const float * query,
                                uint8x8_t     codes,
-                               float         scale,
-                               float32x4_t & acc0,
-                               float32x4_t & acc1) {
-    const int16x8_t   q16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(codes)), vdupq_n_s16(8));
-    const float32x4_t q0  = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16))), scale);
-    const float32x4_t q1  = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))), scale);
-    acc0                  = vmlaq_f32(acc0, vld1q_f32(query), q0);
-    acc1                  = vmlaq_f32(acc1, vld1q_f32(query + 4), q1);
+                               float64x2_t   scale,
+                               float64x2_t & acc0,
+                               float64x2_t & acc1,
+                               float64x2_t & acc2,
+                               float64x2_t & acc3) {
+    const int16x8_t q16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(codes)), vdupq_n_s16(8));
+    dot_q8_neon_accum(query, q16, scale, acc0, acc1, acc2, acc3);
 }
 
-inline float dot_q4_neon(const float * query, const uint8_t * codes, float scale, int dim) {
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    float32x4_t acc2 = vdupq_n_f32(0.0f);
-    float32x4_t acc3 = vdupq_n_f32(0.0f);
+inline double dot_q4_neon(const float * query, const uint8_t * codes, float scale, int dim) {
+    const float64x2_t scale_v = vdupq_n_f64(static_cast<double>(scale));
+    float64x2_t acc0 = vdupq_n_f64(0.0);
+    float64x2_t acc1 = vdupq_n_f64(0.0);
+    float64x2_t acc2 = vdupq_n_f64(0.0);
+    float64x2_t acc3 = vdupq_n_f64(0.0);
 
     int i = 0;
     for (; i + 16 <= dim; i += 16) {
@@ -191,19 +207,18 @@ inline float dot_q4_neon(const float * query, const uint8_t * codes, float scale
         const uint8x8_t   high   = vshr_n_u8(packed, 4);
         const uint8x8x2_t zipped = vzip_u8(low, high);
 
-        dot_q4_neon_accum8(query + i, zipped.val[0], scale, acc0, acc1);
-        dot_q4_neon_accum8(query + i + 8, zipped.val[1], scale, acc2, acc3);
+        dot_q4_neon_accum8(query + i, zipped.val[0], scale_v, acc0, acc1, acc2, acc3);
+        dot_q4_neon_accum8(query + i + 8, zipped.val[1], scale_v, acc0, acc1, acc2, acc3);
     }
 
-    double acc = static_cast<double>(horizontal_sum(acc0)) + static_cast<double>(horizontal_sum(acc1)) +
-                 static_cast<double>(horizontal_sum(acc2)) + static_cast<double>(horizontal_sum(acc3));
+    double acc = horizontal_sum(acc0) + horizontal_sum(acc1) + horizontal_sum(acc2) + horizontal_sum(acc3);
     for (; i < dim; ++i) {
         const uint8_t byte   = codes[static_cast<size_t>(i) / 2];
         const uint8_t nibble = (i & 1) == 0 ? static_cast<uint8_t>(byte & 0x0f) : static_cast<uint8_t>(byte >> 4);
         const double  value  = static_cast<double>(q4_decode(nibble)) * static_cast<double>(scale);
         acc += static_cast<double>(query[i]) * value;
     }
-    return float_score_from_double(acc);
+    return acc;
 }
 
 #endif
@@ -241,17 +256,17 @@ inline double dot_q8(const float * query, const int8_t * codes, float scale, int
     if (dim < 8) {
         return dot_q8_scalar(query, codes, scale, dim);
     }
-#if GGML_VEC_INDEX_USE_NEON
+#if GGML_VEC_INDEX_USE_NEON && defined(__aarch64__)
     if (!quantized_dot_float_path_is_safe(max_query, dim, scale, 127.0f)) {
         return dot_q8_scalar(query, codes, scale, dim);
     }
-    const float score = dot_q8_neon(query, codes, scale, dim);
-    return std::isfinite(score) ? static_cast<double>(score) : dot_q8_scalar(query, codes, scale, dim);
+    const double score = dot_q8_neon(query, codes, scale, dim);
+    return std::isfinite(score) ? score : dot_q8_scalar(query, codes, scale, dim);
 #elif defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
     static const bool has_avx2 = cpu_has_avx2();
     if (has_avx2 && quantized_dot_float_path_is_safe(max_query, dim, scale, 127.0f)) {
-        const float score = ggml_vec_index_detail::dot_q8_avx2(query, codes, scale, dim);
-        return std::isfinite(score) ? static_cast<double>(score) : dot_q8_scalar(query, codes, scale, dim);
+        const double score = ggml_vec_index_detail::dot_q8_avx2(query, codes, scale, dim);
+        return std::isfinite(score) ? score : dot_q8_scalar(query, codes, scale, dim);
     }
     return dot_q8_scalar(query, codes, scale, dim);
 #else
@@ -264,17 +279,17 @@ inline double dot_q4(const float * query, const uint8_t * codes, float scale, in
     if (dim < 16) {
         return dot_q4_scalar(query, codes, scale, dim);
     }
-#if GGML_VEC_INDEX_USE_NEON
+#if GGML_VEC_INDEX_USE_NEON && defined(__aarch64__)
     if (!quantized_dot_float_path_is_safe(max_query, dim, scale, 7.0f)) {
         return dot_q4_scalar(query, codes, scale, dim);
     }
-    const float score = dot_q4_neon(query, codes, scale, dim);
-    return std::isfinite(score) ? static_cast<double>(score) : dot_q4_scalar(query, codes, scale, dim);
+    const double score = dot_q4_neon(query, codes, scale, dim);
+    return std::isfinite(score) ? score : dot_q4_scalar(query, codes, scale, dim);
 #elif defined(GGML_VEC_INDEX_HAVE_AVX2_KERNEL)
     static const bool has_avx2 = cpu_has_avx2();
     if (has_avx2 && quantized_dot_float_path_is_safe(max_query, dim, scale, 7.0f)) {
-        const float score = ggml_vec_index_detail::dot_q4_avx2(query, codes, scale, dim);
-        return std::isfinite(score) ? static_cast<double>(score) : dot_q4_scalar(query, codes, scale, dim);
+        const double score = ggml_vec_index_detail::dot_q4_avx2(query, codes, scale, dim);
+        return std::isfinite(score) ? score : dot_q4_scalar(query, codes, scale, dim);
     }
     return dot_q4_scalar(query, codes, scale, dim);
 #else
@@ -721,12 +736,6 @@ int ggml_vec_index_search_ivf(
     if (n_q < 0 || k <= 0 || nprobe <= 0) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
-    if (n_q == 0) {
-        return GGML_VEC_INDEX_OK;
-    }
-    if (queries == nullptr || out_scores == nullptr || out_ids == nullptr) {
-        return GGML_VEC_INDEX_E_INVALID_ARG;
-    }
 
     try {
         std::shared_lock<std::shared_mutex> lock(idx->mutex);
@@ -734,18 +743,24 @@ int ggml_vec_index_search_ivf(
         const size_t n_q_sz = static_cast<size_t>(n_q);
         const size_t k_sz = static_cast<size_t>(k);
         const size_t dim_sz = static_cast<size_t>(dim);
+        if (idx->ivf_generation != idx->generation ||
+            idx->ivf_n_lists < 0 ||
+            static_cast<size_t>(idx->ivf_n_lists) != idx->ivf_lists.size() ||
+            idx->ivf_centroids.size() != static_cast<size_t>(idx->ivf_n_lists) * dim_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (n_q == 0) {
+            return GGML_VEC_INDEX_OK;
+        }
+        if (queries == nullptr || out_scores == nullptr || out_ids == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (!search_buffers_addressable(n_q_sz, k_sz, dim_sz)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         std::vector<double> query_max_abs_values;
         if (!validate_queries_and_maybe_max_abs(
                 queries, n_q, dim, is_quantized(*idx), query_max_abs_values)) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        if (idx->ivf_generation != idx->generation ||
-            idx->ivf_n_lists < 0 ||
-            static_cast<size_t>(idx->ivf_n_lists) != idx->ivf_lists.size() ||
-            idx->ivf_centroids.size() != static_cast<size_t>(idx->ivf_n_lists) * dim_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
