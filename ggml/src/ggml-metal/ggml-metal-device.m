@@ -95,6 +95,12 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
 }
 
+// simdgroup / subgroup / wave size
+int ggml_metal_pipeline_thread_execution_width(struct ggml_metal_pipeline_with_params pipeline) {
+    return pipeline.pipeline->obj.threadExecutionWidth;
+}
+
+
 struct ggml_metal_library {
     id<MTLLibrary> obj;
 
