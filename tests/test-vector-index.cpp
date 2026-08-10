@@ -628,6 +628,8 @@ void check_filtered_and_ivf_search(int bit_width) {
     std::array<uint64_t, 3> padded_ids{};
     CHECK(ggml_vec_index_search_filtered(idx, query, 1, 3, allowed.data(), static_cast<int>(allowed.size()),
                                          padded_scores.data(), padded_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(padded_ids[0] == ids[1]);
+    CHECK(padded_ids[1] == ids[2]);
     CHECK(padded_scores[0] >= padded_scores[1]);
     CHECK(padded_ids[2] == UINT64_MAX);
     CHECK(padded_scores[2] == -FLT_MAX);
@@ -776,9 +778,15 @@ void check_ivf_state_not_persisted() {
     CHECK(ggml_vec_index_search_ivf(loaded, vectors.data(), 1, 1, 2, scores.data(), out_ids.data()) ==
           GGML_VEC_INDEX_E_INVALID_ARG);
     CHECK(ggml_vec_index_build_ivf(loaded, /*n_lists=*/2, /*n_iter=*/1) == GGML_VEC_INDEX_OK);
+    std::array<float, 1>    exact_scores{};
+    std::array<uint64_t, 1> exact_ids{};
+    CHECK(ggml_vec_index_search(loaded, vectors.data(), 1, 1, exact_scores.data(), exact_ids.data()) ==
+          GGML_VEC_INDEX_OK);
     CHECK(ggml_vec_index_search_ivf(loaded, vectors.data(), 1, 1, 2, scores.data(), out_ids.data()) ==
           GGML_VEC_INDEX_OK);
-    CHECK(out_ids[0] == ids[0]);
+    CHECK(exact_ids[0] == ids[0]);
+    CHECK(out_ids == exact_ids);
+    CHECK(scores == exact_scores);
     ggml_vec_index_free(loaded);
 }
 
@@ -837,6 +845,66 @@ int main() {
         CHECK(ggml_vec_index_build_ivf(idx, 1, -1) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_search_ivf(nullptr, vector.data(), 1, 1, 1, scores.data(), out_ids.data()) ==
               GGML_VEC_INDEX_E_INVALID_ARG);
+        {
+            auto * search_idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
+            CHECK(search_idx != nullptr);
+            auto * filter = ggml_vec_index_filter_create(search_idx, &id, 1);
+            CHECK(filter != nullptr);
+
+            CHECK(ggml_vec_index_search_filtered(
+                      search_idx, vector.data(), -1, 1, &id, 1, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_filtered(
+                      search_idx, vector.data(), 1, 0, &id, 1, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_filtered(
+                      search_idx, nullptr, 1, 1, &id, 1, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_filtered(
+                      search_idx, vector.data(), 1, 1, &id, 1, nullptr, out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_filtered(
+                      search_idx, vector.data(), 1, 1, &id, 1, scores.data(), nullptr) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_prepared_filtered(
+                      search_idx, filter, vector.data(), -1, 1, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_prepared_filtered(
+                      search_idx, filter, vector.data(), 1, 0, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_prepared_filtered(
+                      search_idx, filter, nullptr, 1, 1, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_prepared_filtered(
+                      search_idx, filter, vector.data(), 1, 1, nullptr, out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_prepared_filtered(
+                      search_idx, filter, vector.data(), 1, 1, scores.data(), nullptr) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+
+            CHECK(ggml_vec_index_build_ivf(search_idx, 1, 0) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_search_ivf(
+                      search_idx, vector.data(), -1, 1, 1, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_ivf(
+                      search_idx, vector.data(), 1, 0, 1, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_ivf(
+                      search_idx, vector.data(), 1, 1, 0, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_ivf(
+                      search_idx, nullptr, 1, 1, 1, scores.data(), out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_ivf(
+                      search_idx, vector.data(), 1, 1, 1, nullptr, out_ids.data()) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_search_ivf(
+                      search_idx, vector.data(), 1, 1, 1, scores.data(), nullptr) ==
+                  GGML_VEC_INDEX_E_INVALID_ARG);
+
+            ggml_vec_index_filter_free(filter);
+            ggml_vec_index_free(search_idx);
+        }
         CHECK(ggml_vec_index_write(nullptr, "unused.tvim") == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_write(idx, nullptr) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_load(nullptr) == nullptr);
