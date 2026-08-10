@@ -326,6 +326,7 @@ private:
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
+int     ggml_vec_index_test_can_address_array(size_t count, size_t element_size);
 void    ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 void    ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void    ggml_vec_index_test_set_truncate_fail(int fail);
