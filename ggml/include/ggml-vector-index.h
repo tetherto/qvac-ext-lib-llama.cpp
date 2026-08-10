@@ -228,9 +228,10 @@ GGML_API int ggml_vec_index_load_ex(
 // Returns NULL on failure.
 GGML_API ggml_vec_index_t * ggml_vec_index_load(const char * path);
 
-// Loads a read-only mmap snapshot on a little-endian host. On POSIX, the
-// snapshot filesystem must support flock(). Returns 0 on success and stores the
-// loaded handle in `out`.
+// Loads a read-only current-version (v2) mmap snapshot on a little-endian host.
+// Legacy v1 snapshots return GGML_VEC_INDEX_E_BAD_VERSION. On POSIX, the
+// snapshot filesystem must support flock(). Returns 0 on success and stores
+// the loaded handle in `out`.
 GGML_API int ggml_vec_index_load_mmap_ex(
     const char         * path,
     ggml_vec_index_t  ** out);
@@ -239,8 +240,10 @@ GGML_API int ggml_vec_index_load_mmap_ex(
 // failure.
 GGML_API ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path);
 
-// Loads a snapshot and replays a .tvid delta log. Returns 0 on success and
-// stores the loaded handle in `out`.
+// Loads a snapshot and replays a .tvid delta log. The returned handle is bound
+// to that delta log: plain add, remove, compact, and snapshot write operations
+// return GGML_VEC_INDEX_E_INVALID_ARG. Returns 0 on success and stores the
+// loaded handle in `out`.
 GGML_API int ggml_vec_index_load_with_delta_ex(
     const char         * snapshot_path,
     const char         * delta_path,

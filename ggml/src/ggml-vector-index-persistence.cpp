@@ -504,7 +504,7 @@ static bool open_temp_file(const char * path, TempFile & temp) {
 }
 
 static bool map_file_readonly(const char * path, MappedFile & mapped) {
-    mapped.fd = ::open(path, O_RDONLY | kOpenNoFollow);
+    mapped.fd = ::open(path, O_RDONLY);
     if (mapped.fd < 0) {
         return false;
     }
@@ -3241,7 +3241,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
         }
 
         auto mapped = std::make_unique<MappedFile>();
-        if (!map_file_readonly(path, *mapped) || mapped->size < kTvimHeaderSize) {
+        if (!map_file_readonly(path, *mapped) || mapped->size < kTvimV1HeaderSize) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
 
@@ -3251,6 +3251,9 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
         }
         if (bytes[kTvimOffVersion] != kTvimVersion) {
             return load_fail(GGML_VEC_INDEX_E_BAD_VERSION);
+        }
+        if (mapped->size < kTvimHeaderSize) {
+            return load_fail(GGML_VEC_INDEX_E_IO);
         }
 
         const uint8_t flags = bytes[kTvimOffFlags];
