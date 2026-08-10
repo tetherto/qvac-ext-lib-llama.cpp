@@ -2140,6 +2140,17 @@ void check_committed_delta_replay() {
         CHECK(ggml_vec_index_search(loaded, added_vector.data(), 1, 1, scores.data(), out_ids.data()) ==
               GGML_VEC_INDEX_OK);
         CHECK(out_ids[0] == added_id);
+
+        const uint64_t rejected_id = 9253ULL;
+        temp_file     rejected_snapshot(".tvim");
+        CHECK(ggml_vec_index_add(loaded, base_vector.data(), 1, &rejected_id) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_remove(loaded, added_id) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_compact(loaded) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_write(loaded, rejected_snapshot.path.string().c_str()) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_len(loaded) == 1);
+        CHECK(ggml_vec_index_contains(loaded, added_id) == 1);
         ggml_vec_index_free(loaded);
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
@@ -6760,7 +6771,10 @@ int main(int argc, char ** argv) {
 
             auto * v1 = ggml_vec_index_load(v1_path.c_str());
             CHECK(v1 != nullptr);
-            CHECK(ggml_vec_index_load_mmap(v1_path.c_str()) == nullptr);
+            ggml_vec_index_t * mapped_v1 = nullptr;
+            CHECK(ggml_vec_index_load_mmap_ex(v1_path.c_str(), &mapped_v1) ==
+                  GGML_VEC_INDEX_E_BAD_VERSION);
+            CHECK(mapped_v1 == nullptr);
             CHECK(ggml_vec_index_dim(v1) == kDim);
             CHECK(ggml_vec_index_len(v1) == 2);
             CHECK(ggml_vec_index_bit_width(v1) == (bit_width == 8 ? 8 : 32));
@@ -6830,6 +6844,23 @@ int main(int argc, char ** argv) {
             for (int i = 0; i < 4; ++i) {
                 CHECK(mmap_out_ids[i] == normal_ids[i]);
                 CHECK(std::fabs(mmap_scores[i] - normal_scores[i]) <= 1e-6f);
+            }
+            if (bit_width == 32) {
+                temp_file       symlink_file(".tvim.link");
+                std::error_code ec;
+                std::filesystem::create_symlink(mmap_path, symlink_file.path, ec);
+                if (!ec) {
+                    auto * symlink_mmap = ggml_vec_index_load_mmap(symlink_file.path.string().c_str());
+                    CHECK(symlink_mmap != nullptr);
+                    CHECK(ggml_vec_index_search(
+                              symlink_mmap, query.data(), 1, 4, mmap_scores.data(), mmap_out_ids.data()) ==
+                          GGML_VEC_INDEX_OK);
+                    CHECK(mmap_out_ids == normal_ids);
+                    ggml_vec_index_free(symlink_mmap);
+                } else {
+                    CHECK(ec == std::errc::operation_not_supported || ec == std::errc::function_not_supported ||
+                          ec == std::errc::permission_denied);
+                }
             }
 
             CHECK(std::filesystem::remove(mmap_path));
