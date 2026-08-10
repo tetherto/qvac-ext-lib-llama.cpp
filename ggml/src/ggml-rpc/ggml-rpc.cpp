@@ -1247,13 +1247,13 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
         rpc_msg_get_alloc_size_req request = {
             /*.device =*/ buft_ctx->device,
-            /*.tensor =*/ serialize_tensor(tensor),
+            /*.tensor =*/ serialize_tensor(tensor, cmd_queue),
             /*.srcs   =*/ {},
         };
 
         // .get_alloc_size could be a function of the tensor's srcs, so we must serialize them as well
         for (int i = 0; i < GGML_MAX_SRC; i++) {
-            request.srcs[i] = serialize_tensor(tensor->src[i]);
+            request.srcs[i] = serialize_tensor(tensor->src[i], cmd_queue);
         }
 
         std::string                cache_key = make_alloc_cache_key(request);
