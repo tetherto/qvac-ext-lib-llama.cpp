@@ -46,7 +46,6 @@ jobs:
           PREFIX="$GGML_PREFIX" \
             CONSUMER_DIR=vector-index-pkg-config \
             LIBDIR=lib/x86_64-linux-gnu \
-            RUN_CMAKE=0 \
             PKG_CONFIG_STATIC=1 \
             bash scripts/vector-index-package-smoke.sh
 

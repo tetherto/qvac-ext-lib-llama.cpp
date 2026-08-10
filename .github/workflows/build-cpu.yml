@@ -9,6 +9,7 @@ on:
       '.github/workflows/build-cpu.yml',
       '.github/workflows/build-cmake-pkg.yml',
       '.github/workflows/build-linux-cross.yml',
+      'scripts/vector-index-package-smoke.sh',
       '**/CMakeLists.txt',
       '**/*.cmake',
       '**/*.cmake.in',
@@ -26,6 +27,7 @@ on:
       '.github/workflows/build-cmake-pkg.yml',
       '.github/workflows/build-linux-cross.yml',
       'ggml/src/ggml-rpc/**',
+      'scripts/vector-index-package-smoke.sh',
       '**/CMakeLists.txt',
       '**/*.cmake',
       '**/*.cmake.in',
@@ -155,7 +157,6 @@ jobs:
           PREFIX="$STATIC_PREFIX" \
             CONSUMER_DIR=vector-index-consumer-static \
             LIBDIR=lib/x86_64-linux-gnu \
-            RUN_CMAKE=0 \
             PKG_CONFIG_STATIC=1 \
             bash scripts/vector-index-package-smoke.sh
 
