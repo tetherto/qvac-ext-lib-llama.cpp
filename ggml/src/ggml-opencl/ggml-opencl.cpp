@@ -10627,7 +10627,10 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(err);
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        if (enable_adreno_trans_weight(backend_ctx, tensor)) {
+        // Ask about extra_src, not the view: set_tensor returns early for views and always
+        // decides on the parent, so asking about the view can pair a transposed writer with
+        // a non-transposed reader whenever the two disagree on the shape predicate.
+        if (enable_adreno_trans_weight(backend_ctx, extra_src)) {
             cl_kernel kernel = backend_ctx->kernel_restore_block_q8_0_trans;
 
             int ne00 = tensor->ne[0];
