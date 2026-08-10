@@ -191,6 +191,25 @@ int main() {
         CHECK(ggml_vec_index_len(idx) == 0);
     }
 
+    // Reject array shapes whose byte spans cannot be represented on 32-bit targets.
+    if (sizeof(size_t) == sizeof(uint32_t)) {
+        constexpr int oversized_dim = 1 << 30;
+        auto *        oversized_idx = ggml_vec_index_create(oversized_dim, /*bit_width=*/32);
+        CHECK(oversized_idx != nullptr);
+
+        float    value = 0.0f;
+        uint64_t id    = 1;
+        CHECK(ggml_vec_index_add(oversized_idx, &value, 1, &id) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_search(oversized_idx, &value, 1, 1, &value, &id) == GGML_VEC_INDEX_E_INVALID_ARG);
+        ggml_vec_index_free(oversized_idx);
+
+        auto * output_idx = ggml_vec_index_create(1, /*bit_width=*/32);
+        CHECK(output_idx != nullptr);
+        CHECK(ggml_vec_index_search(output_idx, &value, 1, std::numeric_limits<int>::max(), &value, &id) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        ggml_vec_index_free(output_idx);
+    }
+
     // The documented oversized-index example exceeds the v1 persistence limit.
     {
         constexpr size_t n   = 262144;

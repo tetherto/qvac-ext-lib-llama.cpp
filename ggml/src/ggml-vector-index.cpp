@@ -79,6 +79,11 @@ bool can_insert_without_rehash(const std::unordered_map<uint64_t, size_t> & map,
     return static_cast<long double>(n) <= bucket_capacity;
 }
 
+bool can_address_array(size_t count, size_t element_size) {
+    size_t bytes = 0;
+    return checked_mul_size(count, element_size, bytes);
+}
+
 bool all_finite(const float * values, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         if (!std::isfinite(values[i])) {
@@ -155,6 +160,23 @@ struct file_closer {
 };
 
 #ifndef _WIN32
+bool sync_file(std::FILE * file) {
+    const int fd = fileno(file);
+#if defined(__APPLE__) && defined(F_FULLFSYNC)
+    int result;
+    do {
+        result = fcntl(fd, F_FULLFSYNC);
+    } while (result != 0 && errno == EINTR);
+    if (result == 0) {
+        return true;
+    }
+    if (errno != ENOTSUP && errno != ENOTTY && errno != EINVAL) {
+        return false;
+    }
+#endif
+    return fsync(fd) == 0;
+}
+
 bool sync_parent_directory(const std::filesystem::path & path) {
     std::filesystem::path dir_path = path.parent_path();
     if (dir_path.empty()) {
@@ -519,7 +541,21 @@ int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, con
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         size_t value_count = 0;
-        if (!checked_mul_size(n_sz, dim_sz, value_count)) {
+        if (!checked_mul_size(n_sz, dim_sz, value_count) ||
+            !can_address_array(value_count, sizeof(float)) ||
+            !can_address_array(n_sz, sizeof(uint64_t))) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+
+        base_slot = idx->slot_to_id.size();
+        if (n_sz > std::numeric_limits<size_t>::max() - base_slot) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        const size_t new_slots = base_slot + n_sz;
+        size_t       new_value_count = 0;
+        if (!checked_mul_size(new_slots, dim_sz, new_value_count) ||
+            !can_address_array(new_value_count, sizeof(float)) ||
+            !can_address_array(new_slots, sizeof(uint64_t))) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (!all_finite(vectors, value_count)) {
@@ -542,17 +578,10 @@ int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, con
             }
         }
 
-        base_slot = idx->slot_to_id.size();
-        if (n_sz > std::numeric_limits<size_t>::max() - base_slot) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        const size_t new_slots = base_slot + n_sz;
-        if (dim_sz != 0 && new_slots > std::numeric_limits<size_t>::max() / dim_sz) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-
-        const size_t max_slots = std::min(static_cast<size_t>(std::numeric_limits<int>::max()),
-                                          std::numeric_limits<size_t>::max() / dim_sz);
+        const size_t max_data_slots = (std::numeric_limits<size_t>::max() / sizeof(float)) / dim_sz;
+        const size_t max_id_slots   = std::numeric_limits<size_t>::max() / sizeof(uint64_t);
+        const size_t max_slots      = std::min(static_cast<size_t>(std::numeric_limits<int>::max()),
+                                              std::min(max_data_slots, max_id_slots));
         const size_t current_slots = std::min(idx->slot_to_id.capacity(), idx->data.capacity() / dim_sz);
         const size_t target_slots  = grow_capacity(current_slots, new_slots, max_slots);
         const size_t target_values = target_slots * dim_sz;
@@ -730,11 +759,16 @@ int ggml_vec_index_search(const ggml_vec_index_t * idx,
         const size_t n_q_sz = static_cast<size_t>(n_q);
         const size_t k_sz   = static_cast<size_t>(k);
         const size_t dim_sz = static_cast<size_t>(dim);
-        if ((dim_sz != 0 && n_q_sz > std::numeric_limits<size_t>::max() / dim_sz) ||
-            n_q_sz > std::numeric_limits<size_t>::max() / k_sz) {
+        size_t       query_count = 0;
+        size_t       result_count = 0;
+        if (!checked_mul_size(n_q_sz, dim_sz, query_count) ||
+            !can_address_array(query_count, sizeof(float)) ||
+            !checked_mul_size(n_q_sz, k_sz, result_count) ||
+            !can_address_array(result_count, sizeof(float)) ||
+            !can_address_array(result_count, sizeof(uint64_t))) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (!all_finite(queries, n_q_sz * dim_sz)) {
+        if (!all_finite(queries, query_count)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
@@ -812,14 +846,19 @@ int ggml_vec_index_write(const ggml_vec_index_t * idx, const char * path) {
         if (std::fflush(f.get()) != 0) {
             return fail_io();
         }
-#ifndef _WIN32
-        if (fsync(fileno(f.get())) != 0) {
+#ifdef _WIN32
+        const intptr_t os_handle = _get_osfhandle(_fileno(f.get()));
+        if (os_handle == -1 || FlushFileBuffers(reinterpret_cast<HANDLE>(os_handle)) == 0) {
+            return fail_io();
+        }
+#else
+        if (!sync_file(f.get())) {
             return fail_io();
         }
         if (!set_snapshot_permissions(f.get(), dst_path)) {
             return fail_io();
         }
-        if (fsync(fileno(f.get())) != 0) {
+        if (!sync_file(f.get())) {
             return fail_io();
         }
 #endif

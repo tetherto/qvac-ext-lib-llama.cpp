@@ -377,7 +377,7 @@ install(
   NAMESPACE ggml::
   DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml)
 
-if (GGML_STANDALONE)
+if (GGML_STANDALONE AND BUILD_SHARED_LIBS)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml.pc.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
         @ONLY)
