@@ -191,6 +191,16 @@ int main() {
         CHECK(ggml_vec_index_len(idx) == 0);
     }
 
+    // Byte-span arithmetic is checked independently of the host word size so
+    // 64-bit CI still covers the overflow boundary used by 32-bit builds.
+    {
+        constexpr size_t max_size = std::numeric_limits<size_t>::max();
+        CHECK(ggml_vec_index_detail::can_address_array(max_size / sizeof(float), sizeof(float)));
+        CHECK(!ggml_vec_index_detail::can_address_array(max_size / sizeof(float) + 1, sizeof(float)));
+        CHECK(ggml_vec_index_detail::can_address_array(max_size / sizeof(uint64_t), sizeof(uint64_t)));
+        CHECK(!ggml_vec_index_detail::can_address_array(max_size / sizeof(uint64_t) + 1, sizeof(uint64_t)));
+    }
+
     // Reject array shapes whose byte spans cannot be represented on 32-bit targets.
     if (sizeof(size_t) == sizeof(uint32_t)) {
         constexpr int oversized_dim = 1 << 30;

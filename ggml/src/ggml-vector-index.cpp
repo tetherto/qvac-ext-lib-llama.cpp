@@ -50,6 +50,7 @@
 namespace {
 
 using ggml_vec_index_detail::checked_mul_size;
+using ggml_vec_index_detail::can_address_array;
 using ggml_vec_index_detail::kTvimHeaderSize;
 using ggml_vec_index_detail::snapshot_write_preflight;
 using ggml_vec_index_detail::supported_snapshot_size;
@@ -77,11 +78,6 @@ bool can_insert_without_rehash(const std::unordered_map<uint64_t, size_t> & map,
     const long double bucket_capacity =
         static_cast<long double>(map.bucket_count()) * static_cast<long double>(map.max_load_factor());
     return static_cast<long double>(n) <= bucket_capacity;
-}
-
-bool can_address_array(size_t count, size_t element_size) {
-    size_t bytes = 0;
-    return checked_mul_size(count, element_size, bytes);
 }
 
 bool all_finite(const float * values, size_t n) {
