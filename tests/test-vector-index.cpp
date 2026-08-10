@@ -1347,6 +1347,15 @@ void check_q8_ivf_extreme_centroid_routing() {
     ggml_vec_index_free(idx);
 }
 
+uint64_t encoded_slot_state_hash(uint64_t id, float scale, const std::vector<uint8_t> & codes);
+std::array<uint64_t, 4> wide_state_from_hashes(std::initializer_list<uint64_t> hashes);
+void append_v4_delta_record(
+        std::vector<uint8_t> & bytes,
+        uint8_t op,
+        uint32_t n,
+        const std::vector<uint8_t> & payload,
+        const std::array<uint64_t, 4> & post_state);
+
 void check_ivf_empty_batch_state_validation() {
     constexpr int dim = 2;
 
@@ -1882,27 +1891,6 @@ void expect_corrupt_load_fails(
     std::filesystem::remove(corrupt_path);
 }
 
-struct temp_file {
-    explicit temp_file(const char * suffix) {
-        static uint64_t counter = 0;
-        path = std::filesystem::temp_directory_path() /
-            ("ggml-vector-index-pr2d-" + std::to_string(counter++) + suffix);
-        std::filesystem::remove(path);
-    }
-
-    ~temp_file() { std::filesystem::remove(path); }
-
-    std::filesystem::path path;
-};
-
-void write_bytes(const std::filesystem::path & path, const std::vector<uint8_t> & bytes) {
-    write_file_bytes(path.string(), bytes);
-}
-
-std::vector<uint8_t> read_bytes(const std::filesystem::path & path) {
-    return read_file_bytes(path.string());
-}
-
 void write_sparse_bytes(const std::filesystem::path & path, const std::vector<uint8_t> & prefix, uint64_t size) {
     CHECK(size >= prefix.size());
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -1916,10 +1904,6 @@ void write_sparse_bytes(const std::filesystem::path & path, const std::vector<ui
         f.write(&zero, 1);
     }
     CHECK(static_cast<bool>(f));
-}
-
-void put_u32_le(std::vector<uint8_t> & bytes, size_t offset, uint32_t value) {
-    write_u32_le_at(bytes, offset, value);
 }
 
 uint32_t crc32c_u32(uint32_t crc, uint32_t value) {
