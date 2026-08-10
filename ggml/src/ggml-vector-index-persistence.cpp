@@ -10,10 +10,15 @@ void test_wait_after_load_with_delta_snapshot() {}
 
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 static std::atomic<int64_t> g_write_bytes_remaining{ -1 };
+static std::atomic<bool> g_parent_fsync_fail{ false };
 
 extern "C" {
 GGML_API void ggml_vec_index_test_set_write_fail_after(int64_t bytes) {
     g_write_bytes_remaining.store(bytes, std::memory_order_relaxed);
+}
+
+GGML_API void ggml_vec_index_test_set_parent_fsync_fail(int fail) {
+    g_parent_fsync_fail.store(fail != 0, std::memory_order_relaxed);
 }
 }
 
@@ -294,6 +299,11 @@ static bool close_file(std::FILE *& f) {
 }
 
 static bool sync_parent_dir(const std::filesystem::path & path) {
+#ifdef GGML_VEC_INDEX_TEST_HOOKS
+    if (g_parent_fsync_fail.load(std::memory_order_relaxed)) {
+        return false;
+    }
+#endif
 #ifdef _WIN32
     (void) path;
     return true;
@@ -472,7 +482,7 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
             return GGML_VEC_INDEX_E_IO;
         }
         if (!sync_parent_dir(dst_path)) {
-            return GGML_VEC_INDEX_E_IO;
+            return GGML_VEC_INDEX_E_NOT_DURABLE;
         }
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
@@ -556,6 +566,9 @@ int ggml_vec_index_load_ex(const char * path, ggml_vec_index_t ** out) {
             return GGML_VEC_INDEX_E_OOM;
         }
         const int rc = ggml_vec_index_add(idx.get(), vectors.data(), static_cast<int>(n), ids.data());
+        if (rc == GGML_VEC_INDEX_E_DUPLICATE) {
+            return GGML_VEC_INDEX_E_IO;
+        }
         if (rc != GGML_VEC_INDEX_OK) {
             return rc;
         }

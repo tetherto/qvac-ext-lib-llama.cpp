@@ -58,10 +58,10 @@ enum ggml_vec_index_error {
     GGML_VEC_INDEX_E_IO              = -3,
     GGML_VEC_INDEX_E_OOM             = -4,
     GGML_VEC_INDEX_E_INTERNAL        = -5,
-    GGML_VEC_INDEX_E_BAD_MAGIC       = -6,
-    GGML_VEC_INDEX_E_BAD_VERSION     = -7,
-    GGML_VEC_INDEX_E_PARTIAL_COMPACT = -8,
-    GGML_VEC_INDEX_E_NOT_FOUND       = -9,
+    GGML_VEC_INDEX_E_NOT_FOUND       = -6,
+    GGML_VEC_INDEX_E_BAD_MAGIC       = -7,
+    GGML_VEC_INDEX_E_BAD_VERSION     = -8,
+    GGML_VEC_INDEX_E_PARTIAL_COMPACT = -9,
     GGML_VEC_INDEX_E_NOT_DURABLE     = -10,
 };
 
