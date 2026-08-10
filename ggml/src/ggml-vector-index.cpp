@@ -250,6 +250,8 @@ const char * ggml_vec_index_error_to_string(int error) {
             return "partial compaction";
         case GGML_VEC_INDEX_E_NOT_FOUND:
             return "not found";
+        case GGML_VEC_INDEX_E_NOT_DURABLE:
+            return "not durable";
         case GGML_VEC_INDEX_E_INTERNAL:
             return "internal error";
         default:
