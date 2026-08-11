@@ -770,10 +770,11 @@ if [ -z ${GG_BUILD_LOW_PERF} ]; then
     fi
     source "$MNT/venv/bin/activate"
 
-    pip install -r ${SRC}/requirements.txt --disable-pip-version-check
-    pip install --editable gguf-py --disable-pip-version-check
-    pip install jinja2 --disable-pip-version-check
-    if ! python3 -c "import jinja2"; then
+    venv_python="$MNT/venv/bin/python"
+    "$venv_python" -m pip install -r "${SRC}/requirements.txt" --disable-pip-version-check
+    "$venv_python" -m pip install --editable "${SRC}/gguf-py" --disable-pip-version-check
+    "$venv_python" -m pip install jinja2 --disable-pip-version-check
+    if ! "$venv_python" -c "import jinja2"; then
         echo "Error: jinja2 is not importable after pip install"
         exit 1
     fi
