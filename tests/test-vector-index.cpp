@@ -637,6 +637,40 @@ int main() {
     CHECK(ggml_vec_index_len(preserved) == 3);
     ggml_vec_index_free(preserved);
 
+#ifndef _WIN32
+    // A failed overwrite must leave an existing snapshot unchanged.
+    if (geteuid() != 0) {
+        const std::filesystem::path protected_dir  = temp_path(".protected-dir");
+        const std::filesystem::path protected_path = protected_dir / "snapshot.tvim";
+        CHECK(std::filesystem::create_directory(protected_dir));
+
+        const std::vector<uint8_t> original = snapshot_bytes(kDim, 0, {}, {});
+        write_bytes(protected_path, original);
+
+        std::error_code ec;
+        std::filesystem::permissions(protected_dir,
+                                     std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec,
+                                     std::filesystem::perm_options::replace, ec);
+        CHECK(!ec);
+        const int protected_write_result = ggml_vec_index_write(idx, protected_path.string().c_str());
+        std::filesystem::permissions(protected_dir, std::filesystem::perms::owner_all,
+                                     std::filesystem::perm_options::replace, ec);
+        CHECK(!ec);
+
+        CHECK(protected_write_result == GGML_VEC_INDEX_E_IO);
+        std::ifstream in(protected_path, std::ios::binary);
+        CHECK(in.is_open());
+        const std::vector<uint8_t> actual{
+            std::istreambuf_iterator<char>(in),
+            std::istreambuf_iterator<char>(),
+        };
+        CHECK(actual == original);
+        CHECK(!has_snapshot_tmp(protected_path));
+        in.close();
+        CHECK(std::filesystem::remove_all(protected_dir) == 2);
+    }
+#endif
+
     // Replacement failure leaves the destination and no temporary file.
     {
         temp_file directory_path(".dir");
