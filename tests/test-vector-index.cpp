@@ -2808,7 +2808,7 @@ void check_delta_log_tail_recovery() {
         if (!ec) {
             CHECK(std::filesystem::equivalent(delta_path, delta_alias_path, ec));
             CHECK(!ec);
-            CHECK(ggml_vec_index_compact_delta(base, snapshot.c_str(), delta.c_str()) == GGML_VEC_INDEX_OK);
+            CHECK(ggml_vec_index_compact_delta(base, snapshot.c_str(), delta_alias.c_str()) == GGML_VEC_INDEX_OK);
             CHECK(std::filesystem::equivalent(delta_path, delta_alias_path, ec));
             CHECK(!ec);
             CHECK(read_file_bytes(delta_alias) == read_file_bytes(delta));
@@ -5492,26 +5492,53 @@ int main(int argc, char ** argv) {
                     rows[static_cast<size_t>((t % n_rows) * kDim + 2)],
                     rows[static_cast<size_t>((t % n_rows) * kDim + 3)],
                 };
-                std::array<float, 3> scores{};
-                std::array<uint64_t, 3> out_ids{};
+                std::array<float, 3> expected_scores{};
+                std::array<uint64_t, 3> expected_ids{};
+                std::array<float, 3> expected_filtered_scores{};
+                std::array<uint64_t, 3> expected_filtered_ids{};
+                CHECK(ggml_vec_index_search(
+                    concurrent, query.data(), 1, /*k=*/3,
+                    expected_scores.data(), expected_ids.data()) == GGML_VEC_INDEX_OK);
+                CHECK(ggml_vec_index_search_filtered(
+                    concurrent, query.data(), 1, /*k=*/3,
+                    allowed.data(), static_cast<int>(allowed.size()),
+                    expected_filtered_scores.data(), expected_filtered_ids.data()) == GGML_VEC_INDEX_OK);
                 ready.fetch_add(1);
                 while (!start.load()) {
                     std::this_thread::yield();
                 }
                 for (int iter = 0; iter < 200; ++iter) {
+                    std::array<float, 3> scores{};
+                    std::array<uint64_t, 3> out_ids{};
+                    scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    out_ids.fill(UINT64_MAX);
                     CHECK(ggml_vec_index_search(
                         concurrent, query.data(), 1, /*k=*/3,
                         scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(scores == expected_scores);
+                    CHECK(out_ids == expected_ids);
+                    scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    out_ids.fill(UINT64_MAX);
                     CHECK(ggml_vec_index_search_filtered(
                         concurrent, query.data(), 1, /*k=*/3,
                         allowed.data(), static_cast<int>(allowed.size()),
                         scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(scores == expected_filtered_scores);
+                    CHECK(out_ids == expected_filtered_ids);
+                    scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    out_ids.fill(UINT64_MAX);
                     CHECK(ggml_vec_index_search_prepared_filtered(
                         concurrent, filter, query.data(), 1, /*k=*/3,
                         scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(scores == expected_filtered_scores);
+                    CHECK(out_ids == expected_filtered_ids);
+                    scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    out_ids.fill(UINT64_MAX);
                     CHECK(ggml_vec_index_search_ivf(
                         concurrent, query.data(), 1, /*k=*/3, /*nprobe=*/4,
                         scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+                    CHECK(scores == expected_scores);
+                    CHECK(out_ids == expected_ids);
                     CHECK(ggml_vec_index_contains(concurrent, row_ids[static_cast<size_t>(t % n_rows)]) == 1);
                     CHECK(ggml_vec_index_len(concurrent) == n_rows);
                     CHECK(ggml_vec_index_dim(concurrent) == kDim);
@@ -5557,8 +5584,11 @@ int main(int argc, char ** argv) {
 
         std::atomic<int>         ready{ 0 };
         std::atomic<int>         read_count{ 0 };
+        std::atomic<int>         readers_waiting{ 0 };
+        std::atomic<int>         post_signal_reads{ 0 };
         std::atomic<bool>        start{ false };
         std::atomic<bool>        writer_pending{ false };
+        std::atomic<bool>        race_start{ false };
         std::atomic<bool>        writer_done{ false };
         std::atomic<int>         failures{ 0 };
         std::vector<std::thread> readers;
@@ -5581,6 +5611,21 @@ int main(int argc, char ** argv) {
                     }
                     read_count.fetch_add(1);
                 }
+                readers_waiting.fetch_add(1);
+                while (!race_start.load()) {
+                    std::this_thread::yield();
+                }
+                for (int iter = 0; iter < 64; ++iter) {
+                    if (ggml_vec_index_search(concurrent_mutation, query, 1, /*k=*/3, scores.data(), out_ids.data()) !=
+                        GGML_VEC_INDEX_OK) {
+                        failures.fetch_add(1);
+                    }
+                    if (ggml_vec_index_len(concurrent_mutation) < n_rows) {
+                        failures.fetch_add(1);
+                    }
+                    post_signal_reads.fetch_add(1);
+                    std::this_thread::yield();
+                }
             });
         }
 
@@ -5596,6 +5641,10 @@ int main(int argc, char ** argv) {
 
         std::thread writer([&]() {
             writer_pending.store(true);
+            while (readers_waiting.load() != 4) {
+                std::this_thread::yield();
+            }
+            race_start.store(true);
             for (int iter = 0; iter < 100; ++iter) {
                 const std::vector<float> v  = normalize({
                     0.25f,
@@ -5623,6 +5672,7 @@ int main(int argc, char ** argv) {
             reader.join();
         }
         CHECK(failures.load() == 0);
+        CHECK(post_signal_reads.load() == 4 * 64);
         CHECK(ggml_vec_index_len(concurrent_mutation) == n_rows);
 
         ggml_vec_index_free(concurrent_mutation);
@@ -6852,10 +6902,15 @@ int main(int argc, char ** argv) {
                 if (!ec) {
                     auto * symlink_mmap = ggml_vec_index_load_mmap(symlink_file.path.string().c_str());
                     CHECK(symlink_mmap != nullptr);
+                    mmap_scores.fill(std::numeric_limits<float>::quiet_NaN());
+                    mmap_out_ids.fill(UINT64_MAX);
                     CHECK(ggml_vec_index_search(
                               symlink_mmap, query.data(), 1, 4, mmap_scores.data(), mmap_out_ids.data()) ==
                           GGML_VEC_INDEX_OK);
-                    CHECK(mmap_out_ids == normal_ids);
+                    for (int i = 0; i < 4; ++i) {
+                        CHECK(mmap_out_ids[i] == normal_ids[i]);
+                        CHECK(std::fabs(mmap_scores[i] - normal_scores[i]) <= 1e-6f);
+                    }
                     ggml_vec_index_free(symlink_mmap);
                 } else {
                     CHECK(ec == std::errc::operation_not_supported || ec == std::errc::function_not_supported ||
@@ -6876,9 +6931,17 @@ int main(int argc, char ** argv) {
 
             CHECK(ggml_vec_index_build_ivf(mapped, /*n_lists=*/2, /*n_iter=*/2)
                   == GGML_VEC_INDEX_OK);
+            std::array<float, 2> mmap_ivf_scores{};
+            std::array<uint64_t, 2> mmap_ivf_ids{};
+            mmap_ivf_scores.fill(std::numeric_limits<float>::quiet_NaN());
+            mmap_ivf_ids.fill(UINT64_MAX);
             CHECK(ggml_vec_index_search_ivf(
                 mapped, query.data(), 1, /*k=*/2, /*nprobe=*/2,
-                mmap_scores.data(), mmap_out_ids.data()) == GGML_VEC_INDEX_OK);
+                mmap_ivf_scores.data(), mmap_ivf_ids.data()) == GGML_VEC_INDEX_OK);
+            for (int i = 0; i < 2; ++i) {
+                CHECK(mmap_ivf_ids[i] == normal_ids[i]);
+                CHECK(std::fabs(mmap_ivf_scores[i] - normal_scores[i]) <= 1e-6f);
+            }
 
             const uint64_t new_id = (1ULL << 38) + 99ULL;
             CHECK(ggml_vec_index_add(mapped, seeds[0].data(), 1, &new_id)
