@@ -425,8 +425,8 @@ function gg_run_qwen3_0_6b {
     (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
     (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
-    python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-f16.gguf  --outtype f16
-    python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-bf16.gguf --outtype bf16
+    "$PYTHON" ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-f16.gguf  --outtype f16
+    "$PYTHON" ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-bf16.gguf --outtype bf16
 
     model_f16="${path_models}/ggml-model-f16.gguf"
     model_bf16="${path_models}/ggml-model-bf16.gguf"
@@ -574,7 +574,7 @@ function gg_run_embd_bge_small {
     (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
     (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
-    python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-f16.gguf
+    "$PYTHON" ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-f16.gguf
 
     model_f16="${path_models}/ggml-model-f16.gguf"
     model_q8_0="${path_models}/ggml-model-q8_0.gguf"
@@ -619,7 +619,7 @@ function gg_run_rerank_tiny {
     (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
     (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
-    python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-f16.gguf
+    "$PYTHON" ../convert_hf_to_gguf.py ${path_models} --outfile ${path_models}/ggml-model-f16.gguf
 
     model_f16="${path_models}/ggml-model-f16.gguf"
 
@@ -745,12 +745,13 @@ if [ -z ${GG_BUILD_LOW_PERF} ]; then
         exit 1
     fi
     source "$MNT/venv/bin/activate"
+    PYTHON="$MNT/venv/bin/python3"
 
-    pip install -r ${SRC}/requirements.txt --disable-pip-version-check
-    pip install --editable gguf-py --disable-pip-version-check
-    pip install jinja2 --disable-pip-version-check
-    if ! python3 -c "import jinja2"; then
-        echo "Error: jinja2 is not importable after pip install"
+    "$PYTHON" -m pip install -r ${SRC}/requirements.txt --disable-pip-version-check
+    "$PYTHON" -m pip install --editable gguf-py --disable-pip-version-check
+    "$PYTHON" -m pip install jinja2 --disable-pip-version-check
+    if ! "$PYTHON" -c "import jinja2; import torch"; then
+        echo "Error: jinja2 or torch is not importable after pip install"
         exit 1
     fi
 fi
