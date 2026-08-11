@@ -5108,7 +5108,8 @@ int ggml_vec_index_compact_delta(ggml_vec_index_t * idx, const char * snapshot_p
         std::string bound_delta_path_key;
         if (!delta_log_path_key(delta_path, bound_delta_path_key) ||
             (!idx->bound_delta_log_path_key.empty() &&
-             idx->bound_delta_log_path_key != bound_delta_path_key)) {
+             idx->bound_delta_log_path_key != bound_delta_path_key &&
+             !filesystem_paths_equal(idx->bound_delta_log_path_key.c_str(), delta_path))) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         auto commit_delta_log_binding = [&]() noexcept {
