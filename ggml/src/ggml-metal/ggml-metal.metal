@@ -2076,28 +2076,6 @@ kernel void kernel_silu_f32_4(
     dst[tpig] = x / (1.0f + exp(-x));
 }
 
-kernel void kernel_silu_back(
-        device const float * grad,
-        device const float * src1,
-        device       float * dst,
-        uint tpig[[thread_position_in_grid]]) {
-    const float dy = grad[tpig];
-    const float x  = src1[tpig];
-    const float s  = 1.0f/(1.0f + exp(-x));
-    dst[tpig] = dy*s*(1.0f + x*(1.0f - s));
-}
-
-kernel void kernel_silu_back_4(
-        device const float4 * grad,
-        device const float4 * src1,
-        device       float4 * dst,
-        uint tpig[[thread_position_in_grid]]) {
-    const float4 dy = grad[tpig];
-    const float4 x  = src1[tpig];
-    const float4 s  = 1.0f/(1.0f + exp(-x));
-    dst[tpig] = dy*s*(1.0f + x*(1.0f - s));
-}
-
 static inline float ggml_metal_gelu_back(float x, float dy) {
     const float GELU_COEF_A    = 0.044715f;
     const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
