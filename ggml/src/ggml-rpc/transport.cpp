@@ -10,6 +10,7 @@
 #  include <winsock2.h>
 #else
 #  include <arpa/inet.h>
+#  include <sys/select.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <netinet/in.h>
@@ -585,7 +586,29 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
-socket_ptr socket_t::accept() {
+socket_ptr socket_t::accept(int timeout_ms) {
+    if (timeout_ms >= 0) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(pimpl->fd, &readfds);
+
+        struct timeval timeout = {
+            /*.tv_sec  =*/ timeout_ms / 1000,
+            /*.tv_usec =*/ (timeout_ms % 1000) * 1000,
+        };
+#ifdef _WIN32
+        const int ready = select(0, &readfds, NULL, NULL, &timeout);
+#else
+        const int ready = select(pimpl->fd + 1, &readfds, NULL, NULL, &timeout);
+#endif
+        if (ready <= 0) {
+            if (ready < 0) {
+                GGML_LOG_ERROR("Failed to wait for incoming connection\n");
+            }
+            return nullptr;
+        }
+    }
+
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;

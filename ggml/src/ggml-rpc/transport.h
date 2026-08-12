@@ -16,7 +16,7 @@ struct socket_t {
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
 
-    socket_ptr accept();
+    socket_ptr accept(int timeout_ms = -1);
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
