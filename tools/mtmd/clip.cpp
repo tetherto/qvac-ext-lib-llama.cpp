@@ -1533,6 +1533,12 @@ struct clip_model_loader {
                         // use default llava-uhd preprocessing params
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // The reference stretches straight to the refined size,
+                        // resize(img, [new_h, new_w]) in DynamicResize.forward, so the default
+                        // aspect-preserving pad would letterbox the slices instead. 640x488
+                        // refines to 1024x512, where PAD_CEIL would leave 176 black columns on
+                        // each side, about a third of the encoded pixels.
+                        hparams.image_pad_rf = PAD_NONE;
                         // Optional; absent from every mmproj published so far, including the
                         // VisionPsy Flash one, which is why --image-no-upscale exists. An
                         // mmproj that carries the key needs no flag. gguf-py can write it
