@@ -1559,6 +1559,10 @@ bool rpc_server::get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::v
                            __func__, request.offset, span, ggml_nbytes(tensor));
             return false;
         }
+        if (request.size * request.n_copies > ggml_nbytes(tensor)) {
+            GGML_LOG_ERROR("[%s] packed response size exceeds tensor size\n", __func__);
+            return false;
+        }
     }
 
     response.resize(request.size * request.n_copies, 0);
@@ -1875,7 +1879,13 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
     const size_t need       = wire_bf16 ? 2*nbytes : nbytes;
     if (state.scratch_size < need) {
-        state.scratch.reset(ggml_backend_alloc_buffer(backend, need));
+        ggml_backend_buffer_ptr scratch { ggml_backend_alloc_buffer(backend, need) };
+        if (scratch == nullptr) {
+            GGML_LOG_ERROR("[%s] failed to allocate %zu bytes of scratch space\n", __func__, need);
+            return false;
+        }
+        ggml_backend_synchronize(backend);
+        state.scratch = std::move(scratch);
         state.scratch_size = need;
     }
     char * scratch_base = (char *) ggml_backend_buffer_get_base(state.scratch.get());
@@ -1961,6 +1971,7 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
     if (request.device >= backends.size()) {
         return false;
     }
+    ggml_backend_synchronize(backends[request.device]);
     comm_states[request.device] = comm_state();
     return true;
 }
