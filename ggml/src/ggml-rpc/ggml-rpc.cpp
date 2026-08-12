@@ -377,7 +377,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * minor = nullptr) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -392,21 +392,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t * mi
         return false;
     }
 
-    if (minor != nullptr) {
-        *minor = response.minor;
-    }
     sock->update_caps(response.conn_caps);
     return true;
-}
-
-// minor protocol version of each connected server, used to gate newer commands (comm collectives)
-static std::mutex server_minor_mutex;
-static std::unordered_map<std::string, uint8_t> server_minor_versions;
-
-static uint8_t rpc_server_minor_version(const std::string & endpoint) {
-    std::lock_guard<std::mutex> lock(server_minor_mutex);
-    auto it = server_minor_versions.find(endpoint);
-    return it != server_minor_versions.end() ? it->second : 0;
 }
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
@@ -434,13 +421,8 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
-    uint8_t minor = 0;
-    if (!negotiate_hello(sock, &minor)) {
+    if (!negotiate_hello(sock)) {
         return nullptr;
-    }
-    {
-        std::lock_guard<std::mutex> minor_lock(server_minor_mutex);
-        server_minor_versions[endpoint] = minor;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     sockets[endpoint] = sock;
@@ -2549,10 +2531,6 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
                 GGML_LOG_WARN("%s: multiple ranks on endpoint %s are not supported\n", __func__, rpc_ctx->endpoint.c_str());
                 return nullptr;
             }
-        }
-        if (rpc_server_minor_version(rpc_ctx->endpoint) < 1) {
-            GGML_LOG_WARN("%s: server %s does not support collectives\n", __func__, rpc_ctx->endpoint.c_str());
-            return nullptr;
         }
         ranks.push_back({rpc_ctx->endpoint, rpc_ctx->device});
     }
