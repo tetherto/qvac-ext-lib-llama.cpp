@@ -3644,15 +3644,31 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
                 }
             }
             {
-                // calc_size_no_upscale() divides by both of these. image_size == 0 is legal in
-                // general, it means dynamic sizing, so it is only rejected once the no-upscale
-                // rule is actually the one that will run. Checked after the override above so
-                // it covers the flag as well as the GGUF key.
+                // Both idefics3-style sizing rules divide by image_size and cap with
+                // image_longest_edge, and neither degrades gracefully at zero: image_size 0 hits
+                // GGML_ASSERT(align_size > 0) at preprocess time, which aborts the process rather
+                // than failing the request, and image_longest_edge 0 makes the refined size {0,0},
+                // so the grid is empty and the model silently gets the overview alone, 64 image
+                // tokens where it expects hundreds. Fail the load instead, where it is reportable.
+                //
+                // Scoped to this projector, NOT applied to every slicing model: image_size == 0 is
+                // legal elsewhere and means dynamic sizing, as the sanity check in load_hparams
+                // says, and idefics3 cannot be included either, because the shipped
+                // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj carries no preproc_image_size at all
+                // and would stop loading. That model is already overview-only for this reason, so
+                // it gets a warning instead. Checked after the override above so it covers the
+                // flag as well as the GGUF key.
                 const auto & vp = ctx_vision->model.hparams;
-                if (vp.image_no_upscale && (vp.image_size <= 0 || vp.image_longest_edge <= 0)) {
+                if (ctx_vision->model.proj_type == PROJECTOR_TYPE_VISIONPSY &&
+                        (vp.image_size <= 0 || vp.image_longest_edge <= 0)) {
                     throw std::runtime_error(
-                        string_format("%s: preproc_no_upscale needs a positive image_size (%d) and %s (%d)\n", __func__,
-                                      vp.image_size, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+                        string_format("%s: this projector slices by image_size, which needs a positive image_size (%d) and %s (%d)\n",
+                                      __func__, vp.image_size, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+                }
+                if (ctx_vision->model.proj_type == PROJECTOR_TYPE_IDEFICS3 && vp.image_longest_edge <= 0) {
+                    LOG_WRN("%s: %s is missing, so the refined size is empty and every image will be "
+                            "encoded as the overview alone; slicing is effectively off\n",
+                            __func__, KEY_PREPROC_IMAGE_SIZE);
                 }
                 // The cap is also the upper bound of the clamps in calc_size_no_upscale(), and
                 // std::clamp requires lo <= hi, so metadata that puts the cap below one slice is
