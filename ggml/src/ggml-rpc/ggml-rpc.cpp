@@ -93,6 +93,11 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 // so that both sides clear their caches at the same point in the message stream
 const size_t GRAPH_CACHE_MAX = 1024;
 
+static constexpr int RPC_COMM_CONNECT_RETRY_COUNT = 100;
+static constexpr int RPC_COMM_CONNECT_RETRY_MS    = 50;
+static constexpr int RPC_COMM_ACCEPT_TIMEOUT_MS   =
+        RPC_COMM_CONNECT_RETRY_COUNT * RPC_COMM_CONNECT_RETRY_MS + 1000;
+
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
@@ -1791,8 +1796,9 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             GGML_LOG_ERROR("[%s] failed to listen on comm port %u\n", __func__, request.port);
             return true;
         }
-        state.peer = srv->accept();
+        state.peer = srv->accept(RPC_COMM_ACCEPT_TIMEOUT_MS);
         if (state.peer == nullptr) {
+            GGML_LOG_ERROR("[%s] timed out waiting for rank 1 on comm port %u\n", __func__, request.port);
             return true;
         }
         if (!state.peer->recv_data(remote_caps, sizeof(remote_caps))) {
@@ -1808,10 +1814,10 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     } else {
         const std::string host(request.host, strnlen(request.host, sizeof(request.host)));
         // rank 0 may not be listening yet, retry for a few seconds
-        for (int i = 0; i < 100 && state.peer == nullptr; i++) {
+        for (int i = 0; i < RPC_COMM_CONNECT_RETRY_COUNT && state.peer == nullptr; i++) {
             state.peer = socket_t::connect(host.c_str(), request.port);
             if (state.peer == nullptr) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                std::this_thread::sleep_for(std::chrono::milliseconds(RPC_COMM_CONNECT_RETRY_MS));
             }
         }
         if (state.peer == nullptr) {
@@ -2599,6 +2605,8 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
 
     // Send all init requests before reading any response: rank 0 blocks in accept
     // until rank 1 has connected.
+    bool ok = true;
+    std::array<bool, 2> request_sent = {};
     for (size_t i = 0; i < n_backends; i++) {
         rpc_msg_comm_init_req request = {};
         request.device = ranks[i].device;
@@ -2610,11 +2618,17 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
         auto sock = get_socket(ranks[i].endpoint);
         if (sock == nullptr || !send_rpc_cmd(sock, RPC_CMD_COMM_INIT, &request, sizeof(request))) {
-            return nullptr;
+            GGML_LOG_WARN("%s: failed to send init request to rank %zu (%s)\n",
+                          __func__, i, ranks[i].endpoint.c_str());
+            ok = false;
+            continue;
         }
+        request_sent[i] = true;
     }
-    bool ok = true;
     for (size_t i = 0; i < n_backends; i++) {
+        if (!request_sent[i]) {
+            continue;
+        }
         auto sock = get_socket(ranks[i].endpoint);
         rpc_msg_comm_init_rsp response = {};
         uint64_t rsp_size = 0;
