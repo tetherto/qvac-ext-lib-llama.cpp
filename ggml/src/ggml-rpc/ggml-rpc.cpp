@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <thread>
@@ -79,6 +80,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
+    RPC_CMD_SYNCHRONIZE,
     RPC_CMD_COUNT,
 };
 
@@ -236,6 +238,10 @@ struct rpc_msg_comm_allreduce_req {
 };
 
 struct rpc_msg_comm_free_req {
+    uint32_t device;
+};
+
+struct rpc_msg_synchronize_req {
     uint32_t device;
 };
 
@@ -758,8 +764,11 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
-    GGML_UNUSED(backend);
-    // this is no-op because we don't have any async operations
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_msg_synchronize_req request = {rpc_ctx->device};
+    auto sock = get_socket(rpc_ctx->endpoint);
+    bool status = send_rpc_cmd(sock, RPC_CMD_SYNCHRONIZE, &request, sizeof(request), nullptr, 0);
+    RPC_STATUS_ASSERT(status);
 }
 
 static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -975,6 +984,7 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool synchronize(const rpc_msg_synchronize_req & request);
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
     bool comm_allreduce(const rpc_msg_comm_allreduce_req & request);
     bool comm_free(const rpc_msg_comm_free_req & request);
@@ -1755,6 +1765,14 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     return true;
 }
 
+bool rpc_server::synchronize(const rpc_msg_synchronize_req & request) {
+    if (request.device >= backends.size()) {
+        return false;
+    }
+    ggml_backend_synchronize(backends[request.device]);
+    return true;
+}
+
 // graph compute is asynchronous; commands that read or write buffer data synchronize first
 void rpc_server::sync_all_backends() {
     for (ggml_backend_t backend : backends) {
@@ -1965,6 +1983,7 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    sync_all_backends();
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -2252,6 +2271,19 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SYNCHRONIZE: {
+                rpc_msg_synchronize_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.synchronize(request)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_COMM_INIT: {
                 rpc_msg_comm_init_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -2525,6 +2557,9 @@ static void ggml_backend_rpc_comm_free(void * comm_ctx_v) {
 
 static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_backends) {
     if (n_backends != 2 || std::getenv("GGML_RPC_NO_COMM") != nullptr) {
+        if (n_backends != 2) {
+            GGML_LOG_WARN("RPC all-reduce currently only supports 2 ranks, falling back to slow all-reduce\n");
+        }
         return nullptr;
     }
     std::vector<ggml_backend_rpc_comm_context::rank_info> ranks;
@@ -2552,9 +2587,24 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
     if (!parse_endpoint(ranks[0].endpoint, host0, port0)) {
         return nullptr;
     }
-    const uint32_t comm_port = (uint32_t) port0 + 1000;
     if (host0.size() >= 64) {
         return nullptr;
+    }
+
+    uint32_t comm_port = 0;
+    if (const char * env = std::getenv("GGML_RPC_COMM_PORT")) {
+        char * end = nullptr;
+        const unsigned long parsed = std::strtoul(env, &end, 10);
+        if (end == env || *end != '\0' || parsed == 0 || parsed > 65535) {
+            GGML_LOG_WARN("%s: invalid GGML_RPC_COMM_PORT '%s'\n", __func__, env);
+            return nullptr;
+        }
+        comm_port = (uint32_t) parsed;
+    } else if (port0 <= 0 || port0 > 65535 - 1000) {
+        GGML_LOG_WARN("%s: RPC port %d + 1000 is out of range; set GGML_RPC_COMM_PORT\n", __func__, port0);
+        return nullptr;
+    } else {
+        comm_port = (uint32_t) port0 + 1000;
     }
 
     // Send all init requests before reading any response: rank 0 blocks in accept
@@ -2604,7 +2654,7 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
     }
     for (size_t i = 0; i < n_ranks; i++) {
         if (tensors[i] == nullptr || tensors[i]->type != GGML_TYPE_F32 || ggml_nelements(tensors[i]) != ne ||
-                !ggml_is_contiguously_allocated(tensors[i]) ||
+                !ggml_is_contiguous(tensors[i]) ||
                 tensors[i]->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensors[i]->buffer)) {
             return false;
         }
