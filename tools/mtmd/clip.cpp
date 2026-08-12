@@ -4315,6 +4315,14 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
                         string_format("%s: preproc_no_upscale needs a positive image_size (%d) and %s (%d)\n", __func__,
                                       vp.image_size, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
                 }
+                // The cap is also the upper bound of the clamps in calc_size_no_upscale(), and
+                // std::clamp requires lo <= hi, so metadata that puts the cap below one slice is
+                // undefined behaviour rather than a bad result. Reject it here.
+                if (vp.image_no_upscale && vp.image_longest_edge < vp.image_size) {
+                    throw std::runtime_error(
+                        string_format("%s: preproc_no_upscale needs %s (%d) >= image_size (%d)\n", __func__,
+                                      KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                }
             }
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
