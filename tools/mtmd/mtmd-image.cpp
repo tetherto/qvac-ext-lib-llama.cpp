@@ -144,13 +144,18 @@ struct img_tool {
             return {0, 0};
         }
 
-        float scale = std::min(static_cast<float>(longest_edge) / inp_size.width,
-                               static_cast<float>(longest_edge) / inp_size.height);
+        // double, not float: the reference processors do this in Python floats, and where the
+        // true product lands on a multiple of align_size, float32 rounding pushes it just past
+        // and the ceil buys a whole extra row or column of slices. 960x720 at align 512 and
+        // longest_edge 2048 is the common case: 1536 in double, 2048 in float32, so a 4x3 grid
+        // becomes 4x4 and the image gains 4 slices the reference never emits.
+        double scale = std::min(static_cast<double>(longest_edge) / inp_size.width,
+                                static_cast<double>(longest_edge) / inp_size.height);
 
-        float target_width_f  = static_cast<float>(inp_size.width)  * scale;
-        float target_height_f = static_cast<float>(inp_size.height) * scale;
+        double target_width_f  = static_cast<double>(inp_size.width)  * scale;
+        double target_height_f = static_cast<double>(inp_size.height) * scale;
 
-        auto ceil_by_factor = [f = align_size](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
+        auto ceil_by_factor = [f = align_size](double x) { return static_cast<int>(std::ceil(x / static_cast<double>(f))) * f; };
         int aligned_width  = ceil_by_factor(target_width_f);
         int aligned_height = ceil_by_factor(target_height_f);
 
