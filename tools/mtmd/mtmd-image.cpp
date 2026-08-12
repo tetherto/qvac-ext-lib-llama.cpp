@@ -740,11 +740,16 @@ mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_ll
 mtmd_image_preprocessor_llava_uhd::slice_output mtmd_image_preprocessor_llava_uhd::slice_image(const clip_image_u8 & img, const mtmd_image_preprocessor_llava_uhd::slice_instructions & inst) {
     slice_output output;
 
-    // resize to overview size
-    img_tool::resize(img, output.overview, inst.overview_size, hparams.image_resize_algo_ov,
-                        hparams.image_pad_ov, hparams.image_pad_color_ov);
+    const bool overview_only = inst.slices.empty();
 
-    if (inst.slices.empty()) {
+    // resize to overview size. overview_from_refined defers this until the refined image exists,
+    // since the overview is then a downscale of that rather than of the original.
+    if (overview_only || !inst.overview_from_refined) {
+        img_tool::resize(img, output.overview, inst.overview_size, hparams.image_resize_algo_ov,
+                            hparams.image_pad_ov, hparams.image_pad_color_ov);
+    }
+
+    if (overview_only) {
         // no slices, just return the overview image
         return output;
     }
@@ -753,6 +758,11 @@ mtmd_image_preprocessor_llava_uhd::slice_output mtmd_image_preprocessor_llava_uh
     clip_image_u8 refined_img;
     img_tool::resize(img, refined_img, inst.refined_size, hparams.image_resize_algo_rf,
                         hparams.image_pad_rf, hparams.image_pad_color_rf);
+
+    if (inst.overview_from_refined) {
+        img_tool::resize(refined_img, output.overview, inst.overview_size, hparams.image_resize_algo_ov,
+                            hparams.image_pad_ov, hparams.image_pad_color_ov);
+    }
 
     // create slices
     for (const auto & slice : inst.slices) {
@@ -1272,6 +1282,12 @@ mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_i
     // Square, in both variants: the reference resizes the global image to (p, p) regardless
     // of no_upscale (GlobalAndSplitImages in custom_transforms.py).
     instructions.overview_size = clip_image_size{hparams.image_size, hparams.image_size};
+    // Both references refine first and take the global image from that result, not from the
+    // original: GlobalAndSplitImages.forward() receives what DynamicResize returned, and
+    // HF's Idefics3 split_images() resizes the tensor it just split
+    // (resize_for_vision_encoder runs before it). Sourcing the overview from the original
+    // instead leaves the overview pixels off-reference on every grid above 1x1.
+    instructions.overview_from_refined = true;
     for (int y = 0; y < refined_size.height; y += hparams.image_size) {
         for (int x = 0; x < refined_size.width; x += hparams.image_size) {
             // LOG_INF("%s: adding slice at x=%d, y=%d\n", __func__, x, y);

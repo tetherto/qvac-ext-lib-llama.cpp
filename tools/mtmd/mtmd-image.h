@@ -74,6 +74,10 @@ struct mtmd_image_preprocessor_llava_uhd : mtmd_image_preprocessor {
         clip_image_size refined_size;  // size of image right before slicing (must be multiple of slice size)
         clip_image_size grid_size;     // grid_size.width * grid_size.height = number of slices
         std::vector<slice_coordinates> slices;
+        // Downscale the overview from the refined image instead of the original. Set it when the
+        // reference processor resizes first and derives its global image from that result; leave
+        // it off where the overview is sized from the original independently of the slices.
+        bool overview_from_refined = false;
     };
 
     // LFM2 override this function to implement its custom slicing logic
