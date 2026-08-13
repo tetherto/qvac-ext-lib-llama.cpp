@@ -4318,21 +4318,31 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
                 // so the grid is empty and the model silently gets the overview alone, 64 image
                 // tokens where it expects hundreds. Fail the load instead, where it is reportable.
                 //
-                // Scoped to this projector, NOT applied to every slicing model: image_size == 0 is
-                // legal elsewhere and means dynamic sizing, as the sanity check in load_hparams
-                // says, and idefics3 cannot be included either, because the shipped
-                // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj carries no preproc_image_size at all
-                // and would stop loading. That model is already overview-only for this reason, so
-                // it gets a warning instead. Checked after the override above so it covers the
-                // flag as well as the GGUF key.
+                // Scoped to the two projectors that run this rule, NOT applied to every slicing
+                // model: image_size == 0 is legal elsewhere and means dynamic sizing, as the
+                // sanity check in load_hparams says, so a blanket check would reject Qwen-VL.
+                // Checked after the override above so it covers the flag as well as the GGUF key.
                 const auto & vp = ctx_vision->model.hparams;
-                if (ctx_vision->model.proj_type == PROJECTOR_TYPE_VISIONPSY &&
-                        (vp.image_size <= 0 || vp.image_longest_edge <= 0)) {
+                const projector_type slicing_pt = ctx_vision->model.proj_type;
+                const bool idefics3_style = slicing_pt == PROJECTOR_TYPE_VISIONPSY ||
+                                            slicing_pt == PROJECTOR_TYPE_IDEFICS3;
+                // image_size is the divisor and the align size, and zero aborts the process at the
+                // first image, so it is a load failure for both.
+                if (idefics3_style && vp.image_size <= 0) {
                     throw std::runtime_error(
-                        string_format("%s: this projector slices by image_size, which needs a positive image_size (%d) and %s (%d)\n",
-                                      __func__, vp.image_size, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+                        string_format("%s: this projector slices by image_size, which must be positive (%d)\n",
+                                      __func__, vp.image_size));
                 }
-                if (ctx_vision->model.proj_type == PROJECTOR_TYPE_IDEFICS3 && vp.image_longest_edge <= 0) {
+                // The cap is the one the two disagree on. VisionPsy's published mmprojs all carry
+                // it, so a missing cap there is broken metadata. idefics3 cannot throw: the shipped
+                // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj has no preproc_image_size at all and
+                // would stop loading. It is already overview-only for that reason, so say so.
+                if (slicing_pt == PROJECTOR_TYPE_VISIONPSY && vp.image_longest_edge <= 0) {
+                    throw std::runtime_error(
+                        string_format("%s: this projector slices by image_size, so %s must be positive (%d)\n",
+                                      __func__, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+                }
+                if (slicing_pt == PROJECTOR_TYPE_IDEFICS3 && vp.image_longest_edge <= 0) {
                     LOG_WRN("%s: %s is missing, so the refined size is empty and every image will be "
                             "encoded as the overview alone; slicing is effectively off\n",
                             __func__, KEY_PREPROC_IMAGE_SIZE);
