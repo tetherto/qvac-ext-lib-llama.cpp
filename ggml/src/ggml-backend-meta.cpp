@@ -771,6 +771,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         const bool kv_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
         GGML_ASSERT(kv_split || kv_mirrored);
+        GGML_ASSERT(!kv_mirrored || (tensor->src[1]->ne[2] == 1 && tensor->src[2]->ne[2] == 1));
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
