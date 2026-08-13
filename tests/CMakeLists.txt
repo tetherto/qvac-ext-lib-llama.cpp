@@ -366,6 +366,13 @@ if (LLAMA_MTMD)
     target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
     target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
     unset(LLAMA_TEST_NAME)
+
+    # QVAC-23075: preprocessing metadata rejected at load, on generated metadata-only mmprojs.
+    set(LLAMA_TEST_NAME test-clip-preproc-metadata)
+    llama_build_and_test(test-clip-preproc-metadata.cpp)
+    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+    target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    unset(LLAMA_TEST_NAME)
 endif()
 
 llama_build_and_test(test-mtmd-impl.cpp)
