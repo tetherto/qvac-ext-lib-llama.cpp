@@ -339,6 +339,14 @@ if (LLAMA_MTMD)
     target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
     target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
     unset(LLAMA_TEST_NAME)
+
+    # QVAC-23075: idefics3-family refined size and slice grid against the reference rule
+    # (pure CPU, no model).
+    set(LLAMA_TEST_NAME test-mtmd-preproc-sizing)
+    llama_build_and_test(test-mtmd-preproc-sizing.cpp)
+    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+    target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    unset(LLAMA_TEST_NAME)
 endif()
 
 # GGUF model data fetcher library for tests that need real model metadata
