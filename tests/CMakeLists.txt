@@ -340,27 +340,36 @@ if (LLAMA_MTMD)
     target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
     unset(LLAMA_TEST_NAME)
 
-    # QVAC-23075: idefics3-family refined size and slice grid against the reference rule
-    # (pure CPU, no model).
-    set(LLAMA_TEST_NAME test-mtmd-preproc-sizing)
-    llama_build_and_test(test-mtmd-preproc-sizing.cpp)
-    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
-    target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
-    unset(LLAMA_TEST_NAME)
-
     # QVAC-23075: legacy projector alias resolution, which must stay gated on general.name.
+    # Resolution is inline in clip-impl.h, so this one links on every platform.
     set(LLAMA_TEST_NAME test-clip-projector-alias)
     llama_build_and_test(test-clip-projector-alias.cpp)
     target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
     target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
     unset(LLAMA_TEST_NAME)
 
-    # QVAC-23075: preprocessing metadata rejected at load, on generated metadata-only mmprojs.
-    set(LLAMA_TEST_NAME test-clip-preproc-metadata)
-    llama_build_and_test(test-clip-preproc-metadata.cpp)
-    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
-    target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
-    unset(LLAMA_TEST_NAME)
+    if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+        # Same reason as the llama tests above, and as the note at clip.h's
+        # clip_fa_effective_min_kv: these reach mtmd_calc_idefics3_sizing, clip_init and
+        # clip_log_set_callback, which carry no MTMD_API decoration and so are not exported
+        # across the Windows mtmd.dll boundary. They still run on every other platform, and on
+        # Windows itself in a static build.
+
+        # QVAC-23075: idefics3-family refined size and slice grid against the reference rule
+        # (pure CPU, no model).
+        set(LLAMA_TEST_NAME test-mtmd-preproc-sizing)
+        llama_build_and_test(test-mtmd-preproc-sizing.cpp)
+        target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+        target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+        unset(LLAMA_TEST_NAME)
+
+        # QVAC-23075: preprocessing metadata rejected at load, on generated metadata-only mmprojs.
+        set(LLAMA_TEST_NAME test-clip-preproc-metadata)
+        llama_build_and_test(test-clip-preproc-metadata.cpp)
+        target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+        target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+        unset(LLAMA_TEST_NAME)
+    endif()
 endif()
 
 # GGUF model data fetcher library for tests that need real model metadata
