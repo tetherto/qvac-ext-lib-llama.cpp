@@ -142,6 +142,13 @@ int main() {
     // A cap of exactly one slice is legal, every image becomes a single slice.
     expect_passes_validation("cap-equals-slice", { 512, 512, true });
 
+    // idefics3 with both keys present is the same shape and must stay loadable.
+    {
+        fixture_params p = { 512, 2048, false };
+        p.proj_type = "idefics3";
+        expect_passes_validation("valid-idefics3", p);
+    }
+
     // Zero image_size: the divide and the GGML_ASSERT case. Rejected with the flag off too,
     // which is the half that only applied under no-upscale before.
     expect_rejected("zero-image-size-base",  { 0, 2048, false }, "slices by image_size");
@@ -154,6 +161,19 @@ int main() {
     // Cap below one slice: std::clamp(val, lo, hi) with lo > hi, undefined behaviour rather
     // than a bad size. Only reachable on the no-upscale path, which is the only one that clamps.
     expect_rejected("cap-below-slice", { 512, 256, true }, "preproc_no_upscale needs");
+
+    // idefics3 runs the same rule, so zero image_size aborts there too and has to be rejected as
+    // well. The cap is the only half that differs, below.
+    {
+        fixture_params p = { 0, 2048, false };
+        p.proj_type = "idefics3";
+        expect_rejected("zero-image-size-idefics3", p, "slices by image_size");
+    }
+    {
+        fixture_params p = { 0, 2048, true };
+        p.proj_type = "idefics3";
+        expect_rejected("zero-image-size-idefics3-flash", p, "slices by image_size");
+    }
 
     // idefics3 keeps loading without the cap key, because the shipped
     // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj has none. It is overview-only in that state, so
