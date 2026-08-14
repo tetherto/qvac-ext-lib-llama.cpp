@@ -7575,22 +7575,27 @@ inline bool use_adreno_moe_kernels(const ggml_backend_opencl_context *backend_ct
     return (((strstr(tensor->name, "ffn") != NULL) && (strstr(tensor->name, "exps") != NULL)) || (strstr(tensor->name, "as") != NULL)) && (ne01 % 32 == 0);
 }
 
-static bool use_cpu_q4_k_moe_repack(const ggml_backend_opencl_context * backend_ctx) {
+// Opt-in host-side equivalent of kernel_convert_block_q4_k_trans4_ns, used to
+// tell weight-layout defects apart from matmul defects on a given driver.
+static bool use_cpu_q4_k_moe_repack() {
     const char * env = getenv("GGML_OPENCL_Q4K_MOE_CPU_REPACK");
-    if (env) {
-        return atoi(env) != 0;
-    }
+    return env && atoi(env) != 0;
+}
 
-    if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
+// The optimized Q4_K MoE MUL_MAT_ID kernels return corrupted results on Adreno
+// 8xx: repacking the weights on the host reproduces the corruption bit for bit,
+// so the defect is in the matmul kernels rather than in the weight layout.
+// Decline the op so it runs on the CPU backend, which is the only configuration
+// that produces correct output on this hardware. Set
+// GGML_OPENCL_ADRENO_Q4K_MOE=1 to re-enable the kernels for driver validation.
+static bool adreno_q4_k_moe_mul_mat_id_broken(const ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO ||
+        backend_ctx->adreno_gen != ADRENO_GPU_GEN::A8X) {
         return false;
     }
 
-    // Qualcomm E031.47 miscompiles the Q4_K trans4 OpenCL repack used by MoE
-    // weights. Some Android drivers omit the compiler token from
-    // CL_DRIVER_VERSION, so identify the affected Adreno 830 directly too.
-    return backend_ctx->device_name.find("830") != std::string::npos ||
-           (backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E031 &&
-            backend_ctx->adreno_cl_compiler_version.major == 47);
+    const char * env = getenv("GGML_OPENCL_ADRENO_Q4K_MOE");
+    return !(env && atoi(env) != 0);
 }
 
 inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
@@ -7900,6 +7905,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 op->src[0]->type == GGML_TYPE_Q6_K) {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
                 if (op->src[1]->type == GGML_TYPE_F32) {
+                    if (op->src[0]->type == GGML_TYPE_Q4_K &&
+                        adreno_q4_k_moe_mul_mat_id_broken(backend_ctx)) {
+                        return false;
+                    }
                     return use_adreno_moe_kernels(backend_ctx, op->src[0])
                         && ggml_is_contiguous(op->src[0])
                         && ggml_is_contiguous(op->src[1]);
@@ -9596,7 +9605,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             int ne01 = tensor->ne[1];
             int ne02 = tensor->ne[2];
 
-            if (use_cpu_q4_k_moe_repack(backend_ctx)) {
+            if (use_cpu_q4_k_moe_repack()) {
                 GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor) &&
                             "CPU Q4_K MoE repack requires a full-tensor upload");
                 GGML_LOG_INFO(
