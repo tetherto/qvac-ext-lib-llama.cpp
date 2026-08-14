@@ -7582,15 +7582,21 @@ static bool use_cpu_q4_k_moe_repack() {
     return env && atoi(env) != 0;
 }
 
-// The optimized Q4_K MoE MUL_MAT_ID kernels return corrupted results on Adreno
-// 8xx: repacking the weights on the host reproduces the corruption bit for bit,
-// so the defect is in the matmul kernels rather than in the weight layout.
+// Both Q4_K MoE MUL_MAT_ID kernel families - the F32 kernels and the dp4a ones
+// - return corrupted results on Adreno 8xx with the E031.47 shader compiler
+// (observed on Adreno 830 / Snapdragon 8 Elite, compiler E031.47.18.51).
+// Repacking the weights on the host reproduces the corruption bit for bit, so
+// the defect is in the matmul kernels rather than in the weight layout.
+//
 // Decline the op so it runs on the CPU backend, which is the only configuration
-// that produces correct output on this hardware. Set
-// GGML_OPENCL_ADRENO_Q4K_MOE=1 to re-enable the kernels for driver validation.
+// that produces correct output on this driver. Newer compilers keep the
+// optimized kernels and must be re-validated before being trusted. Set
+// GGML_OPENCL_ADRENO_Q4K_MOE=1 to re-enable the kernels for that validation.
 static bool adreno_q4_k_moe_mul_mat_id_broken(const ggml_backend_opencl_context * backend_ctx) {
     if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO ||
-        backend_ctx->adreno_gen != ADRENO_GPU_GEN::A8X) {
+        backend_ctx->adreno_gen != ADRENO_GPU_GEN::A8X ||
+        backend_ctx->adreno_cl_compiler_version.type != ADRENO_CL_COMPILER_TYPE::E031 ||
+        backend_ctx->adreno_cl_compiler_version.major > 47) {
         return false;
     }
 
