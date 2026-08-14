@@ -7581,11 +7581,16 @@ static bool use_cpu_q4_k_moe_repack(const ggml_backend_opencl_context * backend_
         return atoi(env) != 0;
     }
 
+    if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
+        return false;
+    }
+
     // Qualcomm E031.47 miscompiles the Q4_K trans4 OpenCL repack used by MoE
-    // weights. Default to the equivalent host repack on affected drivers.
-    return backend_ctx &&
-           backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E031 &&
-           backend_ctx->adreno_cl_compiler_version.major == 47;
+    // weights. Some Android drivers omit the compiler token from
+    // CL_DRIVER_VERSION, so identify the affected Adreno 830 directly too.
+    return backend_ctx->device_name.find("830") != std::string::npos ||
+           (backend_ctx->adreno_cl_compiler_version.type == ADRENO_CL_COMPILER_TYPE::E031 &&
+            backend_ctx->adreno_cl_compiler_version.major == 47);
 }
 
 inline bool enable_adreno_trans_weight(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
