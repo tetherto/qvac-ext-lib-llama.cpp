@@ -1652,6 +1652,11 @@ struct clip_model_loader {
                         // use default llava-uhd preprocessing params
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // Same optional key as VisionPsy below. Both run the idefics3 sizing
+                        // rule and --image-no-upscale is accepted for both, so a GGUF that
+                        // declares the rule must be honoured here too, or the flag is the only
+                        // way to reach it and metadata is silently ignored.
+                        get_bool(KEY_PREPROC_NO_UPSCALE, hparams.image_no_upscale, false);
                         hparams.set_limit_image_tokens();
                     } break;
                 case PROJECTOR_TYPE_VISIONPSY:
@@ -4346,14 +4351,46 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
                     LOG_WRN("%s: %s is missing, so the refined size is empty and every image will be "
                             "encoded as the overview alone; slicing is effectively off\n",
                             __func__, KEY_PREPROC_IMAGE_SIZE);
-                }
-                // The cap is also the upper bound of the clamps in calc_size_no_upscale(), and
-                // std::clamp requires lo <= hi, so metadata that puts the cap below one slice is
-                // undefined behaviour rather than a bad result. Reject it here.
-                if (vp.image_no_upscale && vp.image_longest_edge < vp.image_size) {
-                    throw std::runtime_error(
-                        string_format("%s: preproc_no_upscale needs %s (%d) >= image_size (%d)\n", __func__,
-                                      KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                } else if (idefics3_style) {
+                    // Past this point the cap is positive for both projectors, so the rest of the
+                    // rule's invariants are checkable. They are `else` because the overview-only
+                    // idefics3 above never reaches the sizing rule at all, and throwing there
+                    // would contradict the warning we just printed.
+
+                    // The cap is also the upper bound of the clamps in calc_size_no_upscale(), and
+                    // std::clamp requires lo <= hi, so metadata that puts the cap below one slice is
+                    // undefined behaviour rather than a bad result. Reject it here.
+                    if (vp.image_no_upscale && vp.image_longest_edge < vp.image_size) {
+                        throw std::runtime_error(
+                            string_format("%s: preproc_no_upscale needs %s (%d) >= image_size (%d)\n", __func__,
+                                          KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                    }
+                    // The slicing loop steps by image_size and both sizing rules round up to a
+                    // multiple of it, so a cap that is not itself a multiple is the one input that
+                    // breaks the invariant: calc_size_no_upscale() clamps the long side down to the
+                    // cap and lands off-grid, giving a ragged trailing slice the reference splitter
+                    // never emits. test-mtmd-preproc-sizing.cpp asserts the invariant; enforce it
+                    // against real metadata here.
+                    if (vp.image_longest_edge % vp.image_size != 0) {
+                        throw std::runtime_error(
+                            string_format("%s: %s (%d) must be a multiple of image_size (%d)\n", __func__,
+                                          KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                    }
+                    // Upper bound, the counterpart of the image_max_tiles clamp above. The cap is a
+                    // GGUF u32 read into an int, so a corrupt or hostile mmproj can declare a value
+                    // that upscales every image to it: the grid is (cap/image_size)^2 slices and the
+                    // loop in mtmd-image.cpp reserves one tile each, so cap=100000 at image_size=512
+                    // is a 196x196 grid, ~30 GB of tiles, and a cap near INT32_MAX overflows the
+                    // multiply-back in calc_size_preserved_ratio() first. Bound the grid, not the
+                    // pixels, so the limit means the same thing as the Qwen-VL one.
+                    const int64_t tiles_per_side = vp.image_longest_edge / vp.image_size;
+                    if (tiles_per_side * tiles_per_side > CLIP_PREPROC_MAX_TILES_LIMIT) {
+                        throw std::runtime_error(
+                            string_format("%s: %s (%d) at image_size %d implies %lld slices, over the limit of %d\n",
+                                          __func__, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size,
+                                          (long long) (tiles_per_side * tiles_per_side),
+                                          CLIP_PREPROC_MAX_TILES_LIMIT));
+                    }
                 }
             }
             loader.load_tensors(*ctx_vision);
