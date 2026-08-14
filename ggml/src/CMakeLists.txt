@@ -1,4 +1,5 @@
 include(CheckCXXCompilerFlag)
+include(CheckCXXSourceCompiles)
 include("../cmake/common.cmake")
 
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
@@ -261,6 +262,10 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
 
+if (GGML_VECTOR_INDEX)
+    add_subdirectory(ggml-vector-index)
+endif()
+
 function(ggml_add_backend_library backend)
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
@@ -510,14 +515,15 @@ ggml_add_backend(Hexagon)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
 
-foreach (target ggml-base ggml)
+set(GGML_CORE_TARGETS ggml-base ggml)
+if (GGML_VECTOR_INDEX)
+    list(APPEND GGML_CORE_TARGETS ggml-vector-index)
+endif()
+
+foreach (target ${GGML_CORE_TARGETS})
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
 endforeach()
-
-if (GGML_VECTOR_INDEX)
-    add_subdirectory(ggml-vector-index)
-endif()
 
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
 
@@ -536,7 +542,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
 endif()
 
 if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
-    foreach (target ggml-base ggml)
+    foreach (target ${GGML_CORE_TARGETS})
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
         target_compile_definitions(${target} PUBLIC  GGML_SHARED)
