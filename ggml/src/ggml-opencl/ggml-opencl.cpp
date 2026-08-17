@@ -10505,19 +10505,30 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         const ggml_tensor * extra_src = tensor->view_src != nullptr ? tensor->view_src : tensor;
         ggml_tensor_extra_cl_q8_0 * extra = (ggml_tensor_extra_cl_q8_0 *)extra_src->extra;
 
+        // Reconstruct the WHOLE parent and read the view out of it, the same way set_tensor
+        // does. The SoA buffers cover the parent, and the transposed layout is indexed by the
+        // parent's row count, so a view's own ne01 would both stride the source wrongly and,
+        // once the dispatch rounds it up to the work-group size, write past a view-sized
+        // buffer. Non-view tensors are their own parent, so this is a no-op for them.
+        const size_t parent_nbytes = ggml_nbytes(extra_src);
+        const size_t parent_offset = (size_t) tensor->view_offs + offset;
+
         cl_int err;
         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_WRITE,
-            ggml_nbytes(tensor), NULL, &err);
+            parent_nbytes, NULL, &err);
         CL_CHECK(err);
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-        if (enable_adreno_trans_weight(backend_ctx, tensor)) {
+        // Ask about extra_src, not the view: set_tensor returns early for views and always
+        // decides on the parent, so asking about the view can pair a transposed writer with
+        // a non-transposed reader whenever the two disagree on the shape predicate.
+        if (enable_adreno_trans_weight(backend_ctx, extra_src)) {
             cl_kernel kernel = backend_ctx->kernel_restore_block_q8_0_trans;
 
-            int ne00 = tensor->ne[0];
-            int ne01 = tensor->ne[1];
-            GGML_ASSERT(tensor->ne[2] == 1);
-            GGML_ASSERT(tensor->ne[3] == 1);
+            int ne00 = extra_src->ne[0];
+            int ne01 = extra_src->ne[1];
+            GGML_ASSERT(extra_src->ne[2] == 1);
+            GGML_ASSERT(extra_src->ne[3] == 1);
 
             CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &extra->q));
             CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
@@ -10534,7 +10545,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             CL_CHECK(clWaitForEvents(1, &evt));
 
             CL_CHECK(clEnqueueReadBuffer(
-                queue, data_device, CL_TRUE, offset,
+                queue, data_device, CL_TRUE, parent_offset,
                 size, data, 0, NULL, NULL));
             CL_CHECK(clReleaseMemObject(data_device));
             return;
@@ -10545,7 +10556,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_mem), &extra->d));
         CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &data_device));
 
-        size_t global_work_size[] = {(size_t)ggml_nelements(tensor)/ggml_blck_size(tensor->type), 1, 1};
+        size_t global_work_size[] = {(size_t)ggml_nelements(extra_src)/ggml_blck_size(tensor->type), 1, 1};
         size_t local_work_size[] = {1, 1, 1};
 
         cl_event evt;
@@ -10553,7 +10564,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
             global_work_size, local_work_size, 0, NULL, &evt));
         CL_CHECK(clWaitForEvents(1, &evt));
         CL_CHECK(clEnqueueReadBuffer(
-            queue, data_device, CL_TRUE, offset,
+            queue, data_device, CL_TRUE, parent_offset,
             size, data, 0, NULL, NULL));
         CL_CHECK(clReleaseMemObject(data_device));
         return;

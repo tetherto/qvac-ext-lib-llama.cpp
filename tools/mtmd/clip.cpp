@@ -1028,6 +1028,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
     switch (ctx->proj_type()) {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_VISIONPSY:
         case PROJECTOR_TYPE_LFM2:
         case PROJECTOR_TYPE_JANUS_PRO:
         case PROJECTOR_TYPE_PHI4:
@@ -1318,6 +1319,20 @@ struct clip_model_loader {
             model.proj_type = clip_projector_type_from_string(proj_type);
 
             if (model.proj_type == PROJECTOR_TYPE_UNKNOWN) {
+                // Not a canonical name. Try the legacy aliases, which are gated on
+                // general.name so a generic string like "custom" only resolves for the
+                // one model that shipped it.
+                std::string model_name;
+                get_string(KEY_NAME, model_name, false);
+                model.proj_type = clip_projector_type_from_alias(proj_type, model_name);
+                if (model.proj_type != PROJECTOR_TYPE_UNKNOWN) {
+                    LOG_WRN("%s: legacy projector type '%s' from general.name='%s' loaded as '%s'\n",
+                            __func__, proj_type.c_str(), model_name.c_str(),
+                            PROJECTOR_TYPE_NAMES.at(model.proj_type).c_str());
+                }
+            }
+
+            if (model.proj_type == PROJECTOR_TYPE_UNKNOWN) {
                 throw std::runtime_error(string_format("%s: unknown projector type: %s\n", __func__, proj_type.c_str()));
             }
 
@@ -1512,6 +1527,30 @@ struct clip_model_loader {
                         // use default llava-uhd preprocessing params
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
                         get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // Same optional key as VisionPsy below. Both run the idefics3 sizing
+                        // rule and --image-no-upscale is accepted for both, so a GGUF that
+                        // declares the rule must be honoured here too, or the flag is the only
+                        // way to reach it and metadata is silently ignored.
+                        get_bool(KEY_PREPROC_NO_UPSCALE, hparams.image_no_upscale, false);
+                    } break;
+                case PROJECTOR_TYPE_VISIONPSY:
+                    {
+                        // use default llava-uhd preprocessing params
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                        get_u32(KEY_PREPROC_IMAGE_SIZE, hparams.image_longest_edge, false);
+                        // The reference stretches straight to the refined size,
+                        // resize(img, [new_h, new_w]) in DynamicResize.forward, so the default
+                        // aspect-preserving pad would letterbox the slices instead. 640x488
+                        // refines to 1024x512, where PAD_CEIL would leave 176 black columns on
+                        // each side, about a third of the encoded pixels.
+                        hparams.image_pad_rf = PAD_NONE;
+                        // Optional; absent from every mmproj published so far, including the
+                        // VisionPsy Flash one, which is why --image-no-upscale exists. An
+                        // mmproj that carries the key needs no flag. gguf-py can write it
+                        // (add_vision_preproc_no_upscale, from the reference config's
+                        // resize_to_max_side_len == false); no converter in this repo emits
+                        // it yet because there is no VisionPsy conversion path here.
+                        get_bool(KEY_PREPROC_NO_UPSCALE, hparams.image_no_upscale, false);
                     } break;
                 case PROJECTOR_TYPE_LFM2:
                     {
@@ -2136,6 +2175,7 @@ struct clip_model_loader {
                     || model.proj_type == PROJECTOR_TYPE_GLM_EDGE
                     || model.proj_type == PROJECTOR_TYPE_GEMMA3
                     || model.proj_type == PROJECTOR_TYPE_IDEFICS3
+                    || model.proj_type == PROJECTOR_TYPE_VISIONPSY
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV
                     || model.proj_type == PROJECTOR_TYPE_MINICPMV4_6
                 ) && layer.ff_up_w && layer.ff_down_w && layer.ff_down_w->ne[0] == hparams.n_embd;
@@ -2517,6 +2557,7 @@ struct clip_model_loader {
                     model.mm_soft_emb_norm_w = get_tensor(TN_MM_SOFT_EMB_N);
                 } break;
             case PROJECTOR_TYPE_IDEFICS3:
+            case PROJECTOR_TYPE_VISIONPSY:
                 {
                     model.mm_fc_w = get_tensor(string_format(TN_MM_PROJECTOR, "weight"));
                 } break;
@@ -3585,6 +3626,106 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
                     LOG_INF("%s: preproc_max_tiles: %d (custom value)\n", __func__, max_tiles);
                 }
             }
+            // Same ordering rule as above: override the GGUF value, don't get clobbered by it.
+            // -1 is the unset sentinel; 0 and 1 are both explicit, unlike image_max_tiles, since
+            // "off" is a meaningful choice against a GGUF that turns it on. Only the idefics3
+            // preprocessor reads the flag, and VisionPsy shares that preprocessor.
+            if (ctx_params.image_no_upscale >= 0) {
+                const bool no_upscale = ctx_params.image_no_upscale != 0;
+                const projector_type pt = ctx_vision->model.proj_type;
+                if (pt != PROJECTOR_TYPE_IDEFICS3 && pt != PROJECTOR_TYPE_VISIONPSY) {
+                    LOG_WRN("%s: --image-no-upscale only affects idefics3-style preprocessing; ignoring for this model\n", __func__);
+                } else {
+                    // Turning it OFF against a GGUF that turned it on is the one case that
+                    // silently degrades quality, and it is also what a zero-initialized
+                    // clip_context_params/mtmd_context_params passes (bindings and direct C
+                    // API callers that never set the field). Say so rather than swallow it.
+                    if (!no_upscale && ctx_vision->model.hparams.image_no_upscale) {
+                        LOG_WRN("%s: image_no_upscale=0 overrides %s=true from the GGUF; "
+                                "pass -1 to keep the model default\n", __func__, KEY_PREPROC_NO_UPSCALE);
+                    }
+                    ctx_vision->model.hparams.image_no_upscale = no_upscale;
+                    LOG_INF("%s: preproc_no_upscale: %d (custom value)\n", __func__, no_upscale);
+                }
+            }
+            {
+                // Both idefics3-style sizing rules divide by image_size and cap with
+                // image_longest_edge, and neither degrades gracefully at zero: image_size 0 hits
+                // GGML_ASSERT(align_size > 0) at preprocess time, which aborts the process rather
+                // than failing the request, and image_longest_edge 0 makes the refined size {0,0},
+                // so the grid is empty and the model silently gets the overview alone, 64 image
+                // tokens where it expects hundreds. Fail the load instead, where it is reportable.
+                //
+                // Scoped to the two projectors that run this rule, NOT applied to every slicing
+                // model: image_size == 0 is legal elsewhere and means dynamic sizing, as the
+                // sanity check in load_hparams says, so a blanket check would reject Qwen-VL.
+                // Checked after the override above so it covers the flag as well as the GGUF key.
+                const auto & vp = ctx_vision->model.hparams;
+                const projector_type slicing_pt = ctx_vision->model.proj_type;
+                const bool idefics3_style = slicing_pt == PROJECTOR_TYPE_VISIONPSY ||
+                                            slicing_pt == PROJECTOR_TYPE_IDEFICS3;
+                // image_size is the divisor and the align size, and zero aborts the process at the
+                // first image, so it is a load failure for both.
+                if (idefics3_style && vp.image_size <= 0) {
+                    throw std::runtime_error(
+                        string_format("%s: this projector slices by image_size, which must be positive (%d)\n",
+                                      __func__, vp.image_size));
+                }
+                // The cap is the one the two disagree on. VisionPsy's published mmprojs all carry
+                // it, so a missing cap there is broken metadata. idefics3 cannot throw: the shipped
+                // ggml-org/SmolVLM-500M-Instruct-GGUF mmproj has no preproc_image_size at all and
+                // would stop loading. It is already overview-only for that reason, so say so.
+                if (slicing_pt == PROJECTOR_TYPE_VISIONPSY && vp.image_longest_edge <= 0) {
+                    throw std::runtime_error(
+                        string_format("%s: this projector slices by image_size, so %s must be positive (%d)\n",
+                                      __func__, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge));
+                }
+                if (slicing_pt == PROJECTOR_TYPE_IDEFICS3 && vp.image_longest_edge <= 0) {
+                    LOG_WRN("%s: %s is missing, so the refined size is empty and every image will be "
+                            "encoded as the overview alone; slicing is effectively off\n",
+                            __func__, KEY_PREPROC_IMAGE_SIZE);
+                } else if (idefics3_style) {
+                    // Past this point the cap is positive for both projectors, so the rest of the
+                    // rule's invariants are checkable. They are `else` because the overview-only
+                    // idefics3 above never reaches the sizing rule at all, and throwing there
+                    // would contradict the warning we just printed.
+
+                    // The cap is also the upper bound of the clamps in calc_size_no_upscale(), and
+                    // std::clamp requires lo <= hi, so metadata that puts the cap below one slice is
+                    // undefined behaviour rather than a bad result. Reject it here.
+                    if (vp.image_no_upscale && vp.image_longest_edge < vp.image_size) {
+                        throw std::runtime_error(
+                            string_format("%s: preproc_no_upscale needs %s (%d) >= image_size (%d)\n", __func__,
+                                          KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                    }
+                    // The slicing loop steps by image_size and both sizing rules round up to a
+                    // multiple of it, so a cap that is not itself a multiple is the one input that
+                    // breaks the invariant: calc_size_no_upscale() clamps the long side down to the
+                    // cap and lands off-grid, giving a ragged trailing slice the reference splitter
+                    // never emits. test-mtmd-preproc-sizing.cpp asserts the invariant; enforce it
+                    // against real metadata here.
+                    if (vp.image_longest_edge % vp.image_size != 0) {
+                        throw std::runtime_error(
+                            string_format("%s: %s (%d) must be a multiple of image_size (%d)\n", __func__,
+                                          KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size));
+                    }
+                    // Upper bound, the counterpart of the image_max_tiles clamp above. The cap is a
+                    // GGUF u32 read into an int, so a corrupt or hostile mmproj can declare a value
+                    // that upscales every image to it: the grid is (cap/image_size)^2 slices and the
+                    // loop in mtmd-image.cpp reserves one tile each, so cap=100000 at image_size=512
+                    // is a 196x196 grid, ~30 GB of tiles, and a cap near INT32_MAX overflows the
+                    // multiply-back in calc_size_preserved_ratio() first. Bound the grid, not the
+                    // pixels, so the limit means the same thing as the Qwen-VL one.
+                    const int64_t tiles_per_side = vp.image_longest_edge / vp.image_size;
+                    if (tiles_per_side * tiles_per_side > CLIP_PREPROC_MAX_TILES_LIMIT) {
+                        throw std::runtime_error(
+                            string_format("%s: %s (%d) at image_size %d implies %lld slices, over the limit of %d\n",
+                                          __func__, KEY_PREPROC_IMAGE_SIZE, vp.image_longest_edge, vp.image_size,
+                                          (long long) (tiles_per_side * tiles_per_side),
+                                          CLIP_PREPROC_MAX_TILES_LIMIT));
+                    }
+                }
+            }
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
             if (ctx_params.warmup) {
@@ -3784,6 +3925,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 n_patches = x_patch * y_patch;
             } break;
         case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_VISIONPSY:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
             {
                 // These merge via build_patch_merge_permute(), which pads each
@@ -4727,6 +4869,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
         case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_VISIONPSY:
         case PROJECTOR_TYPE_INTERNVL:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_QWEN2A:
@@ -5139,6 +5282,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_GEMMA4UA:
             return ctx->model.mm_input_proj_w->ne[1];
         case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_VISIONPSY:
             return ctx->model.mm_fc_w->ne[1];
         case PROJECTOR_TYPE_ULTRAVOX:
         case PROJECTOR_TYPE_VOXTRAL:
