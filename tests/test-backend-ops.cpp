@@ -4881,12 +4881,15 @@ struct test_mul_mat_id_adreno_repack : public test_mul_mat_id {
         roundtrip_ok = init_mul_mat_id_adreno_repack_tensors(ctx, n_mats);
     }
 
+    // A repack that does not survive a store/load roundtrip is a genuine
+    // failure. The matmul error on its own can stay under the threshold while
+    // the packed weights are wrong, which is how the Adreno E031.47 packing
+    // miscompile stayed hidden.
     double err(const float * a, const float * b, size_t n) override {
-        const double matmul_err = test_mul_mat_id::err(a, b, n);
         if (!roundtrip_ok) {
-            printf("[repack readback defect, matmul err = %.9f] ", matmul_err);
+            return DBL_MAX;
         }
-        return matmul_err;
+        return test_mul_mat_id::err(a, b, n);
     }
 };
 
