@@ -132,7 +132,7 @@ jobs:
           SLOW_TESTS=1 pytest -v -x
 
   windows:
-    runs-on: windows-2025
+    runs-on: windows-2025  # QVAC-23796: self-hosted qvac-win25-x64 has no pwsh; see build-cpu.yml
 
     steps:
       - name: Clone

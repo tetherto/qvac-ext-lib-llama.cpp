@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   cuda:
-    runs-on: ubuntu-24.04
+    runs-on: qvac-ubuntu2204-x64-gpu
     container: nvidia/cuda:12.6.2-devel-ubuntu24.04
 
     steps:

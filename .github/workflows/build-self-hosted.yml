@@ -58,8 +58,14 @@ permissions:
   contents: read
 
 jobs:
+  # QVAC-23796: correct hardware (RTX 4000 Ada), but this job builds CUDA
+  # natively via ci/run.sh and the runner image has no CUDA toolkit - nvcc is
+  # absent, only the driver/nvidia-smi is present. Expect this to fail until
+  # the toolkit is added to the qvac-ubuntu2204-x64-gpu image. CUDA *build*
+  # coverage meanwhile comes from build-cuda-ubuntu.yml, which gets its
+  # toolkit from the nvidia/cuda container instead.
   gpu-cuda:
-    runs-on: [self-hosted, Linux, NVIDIA]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -73,7 +79,7 @@ jobs:
           GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm:
-    runs-on: [self-hosted, Linux, NVIDIA]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -87,7 +93,7 @@ jobs:
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm2:
-    runs-on: [self-hosted, Linux, NVIDIA, COOPMAT2]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -101,7 +107,7 @@ jobs:
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-nvidia:
-    runs-on: [self-hosted, Linux, NVIDIA, X64]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -174,7 +180,7 @@ jobs:
   #         GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-metal:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -187,7 +193,7 @@ jobs:
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-apple:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -214,7 +220,7 @@ jobs:
             bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-apple:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -227,6 +233,9 @@ jobs:
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
+  # QVAC-23796: no Intel-GPU box in the qvac self-hosted fleet, so this keeps
+  # the upstream ggml-org label and stays permanently queued here. Either
+  # provision Intel hardware or drop the job.
   gpu-vulkan-intel-linux:
     runs-on: [self-hosted, Linux, Intel]
 
@@ -243,6 +252,10 @@ jobs:
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
+  # QVAC-23796: Intel-GPU specific and MSYS2-based. The fleet's Windows box
+  # (qvac-win25-x64-gpu) is NVIDIA and its MSYS2 availability is unverified, so
+  # repointing it would silently change what this job tests. Left as-is;
+  # Windows Vulkan *build* coverage now runs via build-cpu.yml (x64-vulkan).
   gpu-vulkan-intel-windows:
     runs-on: [self-hosted, Windows, X64, Intel]
 
@@ -264,6 +277,7 @@ jobs:
           # a valid python environment for testing
           LLAMA_FATAL_WARNINGS=OFF GG_BUILD_NINJA=1 GG_BUILD_VULKAN=1 GG_BUILD_LOW_PERF=1 ./ci/run.sh ./results/llama.cpp ./mnt/llama.cpp
 
+  # QVAC-23796: needs Intel + OpenVINO hardware, not present in the fleet.
   gpu-openvino-low-perf:
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
@@ -297,7 +311,7 @@ jobs:
           GG_BUILD_OPENVINO=1 GGML_OPENVINO_DEVICE=GPU GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-x64-high-perf:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: qvac-ubuntu2204-x64
 
     steps:
       - name: Clone
@@ -309,6 +323,8 @@ jobs:
         run: |
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
+  # QVAC-23796: arm64 Graviton label from upstream; the qvac fleet has no
+  # arm64 Linux box, so these two jobs stay permanently queued.
   cpu-arm64-high-perf-graviton4:
     runs-on: ah-ubuntu_22_04-c8g_8x
 
