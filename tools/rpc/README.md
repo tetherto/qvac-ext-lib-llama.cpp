@@ -108,3 +108,5 @@ Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `ggm
 $ GGML_RPC_DEBUG=1 bin/ggml-rpc-server
 ```
 
+Set `GGML_RPC_NO_WIRE_BF16=1` on the main host to keep direct all-reduce transfers in F32. By default, large F32 all-reduce tensors use BF16 on the wire to reduce peer traffic.
+
