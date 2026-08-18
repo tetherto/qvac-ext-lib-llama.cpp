@@ -237,6 +237,7 @@ struct rpc_msg_comm_init_req {
     uint32_t port;      // rank 0: port to listen on; rank > 0: rank 0's comm port
     char     host[64];  // rank > 0: rank 0's host
     uint8_t  session_id[RPC_COMM_SESSION_ID_SIZE];
+    uint8_t  wire_bf16;
 };
 
 struct rpc_msg_comm_init_rsp {
@@ -1082,6 +1083,7 @@ private:
         socket_ptr              peer;
         uint32_t                rank = 0;
         uint32_t                world = 0;
+        bool                    wire_bf16 = true;
         uint64_t                next_op_id = 0;
         ggml_backend_buffer_ptr scratch;
         size_t                  scratch_size = 0;
@@ -1861,7 +1863,7 @@ void rpc_server::sync_all_backends() {
 bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
     response.ok = 0;
     if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world ||
-            request.port == 0 || request.port > UINT16_MAX) {
+            request.port == 0 || request.port > UINT16_MAX || request.wire_bf16 > 1) {
         return true;
     }
     comm_state & state = comm_states[request.device];
@@ -1962,8 +1964,9 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         }
         state.peer->update_caps(remote_caps);
     }
-    state.rank  = request.rank;
-    state.world = request.world;
+    state.rank        = request.rank;
+    state.world       = request.world;
+    state.wire_bf16   = request.wire_bf16 != 0;
     GGML_LOG_INFO("[%s] device %u joined pairwise comm as rank %u\n", __func__, request.device, request.rank);
     response.ok = 1;
     return true;
@@ -2012,7 +2015,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     }
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
-    const bool wire_bf16 = t_dst->type == GGML_TYPE_F32 && ne >= 32768;
+    const bool wire_bf16 = state.wire_bf16 && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
     size_t wire_bytes = nbytes;
     size_t need       = nbytes;
     size_t local_offset = 0;
@@ -2806,12 +2809,14 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
     bool ok = true;
     std::array<bool, 2> request_sent = {};
     std::array<bool, 2> initialized = {};
+    const bool wire_bf16 = std::getenv("GGML_RPC_NO_WIRE_BF16") == nullptr;
     for (size_t i = 0; i < n_backends; i++) {
         rpc_msg_comm_init_req request = {};
-        request.device = ranks[i].device;
-        request.rank   = (uint32_t) i;
-        request.world  = (uint32_t) n_backends;
-        request.port   = comm_port;
+        request.device    = ranks[i].device;
+        request.rank      = (uint32_t) i;
+        request.world     = (uint32_t) n_backends;
+        request.port      = comm_port;
+        request.wire_bf16 = wire_bf16;
         memcpy(request.session_id, session_id.data(), session_id.size());
         if (i > 0) {
             memcpy(request.host, host0.c_str(), host0.size());
