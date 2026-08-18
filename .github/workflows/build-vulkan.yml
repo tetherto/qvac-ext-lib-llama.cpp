@@ -76,6 +76,12 @@ jobs:
         run: |
           time cmake --build build -j $(nproc)
 
+  # QVAC-23796: stays GitHub-hosted for now. This job is a *software*
+  # rasteriser (lavapipe) check, so it gains nothing from fleet hardware, and
+  # it installs mesa-vulkan-drivers via "sudo apt-get" - the qvac Ubuntu
+  # runners have no passwordless sudo, so that step aborts immediately.
+  # Real-GPU Vulkan coverage does run self-hosted, via build-self-hosted.yml
+  # (gpu-vulkan-nvidia-cm / -cm2 on qvac-ubuntu2204-x64-gpu).
   ubuntu-llvmpipe:
     runs-on: ubuntu-24.04
 

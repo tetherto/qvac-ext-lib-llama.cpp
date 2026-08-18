@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   macos-latest-arm64:
-    runs-on: macos-latest
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -54,6 +54,23 @@ jobs:
           key: apple-arm64
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      # QVAC-23796: GGML_METAL_SHADER_DEBUG=ON compiles the .metal shaders
+      # ahead of time, which needs the Metal Toolchain. From Xcode 26 that is a
+      # separately downloaded component, and the self-hosted Mac Studio images
+      # ship without it ("cannot execute tool 'metal'"). Idempotent: a no-op
+      # once the component is present, so this can be dropped again as soon as
+      # the runner image bakes it in.
+      - name: Ensure Metal toolchain
+        run: |
+          if xcrun -find metallib >/dev/null 2>&1; then
+            echo "Metal Toolchain already present"
+          else
+            echo "Metal Toolchain missing, downloading component..."
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -find metal
+          xcrun -find metallib
 
       - name: Build
         id: cmake_build
@@ -114,7 +131,7 @@ jobs:
           ctest -L main --verbose --timeout 900
 
   macos-latest-ios-xcode:
-    runs-on: macos-latest
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Checkout code
@@ -161,7 +178,7 @@ jobs:
           xcodebuild -project examples/llama.swiftui/llama.swiftui.xcodeproj -scheme llama.swiftui -sdk iphoneos CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= -destination 'generic/platform=iOS' FRAMEWORK_FOLDER_PATH=./build-ios build
 
   macos-latest-tvos:
-    runs-on: macos-latest
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -195,7 +212,7 @@ jobs:
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
   macos-latest-visionos:
-    runs-on: macos-latest
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -229,7 +246,7 @@ jobs:
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
   macos-latest-swift:
-    runs-on: macos-latest
+    runs-on: qvac-macos26-arm64-gpu
     needs: macos-latest-ios-xcode
 
     strategy:
