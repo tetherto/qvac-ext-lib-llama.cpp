@@ -80,6 +80,22 @@ jobs:
             -DGGML_CUDA_CUB_3DOT2=ON
           cmake --build build
 
+      # QVAC-23796: this job runs inside a container, i.e. as root, and the
+      # runner's _work directory is shared by every workflow on that machine.
+      # Everything written here (the checkout, .ccache) therefore ends up
+      # root-owned, and the next non-container job to land on the same runner
+      # fails in actions/checkout with
+      #   EACCES: permission denied, rmdir '.../.ccache/0'
+      # because the runner user cannot delete it and has no passwordless sudo.
+      # Hand ownership back while we still have root. Chown rather than delete,
+      # so the ccache survives for the next run.
+      - name: Return workspace ownership to the runner user
+        if: always() && runner.environment != 'github-hosted'
+        run: |
+          owner=$(stat -c '%u:%g' "${GITHUB_WORKSPACE}/..")
+          echo "Restoring ${GITHUB_WORKSPACE} to ${owner}"
+          chown -R "${owner}" "${GITHUB_WORKSPACE}"
+
   hip:
     runs-on: ubuntu-22.04
     container: rocm/dev-ubuntu-22.04:6.1.2
