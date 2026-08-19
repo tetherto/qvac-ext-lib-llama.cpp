@@ -309,6 +309,7 @@ endif()
 llama_build_and_test(test-backend-ops.cpp)
 if (GGML_RPC)
     llama_build_and_test(test-rpc.cpp)
+    target_link_libraries(test-rpc PRIVATE ggml-rpc)
     set_tests_properties(test-rpc PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
 
