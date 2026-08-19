@@ -578,9 +578,11 @@ struct rpc_pending_copy {
 
     void signal(bool value) {
         std::lock_guard<std::mutex> lock(mutex);
-        success = value;
-        done    = true;
-        cv.notify_all();
+        if (!done) {
+            success = value;
+            done    = true;
+            cv.notify_all();
+        }
     }
 
     bool wait() {
