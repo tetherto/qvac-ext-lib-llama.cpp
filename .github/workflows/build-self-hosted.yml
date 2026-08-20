@@ -68,6 +68,17 @@ jobs:
     runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
+      # QVAC-23796: build-cuda-ubuntu.yml's cuda job runs in a container, i.e.
+      # as root, and self-hosted runners share a single _work directory across
+      # every workflow that lands on them. It can therefore leave root-owned
+      # files here that actions/checkout cannot delete ("EACCES ... rmdir
+      # '.ccache/0'") and that we cannot chown away without passwordless sudo.
+      # Docker is available and gives us root, so use it to take the workspace
+      # back. Idempotent, and a no-op once nothing root-owned is left.
+      - name: Reclaim workspace
+        if: runner.environment != 'github-hosted'
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
+
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
@@ -82,6 +93,11 @@ jobs:
     runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
+      # see gpu-cuda above
+      - name: Reclaim workspace
+        if: runner.environment != 'github-hosted'
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
+
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
@@ -96,6 +112,11 @@ jobs:
     runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
+      # see gpu-cuda above
+      - name: Reclaim workspace
+        if: runner.environment != 'github-hosted'
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
+
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
@@ -110,6 +131,11 @@ jobs:
     runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
+      # see gpu-cuda above
+      - name: Reclaim workspace
+        if: runner.environment != 'github-hosted'
+        run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
+
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
