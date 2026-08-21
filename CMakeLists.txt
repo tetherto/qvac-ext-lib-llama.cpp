@@ -32,6 +32,7 @@ else()
 endif()
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
+option(BUILD_LLAMA "Build, install LLAMA package artifacts as well." ON)
 
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
@@ -123,11 +124,16 @@ option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when availab
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 
+# specific extras
+option(LLAMA_MTMD "llama: multimodal support" ${LLAMA_BUILD_TOOLS})
+
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_SUBPROCESS "llama-common: use subprocess, required by server tools and server router mode" ${LLAMA_SUBPROCESS_DEFAULT})
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
+# profiling
+option(FORCE_GGML_VK_PERF_LOGGER "Force vk performance logging in ggml" OFF)
 
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
@@ -202,15 +208,31 @@ endif()
 # build the library
 #
 
+if (NOT BUILD_LLAMA)
+    message(STATUS "BUILD_LLAMA is OFF: skipping LLAMA targets.")
+else()
 add_subdirectory(src)
 
 #
 # utils, programs, examples and tests
 #
 
+# LLAMA_INCLUDE_INSTALL_DIR is referenced by common/CMakeLists.txt (added just
+# below) in llama-common-base's $<INSTALL_INTERFACE:> include dir. It must be
+# defined here, before add_subdirectory(common); otherwise it expands empty and
+# the installed llama::llama-common target carries a bogus "/common" include
+# path that breaks downstream find_package(llama) consumers.
+include(GNUInstallDirs)
+set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header files")
+
+set(LLAMA_CPP_HTTPLIB_SYSTEM_OPENSSL OFF)
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
     add_subdirectory(vendor/cpp-httplib)
+endif()
+
+if(LLAMA_BUILD_EXAMPLES OR LLAMA_BUILD_TESTS)
+    add_subdirectory(common_test)
 endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
@@ -225,6 +247,8 @@ endif()
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
+elseif (LLAMA_MTMD)
+    add_subdirectory(tools/mtmd)
 endif()
 
 if (LLAMA_BUILD_APP)
@@ -241,6 +265,21 @@ if (LLAMA_BUILD_MTMD AND NOT (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS))
     add_subdirectory(tools/mtmd)
 endif()
 
+endif() # NOT BUILD_LLAMA
+
+# Automatically add all files from the 'licenses' directory
+file(GLOB EXTRA_LICENSES "${CMAKE_SOURCE_DIR}/licenses/LICENSE-*")
+
+foreach(FILE_PATH ${EXTRA_LICENSES})
+    get_filename_component(FILE_NAME "${FILE_PATH}" NAME)
+    string(REGEX REPLACE "^LICENSE-" "" NAME "${FILE_NAME}")
+    license_add_file("${NAME}" "${FILE_PATH}")
+endforeach()
+
+if (LLAMA_BUILD_COMMON)
+    license_generate(llama-common)
+endif()
+
 #
 # install
 #
@@ -248,7 +287,8 @@ endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of header  files")
+if (BUILD_LLAMA)
+set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header  files")
 set(LLAMA_LIB_INSTALL_DIR     ${CMAKE_INSTALL_LIBDIR}     CACHE PATH "Location of library files")
 set(LLAMA_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of binary  files")
 
@@ -260,19 +300,54 @@ set_target_properties(llama
     PROPERTIES
         PUBLIC_HEADER "${LLAMA_PUBLIC_HEADERS}")
 
-install(TARGETS llama LIBRARY PUBLIC_HEADER)
+install(
+  TARGETS llama
+  EXPORT llama-targets
+  PUBLIC_HEADER
+    DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR})
+
+if (LLAMA_BUILD_COMMON)
+
+  install(
+      TARGETS cpp-httplib
+      EXPORT llama-targets)
+
+  install(
+    TARGETS llama-common llama-common-base
+    EXPORT llama-targets
+    PUBLIC_HEADER
+      DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/common)
+
+endif()
+
+if (LLAMA_MTMD AND TARGET mtmd)
+
+  install(
+    TARGETS mtmd
+    EXPORT llama-targets
+    PUBLIC_HEADER
+      DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/mtmd)
+
+endif()
+
+install(
+  EXPORT llama-targets
+  FILE llama-targets.cmake
+  NAMESPACE llama::
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+
+install(
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 if (LLAMA_BUILD_COMMON)
     install(TARGETS llama-common LIBRARY)
 endif()
 
 configure_package_config_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama
-    PATH_VARS LLAMA_INCLUDE_INSTALL_DIR
-              LLAMA_LIB_INSTALL_DIR
-              LLAMA_BIN_INSTALL_DIR )
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama-config.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
 
 write_basic_package_version_file(
         ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
@@ -281,7 +356,11 @@ write_basic_package_version_file(
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/llama-version.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/llama)
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/llama)
+
+install(
+    PROGRAMS convert_hf_to_gguf.py vulkan_profiling_analyzer.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
@@ -289,3 +368,4 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+endif() # BUILD_LLAMA

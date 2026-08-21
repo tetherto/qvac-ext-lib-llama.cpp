@@ -58,6 +58,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/gated_delta_net_back.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -67,6 +68,8 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/sigmoid-back.cuh"
+#include "ggml-cuda/ssm-conv-back.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2205,11 +2208,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SILU_BACK:
             ggml_cuda_op_silu_back(ctx, dst);
             break;
+        case GGML_OP_GELU_BACK:
+        case GGML_OP_GEGLU_BACK:
+            ggml_cuda_op_gelu_back(ctx, dst);
+            break;
         case GGML_OP_RMS_NORM:
             ggml_cuda_op_rms_norm(ctx, dst);
             break;
         case GGML_OP_RMS_NORM_BACK:
             ggml_cuda_op_rms_norm_back(ctx, dst);
+            break;
+        case GGML_OP_L2_NORM_BACK:
+            ggml_cuda_op_l2_norm_back(ctx, dst);
             break;
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
@@ -2310,6 +2320,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
+        case GGML_OP_SSM_CONV_BACK_SX:
+            ggml_cuda_op_ssm_conv_back_sx(ctx, dst);
+            break;
+        case GGML_OP_SSM_CONV_BACK_C:
+            ggml_cuda_op_ssm_conv_back_c(ctx, dst);
+            break;
         case GGML_OP_TOP_K:
             ggml_cuda_op_top_k(ctx, dst);
             break;
@@ -2333,6 +2349,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            ggml_cuda_op_gated_delta_net_back(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -2363,6 +2382,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_SIGMOID_BACK:
+            ggml_cuda_op_sigmoid_back(ctx, dst);
             break;
         default:
             return false;
@@ -4850,7 +4872,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            {
+                // ggml_cuda_out_prod dequantizes any non-F32 src to F32 via ggml_get_to_fp32_cuda
+                // before the f32-only cuBLAS GEMM. Only claim support for src types the kernel can
+                // actually handle, otherwise it aborts on e.g. TQ2_0 which has no CUDA dequantizer.
+                auto src_ok = [](const ggml_tensor * src) {
+                    return src->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(src->type) != nullptr;
+                };
+                return op->type == GGML_TYPE_F32 && src_ok(op->src[0]) && src_ok(op->src[1]);
+            }
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -5042,6 +5072,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SILU_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
             break;
+        case GGML_OP_GELU_BACK:
+        case GGML_OP_GEGLU_BACK:
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op->src[1]);
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
@@ -5049,6 +5083,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
             break;
+        case GGML_OP_L2_NORM_BACK:
+            return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -5086,6 +5122,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }
+        case GGML_OP_SSM_CONV_BACK_SX:
+        case GGML_OP_SSM_CONV_BACK_C:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
         case GGML_OP_CONT:
             return true;
         case GGML_OP_DIAG_MASK_INF:
@@ -5150,6 +5193,36 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif // GGML_USE_MUSA
+        case GGML_OP_GATED_DELTA_NET_BACK: {
+                //TODO: shares the forward op's MUSA compiler issue, see GGML_OP_GATED_DELTA_NET above
+#ifdef GGML_USE_MUSA
+                return false;
+#else
+                for (int i = 0; i < 7; i++) { // q, k, v, g, beta, state, d
+                    if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32)
+                        return false;
+                }
+                
+                const ggml_tensor * q     = op->src[0];
+                const ggml_tensor * k     = op->src[1];
+                const ggml_tensor * v     = op->src[2];
+                const ggml_tensor * g     = op->src[3];
+                const ggml_tensor * beta  = op->src[4];
+                const ggml_tensor * state = op->src[5];
+                const ggml_tensor * d     = op->src[6];
+                const int64_t S_v = v->ne[0];
+
+                if ((S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) ||
+                    q->ne[0] != S_v || k->ne[0] != S_v) {
+                    return false;
+                }
+                return op->type == GGML_TYPE_F32 &&
+                       ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v) &&
+                       ggml_are_same_stride(q, k) && ggml_is_contiguous(state) && ggml_is_contiguous(d) &&
+                       (g->ne[0] == S_v ? ggml_is_contiguous(g) && ggml_is_contiguous(beta)
+                                        : g->ne[0] == 1 && ggml_are_same_stride(g, beta));
+#endif // GGML_USE_MUSA
+        }
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -5174,7 +5247,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
-
+        case GGML_OP_SIGMOID_BACK:
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                    op->src[0] != NULL && op->src[1] != NULL &&
+                   op->src[0]->type == op->type && op->src[1]->type == op->type &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_are_same_shape(op, op->src[1]);
         default:
             return false;
     }

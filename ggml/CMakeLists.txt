@@ -221,6 +221,7 @@ option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics ou
 option(GGML_MUSA_GRAPHS                     "ggml: use MUSA graph, experimental, unstable"    OFF)
 option(GGML_MUSA_MUDNN_COPY                 "ggml: enable muDNN for accelerated copy"         OFF)
 option(GGML_VULKAN                          "ggml: use Vulkan"                                OFF)
+option(GGML_VULKAN_BUILD_ADRENO_SHADERS     "ggml: build Adreno-supported shader variants"    ON)
 option(GGML_VULKAN_CHECK_RESULTS            "ggml: run Vulkan op checks"                      OFF)
 option(GGML_VULKAN_DEBUG                    "ggml: enable Vulkan debug output"                OFF)
 option(GGML_VULKAN_MEMORY_DEBUG             "ggml: enable Vulkan memory debug output"         OFF)
@@ -263,6 +264,7 @@ option(GGML_OPENCL                          "ggml: use OpenCL"                  
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
 option(GGML_OPENCL_EMBED_KERNELS            "ggml: embed kernels"                             ON)
 option(GGML_OPENCL_USE_ADRENO_KERNELS       "ggml: use optimized kernels for Adreno"          ON)
+option(GGML_OPENCL_KERNEL_CACHE           "ggml: cache compiled OpenCL program binaries on disk" ON)
 set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "ggml: OpenCL API version to target")
 
@@ -344,8 +346,15 @@ set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
 #endif()
-install(TARGETS ggml LIBRARY PUBLIC_HEADER)
-install(TARGETS ggml-base LIBRARY)
+install(
+  TARGETS ggml ggml-base
+  EXPORT ggml-targets)
+
+install(
+  EXPORT ggml-targets
+  FILE ggml-targets.cmake
+  NAMESPACE ggml::
+  DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml)
 
 if (GGML_STANDALONE)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml.pc.in
@@ -396,7 +405,7 @@ set(GGML_BIN_INSTALL_DIR     ${CMAKE_INSTALL_BINDIR}     CACHE PATH "Location of
 configure_package_config_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml-config.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml
+    INSTALL_DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml
     PATH_VARS GGML_INCLUDE_INSTALL_DIR
               GGML_LIB_INSTALL_DIR
               GGML_BIN_INSTALL_DIR)
@@ -415,8 +424,7 @@ message(STATUS "ggml commit:  ${GGML_BUILD_COMMIT}")
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/ggml-version.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml)
-
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/ggml)
 if (MSVC)
     set(MSVC_WARNING_FLAGS
         /wd4005  # Macro redefinition

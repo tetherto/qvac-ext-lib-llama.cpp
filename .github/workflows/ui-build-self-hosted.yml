@@ -6,6 +6,7 @@ on:
 jobs:
   build:
     runs-on: [self-hosted, fast]
+    timeout-minutes: 20
     env:
       BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
 

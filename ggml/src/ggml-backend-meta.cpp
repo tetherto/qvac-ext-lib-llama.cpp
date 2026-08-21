@@ -859,7 +859,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_CONCAT: {
                 split_state = handle_concat(src_ss);
             } break;
-            case GGML_OP_SILU_BACK: {
+            case GGML_OP_SILU_BACK:
+            case GGML_OP_SIGMOID_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
             case GGML_OP_NORM:
@@ -984,6 +985,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
             } break;
+            case GGML_OP_LIGHTNING_INDEXER:
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
             case GGML_OP_DSV4_HC_POST: {
