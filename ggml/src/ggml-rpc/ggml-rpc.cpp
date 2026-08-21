@@ -1670,6 +1670,9 @@ private:
         uint64_t                next_op_id = 0;
         ggml_backend_buffer_ptr scratch;
         size_t                  scratch_size = 0;
+        ggml_backend_buffer_ptr send_host;
+        ggml_backend_buffer_ptr recv_host;
+        size_t                  host_size = 0;
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
     };
@@ -2648,11 +2651,36 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         state.scratch_size = need;
     }
     char * scratch_base = (char *) ggml_backend_buffer_get_base(state.scratch.get());
-    state.send_buf.resize(frame_bytes);
-    state.recv_buf.resize(frame_bytes);
-    memcpy(state.send_buf.data(), &request.op_id, sizeof(request.op_id));
-    uint8_t * send_data = state.send_buf.data() + sizeof(request.op_id);
-    uint8_t * recv_data = state.recv_buf.data() + sizeof(request.op_id);
+    uint8_t * send_frame = nullptr;
+    uint8_t * recv_frame = nullptr;
+    static const bool use_pinned_comm = getenv("GGML_RPC_NO_PINNED_COMM") == nullptr;
+    ggml_backend_buffer_type_t host_buft =
+        use_pinned_comm ? ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend)) : nullptr;
+    if (host_buft != nullptr && state.host_size < frame_bytes) {
+        ggml_backend_synchronize(backend);
+        state.send_host.reset(ggml_backend_buft_alloc_buffer(host_buft, frame_bytes));
+        state.recv_host.reset(ggml_backend_buft_alloc_buffer(host_buft, frame_bytes));
+        if (state.send_host != nullptr && state.recv_host != nullptr) {
+            state.host_size = frame_bytes;
+        } else {
+            state.send_host.reset();
+            state.recv_host.reset();
+            state.host_size = 0;
+        }
+    }
+    if (state.host_size >= frame_bytes) {
+        send_frame = (uint8_t *) ggml_backend_buffer_get_base(state.send_host.get());
+        recv_frame = (uint8_t *) ggml_backend_buffer_get_base(state.recv_host.get());
+    }
+    if (send_frame == nullptr || recv_frame == nullptr) {
+        state.send_buf.resize(frame_bytes);
+        state.recv_buf.resize(frame_bytes);
+        send_frame = state.send_buf.data();
+        recv_frame = state.recv_buf.data();
+    }
+    memcpy(send_frame, &request.op_id, sizeof(request.op_id));
+    uint8_t * send_data = send_frame + sizeof(request.op_id);
+    uint8_t * recv_data = recv_frame + sizeof(request.op_id);
 
     auto new_scratch_tensor = [&](ggml_type type, size_t offset) {
         ggml_tensor * t = ggml_new_tensor_4d(ctx, type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
@@ -2697,13 +2725,13 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 
     bool exchange_ok;
     if (wire_bytes >= RPC_COMM_FULL_DUPLEX_THRESHOLD) {
-        exchange_ok = state.peer->exchange_data(state.send_buf.data(), state.recv_buf.data(), frame_bytes);
+        exchange_ok = state.peer->exchange_data(send_frame, recv_frame, frame_bytes);
     } else if (state.rank == 0) {
-        exchange_ok = state.peer->send_data(state.send_buf.data(), frame_bytes) &&
-                      state.peer->recv_data(state.recv_buf.data(), frame_bytes);
+        exchange_ok = state.peer->send_data(send_frame, frame_bytes) &&
+                      state.peer->recv_data(recv_frame, frame_bytes);
     } else {
-        exchange_ok = state.peer->recv_data(state.recv_buf.data(), frame_bytes) &&
-                      state.peer->send_data(state.send_buf.data(), frame_bytes);
+        exchange_ok = state.peer->recv_data(recv_frame, frame_bytes) &&
+                      state.peer->send_data(send_frame, frame_bytes);
     }
     if (!exchange_ok) {
         GGML_LOG_ERROR("[%s] peer exchange failed for operation %" PRIu64 "\n", __func__, request.op_id);
@@ -2711,7 +2739,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     }
 
     uint64_t peer_op_id;
-    memcpy(&peer_op_id, state.recv_buf.data(), sizeof(peer_op_id));
+    memcpy(&peer_op_id, recv_frame, sizeof(peer_op_id));
     if (peer_op_id != request.op_id) {
         GGML_LOG_ERROR("[%s] peer operation id %" PRIu64 " does not match %" PRIu64 "\n",
                        __func__, peer_op_id, request.op_id);
