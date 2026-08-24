@@ -458,7 +458,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_a.weight");
             }
             if (std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_b.weight");
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
             }
             if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
@@ -540,6 +540,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
+            if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
@@ -672,10 +675,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     const int64_t n_head_group = hparams.n_head(il) / hparams.dsv4_o_group_count;
                     return {n_head_group * hparams.n_embd_head_k(il)};
                 }
-                if (std::regex_match(tensor_name, pattern_attn_out_a_weight) ||
-                        std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
+                if (std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
                     GGML_ASSERT(segments.size() == 1);
-                    return {std::lcm<int64_t>(hparams.dsv4_o_lora_rank, blck_size)};
+                    return {1};
+                }
+                if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
+                    GGML_ASSERT(segments.size() == 1);
+                    // the boundaries must align with wo_a's per-group split, so quant blocks must not straddle groups
+                    GGML_ASSERT(hparams.dsv4_o_lora_rank % blck_size == 0);
+                    return {hparams.dsv4_o_lora_rank};
                 }
             }
 
