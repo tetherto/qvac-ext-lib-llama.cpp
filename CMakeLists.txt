@@ -276,7 +276,7 @@ foreach(FILE_PATH ${EXTRA_LICENSES})
     license_add_file("${NAME}" "${FILE_PATH}")
 endforeach()
 
-if (LLAMA_BUILD_COMMON)
+if (LLAMA_BUILD_COMMON AND TARGET llama-common)
     license_generate(llama-common)
 endif()
 
@@ -361,6 +361,23 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
 install(
     PROGRAMS convert_hf_to_gguf.py vulkan_profiling_analyzer.py
     DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+    set(LLAMA_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+    set(LLAMA_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+else()
+    set(_LLAMA_PC_PREFIX_BASE "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-prefix")
+    file(RELATIVE_PATH LLAMA_PC_PREFIX_RELATIVE
+        "${_LLAMA_PC_PREFIX_BASE}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+        "${_LLAMA_PC_PREFIX_BASE}")
+    set(LLAMA_PC_PREFIX "\${pcfiledir}/${LLAMA_PC_PREFIX_RELATIVE}")
+    set(LLAMA_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+endif()
+if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+    set(LLAMA_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+else()
+    set(LLAMA_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
 
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
