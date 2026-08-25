@@ -161,10 +161,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         QUE_DBG("%s", "update slots\n");
 
         // this will run the main inference process for all slots
-        // update_slots() throws to abandon a batch it cannot finish, for example a
-        // decode that failed on a memory update. it has already errored and released
-        // the affected slots by then, so keep serving instead of taking the process
-        // down with the batch
+        //
+        // update_slots() throws to abandon a batch it cannot finish, for example a decode
+        // that failed on a memory update. the callback releases the affected slots itself
+        // and this is only the backstop that keeps the process up if that teardown throws
+        // too, since start_loop() runs outside any try and the exception would reach main
         try {
             callback_update_slots();
         } catch (const std::exception & e) {
