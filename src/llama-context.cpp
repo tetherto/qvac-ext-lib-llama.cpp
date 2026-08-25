@@ -822,7 +822,11 @@ llama_context::memory_update_status llama_context::memory_update(bool optimize) 
             // the memory module reset the scheduler to build its own graph, and
             // the reserve below that would have restored the worst-case
             // reservation is now skipped, so drain whatever it dispatched before
-            // failing and ask for a fresh reserve on the next call
+            // failing and leave the rebuild to the next call
+            //
+            // sched_need_reserve makes sched_reserve() build a whole new scheduler
+            // rather than only re-reserve, which is what an allocation failure wants:
+            // the current one is freed before the next attempt asks for memory
             ggml_backend_sched_synchronize(sched.get());
 
             sched_need_reserve = true;
@@ -853,7 +857,23 @@ llama_context::memory_update_status llama_context::memory_update(bool optimize) 
 }
 
 void llama_context::set_memory_update_result(ggml_status status) {
-    memory_update_result = status;
+    // an iswa or hybrid apply() runs every sub-context even after one of them has
+    // failed, so more than one can report here. keep the most severe: an abort is the
+    // caller cancelling and must never mask a real failure from another sub-context
+    const auto severity = [](ggml_status s) {
+        switch (s) {
+            case GGML_STATUS_SUCCESS:      return 0;
+            case GGML_STATUS_ABORTED:      return 1;
+            case GGML_STATUS_ALLOC_FAILED: return 2;
+            case GGML_STATUS_FAILED:       return 3;
+        }
+
+        return 3;
+    };
+
+    if (severity(status) > severity(memory_update_result)) {
+        memory_update_result = status;
+    }
 }
 
 int llama_context::memory_update_ret() const {
