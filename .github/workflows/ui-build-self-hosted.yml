@@ -8,11 +8,6 @@ permissions:
 
 jobs:
   build:
-    # QVAC-23796: was [self-hosted, fast], an upstream label no runner in this
-    # org carries, so this queued for 24h and then failed. Reached on PRs
-    # indirectly, via ui-self-hosted.yml calling this reusable workflow.
-    # Pure Node build - setup-node provides its own toolchain and nothing here
-    # needs sudo, so the plain Ubuntu box is sufficient.
     runs-on: qvac-ubuntu2404-x64
     timeout-minutes: 20
     env:
