@@ -8,6 +8,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstring>
 #include <set>
 #include <string>
 #include <vector>
@@ -175,6 +176,25 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+// Whether allocations on this device draw from the same physical pool as
+// host memory. For such devices the per-device budget alone under-counts:
+// their wired buffers, the host-assigned layers, and every other process all
+// share one pool.
+static bool ggml_dev_shares_host_memory(ggml_backend_dev_t dev) {
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return true;
+    }
+#if defined(__APPLE__) && defined(__aarch64__)
+    // Apple silicon: every Metal device is unified with system memory.
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char * reg_name = reg == nullptr ? nullptr : ggml_backend_reg_name(reg);
+    if (reg_name != nullptr && strcmp(reg_name, "Metal") == 0) {
+        return true;
+    }
+#endif
+    return false;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -233,9 +253,12 @@ static void common_params_fit_impl(
 
     if (nd == 0) {
         sum_projected_used = dmds_full.back().mb.total();
-        sum_free           = dmds_full.back().total;
+        // Budget against what the host can actually still hand out. Using
+        // total physical memory here meant a CPU-only fit always succeeded,
+        // no matter the model size or what else was running.
+        sum_free           = dmds_full.back().free;
         sum_projected_free = sum_free - sum_projected_used;
-        LOG_TRC("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
+        LOG_TRC("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of available host memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (sum_projected_free >= margins[0]) {
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
@@ -266,24 +289,48 @@ static void common_params_fit_impl(
         assert(sum_free >= 0 && sum_projected_used >= 0);
         LOG_TRC("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
-        if (nd == 1) {
-            if (projected_free_per_device[0] >= margins[0]) {
-                LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
-                    __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
-                return;
+    }
+
+    // Combined budget for the host row plus every device that shares physical
+    // memory with the host. The per-device rows cannot see this sum: on
+    // Apple silicon, a model with most layers on the GPU and the rest on the
+    // CPU can pass both individual rows, load, and then fail every decode
+    // because the two allocations plus the rest of the system exceed physical
+    // memory. Uses the first margin as the host margin.
+    int64_t host_shared_deficit = 0;
+    if (nd > 0) {
+        int64_t shared_projected = 0;
+        for (size_t id = 0; id < nd; id++) {
+            if (ggml_dev_shares_host_memory(devs[id])) {
+                shared_projected += dmds_full[id].mb.total();
             }
-        } else {
-            bool changes_needed = false;
-            for (size_t id = 0; id < nd; id++) {
-                if (projected_free_per_device[id] < margins[id]) {
-                    changes_needed = true;
-                    break;
-                }
+        }
+        const int64_t host_projected  = dmds_full.back().mb.total();
+        const int64_t host_free_after = dmds_full.back().free - host_projected - shared_projected;
+        if (host_free_after < margins[0]) {
+            host_shared_deficit = margins[0] - host_free_after;
+            LOG_TRC("%s: host + shared-memory devices projected to overshoot available host memory by %" PRId64 " MiB\n",
+                __func__, host_shared_deficit/MiB);
+        }
+    }
+
+    if (nd == 1) {
+        if (projected_free_per_device[0] >= margins[0] && host_shared_deficit == 0) {
+            LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
+                __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
+            return;
+        }
+    } else if (nd > 1) {
+        bool changes_needed = host_shared_deficit > 0;
+        for (size_t id = 0; id < nd; id++) {
+            if (projected_free_per_device[id] < margins[id]) {
+                changes_needed = true;
+                break;
             }
-            if (!changes_needed) {
-                LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
-                return;
-            }
+        }
+        if (!changes_needed) {
+            LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
+            return;
         }
     }
 
@@ -297,6 +344,9 @@ static void common_params_fit_impl(
             for (size_t id = 0; id < nd; id++) {
                 global_surplus -= margins[id];
             }
+            // A host-side deficit must force a reduction even when the device
+            // rows individually have surplus.
+            global_surplus -= host_shared_deficit;
         }
         if (global_surplus < 0) {
             if (nd <= 1) {
