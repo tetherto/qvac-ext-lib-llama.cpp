@@ -67,23 +67,6 @@ jobs:
     runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
-      # QVAC-23796: build-cuda-ubuntu.yml's cuda job runs in a container, i.e.
-      # as root, and self-hosted runners share a single _work directory across
-      # every workflow that lands on them. It can therefore leave root-owned
-      # files here that actions/checkout cannot delete ("EACCES ... rmdir
-      # '.ccache/0'") and that we cannot chown away without passwordless sudo.
-      # Docker is available and gives us root, so use it to take the workspace
-      # back. Idempotent, and a no-op once nothing root-owned is left.
-      #
-      # NB: tetherto/qvac's standard "Manual Workspace Cleanup" step
-      # (rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE") is NOT
-      # sufficient here - rm still cannot unlink entries inside root-owned
-      # subdirectories without sudo. It works over there only because no
-      # workflow in that repo uses `container:`, so root-owned files never
-      # appear in the first place.
-      - name: Reclaim workspace
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
-
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
@@ -98,10 +81,6 @@ jobs:
     runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
-      # see gpu-cuda above
-      - name: Reclaim workspace
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
-
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
@@ -116,10 +95,6 @@ jobs:
     runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
-      # see gpu-cuda above
-      - name: Reclaim workspace
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
-
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
@@ -141,10 +116,6 @@ jobs:
     runs-on: qvac-ubuntu2404-x64-gpu
 
     steps:
-      # see gpu-cuda above
-      - name: Reclaim workspace
-        run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
-
       - name: Clone
         id: checkout
         uses: actions/checkout@v6
