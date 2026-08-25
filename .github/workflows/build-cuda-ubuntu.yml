@@ -39,8 +39,20 @@ permissions:
   contents: read
 
 jobs:
+  # QVAC-23796: on the 24.04 GPU box to match the container's own distro. The
+  # host only has to provide docker - every step runs inside nvidia/cuda, which
+  # is where the pinned 12.6.2 toolkit comes from.
+  #
+  # TODO: this job is build-only (no nvidia-smi, no ctest, no ci/run.sh), so it
+  # compiles CUDA but never executes it and does not actually need a GPU. Once
+  # the CUDA toolkit is installed on qvac-ubuntu2404-x64, move it there and drop
+  # `container:` entirely. That frees a GPU slot on every PR and removes the
+  # root-owned-workspace problem at source - along with the chown step below and
+  # the four "Reclaim workspace" steps in build-self-hosted.yml, which exist
+  # only to clean up after this job. Ask infra to pin the toolkit version so we
+  # do not lose the reproducibility the container gives us today.
   cuda:
-    runs-on: qvac-ubuntu2204-x64-gpu
+    runs-on: qvac-ubuntu2404-x64-gpu
     container: nvidia/cuda:12.6.2-devel-ubuntu24.04
 
     steps:
