@@ -101,6 +101,12 @@ On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX), the RPC back
 
 RDMA is enabled by default when `libibverbs` is found at build time.
 
+### Direct all-reduce
+
+Tensor split with exactly two RPC devices uses a direct server-to-server connection for all-reduce. The first server listens on its RPC port plus 1000, and the second server connects to it. Set `GGML_RPC_COMM_PORT` on the main host to use a different port.
+
+Allow the communication port through the firewall and ensure that the servers can connect to each other. Use this only on a trusted private network because the connection does not provide transport authentication or encryption. Set `GGML_RPC_NO_COMM=1` on the main host to disable direct all-reduce.
+
 ### Troubleshooting
 
 Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `ggml-rpc-server`:

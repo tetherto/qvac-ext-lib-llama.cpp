@@ -9,7 +9,6 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <optional>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,6 +20,15 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <bcrypt.h>
+#endif
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -339,6 +347,75 @@ static bool checked_add_size(size_t a, size_t b, size_t & result) {
     }
     result = a + b;
     return true;
+}
+
+static bool checked_rpc_tensor_size(const rpc_tensor & tensor, size_t & tensor_size) {
+    const ggml_type type = (ggml_type) tensor.type;
+    const size_t block_size = ggml_blck_size(type);
+    if (tensor.ne[0] % block_size != 0) {
+        return false;
+    }
+
+    int64_t nelements = 1;
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+        if (tensor.ne[i] != 0 && nelements > INT64_MAX / tensor.ne[i]) {
+            return false;
+        }
+        nelements *= tensor.ne[i];
+    }
+
+    size_t data_size;
+    if (!checked_mul_size(ggml_type_size(type), tensor.ne[0] / block_size, data_size)) {
+        return false;
+    }
+    for (uint32_t i = 1; i < GGML_MAX_DIMS; i++) {
+        if (!checked_mul_size(data_size, tensor.ne[i], data_size)) {
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+        if (tensor.ne[i] == 0) {
+            tensor_size = 0;
+            return true;
+        }
+    }
+
+    if (block_size == 1) {
+        tensor_size = ggml_type_size(type);
+        for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+            size_t extent;
+            if (!checked_mul_size(tensor.ne[i] - 1, tensor.nb[i], extent) ||
+                    !checked_add_size(tensor_size, extent, tensor_size)) {
+                return false;
+            }
+        }
+    } else {
+        if (!checked_mul_size(tensor.ne[0] / block_size, tensor.nb[0], tensor_size)) {
+            return false;
+        }
+        for (uint32_t i = 1; i < GGML_MAX_DIMS; i++) {
+            size_t extent;
+            if (!checked_mul_size(tensor.ne[i] - 1, tensor.nb[i], extent) ||
+                    !checked_add_size(tensor_size, extent, tensor_size)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool fill_secure_random(uint8_t * data, size_t size) {
+#ifdef _WIN32
+    if (size > UINT32_MAX) {
+        return false;
+    }
+    return BCryptGenRandom(nullptr, data, (ULONG) size, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+#else
+    std::ifstream source("/dev/urandom", std::ios::binary);
+    source.read((char *) data, size);
+    return source && source.gcount() == (std::streamsize) size;
+#endif
 }
 
 static bool checked_span_size(size_t size, size_t n_copies, size_t stride) {
@@ -1289,6 +1366,12 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         return nullptr;
     }
 
+    size_t tensor_size;
+    if (!checked_rpc_tensor_size(*tensor, tensor_size)) {
+        GGML_LOG_ERROR("[%s] invalid tensor dimensions or strides\n", __func__);
+        return nullptr;
+    }
+
     ggml_tensor * result = ggml_new_tensor_4d(ctx, (ggml_type) tensor->type,
         tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
 
@@ -1305,7 +1388,8 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
         result->buffer = nullptr;
     }
-    if (result->buffer && ggml_nelements(result) > 0 && ggml_backend_buffer_is_multi_buffer(result->buffer)) {
+    const bool empty_unallocated = tensor_size == 0 && tensor->data == 0;
+    if (result->buffer && !empty_unallocated && ggml_backend_buffer_is_multi_buffer(result->buffer)) {
         ggml_backend_buffer_t sub_buffer =
             ggml_backend_multi_buffer_get_buffer(result->buffer, reinterpret_cast<const void *>(tensor->data));
         if (sub_buffer == nullptr) {
@@ -1316,18 +1400,22 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->buffer = sub_buffer;
     }
 
-    if (result->buffer && ggml_nelements(result) > 0) {
+    if (result->buffer && !empty_unallocated) {
         // require that the tensor data does not go beyond the buffer end
-        uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
-        uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
-        uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        if (tensor->data + tensor_size < tensor->data ||
-            tensor->data < buffer_start || tensor->data + tensor_size > buffer_start + buffer_size) {
+        const uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
+        const uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
+        if (tensor_size > UINT64_MAX - tensor->data || buffer_size > UINT64_MAX - buffer_start) {
+            GGML_LOG_ERROR("[%s] tensor or buffer range overflows\n", __func__);
+            return nullptr;
+        }
+        const uint64_t tensor_end = tensor->data + tensor_size;
+        const uint64_t buffer_end = buffer_start + buffer_size;
+        if (tensor->data < buffer_start || tensor_end > buffer_end) {
             GGML_LOG_ERROR("[%s] tensor '%s' (op %s, type %s, ne [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]) "
                            "data [0x%" PRIx64 ", 0x%" PRIx64 ") out of buffer bounds [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
                            __func__, tensor->name, ggml_op_name((ggml_op) tensor->op), ggml_type_name(result->type),
                            result->ne[0], result->ne[1], result->ne[2], result->ne[3],
-                           tensor->data, tensor->data + tensor_size, buffer_start, buffer_start + buffer_size);
+                           tensor->data, tensor_end, buffer_start, buffer_end);
             return nullptr;
         }
     }
@@ -2794,13 +2882,10 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         comm_port = (uint32_t) port0 + 1000;
     }
 
-    std::array<uint8_t, RPC_COMM_SESSION_ID_SIZE> session_id = {};
-    std::random_device random;
-    for (size_t offset = 0; offset < session_id.size();) {
-        const auto value = random();
-        const size_t size = std::min(sizeof(value), session_id.size() - offset);
-        memcpy(session_id.data() + offset, &value, size);
-        offset += size;
+    std::array<uint8_t, RPC_COMM_SESSION_ID_SIZE> session_id;
+    if (!fill_secure_random(session_id.data(), session_id.size())) {
+        GGML_LOG_WARN("%s: failed to generate communicator session id\n", __func__);
+        return nullptr;
     }
 
     // Send all init requests before reading any response: rank 0 blocks in accept
