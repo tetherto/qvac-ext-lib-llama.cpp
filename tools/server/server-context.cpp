@@ -3683,7 +3683,12 @@ private:
                     err = "Compute error.";
                 }
 
-                // TODO: handle ret == 2 (abort) when we start aborting
+                if (ret == 2) {
+                    // aborted through the abort callback. a smaller batch cannot help, and
+                    // when the abort hit a pending K-shift the shift is still owed, so the
+                    // retry aborts again and halves n_batch until it reaches zero
+                    err = "Operation aborted.";
+                }
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
