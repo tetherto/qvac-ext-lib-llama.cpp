@@ -785,6 +785,8 @@ llama_context::memory_update_status llama_context::memory_update(bool optimize) 
         return memory_update_status::no_update;
     }
 
+    memory_update_result = GGML_STATUS_SUCCESS;
+
     {
         const auto mctx = memory->init_update(this, optimize);
         switch (mctx->get_status()) {
@@ -813,10 +815,18 @@ llama_context::memory_update_status llama_context::memory_update(bool optimize) 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
 
-            // A failed K-shift leaves the cells carrying shifted positions that
-            // K was never rotated to match. Report it rather than reserving a
-            // graph and letting the caller decode against a cache it cannot
-            // trust.
+            // the update did not complete, so the memory cannot be trusted for
+            // decode - report it rather than reserving a graph and letting the
+            // caller carry on
+            //
+            // the memory module reset the scheduler to build its own graph, and
+            // the reserve below that would have restored the worst-case
+            // reservation is now skipped, so drain whatever it dispatched before
+            // failing and ask for a fresh reserve on the next call
+            ggml_backend_sched_synchronize(sched.get());
+
+            sched_need_reserve = true;
+
             return memory_update_status::failed;
         }
     }
@@ -840,6 +850,24 @@ llama_context::memory_update_status llama_context::memory_update(bool optimize) 
     }
 
     return memory_update_status::updated;
+}
+
+void llama_context::set_memory_update_result(ggml_status status) {
+    memory_update_result = status;
+}
+
+int llama_context::memory_update_ret() const {
+    // mirror the mapping decode() uses for the ubatch compute status, so the
+    // caller sees the same code for the same failure wherever it happened. an
+    // abort in particular is not a fatal error
+    switch (memory_update_result) {
+        case GGML_STATUS_ABORTED:      return  2;
+        case GGML_STATUS_FAILED:       return -3;
+        case GGML_STATUS_ALLOC_FAILED: return -2;
+        case GGML_STATUS_SUCCESS:      break; // failed before computing a graph
+    }
+
+    return -2;
 }
 
 enum llama_pooling_type llama_context::pooling_type() const {
@@ -1801,9 +1829,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // handle any pending shifts/copies
     if (memory_update(false) == memory_update_status::failed) {
-        LLAMA_LOG_ERROR("%s: failed to apply pending memory updates\n", __func__);
-
-        return -2;
+        return memory_update_ret();
     }
 
     llama_memory_context_ptr mctx;
@@ -1829,7 +1855,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true) == memory_update_status::updated) {
+                        const auto status = memory_update(true);
+
+                        // a failed update means the memory cannot be trusted, so
+                        // it must not be reported as the retryable "no slot"
+                        if (status == memory_update_status::failed) {
+                            return memory_update_ret();
+                        }
+
+                        if (status == memory_update_status::updated) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;

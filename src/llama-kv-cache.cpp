@@ -996,17 +996,24 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             auto * gf = build_graph_shift(res, lctx);
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                // The cells already carry their shifted positions but K was never
-                // rotated to match, so the cache is inconsistent. has_shift stays
-                // set because the shift is still owed; report the failure so the
-                // caller stops rather than attending over stale K.
+
+                // has_shift stays set, the shift is still owed
+                lctx->set_memory_update_result(GGML_STATUS_ALLOC_FAILED);
+
                 return false;
             }
 
             res->set_inputs(nullptr);
 
-            if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
+            const auto status = lctx->graph_compute(gf, false);
+            if (status != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
+
+                // keep the status rather than flattening it: stopping is right
+                // either way since K is left half-rotated, but an abort is the
+                // caller cancelling and must not reach it as a fatal error
+                lctx->set_memory_update_result(status);
+
                 return false;
             }
         }
