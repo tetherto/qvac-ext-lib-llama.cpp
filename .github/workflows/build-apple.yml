@@ -55,23 +55,6 @@ jobs:
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
-      # QVAC-23796: GGML_METAL_SHADER_DEBUG=ON compiles the .metal shaders
-      # ahead of time, which needs the Metal Toolchain. From Xcode 26 that is a
-      # separately downloaded component, and the self-hosted Mac Studio images
-      # ship without it ("cannot execute tool 'metal'"). Idempotent: a no-op
-      # once the component is present, so this can be dropped again as soon as
-      # the runner image bakes it in.
-      - name: Ensure Metal toolchain
-        run: |
-          if xcrun -find metallib >/dev/null 2>&1; then
-            echo "Metal Toolchain already present"
-          else
-            echo "Metal Toolchain missing, downloading component..."
-            xcodebuild -downloadComponent MetalToolchain
-          fi
-          xcrun -find metal
-          xcrun -find metallib
-
       - name: Build
         id: cmake_build
         run: |
