@@ -1836,11 +1836,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
     embd_seq.clear();
 
-    if (t_compute_start_us == 0) {
-        t_compute_start_us = ggml_time_us();
-    }
-    n_queued_tokens += n_tokens_all;
-
     output_swaps.clear();
 
     sched_reserve();
@@ -1851,6 +1846,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (memory_update(false) == memory_update_status::failed) {
         return memory_update_ret();
     }
+
+    // count the batch only once it is going to be evaluated: the memory update above
+    // can fail and return, and synchronize() attributes everything queued to the next
+    // decode that completes
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+    n_queued_tokens += n_tokens_all;
 
     llama_memory_context_ptr mctx;
 
