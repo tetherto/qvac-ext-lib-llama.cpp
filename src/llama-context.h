@@ -75,7 +75,16 @@ struct llama_context {
     llama_memory_t get_memory() const;
 
     // return true if the memory was updated
-    bool memory_update(bool optimize);
+    // Result of applying pending memory updates. A bool cannot express this:
+    // "nothing was pending" and "the update failed" are both not-updated, but
+    // only one of them means the caller must stop.
+    enum class memory_update_status {
+        no_update, // nothing was pending
+        updated,   // pending work was applied successfully
+        failed,    // an update was attempted and did not complete
+    };
+
+    memory_update_status memory_update(bool optimize);
 
     enum llama_pooling_type pooling_type() const;
 

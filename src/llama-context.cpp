@@ -780,9 +780,9 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
-bool llama_context::memory_update(bool optimize) {
+llama_context::memory_update_status llama_context::memory_update(bool optimize) {
     if (!memory) {
-        return false;
+        return memory_update_status::no_update;
     }
 
     {
@@ -795,13 +795,13 @@ bool llama_context::memory_update(bool optimize) {
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
                     // no updates need to be performed
-                    return false;
+                    return memory_update_status::no_update;
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
                     LLAMA_LOG_ERROR("%s: failed to prepare memory update\n", __func__);
-                    return false;
+                    return memory_update_status::failed;
                 }
         }
 
@@ -812,6 +812,12 @@ bool llama_context::memory_update(bool optimize) {
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+
+            // A failed K-shift leaves the cells carrying shifted positions that
+            // K was never rotated to match. Report it rather than reserving a
+            // graph and letting the caller decode against a cache it cannot
+            // trust.
+            return memory_update_status::failed;
         }
     }
 
@@ -833,7 +839,7 @@ bool llama_context::memory_update(bool optimize) {
         }
     }
 
-    return true;
+    return memory_update_status::updated;
 }
 
 enum llama_pooling_type llama_context::pooling_type() const {
@@ -1794,7 +1800,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    if (memory_update(false) == memory_update_status::failed) {
+        LLAMA_LOG_ERROR("%s: failed to apply pending memory updates\n", __func__);
+
+        return -2;
+    }
 
     llama_memory_context_ptr mctx;
 
@@ -1819,7 +1829,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true)) {
+                        if (memory_update(true) == memory_update_status::updated) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
