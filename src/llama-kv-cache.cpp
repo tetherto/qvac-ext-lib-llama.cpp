@@ -513,6 +513,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
+
+        // An empty stream owes no shift. Without this, a K-shift that failed
+        // leaves has_shift set with no way for a caller to clear it short of
+        // llama_memory_clear(), so every later decode retries the same shift.
+        if (cells.get_used() == 0) {
+            cells.reset_shift();
+        }
     } else {
         // match any sequence
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -536,6 +543,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             // If we freed up a slot, set head to it so searching can start there.
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
+            }
+
+            // see the note on the seq_id >= 0 branch above
+            if (cells.get_used() == 0) {
+                cells.reset_shift();
             }
         }
     }
