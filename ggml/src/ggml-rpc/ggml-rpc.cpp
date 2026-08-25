@@ -1388,8 +1388,8 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
         result->buffer = nullptr;
     }
-    const bool empty_unallocated = tensor_size == 0 && tensor->data == 0;
-    if (result->buffer && !empty_unallocated && ggml_backend_buffer_is_multi_buffer(result->buffer)) {
+    const bool empty_tensor = tensor_size == 0;
+    if (result->buffer && !empty_tensor && ggml_backend_buffer_is_multi_buffer(result->buffer)) {
         ggml_backend_buffer_t sub_buffer =
             ggml_backend_multi_buffer_get_buffer(result->buffer, reinterpret_cast<const void *>(tensor->data));
         if (sub_buffer == nullptr) {
@@ -1400,7 +1400,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->buffer = sub_buffer;
     }
 
-    if (result->buffer && !empty_unallocated) {
+    if (result->buffer && !empty_tensor) {
         // require that the tensor data does not go beyond the buffer end
         const uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         const uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
@@ -1426,6 +1426,10 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
     result->flags = tensor->flags;
     result->data = reinterpret_cast<void *>(tensor->data);
+    if (empty_tensor && result->buffer) {
+        // Empty split views have no addressable data and can point outside the local shard.
+        result->data = ggml_backend_buffer_get_base(result->buffer);
+    }
     ggml_set_name(result, tensor->name);
     return result;
 }
