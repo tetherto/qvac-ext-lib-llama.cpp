@@ -1,6 +1,5 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
-#include "ggml-rpc.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -22,7 +21,16 @@ static bool check_values(const std::vector<float> & values, float expected) {
 }
 
 static ggml_backend_ptr init_backend(const std::string & endpoint, ggml_backend_dev_t & device) {
-    ggml_backend_reg_t reg = ggml_backend_rpc_add_server(endpoint.c_str());
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (rpc_reg == nullptr) {
+        return ggml_backend_ptr(nullptr);
+    }
+    using add_rpc_server_fn = ggml_backend_reg_t (*)(const char *);
+    auto add_server = (add_rpc_server_fn) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    if (add_server == nullptr) {
+        return ggml_backend_ptr(nullptr);
+    }
+    ggml_backend_reg_t reg = add_server(endpoint.c_str());
     if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
         return ggml_backend_ptr(nullptr);
     }
@@ -45,6 +53,8 @@ int main() {
     }
     std::string endpoint_a = endpoints.substr(0, separator);
     std::string endpoint_b = endpoints.substr(separator + 1);
+
+    ggml_backend_load_all();
 
     ggml_backend_dev_t device_a  = nullptr;
     ggml_backend_dev_t device_b  = nullptr;
