@@ -29,20 +29,5 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      # QVAC-23796: scripts/check-requirements.sh shells out to shellcheck. The
-      # GitHub-hosted images ship it; the qvac runners do not, and there is no
-      # passwordless sudo to apt-get it. Drop the static binary into RUNNER_TEMP
-      # instead, which needs no elevation.
-      - name: Install shellcheck
-        if: runner.environment != 'github-hosted'
-        run: |
-          if command -v shellcheck >/dev/null 2>&1; then
-            echo "shellcheck already present: $(command -v shellcheck)"
-            exit 0
-          fi
-          ver=v0.10.0
-          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${ver}/shellcheck-${ver}.linux.x86_64.tar.xz" \
-            | tar -xJf - -C "${RUNNER_TEMP}"
-          echo "${RUNNER_TEMP}/shellcheck-${ver}" >> "$GITHUB_PATH"
       - name: Run check-requirements.sh script
         run:  bash scripts/check-requirements.sh

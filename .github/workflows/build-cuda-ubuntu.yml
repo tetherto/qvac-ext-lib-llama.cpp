@@ -90,7 +90,7 @@ jobs:
       # Hand ownership back while we still have root. Chown rather than delete,
       # so the ccache survives for the next run.
       - name: Return workspace ownership to the runner user
-        if: always() && runner.environment != 'github-hosted'
+        if: always()
         run: |
           owner=$(stat -c '%u:%g' "${GITHUB_WORKSPACE}/..")
           echo "Restoring ${GITHUB_WORKSPACE} to ${owner}"

@@ -82,7 +82,6 @@ jobs:
       # workflow in that repo uses `container:`, so root-owned files never
       # appear in the first place.
       - name: Reclaim workspace
-        if: runner.environment != 'github-hosted'
         run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
 
       - name: Clone
@@ -101,7 +100,6 @@ jobs:
     steps:
       # see gpu-cuda above
       - name: Reclaim workspace
-        if: runner.environment != 'github-hosted'
         run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
 
       - name: Clone
@@ -120,7 +118,6 @@ jobs:
     steps:
       # see gpu-cuda above
       - name: Reclaim workspace
-        if: runner.environment != 'github-hosted'
         run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
 
       - name: Clone
@@ -146,7 +143,6 @@ jobs:
     steps:
       # see gpu-cuda above
       - name: Reclaim workspace
-        if: runner.environment != 'github-hosted'
         run: docker run --rm -v "$GITHUB_WORKSPACE":/ws alpine:3 chown -R "$(id -u):$(id -g)" /ws
 
       - name: Clone
