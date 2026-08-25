@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <chrono>
+#include <exception>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -160,7 +161,15 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         QUE_DBG("%s", "update slots\n");
 
         // this will run the main inference process for all slots
-        callback_update_slots();
+        // update_slots() throws to abandon a batch it cannot finish, for example a
+        // decode that failed on a memory update. it has already errored and released
+        // the affected slots by then, so keep serving instead of taking the process
+        // down with the batch
+        try {
+            callback_update_slots();
+        } catch (const std::exception & e) {
+            QUE_ERR("update slots failed: %s\n", e.what());
+        }
         {
             // update_slots() may take a while to finish, we need to make sure it's not counted as idle
             std::unique_lock<std::mutex> lock(mutex_tasks);
