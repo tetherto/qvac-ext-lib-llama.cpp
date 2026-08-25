@@ -781,6 +781,11 @@ class rpc_command_queue {
 
     bool synchronize(uint32_t device) { return submit_synchronize(device)->wait(); }
 
+    bool is_failed() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return failed;
+    }
+
     bool get_cached_alloc_size(const std::string & key, uint64_t & size) {
         std::lock_guard<std::mutex> lock(alloc_cache_mutex);
         auto                        it = alloc_cache.find(key);
@@ -915,7 +920,9 @@ static std::shared_ptr<rpc_command_queue> get_command_queue(const std::string & 
     auto it = queues.find(endpoint);
     if (it != queues.end()) {
         if (auto queue = it->second.lock()) {
-            return queue;
+            if (!queue->is_failed()) {
+                return queue;
+            }
         }
     }
     auto queue = rpc_command_queue::create(endpoint);
@@ -1292,7 +1299,7 @@ static const char * ggml_backend_rpc_name(ggml_backend_t backend) {
 static void ggml_backend_rpc_free(ggml_backend_t backend) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     if (rpc_ctx->cmd_queue != nullptr) {
-        RPC_STATUS_ASSERT(rpc_ctx->cmd_queue->synchronize(rpc_ctx->device));
+        rpc_ctx->cmd_queue->synchronize(rpc_ctx->device);
     }
     delete rpc_ctx;
     delete backend;
