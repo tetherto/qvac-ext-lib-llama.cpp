@@ -934,8 +934,6 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         return true;
     }
 
-    bool updated = false;
-
     auto * sched = lctx->get_sched();
 
     if (!sc_info.empty()) {
@@ -986,17 +984,19 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             auto * gf = build_graph_shift(res, lctx);
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                return updated;
+                // The cells already carry their shifted positions but K was never
+                // rotated to match, so the cache is inconsistent. has_shift stays
+                // set because the shift is still owed; report the failure so the
+                // caller stops rather than attending over stale K.
+                return false;
             }
 
             res->set_inputs(nullptr);
 
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
-                return updated;
+                return false;
             }
-
-            updated = true;
         }
 
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1006,7 +1006,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         }
     }
 
-    return updated;
+    return true;
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
@@ -2750,9 +2750,7 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
-
-        return true;
+        return kv->update(lctx, do_shift, sc_info);
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);

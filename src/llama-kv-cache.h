@@ -196,6 +196,10 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
+    // Applies pending shifts and stream copies. Returns whether the update
+    // SUCCEEDED, not whether it did any work: a no-op update is a success.
+    // A failed K-shift leaves the cells carrying shifted positions that K was
+    // never rotated to match, so the caller must not keep decoding.
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
