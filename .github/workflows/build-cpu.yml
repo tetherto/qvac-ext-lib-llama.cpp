@@ -200,19 +200,24 @@ jobs:
         id: get_vulkan
         if: ${{ matrix.build == 'x64-vulkan' }}
         run: |
-          # QVAC-23796: skip the download when the SDK is already installed.
-          # The runner is persistent, so C:\VulkanSDK\<version> survives between
-          # jobs; the Qt installer then hits "OverwriteTargetDirectory ... you
-          # have selected an existing, non-empty directory", to which
-          # --default-answer replies No, and exits 1. A GitHub-hosted runner
-          # never sees this because it starts from a clean VM.
+          # QVAC-23796: the runner is persistent, so C:\VulkanSDK\<version>
+          # survives between jobs. Key the skip on vulkan-1.lib rather than on
+          # the directory: an interrupted install leaves the headers behind
+          # without the import library, and CMake then fails configure with
+          # "Could NOT find Vulkan (missing: Vulkan_LIBRARY)". Re-running the
+          # installer over an existing directory raises the Qt installer's
+          # OverwriteTargetDirectory prompt, which --default-answer declines
+          # before exiting 1, so answer that one explicitly. A GitHub-hosted
+          # runner never sees any of this because it starts from a clean VM.
           $sdk = "C:\VulkanSDK\${env:VULKAN_VERSION}"
-          if (Test-Path $sdk) {
+          $lib = "$sdk\Lib\vulkan-1.lib"
+          if (Test-Path $lib) {
             Write-Host "Vulkan SDK ${env:VULKAN_VERSION} already installed at $sdk"
           } else {
             curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
-            & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+            & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --auto-answer OverwriteTargetDirectory=Yes --confirm-command install
             if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer failed with exit code $LASTEXITCODE" }
+            if (-not (Test-Path $lib)) { throw "Vulkan SDK installed but $lib is missing" }
           }
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
           Add-Content $env:GITHUB_PATH "$sdk\bin"
