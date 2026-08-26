@@ -5,80 +5,11 @@
 #include "ggml-impl.h"
 
 #include <cassert>
-#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-static int ggml_metal_nsg_from_env(const char * env_name, int fallback) {
-    const char * v = getenv(env_name);
-    if (!v || !v[0]) {
-        return fallback;
-    }
-
-    const int n = atoi(v);
-    if (n < 1 || n > 8) {
-        return fallback;
-    }
-
-    return n;
-}
-
-static int ggml_metal_nsg_q4_k(void) {
-    static int nsg = -1;
-    if (nsg < 0) {
-        nsg = ggml_metal_nsg_from_env("GGML_METAL_Q4K_NSG", N_SG_Q4_K);
-        if (nsg != N_SG_Q4_K) {
-            GGML_LOG_INFO("ggml_metal: Q4_K nsg=%d\n", nsg);
-        }
-    }
-    return nsg;
-}
-
-static int ggml_metal_nsg_q5_k(void) {
-    static int nsg = -1;
-    if (nsg < 0) {
-        nsg = ggml_metal_nsg_from_env("GGML_METAL_Q5K_NSG", N_SG_Q5_K);
-        if (nsg != N_SG_Q5_K) {
-            GGML_LOG_INFO("ggml_metal: Q5_K nsg=%d\n", nsg);
-        }
-    }
-    return nsg;
-}
-
-static int ggml_metal_nsg_q4_0(void) {
-    static int nsg = -1;
-    if (nsg < 0) {
-        nsg = ggml_metal_nsg_from_env("GGML_METAL_Q40_NSG", N_SG_Q4_0);
-        if (nsg != N_SG_Q4_0) {
-            GGML_LOG_INFO("ggml_metal: Q4_0 nsg=%d\n", nsg);
-        }
-    }
-    return nsg;
-}
-
-static int ggml_metal_gdn_ncols(int nsg) {
-    static int env = -2;
-    if (env == -2) {
-        env = -1;
-        const char * v = getenv("GGML_METAL_GDN_COLS");
-        if (v && v[0]) {
-            const int n = atoi(v);
-            if (n >= 1 && n <= 8) {
-                env = n;
-                GGML_LOG_INFO("ggml_metal: GDN cols=%d\n", env);
-            }
-        }
-    }
-
-    int ncols = env > 0 ? env : nsg;
-    if (ncols > nsg) {
-        ncols = nsg;
-    }
-    return ncols;
-}
 
 struct ggml_metal_device_deleter {
     void operator()(ggml_metal_device_t ctx) {
@@ -800,7 +731,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     const int nsg = op->src[2]->ne[0]/32;
     const int ne22 = op->src[2]->ne[2];
     const int16_t nt_fc = ne22 == 1 ? 1 : 0;
-    const int ncols = ggml_metal_gdn_ncols(nsg);
 
     GGML_ASSERT(op->src[5]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->ne[0] == ne20 * ne21);
@@ -823,7 +753,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
         ggml_metal_cv_free(cv);
     }
 
-    res.nsg = ncols;
+    res.nsg = nsg;
 
     return res;
 }
@@ -1002,7 +932,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q4_0:
             {
-                nsg = ggml_metal_nsg_q4_0();
+                nsg = N_SG_Q4_0;
                 nr0 = N_R0_Q4_0;
             } break;
         case GGML_TYPE_Q4_1:
@@ -1050,12 +980,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q4_K:
             {
-                nsg = ggml_metal_nsg_q4_k();
+                nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
             } break;
         case GGML_TYPE_Q5_K:
             {
-                nsg = ggml_metal_nsg_q5_k();
+                nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
             } break;
         case GGML_TYPE_Q6_K:
@@ -1237,7 +1167,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_Q4_0:
             {
-                nsg = ggml_metal_nsg_q4_0();
+                nsg = N_SG_Q4_0;
                 nr0 = N_R0_Q4_0;
             } break;
         case GGML_TYPE_Q4_1:
@@ -1285,12 +1215,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_Q4_K:
             {
-                nsg = ggml_metal_nsg_q4_k();
+                nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
             } break;
         case GGML_TYPE_Q5_K:
             {
-                nsg = ggml_metal_nsg_q5_k();
+                nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
             } break;
         case GGML_TYPE_Q6_K:
@@ -1439,17 +1369,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_glu(ggml_
             } break;
         case GGML_TYPE_Q4_0:
             {
-                nsg = ggml_metal_nsg_q4_0();
+                nsg = N_SG_Q4_0;
                 nr0 = N_R0_Q4_0;
             } break;
         case GGML_TYPE_Q4_K:
             {
-                nsg = ggml_metal_nsg_q4_k();
+                nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
             } break;
         case GGML_TYPE_Q5_K:
             {
-                nsg = ggml_metal_nsg_q5_k();
+                nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
             } break;
         default:
@@ -1523,17 +1453,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_glu(gg
             } break;
         case GGML_TYPE_Q4_0:
             {
-                nsg = ggml_metal_nsg_q4_0();
+                nsg = N_SG_Q4_0;
                 nr0 = N_R0_Q4_0;
             } break;
         case GGML_TYPE_Q4_K:
             {
-                nsg = ggml_metal_nsg_q4_k();
+                nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
             } break;
         case GGML_TYPE_Q5_K:
             {
-                nsg = ggml_metal_nsg_q5_k();
+                nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
             } break;
         default:
