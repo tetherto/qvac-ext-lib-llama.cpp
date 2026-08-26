@@ -372,6 +372,32 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
+// extra nodes to keep with gf->nodes[i] so later reorder cannot split a metal fusion
+static int ggml_metal_graph_optimize_pack(const ggml_cgraph * gf, int i) {
+    const int n = gf->n_nodes;
+    ggml_tensor ** nodes = gf->nodes;
+
+    if (nodes[i]->op == GGML_OP_SOFT_MAX) {
+        static const ggml_op topk_ops[] = {
+            GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
+            GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE,
+            GGML_OP_SCALE,
+        };
+        const int lens[] = { 11, 10, 5 };
+        for (int n_ops : lens) {
+            if (i + n_ops > n) {
+                continue;
+            }
+            const int outs[] = { i + 3, i + n_ops - 1 };
+            if (ggml_can_fuse_subgraph(gf, i, n_ops, topk_ops, outs, 2)) {
+                return n_ops - 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 void ggml_graph_optimize(ggml_cgraph * gf) {
     constexpr int MAX_FUSE = 16;
 
@@ -390,6 +416,8 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
             /*.node =*/ gf->nodes[i],
             /*.fused =*/ {},
         };
+
+        int n_extra = 0;
 
         // fuse only ops that start with these operations
         // can be expanded when needed
@@ -419,13 +447,14 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
                 }
             }
 
-            // add the fused tensors into the node info so we can unfuse them later
-            for (int k = 1; k < f; k++) {
-                ++i;
+            n_extra = f > 1 ? f - 1 : 0;
+        } else {
+            n_extra = ggml_metal_graph_optimize_pack(gf, i);
+        }
 
-                // the .dst() becomes the last fused tensor
-                node.add_fused(gf->nodes[i]);
-            }
+        for (int k = 0; k < n_extra; k++) {
+            ++i;
+            node.add_fused(gf->nodes[i]);
         }
 
         nodes.push_back(std::move(node));
