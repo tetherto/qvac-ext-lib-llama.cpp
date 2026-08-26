@@ -13,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -2451,7 +2452,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 const llama_kv_cell_ext ext = cells.ext_get(i);
                 io.write(&ext, sizeof(ext));
             }
@@ -2588,12 +2589,17 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
 
-                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
-                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+                if (hparams.n_pos_per_embd() > 1) {
+                    ubatch.pos[i + ubatch.n_tokens]   = ext.y;
+                    ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+                }
+
+                // apply_ubatch() below restores ext.tok from the ubatch tokens
+                ubatch.token[i] = ext.tok;
             }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
@@ -2678,7 +2684,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             cells.pos_set(i, pos);
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
                 cells.ext_set(i, ext);
