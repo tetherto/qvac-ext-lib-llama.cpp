@@ -430,6 +430,21 @@ static int ggml_metal_graph_optimize_pack(const ggml_cgraph * gf, int i) {
         }
     }
 
+    if (op0 == GGML_OP_UNARY && i + 2 <= n) {
+        const ggml_unary_op uop = ggml_get_unary_op(nodes[i]);
+        if (uop == GGML_UNARY_OP_SILU ||
+                uop == GGML_UNARY_OP_SIGMOID ||
+                uop == GGML_UNARY_OP_SOFTPLUS) {
+            const ggml_op ops[] = { GGML_OP_UNARY, GGML_OP_MUL };
+            const int out[] = { i + 1 };
+            if (ggml_can_fuse_subgraph(gf, i, 2, ops, out, 1) &&
+                    (nodes[i + 1]->src[0] == nodes[i] || nodes[i + 1]->src[1] == nodes[i]) &&
+                    ggml_are_same_shape(nodes[i]->src[0], nodes[i + 1])) {
+                return 1;
+            }
+        }
+    }
+
     return 0;
 }
 
