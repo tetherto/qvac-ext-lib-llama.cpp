@@ -395,6 +395,24 @@ static int ggml_metal_graph_optimize_pack(const ggml_cgraph * gf, int i) {
         }
     }
 
+    const ggml_op op0 = nodes[i]->op;
+    if (op0 == GGML_OP_MUL_MAT || op0 == GGML_OP_MUL_MAT_ID) {
+        if (i + 3 <= n) {
+            const ggml_op ops[] = { op0, op0, GGML_OP_GLU };
+            const int out[] = { i + 2 };
+            if (ggml_can_fuse_subgraph(gf, i, 3, ops, out, 1)) {
+                return 2;
+            }
+        }
+        if (op0 == GGML_OP_MUL_MAT_ID && i + 4 <= n) {
+            const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU };
+            const int out[] = { i + 3 };
+            if (ggml_can_fuse_subgraph(gf, i, 4, ops, out, 1)) {
+                return 3;
+            }
+        }
+    }
+
     return 0;
 }
 
