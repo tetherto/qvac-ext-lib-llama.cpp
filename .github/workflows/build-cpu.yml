@@ -57,21 +57,12 @@ jobs:
     strategy:
       matrix:
         include:
-          # QVAC-23796: both legs stay GitHub-hosted for now. The "Build
-          # Dependencies" step below installs system packages with
-          # "sudo apt-get", and the qvac Ubuntu runners have no passwordless
-          # sudo; they are also missing libssl-dev / libcurl4-openssl-dev,
-          # which the cmake configure needs. Flip the x64 leg to
-          # qvac-ubuntu2204-x64 once the runner image provides those.
           - build: 'x64'
             os: ubuntu-22.04
-            runner: ubuntu-22.04
-          # no arm64 Linux box in the self-hosted fleet at all
           - build: 'arm64'
             os: ubuntu-24.04-arm
-            runner: ubuntu-24.04-arm
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Clone
@@ -141,7 +132,7 @@ jobs:
           ./bin/llama-completion -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
   windows:
-    runs-on: qvac-win25-x64
+    runs-on: windows-2025
 
     env:
       OPENBLAS_VERSION: 0.3.23
@@ -184,14 +175,8 @@ jobs:
           curl.exe -o $env:RUNNER_TEMP/openblas.zip -L "https://github.com/xianyi/OpenBLAS/releases/download/v${env:OPENBLAS_VERSION}/OpenBLAS-${env:OPENBLAS_VERSION}-x64.zip"
           curl.exe -o $env:RUNNER_TEMP/OpenBLAS.LICENSE.txt -L "https://github.com/xianyi/OpenBLAS/raw/v${env:OPENBLAS_VERSION}/LICENSE"
           mkdir $env:RUNNER_TEMP/openblas
-          # QVAC-23796: call bsdtar by full path. A Git/MSYS tar earlier on PATH
-          # reads the "-C C:\..." argument as a remote host and refuses to extract.
-          & "$env:SystemRoot\system32\tar.exe" -xvf $env:RUNNER_TEMP/openblas.zip -C $env:RUNNER_TEMP/openblas
-          if ($LASTEXITCODE -ne 0) { throw "extracting openblas.zip failed with exit code $LASTEXITCODE" }
-          # QVAC-23796: vswhere ships with the VS installer at a fixed location but is
-          # not on PATH outside the GitHub-hosted images.
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vcdir = $(& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          tar.exe -xvf $env:RUNNER_TEMP/openblas.zip -C $env:RUNNER_TEMP/openblas
+          $vcdir = $(vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
           $msvc = $(join-path $vcdir $('VC\Tools\MSVC\'+$(gc -raw $(join-path $vcdir 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt')).Trim()))
           $lib =  $(join-path $msvc 'bin\Hostx64\x64\lib.exe')
           & $lib /machine:x64 "/def:${env:RUNNER_TEMP}/openblas/lib/libopenblas.def" "/out:${env:RUNNER_TEMP}/openblas/lib/openblas.lib" /name:openblas.dll
@@ -200,41 +185,15 @@ jobs:
         id: get_vulkan
         if: ${{ matrix.build == 'x64-vulkan' }}
         run: |
-          # QVAC-23796: the runner is persistent, so C:\VulkanSDK\<version>
-          # survives between jobs. Key the skip on vulkan-1.lib rather than on
-          # the directory: an interrupted install leaves the headers behind
-          # without the import library, and CMake then fails configure with
-          # "Could NOT find Vulkan (missing: Vulkan_LIBRARY)". Re-running the
-          # installer over an existing directory raises the Qt installer's
-          # OverwriteTargetDirectory prompt, which --default-answer declines
-          # before exiting 1, so answer that one explicitly. A GitHub-hosted
-          # runner never sees any of this because it starts from a clean VM.
-          $sdk = "C:\VulkanSDK\${env:VULKAN_VERSION}"
-          $lib = "$sdk\Lib\vulkan-1.lib"
-          if (Test-Path $lib) {
-            Write-Host "Vulkan SDK ${env:VULKAN_VERSION} already installed at $sdk"
-          } else {
-            curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
-            & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --auto-answer OverwriteTargetDirectory=Yes --confirm-command install
-            if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer failed with exit code $LASTEXITCODE" }
-            if (-not (Test-Path $lib)) { throw "Vulkan SDK installed but $lib is missing" }
-          }
-          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
-          Add-Content $env:GITHUB_PATH "$sdk\bin"
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
 
       - name: Install Ninja
         id: install_ninja
         run: |
-          # QVAC-23796: ninja ships in the qvac Windows image, and a bare
-          # `choco install` (no -y) prompts for confirmation, which aborts with
-          # exit 1 and no output on a non-interactive runner. Skip when it is
-          # already there, and pass -y when it genuinely has to be installed.
-          if (Get-Command ninja -ErrorAction SilentlyContinue) {
-            Write-Host "ninja already present: $((Get-Command ninja).Source)"
-          } else {
-            choco install ninja -y --no-progress
-            if ($LASTEXITCODE -ne 0) { throw "choco install ninja failed with exit code $LASTEXITCODE" }
-          }
+          choco install ninja
 
       - name: Build
         id: cmake_build

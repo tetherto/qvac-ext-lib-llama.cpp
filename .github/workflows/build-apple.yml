@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   macos-latest-arm64:
-    runs-on: qvac-macos26-arm64-gpu
+    runs-on: macos-latest
 
     steps:
       - name: Clone
@@ -114,7 +114,7 @@ jobs:
           ctest -L main --verbose --timeout 900
 
   macos-latest-ios-xcode:
-    runs-on: qvac-macos26-arm64-gpu
+    runs-on: macos-latest
 
     steps:
       - name: Checkout code
@@ -161,7 +161,7 @@ jobs:
           xcodebuild -project examples/llama.swiftui/llama.swiftui.xcodeproj -scheme llama.swiftui -sdk iphoneos CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= -destination 'generic/platform=iOS' FRAMEWORK_FOLDER_PATH=./build-ios build
 
   macos-latest-tvos:
-    runs-on: qvac-macos26-arm64-gpu
+    runs-on: macos-latest
 
     steps:
       - name: Clone
@@ -195,7 +195,7 @@ jobs:
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
   macos-latest-visionos:
-    runs-on: qvac-macos26-arm64-gpu
+    runs-on: macos-latest
 
     steps:
       - name: Clone
@@ -229,7 +229,7 @@ jobs:
           cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
 
   macos-latest-swift:
-    runs-on: qvac-macos26-arm64-gpu
+    runs-on: macos-latest
     needs: macos-latest-ios-xcode
 
     strategy:

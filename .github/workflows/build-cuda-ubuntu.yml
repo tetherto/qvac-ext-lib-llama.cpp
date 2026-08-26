@@ -39,16 +39,9 @@ permissions:
   contents: read
 
 jobs:
-  # QVAC-23796: build-only - it compiles CUDA but never executes it (no
-  # nvidia-smi, no ctest, no ci/run.sh), so it needs a toolkit, not a GPU. Runs
-  # on the plain Ubuntu box to keep a GPU slot free on every PR.
-  #
-  # The nvidia/cuda container it used to run in is gone: the toolkit is now on
-  # the host, so nothing here runs as root and the workspace-ownership problem
-  # disappears with it. cmake, build-essential, ninja-build, libgomp1, git and
-  # libssl-dev - which the container installed via apt - are all in the image.
   cuda:
-    runs-on: qvac-ubuntu2404-x64
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
 
     steps:
       - name: Clone
@@ -59,6 +52,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt update
+          apt install -y cmake build-essential ninja-build libgomp1 git libssl-dev
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
