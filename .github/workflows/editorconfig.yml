@@ -14,6 +14,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # TEMPORARY diagnostic (QVAC-23796) - throwaway branch, never merged.
+  zz-llvm:
+    name: zz-${{ matrix.label }}
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [qvac-win25-x64, qvac-win25-x64-gpu]
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 10
+    steps:
+      - name: Probe
+        shell: powershell
+        run: |
+          Write-Host "LABEL       : ${{ matrix.label }}"
+          Write-Host "RUNNER      : $env:RUNNER_NAME"
+          Write-Host "BOOT TIME   : $((Get-CimInstance Win32_OperatingSystem).LastBootUpTime)"
+          Write-Host ""
+          $c = Get-Command clang -ErrorAction SilentlyContinue
+          if ($c) { Write-Host "clang resolves      : YES -> $($c.Source)" }
+          else     { Write-Host "clang resolves      : NO  <-- CI fails here" }
+          $p = 'C:\Program Files\LLVM\bin\clang.exe'
+          if (Test-Path $p) { Write-Host "clang.exe on disk   : YES -> $p" }
+          else              { Write-Host "clang.exe on disk   : NO" }
+          $m = [Environment]::GetEnvironmentVariable('Path','Machine')
+          if ($m -match 'LLVM') { Write-Host "MACHINE PATH LLVM   : YES -> $(($m -split ';' | Where-Object {$_ -match 'LLVM'}) -join ', ')" }
+          else                  { Write-Host "MACHINE PATH LLVM   : NO" }
+          if ($env:Path -match 'LLVM') { Write-Host "RUNNER PROCESS PATH : YES" }
+          else                         { Write-Host "RUNNER PROCESS PATH : NO  <-- stale env inherited from services.exe" }
+
   editorconfig:
     runs-on: qvac-ubuntu2404-x64
     steps:
