@@ -214,7 +214,16 @@ jobs:
       - name: Install Ninja
         id: install_ninja
         run: |
-          choco install ninja
+          # QVAC-23796: ninja ships in the qvac Windows image, and a bare
+          # `choco install` (no -y) prompts for confirmation, which aborts with
+          # exit 1 and no output on a non-interactive runner. Skip when it is
+          # already there, and pass -y when it genuinely has to be installed.
+          if (Get-Command ninja -ErrorAction SilentlyContinue) {
+            Write-Host "ninja already present: $((Get-Command ninja).Source)"
+          } else {
+            choco install ninja -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install ninja failed with exit code $LASTEXITCODE" }
+          }
 
       - name: Build
         id: cmake_build
