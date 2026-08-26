@@ -8,7 +8,6 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
-#include <cstring>
 #include <set>
 #include <string>
 #include <vector>
@@ -179,20 +178,16 @@ common_device_memory_data_vec common_get_device_memory_data(
 // Whether allocations on this device draw from the same physical pool as
 // host memory. For such devices the per-device budget alone under-counts:
 // their wired buffers, the host-assigned layers, and every other process all
-// share one pool.
+// share one pool. The backend itself is the authority (ggml_backend_dev_props
+// is memset by ggml_backend_dev_get_props, so backends that do not know
+// report false); integrated GPUs share by definition.
 static bool ggml_dev_shares_host_memory(ggml_backend_dev_t dev) {
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
         return true;
     }
-#if defined(__APPLE__) && defined(__aarch64__)
-    // Apple silicon: every Metal device is unified with system memory.
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    const char * reg_name = reg == nullptr ? nullptr : ggml_backend_reg_name(reg);
-    if (reg_name != nullptr && strcmp(reg_name, "Metal") == 0) {
-        return true;
-    }
-#endif
-    return false;
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    return props.memory_unified;
 }
 
 static void common_params_fit_impl(
@@ -252,10 +247,15 @@ static void common_params_fit_impl(
     projected_free_per_device.reserve(nd);
 
     if (nd == 0) {
+        // Budget against what the host can actually still hand out, in
+        // resident terms: with the caller on mmap the weight pages are
+        // file-backed and evictable, so they are not demand against an
+        // availability metric that counts them as free (see host_resident
+        // below — duplicated here because this branch runs before it).
         sum_projected_used = dmds_full.back().mb.total();
-        // Budget against what the host can actually still hand out. Using
-        // total physical memory here meant a CPU-only fit always succeeded,
-        // no matter the model size or what else was running.
+        if (mparams->load_mode == LLAMA_LOAD_MODE_MMAP) {
+            sum_projected_used -= dmds_full.back().mb.model;
+        }
         sum_free           = dmds_full.back().free;
         sum_projected_free = sum_free - sum_projected_used;
         LOG_TRC("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of available host memory\n",
@@ -291,21 +291,43 @@ static void common_params_fit_impl(
             __func__, sum_projected_used/MiB, sum_free/MiB);
     }
 
+    // Host demand must be measured in the same currency as host availability.
+    // The probe loads with LLAMA_LOAD_MODE_NONE, so mb.model counts the full
+    // weight bytes as resident buffers — but under the caller's real
+    // LLAMA_LOAD_MODE_MMAP those pages are file-backed and evictable, i.e.
+    // exactly the pages the availability metric deliberately leaves in the
+    // pool. Charging them as resident would inflate demand by the size of
+    // pages supply has already declared available.
+    const bool host_model_evictable = mparams->load_mode == LLAMA_LOAD_MODE_MMAP;
+    auto host_resident = [&](const llama_device_memory_data & host_row) -> int64_t {
+        int64_t projected = host_row.mb.total();
+        if (host_model_evictable) {
+            projected -= host_row.mb.model;
+        }
+        return projected;
+    };
+
     // Combined budget for the host row plus every device that shares physical
     // memory with the host. The per-device rows cannot see this sum: on
     // Apple silicon, a model with most layers on the GPU and the rest on the
     // CPU can pass both individual rows, load, and then fail every decode
     // because the two allocations plus the rest of the system exceed physical
-    // memory. Uses the first margin as the host margin.
+    // memory. Uses the first margin as the host margin (callers size the
+    // margins buffer per device with one policy value; the host has no
+    // dedicated slot).
     int64_t host_shared_deficit = 0;
+    bool    device_rows_ok      = true;
     if (nd > 0) {
         int64_t shared_projected = 0;
         for (size_t id = 0; id < nd; id++) {
             if (ggml_dev_shares_host_memory(devs[id])) {
                 shared_projected += dmds_full[id].mb.total();
             }
+            if (projected_free_per_device[id] < margins[id]) {
+                device_rows_ok = false;
+            }
         }
-        const int64_t host_projected  = dmds_full.back().mb.total();
+        const int64_t host_projected  = host_resident(dmds_full.back());
         const int64_t host_free_after = dmds_full.back().free - host_projected - shared_projected;
         if (host_free_after < margins[0]) {
             host_shared_deficit = margins[0] - host_free_after;
@@ -366,6 +388,11 @@ static void common_params_fit_impl(
                         for (size_t id = 0; id < nd; id++) {
                             sum_used_target -= margins[id];
                         }
+                        // The deficit forced entry into this reduction; both
+                        // sides of the comparison below must be measured against
+                        // the same budget or the interpolation ratio exceeds 1
+                        // and inflates the context instead of reducing it.
+                        sum_used_target -= host_shared_deficit;
                     }
                     if (nd > 1) {
                         // for multiple devices we need to be more conservative in terms of how much context we think can fit:
@@ -373,7 +400,10 @@ static void common_params_fit_impl(
                         //   - for MoE models only whole tensors can be assigned to devices, which we estimate to be <= 1/3 of a layer
                         //   - on average we expect a waste of 0.5 layers/tensors per device
                         //   - use slightly more than the expected average for nd devices to be safe
-                        const int64_t model_per_layer = sum_projected_model / std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
+                        // n_gpu_layers can legitimately be 0 here (host-forced descent);
+                        // an unguarded division faults on x86-64 and silently returns 0
+                        // on AArch64.
+                        const int64_t model_per_layer = sum_projected_model / std::max(1U, std::min(uint32_t(mparams->n_gpu_layers), hp_ngl));
                         sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
                     }
 
@@ -382,19 +412,32 @@ static void common_params_fit_impl(
                     const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
+                        if (mparams->load_mode == LLAMA_LOAD_MODE_MMAP) {
+                            sum_projected_used_min_ctx -= dmds_min_ctx.back().mb.model;
+                        }
                     } else {
                         for (size_t id = 0; id < nd; id++) {
                             sum_projected_used_min_ctx += dmds_min_ctx[id].mb.total();
                         }
                     }
-                    if (sum_used_target > sum_projected_used_min_ctx) {
+                    // With a host-forced descent the device rows can be
+                    // context-independent (n_gpu_layers == 0 keeps the whole
+                    // KV cache host-side), making this delta exactly 0; an
+                    // unguarded division faults on x86-64 and silently
+                    // returns 0 on AArch64.
+                    const int64_t used_delta = sum_projected_used - sum_projected_used_min_ctx;
+                    if (sum_used_target > sum_projected_used_min_ctx && used_delta > 0) {
                         // linear interpolation between minimum and maximum context size:
                         cparams->n_ctx += (hp_nct - n_ctx_min) * (sum_used_target - sum_projected_used_min_ctx)
-                            / (sum_projected_used - sum_projected_used_min_ctx);
+                            / used_delta;
+                        // No correct input yields a context above the training
+                        // context, but the interpolation can once the target
+                        // exceeds the max-context sample.
+                        cparams->n_ctx = std::min(cparams->n_ctx, hp_nct);
                         cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % 256, n_ctx_min); // round down context for CUDA backend
 
-                        const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (hp_nct - n_ctx_min);
-                        const int64_t memory_reduction = (hp_nct - cparams->n_ctx) * bytes_per_ctx;
+                        const int64_t bytes_per_ctx = used_delta / (hp_nct - n_ctx_min);
+                        const int64_t memory_reduction = ((int64_t) hp_nct - (int64_t) cparams->n_ctx) * bytes_per_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
                         if (nd <= 1) {
@@ -422,6 +465,17 @@ static void common_params_fit_impl(
     }
     if (nd == 0) {
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
+    }
+
+    // When only the combined host+shared budget was short (every device row
+    // met its own margin), falling through to the generic pinned-parameter
+    // throws below would blame n_gpu_layers for a host-memory shortfall.
+    // Name the actual cause instead.
+    if (host_shared_deficit > 0 && device_rows_ok &&
+        mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
+        throw common_params_fit_exception(
+            "available host memory is short by " + std::to_string(host_shared_deficit/MiB) +
+            " MiB for the combined host + unified-device demand, and n_gpu_layers is pinned by the user, abort");
     }
 
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
@@ -608,8 +662,23 @@ static void common_params_fit_impl(
 
     std::vector<int64_t> targets; // maximum acceptable memory use per device
     targets.reserve(nd);
+    // Resident host demand at the full-parameter probe, used to cap the
+    // budget of devices that draw from the host pool. Static across the
+    // descent: with mmap the host-side weights are excluded above, so
+    // moving layers between a unified device and the host barely moves the
+    // resident host demand (context/compute shifts remain a known
+    // imprecision).
+    const int64_t host_resident_full = host_resident(dmds_full.back());
     for (size_t id = 0; id < nd; id++) {
-        targets.push_back(dmds_full[id].free - margins[id]);
+        int64_t target = dmds_full[id].free - margins[id];
+        if (ggml_dev_shares_host_memory(devs[id])) {
+            // The device's "free" is the same physical pool the host row
+            // draws from; leave room for the host's own demand and margin or
+            // step 3 fills the pool and starves the host.
+            const int64_t pool_target = dmds_full.back().free - margins[0] - host_resident_full;
+            target = std::min(target, pool_target);
+        }
+        targets.push_back(target);
         LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }
 
@@ -849,6 +918,12 @@ enum common_params_fit_status common_fit_params(
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    // The impl mutates the params while it works (e.g. n_ctx during the
+    // context-reduction probe). Callers that ignore the status — including
+    // common_init_from_params — would otherwise load with a half-mutated
+    // configuration after a FAILURE, silently clamping the context.
+    const llama_model_params   mparams_original = *mparams;
+    const llama_context_params cparams_original = *cparams;
     try {
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
@@ -858,6 +933,14 @@ enum common_params_fit_status common_fit_params(
     } catch (const std::runtime_error & e) {
         LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_ERROR;
+    } catch (const std::exception & e) {
+        // A preflight gate must never take the caller down.
+        LOG_ERR("%s: unexpected error while trying to fit params: %s\n", __func__, e.what());
+        status = COMMON_PARAMS_FIT_STATUS_ERROR;
+    }
+    if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        *mparams = mparams_original;
+        *cparams = cparams_original;
     }
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);

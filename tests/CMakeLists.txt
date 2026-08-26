@@ -311,6 +311,7 @@ if (GGML_RPC)
     llama_build_and_test(test-rpc.cpp)
     set_tests_properties(test-rpc PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
+llama_build_and_test(test-unified-memory-props.cpp)
 
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
 # GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
