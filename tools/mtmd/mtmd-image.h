@@ -189,7 +189,9 @@ struct mtmd_idefics3_sizing {
 mtmd_idefics3_sizing mtmd_calc_idefics3_sizing(const clip_image_size & original_size,
                                                int image_size,
                                                int image_longest_edge,
-                                               bool no_upscale);
+                                               bool no_upscale,
+                                               int min_pixels = 0,
+                                               int max_pixels = 0);
 
 struct mtmd_image_preprocessor_idefics3 : mtmd_image_preprocessor_llava_uhd {
     mtmd_image_preprocessor_idefics3(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {}
