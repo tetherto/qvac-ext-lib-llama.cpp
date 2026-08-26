@@ -175,6 +175,45 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+int64_t common_fit_shared_pool_deficit(
+        const std::vector<int64_t> & dev_projected,
+        const std::vector<bool>    & shares_host,
+                           int64_t   host_free,
+                           int64_t   host_projected_resident,
+                           int64_t   host_margin) {
+    GGML_ASSERT(dev_projected.size() == shares_host.size());
+    int64_t shared_projected = 0;
+    for (size_t id = 0; id < dev_projected.size(); id++) {
+        if (shares_host[id]) {
+            shared_projected += dev_projected[id];
+        }
+    }
+    const int64_t host_free_after = host_free - host_projected_resident - shared_projected;
+    return host_free_after < host_margin ? host_margin - host_free_after : 0;
+}
+
+uint32_t common_fit_reduced_n_ctx(
+        int64_t  sum_used_target,
+        int64_t  sum_projected_used,
+        int64_t  sum_projected_used_min_ctx,
+        uint32_t hp_nct,
+        uint32_t n_ctx_min) {
+    // A context-independent memory profile (e.g. n_gpu_layers == 0 keeps the
+    // whole KV cache host-side, so the device rows do not vary with context)
+    // makes this delta exactly 0; an unguarded division faults on x86-64 and
+    // silently returns 0 on AArch64.
+    const int64_t used_delta = sum_projected_used - sum_projected_used_min_ctx;
+    if (sum_used_target <= sum_projected_used_min_ctx || used_delta <= 0) {
+        return 0;
+    }
+    uint32_t n_ctx = n_ctx_min + (hp_nct - n_ctx_min) * (sum_used_target - sum_projected_used_min_ctx) / used_delta;
+    // No correct input yields a context above the training context, but the
+    // interpolation can once the target exceeds the max-context sample.
+    n_ctx = std::min(n_ctx, hp_nct);
+    n_ctx = std::max(n_ctx - n_ctx % 256, n_ctx_min); // round down context for CUDA backend
+    return n_ctx;
+}
+
 // Whether allocations on this device draw from the same physical pool as
 // host memory. For such devices the per-device budget alone under-counts:
 // their wired buffers, the host-assigned layers, and every other process all
@@ -220,6 +259,13 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             margins.push_back(margins_s[id]);
         }
+    }
+
+    // Single registry touchpoint: the decision arithmetic below is pure over
+    // these flags (and unit-testable without live devices, see fit.h).
+    std::vector<bool> shares_host(nd);
+    for (size_t id = 0; id < nd; id++) {
+        shares_host[id] = ggml_dev_shares_host_memory(devs[id]);
     }
 
     std::vector<std::string> dev_names;
@@ -318,19 +364,16 @@ static void common_params_fit_impl(
     int64_t host_shared_deficit = 0;
     bool    device_rows_ok      = true;
     if (nd > 0) {
-        int64_t shared_projected = 0;
+        std::vector<int64_t> dev_projected(nd);
         for (size_t id = 0; id < nd; id++) {
-            if (ggml_dev_shares_host_memory(devs[id])) {
-                shared_projected += dmds_full[id].mb.total();
-            }
+            dev_projected[id] = dmds_full[id].mb.total();
             if (projected_free_per_device[id] < margins[id]) {
                 device_rows_ok = false;
             }
         }
-        const int64_t host_projected  = host_resident(dmds_full.back());
-        const int64_t host_free_after = dmds_full.back().free - host_projected - shared_projected;
-        if (host_free_after < margins[0]) {
-            host_shared_deficit = margins[0] - host_free_after;
+        host_shared_deficit = common_fit_shared_pool_deficit(
+            dev_projected, shares_host, dmds_full.back().free, host_resident(dmds_full.back()), margins[0]);
+        if (host_shared_deficit > 0) {
             LOG_TRC("%s: host + shared-memory devices projected to overshoot available host memory by %" PRId64 " MiB\n",
                 __func__, host_shared_deficit/MiB);
         }
@@ -420,23 +463,12 @@ static void common_params_fit_impl(
                             sum_projected_used_min_ctx += dmds_min_ctx[id].mb.total();
                         }
                     }
-                    // With a host-forced descent the device rows can be
-                    // context-independent (n_gpu_layers == 0 keeps the whole
-                    // KV cache host-side), making this delta exactly 0; an
-                    // unguarded division faults on x86-64 and silently
-                    // returns 0 on AArch64.
-                    const int64_t used_delta = sum_projected_used - sum_projected_used_min_ctx;
-                    if (sum_used_target > sum_projected_used_min_ctx && used_delta > 0) {
-                        // linear interpolation between minimum and maximum context size:
-                        cparams->n_ctx += (hp_nct - n_ctx_min) * (sum_used_target - sum_projected_used_min_ctx)
-                            / used_delta;
-                        // No correct input yields a context above the training
-                        // context, but the interpolation can once the target
-                        // exceeds the max-context sample.
-                        cparams->n_ctx = std::min(cparams->n_ctx, hp_nct);
-                        cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % 256, n_ctx_min); // round down context for CUDA backend
+                    const uint32_t n_ctx_reduced = common_fit_reduced_n_ctx(
+                        sum_used_target, sum_projected_used, sum_projected_used_min_ctx, hp_nct, n_ctx_min);
+                    if (n_ctx_reduced > 0) {
+                        cparams->n_ctx = n_ctx_reduced;
 
-                        const int64_t bytes_per_ctx = used_delta / (hp_nct - n_ctx_min);
+                        const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (hp_nct - n_ctx_min);
                         const int64_t memory_reduction = ((int64_t) hp_nct - (int64_t) cparams->n_ctx) * bytes_per_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
@@ -671,7 +703,7 @@ static void common_params_fit_impl(
     const int64_t host_resident_full = host_resident(dmds_full.back());
     for (size_t id = 0; id < nd; id++) {
         int64_t target = dmds_full[id].free - margins[id];
-        if (ggml_dev_shares_host_memory(devs[id])) {
+        if (shares_host[id]) {
             // The device's "free" is the same physical pool the host row
             // draws from; leave room for the host's own demand and margin or
             // step 3 fills the pool and starves the host.
