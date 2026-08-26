@@ -194,10 +194,22 @@ jobs:
         id: get_vulkan
         if: ${{ matrix.build == 'x64-vulkan' }}
         run: |
-          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
-          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
-          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
-          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+          # QVAC-23796: skip the download when the SDK is already installed.
+          # The runner is persistent, so C:\VulkanSDK\<version> survives between
+          # jobs; the Qt installer then hits "OverwriteTargetDirectory ... you
+          # have selected an existing, non-empty directory", to which
+          # --default-answer replies No, and exits 1. A GitHub-hosted runner
+          # never sees this because it starts from a clean VM.
+          $sdk = "C:\VulkanSDK\${env:VULKAN_VERSION}"
+          if (Test-Path $sdk) {
+            Write-Host "Vulkan SDK ${env:VULKAN_VERSION} already installed at $sdk"
+          } else {
+            curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+            & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+            if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer failed with exit code $LASTEXITCODE" }
+          }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
+          Add-Content $env:GITHUB_PATH "$sdk\bin"
 
       - name: Install Ninja
         id: install_ninja
