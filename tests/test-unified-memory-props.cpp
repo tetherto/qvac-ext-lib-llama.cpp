@@ -49,7 +49,9 @@ int main() {
         }
     }
 
-#if defined(__APPLE__) && defined(__aarch64__)
+    // LLAMA_TEST_EXPECT_METAL is set only when GGML_METAL is ON. Apple silicon
+    // CI also builds Vulkan/WebGPU with Metal off, where no Metal device exists.
+#if defined(__APPLE__) && defined(__aarch64__) && defined(LLAMA_TEST_EXPECT_METAL)
     if (!saw_metal) {
         fprintf(stderr, "FAIL: no Metal device enumerated on Apple silicon\n");
         return 1;
