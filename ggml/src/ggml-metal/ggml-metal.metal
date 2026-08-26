@@ -1300,6 +1300,95 @@ template [[host_name("kernel_unary_f32_f32_4")]] kernel kernel_unary_t kernel_un
 template [[host_name("kernel_unary_f16_f16")]]   kernel kernel_unary_t kernel_unary_impl<half,   half,   float>;
 template [[host_name("kernel_unary_f16_f16_4")]] kernel kernel_unary_t kernel_unary_impl<half4,  half4,  float4>;
 
+// dst = unary(src0) * src1, with ggml broadcast
+template <typename T0, typename T, typename TC>
+kernel void kernel_unary_mul_impl(
+        constant ggml_metal_kargs_bin & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+#define FC_OP  FC_unary_op
+#define FC_CNT FC_unary_cnt
+
+    if (FC_CNT) {
+        const int i0 = tgpig.x;
+        const TC x = (TC) ((device const T0 *) src0)[i0];
+        const TC y = (TC) ((device const T0 *) src1)[i0];
+
+        TC u = x;
+        if (FC_OP == OP_UNARY_NUM_SIGMOID) {
+            u = 1 / (1 + exp(-x));
+        }
+        if (FC_OP == OP_UNARY_NUM_SILU) {
+            u = x / (1 + exp(-x));
+        }
+        if (FC_OP == OP_UNARY_NUM_SOFTPLUS) {
+            u = select(log(1 + exp(x)), x, x > 20);
+        }
+
+        ((device T *) dst)[i0] = (T) (u * y);
+        return;
+    }
+
+    const int i03 = tgpig.z;
+    const int i02 = tgpig.y;
+    const int i01 = tgpig.x;
+
+    if (i01 >= args.ne1) {
+        return;
+    }
+
+    const int i03u = i03 % args.ne03;
+    const int i02u = i02 % args.ne02;
+    const int i01u = i01 % args.ne01;
+
+    const int i13 = i03 % args.ne13;
+    const int i12 = i02 % args.ne12;
+    const int i11 = i01 % args.ne11;
+
+    const uint64_t nb00 = args.nb00 > sizeof(T0) ? args.nb00 : sizeof(T0);
+    const uint64_t nb10 = args.nb10 > sizeof(T0) ? args.nb10 : sizeof(T0);
+    const uint64_t nb0  = args.nb0  > sizeof(T)  ? args.nb0  : sizeof(T);
+
+    device const char * src0_ptr = src0 + i03u*args.nb03 + i02u*args.nb02 + i01u*args.nb01;
+    device const char * src1_ptr = src1 + i13*args.nb13 + i12*args.nb12 + i11*args.nb11;
+    device       char * dst_ptr  = dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1;
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const int i00 = i0 % args.ne00;
+        const int i10 = i0 % args.ne10;
+
+        const TC x = (TC) *((device const T0 *) (src0_ptr + i00*nb00));
+        const TC y = (TC) *((device const T0 *) (src1_ptr + i10*nb10));
+
+        TC u = x;
+        if (FC_OP == OP_UNARY_NUM_SIGMOID) {
+            u = 1 / (1 + exp(-x));
+        }
+        if (FC_OP == OP_UNARY_NUM_SILU) {
+            u = x / (1 + exp(-x));
+        }
+        if (FC_OP == OP_UNARY_NUM_SOFTPLUS) {
+            u = select(log(1 + exp(x)), x, x > 20);
+        }
+
+        *((device T *) (dst_ptr + i0*nb0)) = (T) (u * y);
+    }
+
+#undef FC_OP
+#undef FC_CNT
+}
+
+typedef decltype(kernel_unary_mul_impl<float, float, float>) kernel_unary_mul_t;
+
+template [[host_name("kernel_unary_mul_f32_f32")]]   kernel kernel_unary_mul_t kernel_unary_mul_impl<float,  float,  float>;
+template [[host_name("kernel_unary_mul_f32_f32_4")]] kernel kernel_unary_mul_t kernel_unary_mul_impl<float4, float4, float4>;
+template [[host_name("kernel_unary_mul_f16_f16")]]   kernel kernel_unary_mul_t kernel_unary_mul_impl<half,   half,   float>;
+template [[host_name("kernel_unary_mul_f16_f16_4")]] kernel kernel_unary_mul_t kernel_unary_mul_impl<half4,  half4,  float4>;
+
 kernel void kernel_silu_back_f32(
         constant ggml_metal_kargs_silu_back & args,
         device const float * dy,
@@ -5183,6 +5272,89 @@ void mul_vec_q_n_f32_impl(
     }
 }
 
+template<typename block_q_type, short NR0, typename args_t>
+void mul_vec_q_n_f32_glu_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src0_gate,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 16;
+
+    const int nb = args.ne00/QK4_0;
+
+    const int r0 = (tgpig.x*NSG + sgitg)*NR0;
+    const int r1 =  tgpig.y;
+    const int im =  tgpig.z;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_q_type * ax[2][NR0];
+    FOR_UNROLL (short p = 0; p < 2; ++p) {
+        device const char * src0p = (p == 0) ? src0 : src0_gate;
+        FOR_UNROLL (int row = 0; row < NR0; ++row) {
+            const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+            ax[p][row] = (device const block_q_type *) (src0p + offset0);
+        }
+    }
+
+    float sumf[2][NR0] = { { 0.f } };
+
+    const short ix = (tiisg/(NW/NQ));
+    const short il = (tiisg%(NW/NQ))*8;
+
+    const int ib0 = ix;
+
+    float yl[16];
+
+    device const float * yb = y + ib0*QK4_0 + il;
+
+    for (int ib = ib0; ib < nb; ib += NQ) {
+        float sumy[2] = { 0.f, 0.f };
+
+        FOR_UNROLL (short i = 0; i < 8; i += 2) {
+            sumy[0]  += yb[i +  0] + yb[i +  1];
+            yl[i + 0] = yb[i +  0];
+            yl[i + 1] = yb[i +  1]/256.f;
+
+            sumy[1]  += yb[i + 16] + yb[i + 17];
+            yl[i + 8] = yb[i + 16]/16.f;
+            yl[i + 9] = yb[i + 17]/4096.f;
+        }
+
+        FOR_UNROLL (short p = 0; p < 2; ++p) {
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                sumf[p][row] += block_q_n_dot_y(ax[p][row] + ib, sumy[0] + sumy[1], yl, il);
+            }
+        }
+
+        yb += QK4_0 * 16;
+    }
+
+    device float * dst_f32 = (device float *) dst + im*args.ne0*args.ne1 + r1*args.ne0;
+
+    for (int row = 0; row < NR0; ++row) {
+        const float tot_up   = simd_sum(sumf[0][row]);
+        const float tot_gate = simd_sum(sumf[1][row]);
+
+        if (tiisg == 0 && r0 + row < args.ne01) {
+            dst_f32[r0 + row] = (tot_gate / (1.0f + exp(-tot_gate))) * tot_up;
+        }
+    }
+}
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_q1_0_f32_impl(
         args_t args,
@@ -5352,6 +5524,19 @@ kernel void kernel_mul_mv_q4_0_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_glu_q4_0_f32")]]
+kernel void kernel_mul_mv_glu_q4_0_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src0_gate,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_vec_q_n_f32_glu_impl<block_q4_0, N_R0_Q4_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src0_gate, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_mul_mv_q4_1_f32(
@@ -13680,6 +13865,7 @@ template [[host_name("kernel_mul_mv_id_glu_f16_f32_4")]]  kernel kernel_mul_mv_i
 template [[host_name("kernel_mul_mv_id_glu_bf16_f32_4")]] kernel kernel_mul_mv_id_glu_4_t kernel_mul_mv_id_glu<kernel_mul_mv_t_t_4_glu_disp<bfloat, bfloat4, float, float4>>;
 #endif
 template [[host_name("kernel_mul_mv_id_glu_q8_0_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_q8_0_f32_glu_impl<N_R0_Q8_0>>;
+template [[host_name("kernel_mul_mv_id_glu_q4_0_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<mul_vec_q_n_f32_glu_impl<block_q4_0, N_R0_Q4_0, ggml_metal_kargs_mul_mv>>;
 template [[host_name("kernel_mul_mv_id_glu_q4_K_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_q4_K_f32_glu_impl<N_R0_Q4_K>>;
 template [[host_name("kernel_mul_mv_id_glu_q5_K_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_q5_K_f32_glu_impl<N_R0_Q5_K>>;
 
