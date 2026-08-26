@@ -39,21 +39,16 @@ permissions:
   contents: read
 
 jobs:
-  # QVAC-23796: on the 24.04 GPU box to match the container's own distro. The
-  # host only has to provide docker - every step runs inside nvidia/cuda, which
-  # is where the pinned 12.6.2 toolkit comes from.
+  # QVAC-23796: build-only - it compiles CUDA but never executes it (no
+  # nvidia-smi, no ctest, no ci/run.sh), so it needs a toolkit, not a GPU. Runs
+  # on the plain Ubuntu box to keep a GPU slot free on every PR.
   #
-  # TODO: this job is build-only (no nvidia-smi, no ctest, no ci/run.sh), so it
-  # compiles CUDA but never executes it and does not actually need a GPU. Once
-  # the CUDA toolkit is installed on qvac-ubuntu2404-x64, move it there and drop
-  # `container:` entirely. That frees a GPU slot on every PR and removes the
-  # root-owned-workspace problem at source - along with the chown step below and
-  # the four "Reclaim workspace" steps in build-self-hosted.yml, which exist
-  # only to clean up after this job. Ask infra to pin the toolkit version so we
-  # do not lose the reproducibility the container gives us today.
+  # The nvidia/cuda container it used to run in is gone: the toolkit is now on
+  # the host, so nothing here runs as root and the workspace-ownership problem
+  # disappears with it. cmake, build-essential, ninja-build, libgomp1, git and
+  # libssl-dev - which the container installed via apt - are all in the image.
   cuda:
-    runs-on: qvac-ubuntu2404-x64-gpu
-    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    runs-on: qvac-ubuntu2404-x64
 
     steps:
       - name: Clone
@@ -64,13 +59,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Install dependencies
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          apt update
-          apt install -y cmake build-essential ninja-build libgomp1 git libssl-dev
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
@@ -91,22 +79,6 @@ jobs:
             -DGGML_CUDA=ON \
             -DGGML_CUDA_CUB_3DOT2=ON
           cmake --build build
-
-      # QVAC-23796: this job runs inside a container, i.e. as root, and the
-      # runner's _work directory is shared by every workflow on that machine.
-      # Everything written here (the checkout, .ccache) therefore ends up
-      # root-owned, and the next non-container job to land on the same runner
-      # fails in actions/checkout with
-      #   EACCES: permission denied, rmdir '.../.ccache/0'
-      # because the runner user cannot delete it and has no passwordless sudo.
-      # Hand ownership back while we still have root. Chown rather than delete,
-      # so the ccache survives for the next run.
-      - name: Return workspace ownership to the runner user
-        if: always()
-        run: |
-          owner=$(stat -c '%u:%g' "${GITHUB_WORKSPACE}/..")
-          echo "Restoring ${GITHUB_WORKSPACE} to ${owner}"
-          chown -R "${owner}" "${GITHUB_WORKSPACE}"
 
   hip:
     runs-on: ubuntu-22.04
