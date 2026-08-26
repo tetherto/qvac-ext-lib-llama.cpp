@@ -107,6 +107,7 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
+#define FC_TOPK_MOE                    1700
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -1466,5 +1467,14 @@ typedef struct {
 typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
+
+typedef struct {
+    int32_t n_rows;
+    int32_t n_experts;
+    int32_t n_expert_used;
+    int32_t with_norm;
+    float   clamp_val;
+    float   scale_val;
+} ggml_metal_kargs_topk_moe;
 
 #endif // GGML_METAL_IMPL
