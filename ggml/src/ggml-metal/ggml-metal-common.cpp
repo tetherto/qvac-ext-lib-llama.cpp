@@ -421,6 +421,15 @@ static int ggml_metal_graph_optimize_pack(const ggml_cgraph * gf, int i) {
         }
     }
 
+    if (op0 == GGML_OP_SSM_CONV && i + 2 <= n) {
+        const ggml_op ops[] = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+        const int out[] = { i + 1 };
+        if (ggml_can_fuse_subgraph(gf, i, 2, ops, out, 1) &&
+                ggml_get_unary_op(nodes[i + 1]) == GGML_UNARY_OP_SILU) {
+            return 1;
+        }
+    }
+
     return 0;
 }
 

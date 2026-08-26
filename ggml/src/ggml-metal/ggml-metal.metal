@@ -3107,6 +3107,13 @@ kernel void kernel_soft_max_back_4(
 }
 
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
+constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
+constant bool  FC_ssm_conv_silu [[function_constant(FC_SSM_CONV + 1)]];
+
+static inline float ssm_conv_out(float x) {
+    return FC_ssm_conv_silu ? x / (1.0f + exp(-x)) : x;
+}
+
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,
@@ -3115,15 +3122,15 @@ kernel void kernel_ssm_conv_f32_f32(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = (int64_t) tgpig.x * ntg.x + tpitg.x;
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
 
+    if (ir >= args.ne01) {
+        return;
+    }
+
     const int64_t nc  = args.ne10;
-  //const int64_t ncs = args.ne00;
-  //const int64_t nr  = args.ne01;
-  //const int64_t n_t = args.ne1;
-  //const int64_t n_s = args.ne2;
 
     device const float * s = (device const float *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
     device const float * c = (device const float *) ((device const char *) src1 + ir*args.nb11);
@@ -3135,7 +3142,7 @@ kernel void kernel_ssm_conv_f32_f32(
         sumf += s[i0] * c[i0];
     }
 
-    x[0] = sumf;
+    x[0] = ssm_conv_out(sumf);
 }
 
 kernel void kernel_ssm_conv_f32_f32_4(
@@ -3146,15 +3153,15 @@ kernel void kernel_ssm_conv_f32_f32_4(
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
+    const int64_t ir = (int64_t) tgpig.x * ntg.x + tpitg.x;
     const int64_t i2 = tgpig.y;
     const int64_t i3 = tgpig.z;
 
+    if (ir >= args.ne01) {
+        return;
+    }
+
     const int64_t nc  = args.ne10;
-  //const int64_t ncs = args.ne00;
-  //const int64_t nr  = args.ne01;
-  //const int64_t n_t = args.ne1;
-  //const int64_t n_s = args.ne2;
 
     device const float4 * s = (device const float4 *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
     device const float4 * c = (device const float4 *) ((device const char *) src1 + ir*args.nb11);
@@ -3166,10 +3173,8 @@ kernel void kernel_ssm_conv_f32_f32_4(
         sumf += dot(s[i0], c[i0]);
     }
 
-    x[0] = sumf;
+    x[0] = ssm_conv_out(sumf);
 }
-
-constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
 
 // Batched version: each threadgroup processes multiple tokens for better efficiency
 // Thread layout: each thread handles one token, threadgroup covers BATCH_SIZE tokens
@@ -3215,7 +3220,7 @@ kernel void kernel_ssm_conv_f32_f32_batched(
         sumf += s[i0] * c[i0];
     }
 
-    x[0] = sumf;
+    x[0] = ssm_conv_out(sumf);
 }
 
 kernel void kernel_ssm_conv_f32_f32_batched_4(
@@ -3260,7 +3265,7 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
         sumf += dot(s[i0], c[i0]);
     }
 
-    x[0] = sumf;
+    x[0] = ssm_conv_out(sumf);
 }
 
 // ref: ggml.c:ggml_compute_forward_ssm_conv_back_sx_f32
