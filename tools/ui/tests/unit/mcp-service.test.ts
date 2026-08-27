@@ -53,6 +53,7 @@ describe('MCPService', () => {
 					request?: { url?: string };
 					response?: { url?: string };
 				};
+
 				return details.request?.url ?? details.response?.url;
 			})
 		).toEqual(['https://example.com/mcp', 'https://example.com/mcp']);
