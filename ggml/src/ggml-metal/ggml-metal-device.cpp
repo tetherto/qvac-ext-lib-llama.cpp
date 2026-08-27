@@ -1370,7 +1370,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_glu(ggml_
         case GGML_TYPE_Q4_0:
             {
                 nsg = N_SG_Q4_0;
-                nr0 = N_R0_Q4_0;
+                nr0 = N_R0_Q4_0_GLU;
             } break;
         case GGML_TYPE_Q4_K:
             {
@@ -1454,7 +1454,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_glu(gg
         case GGML_TYPE_Q4_0:
             {
                 nsg = N_SG_Q4_0;
-                nr0 = N_R0_Q4_0;
+                nr0 = N_R0_Q4_0_GLU;
             } break;
         case GGML_TYPE_Q4_K:
             {
