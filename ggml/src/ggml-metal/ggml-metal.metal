@@ -5536,7 +5536,7 @@ kernel void kernel_mul_mv_glu_q4_0_f32(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    mul_vec_q_n_f32_glu_impl<block_q4_0, N_R0_Q4_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src0_gate, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    mul_vec_q_n_f32_glu_impl<block_q4_0, N_R0_Q4_0_GLU, constant ggml_metal_kargs_mul_mv &>(args, src0, src0_gate, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_mul_mv_q4_1_f32(
@@ -13865,7 +13865,7 @@ template [[host_name("kernel_mul_mv_id_glu_f16_f32_4")]]  kernel kernel_mul_mv_i
 template [[host_name("kernel_mul_mv_id_glu_bf16_f32_4")]] kernel kernel_mul_mv_id_glu_4_t kernel_mul_mv_id_glu<kernel_mul_mv_t_t_4_glu_disp<bfloat, bfloat4, float, float4>>;
 #endif
 template [[host_name("kernel_mul_mv_id_glu_q8_0_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_q8_0_f32_glu_impl<N_R0_Q8_0>>;
-template [[host_name("kernel_mul_mv_id_glu_q4_0_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<mul_vec_q_n_f32_glu_impl<block_q4_0, N_R0_Q4_0, ggml_metal_kargs_mul_mv>>;
+template [[host_name("kernel_mul_mv_id_glu_q4_0_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<mul_vec_q_n_f32_glu_impl<block_q4_0, N_R0_Q4_0_GLU, ggml_metal_kargs_mul_mv>>;
 template [[host_name("kernel_mul_mv_id_glu_q4_K_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_q4_K_f32_glu_impl<N_R0_Q4_K>>;
 template [[host_name("kernel_mul_mv_id_glu_q5_K_f32")]]   kernel kernel_mul_mv_id_glu_t   kernel_mul_mv_id_glu<kernel_mul_mv_q5_K_f32_glu_impl<N_R0_Q5_K>>;
 
