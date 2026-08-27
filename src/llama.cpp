@@ -320,6 +320,8 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(llama_model_loader & ml, llama_model_params & params) {
     try {
+        ml.tensor_read_lazy = params.tensor_read_lazy;
+
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 
