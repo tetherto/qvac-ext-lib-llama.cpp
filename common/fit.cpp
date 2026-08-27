@@ -192,6 +192,21 @@ int64_t common_fit_shared_pool_deficit(
     return host_free_after < host_margin ? host_margin - host_free_after : 0;
 }
 
+int64_t common_fit_shared_pool_target(
+                           int64_t   host_free,
+                           int64_t   host_projected_resident,
+                           int64_t   host_margin,
+                            size_t   n_shares_host) {
+    GGML_ASSERT(n_shares_host > 0);
+    const int64_t budget = host_free - host_projected_resident - host_margin;
+    // keep a negative budget whole: the descent reads it as "must reduce",
+    // and a division would only make it look less short than it is
+    if (budget <= 0) {
+        return budget;
+    }
+    return budget / (int64_t) n_shares_host;
+}
+
 uint32_t common_fit_reduced_n_ctx(
         int64_t  sum_used_target,
         int64_t  sum_projected_used,
@@ -701,13 +716,19 @@ static void common_params_fit_impl(
     // resident host demand (context/compute shifts remain a known
     // imprecision).
     const int64_t host_resident_full = host_resident(dmds_full.back());
+    size_t n_shares_host = 0;
+    for (size_t id = 0; id < nd; id++) {
+        n_shares_host += shares_host[id] ? 1 : 0;
+    }
     for (size_t id = 0; id < nd; id++) {
         int64_t target = dmds_full[id].free - margins[id];
         if (shares_host[id]) {
             // The device's "free" is the same physical pool the host row
             // draws from; leave room for the host's own demand and margin or
-            // step 3 fills the pool and starves the host.
-            const int64_t pool_target = dmds_full.back().free - margins[0] - host_resident_full;
+            // step 3 fills the pool and starves the host. The budget is split
+            // between the shared devices so they cannot each claim all of it.
+            const int64_t pool_target = common_fit_shared_pool_target(
+                dmds_full.back().free, host_resident_full, margins[0], n_shares_host);
             target = std::min(target, pool_target);
         }
         targets.push_back(target);
