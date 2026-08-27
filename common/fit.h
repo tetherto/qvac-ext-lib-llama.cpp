@@ -39,6 +39,15 @@ int64_t common_fit_shared_pool_deficit(
                            int64_t   host_projected_resident,
                            int64_t   host_margin);
 
+// Per-device cap for a device that draws from the host pool. The pool budget
+// is what stays free after the host's own demand and margin, split evenly
+// between the devices that share it. A negative budget is returned unsplit.
+int64_t common_fit_shared_pool_target(
+                           int64_t   host_free,
+                           int64_t   host_projected_resident,
+                           int64_t   host_margin,
+                            size_t   n_shares_host);
+
 // Context size after the step-2 linear interpolation, guarded against a
 // context-independent memory delta (returns n_ctx_min) and clamped to the
 // training context. Returns 0 when no reduction can meet the target.

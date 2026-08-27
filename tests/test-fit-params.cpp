@@ -53,6 +53,24 @@ int main() {
         common_fit_shared_pool_deficit({10 * GiB, 30 * GiB}, {true, false}, 18 * GiB, 5 * GiB, 1 * GiB),
         0);
 
+    // --- common_fit_shared_pool_target ---
+
+    // One shared device takes the whole pool budget: 18 - 5 - 1 = 12.
+    expect_i64("single shared device takes the whole budget",
+        common_fit_shared_pool_target(18 * GiB, 5 * GiB, 1 * GiB, 1),
+        12 * GiB);
+
+    // Two shared devices split it, so they cannot each claim all of it.
+    // Without the split both would cap at 12 GiB and together overrun the pool.
+    expect_i64("two shared devices split the budget",
+        common_fit_shared_pool_target(18 * GiB, 5 * GiB, 1 * GiB, 2),
+        6 * GiB);
+
+    // A negative budget stays whole: splitting would understate the shortfall.
+    expect_i64("negative budget is not split",
+        common_fit_shared_pool_target(6 * GiB, 8 * GiB, 1 * GiB, 2),
+        -3 * GiB);
+
     // --- common_fit_reduced_n_ctx ---
 
     // Reviewer-traced inflation shape: deficit-forced entry where the target
