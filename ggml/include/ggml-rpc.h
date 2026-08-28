@@ -30,6 +30,12 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 
+// Connects to `endpoint` and caches the connection without registering it as
+// a backend. Safe to call concurrently for different endpoints - see the
+// definition for why this exists and how it composes with
+// ggml_backend_rpc_add_server().
+GGML_BACKEND_API bool ggml_backend_rpc_prefetch_connection(const char * endpoint);
+
 #ifdef  __cplusplus
 }
 #endif
