@@ -419,6 +419,7 @@ int ggml_metal_try_gdn_cache_fusion(
     for (int j = node_idx + 1; j < gf->n_nodes && cpy == nullptr; ++j) {
         const ggml_tensor * n = gf->nodes[j];
         if (ggml_metal_is_view_or_noop(n)) {
+            // views of the snapshot tail other than the matched cpy src are checked below
             continue;
         }
         if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
@@ -446,6 +447,34 @@ int ggml_metal_try_gdn_cache_fusion(
         return 0;
     }
 
+    // fusion writes snapshots to the cache and leaves the gdn tail unwritten, so the only
+    // consumer of that tail must be this cpy. attn-prefix views (view_offs < tail_off) are fine.
+    int src_idx = -1;
+    int tail_views = 0;
+    for (int j = 0; j < gf->n_nodes; ++j) {
+        const ggml_tensor * n = gf->nodes[j];
+        if (n == src) {
+            src_idx = j;
+        }
+        if (n->op == GGML_OP_VIEW && n->src[0] == gdn && n->view_offs >= tail_off) {
+            ++tail_views;
+            if (n != src) {
+                return 0;
+            }
+        }
+        if (n == gdn || n == cpy || ggml_metal_is_view_or_noop(n)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] == gdn) {
+                return 0;
+            }
+        }
+    }
+    if (tail_views != 1 || src_idx < 0 || ggml_node_get_use_count(gf, src_idx) != 1) {
+        return 0;
+    }
+
     if (cache) {
         *cache = dst;
     }
@@ -462,7 +491,12 @@ static int ggml_metal_graph_optimize_pack(const ggml_cgraph * gf, int i, std::ve
     ggml_tensor ** nodes = gf->nodes;
 
     if (nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
-        return ggml_metal_try_gdn_cache_fusion(gf, i, nullptr, nullptr);
+        const int skip = ggml_metal_try_gdn_cache_fusion(gf, i, nullptr, nullptr);
+        if (skip > 0) {
+            // gdn attn output is consumed outside the pack; cpy (fused.back()) covers the cache
+            extra_dsts.push_back(nodes[i]);
+        }
+        return skip;
     }
 
     if (nodes[i]->op == GGML_OP_SOFT_MAX) {

@@ -168,14 +168,6 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
 }
 
-struct ggml_tensor * ggml_metal_op_get_node(ggml_metal_op_t ctx, int idx) {
-    return ctx->node(idx);
-}
-
-int ggml_metal_op_node_graph_idx(ggml_metal_op_t ctx, int idx) {
-    return ctx->graph_idx(idx);
-}
-
 static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
     if (!ctx->mem_ranges) {
         return true;
@@ -1944,7 +1936,7 @@ static int ggml_metal_op_try_topk_moe(ggml_metal_op_t ctx, int idx) {
     if (!ggml_metal_topk_moe_n_experts_ok(n_experts)) {
         return 0;
     }
-    if (ids->nb[0] == 0 || (int) (ids->nb[1] / ids->nb[0]) != n_experts) {
+    if ((int) (ids->nb[1] / ggml_type_size(ids->type)) != n_experts) {
         return 0;
     }
 
@@ -2580,7 +2572,9 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
                 ggml_get_unary_op(gf->nodes[gi + 1]) == GGML_UNARY_OP_SILU &&
                 op->type == GGML_TYPE_F32 &&
                 gf->nodes[gi + 1]->type == GGML_TYPE_F32 &&
-                ggml_are_same_shape(op, gf->nodes[gi + 1])) {
+                ggml_are_same_shape(op, gf->nodes[gi + 1]) &&
+                // kernel indexes dst with the conv's nb
+                ggml_are_same_stride(op, gf->nodes[gi + 1])) {
             dst = gf->nodes[gi + 1];
             n_fuse = ctx->n_fuse_span(idx, n_graph_ops);
             apply_silu = 1;
