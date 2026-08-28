@@ -921,11 +921,17 @@ class rpc_command_queue {
 };
 
 static std::shared_ptr<rpc_command_queue> get_command_queue(const std::string & endpoint) {
-    static std::mutex                                                        mutex;
-    static std::unordered_map<std::string, std::weak_ptr<rpc_command_queue>> queues;
+    struct connection_attempt {
+        std::condition_variable              cv;
+        std::shared_ptr<rpc_command_queue>   queue;
+        bool                                 done = false;
+    };
+
+    static std::mutex                                                           mutex;
+    static std::unordered_map<std::string, std::weak_ptr<rpc_command_queue>>    queues;
+    static std::unordered_map<std::string, std::shared_ptr<connection_attempt>> connecting;
 
     auto cached = [&]() -> std::shared_ptr<rpc_command_queue> {
-        std::lock_guard<std::mutex> lock(mutex);
         auto it = queues.find(endpoint);
         if (it != queues.end()) {
             if (auto queue = it->second.lock()) {
@@ -937,33 +943,42 @@ static std::shared_ptr<rpc_command_queue> get_command_queue(const std::string & 
         return nullptr;
     };
 
-    if (auto queue = cached()) {
-        return queue;
-    }
+    std::shared_ptr<connection_attempt> attempt;
+    bool                                is_connector = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (auto queue = cached()) {
+            return queue;
+        }
 
-    // Connect without holding the lock: this is the part that can block for
-    // seconds (RPC_CLIENT_CONNECT_TIMEOUT_MS on an unreachable host), and
-    // different endpoints connecting concurrently are independent of each
-    // other. Holding the lock across it would serialize every endpoint a
-    // caller connects to in one call, one full connect-timeout at a time,
-    // regardless of how many callers or threads are involved.
-    auto queue = rpc_command_queue::create(endpoint);
-
-    std::lock_guard<std::mutex> lock(mutex);
-    // Re-check: a concurrent call for the same endpoint may have already
-    // connected and published its queue while this one was connecting.
-    // Prefer that one so this endpoint does not end up with two live
-    // command-queue threads racing on the same socket.
-    if (auto it = queues.find(endpoint); it != queues.end()) {
-        if (auto existing = it->second.lock()) {
-            if (!existing->is_failed()) {
-                return existing;
-            }
+        auto it = connecting.find(endpoint);
+        if (it == connecting.end()) {
+            attempt = std::make_shared<connection_attempt>();
+            connecting.emplace(endpoint, attempt);
+            is_connector = true;
+        } else {
+            attempt = it->second;
         }
     }
-    if (queue) {
-        queues[endpoint] = queue;
+
+    if (!is_connector) {
+        std::unique_lock<std::mutex> lock(mutex);
+        attempt->cv.wait(lock, [&] { return attempt->done; });
+        return attempt->queue;
     }
+
+    auto queue = rpc_command_queue::create(endpoint);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (queue) {
+            queues[endpoint] = queue;
+        }
+        attempt->queue = queue;
+        attempt->done  = true;
+        connecting.erase(endpoint);
+    }
+    attempt->cv.notify_all();
     return queue;
 }
 
@@ -3667,19 +3682,8 @@ static const ggml_backend_reg_i ggml_backend_rpc_reg_interface = {
     /* .get_proc_address  = */ ggml_backend_rpc_get_proc_address,
 };
 
-// Establishes (and caches) the connection to `endpoint` without registering
-// it as a backend. Safe to call from multiple threads for different
-// endpoints concurrently - unlike ggml_backend_rpc_add_server(), this does
-// not touch the reg_map/dev_id bookkeeping below, only get_command_queue()'s
-// own connection cache.
-//
-// Exists so a caller adding several RPC servers at once (e.g. every endpoint
-// in one --rpc list) can pay the connect latency for all of them in
-// parallel, then call ggml_backend_rpc_add_server() for each in the order it
-// wants device numbering assigned: that call's own connect becomes a cheap
-// cache hit on an already-open connection, so registration stays exactly as
-// fast and exactly as sequential/deterministic as it is today, while the
-// slow part - the network round trip - already happened concurrently.
+// Establishes the connection without registering a backend. This lets callers
+// warm many endpoints in parallel, then register them in deterministic order.
 bool ggml_backend_rpc_prefetch_connection(const char * endpoint) {
     return get_command_queue(endpoint) != nullptr;
 }
