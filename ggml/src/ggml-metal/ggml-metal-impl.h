@@ -29,6 +29,8 @@
 
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
+// glu holds 2 accs per row, so use fewer rows per simdgroup
+#define N_R0_Q4_0_GLU 1
 
 #define N_R0_Q4_1 4
 #define N_SG_Q4_1 2
@@ -54,7 +56,7 @@
 #define N_R0_Q3_K 2
 #define N_SG_Q3_K 2
 
-#define N_R0_Q4_K 2
+#define N_R0_Q4_K 1
 #define N_SG_Q4_K 2
 
 #define N_R0_Q5_K 1
@@ -588,6 +590,13 @@ typedef struct {
     int32_t  ne1;
     uint64_t nb1;
     int32_t  nr0;
+    int32_t  scale_grouped;
+    int32_t  nes0;
+    int32_t  nes1;
+    int32_t  nes2;
+    uint64_t nbs0;
+    uint64_t nbs1;
+    uint64_t nbs2;
 } ggml_metal_kargs_mul_mv_id;
 
 // NORM
@@ -1102,6 +1111,8 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    uint64_t ns_cache;
+    int32_t  fuse_cache;
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
@@ -1454,5 +1465,14 @@ typedef struct {
 typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
+
+typedef struct {
+    int32_t n_rows;
+    int32_t n_experts;
+    int32_t n_expert_used;
+    int32_t with_norm;
+    float   clamp_val;
+    float   scale_val;
+} ggml_metal_kargs_topk_moe;
 
 #endif // GGML_METAL_IMPL
