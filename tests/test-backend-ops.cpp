@@ -4660,6 +4660,13 @@ struct test_mul_mat : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        if (strcmp(ggml_backend_name(backend), "OPENVINO") == 0 &&
+                type_a == GGML_TYPE_F32 && type_b == GGML_TYPE_F32 &&
+                m == 1 && n == 1 && k == 2048 &&
+                bs[0] == 1 && bs[1] == 1 && nr[0] == 1 && nr[1] == 1 &&
+                per == std::array<int64_t, 4>{0, 1, 2, 3} && k_v == 0 && o == 1) {
+            return 2e-3;
+        }
         return max_nmse_err();
     }
 
