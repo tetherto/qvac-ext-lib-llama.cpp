@@ -920,66 +920,107 @@ class rpc_command_queue {
     std::unordered_map<std::string, uint64_t> alloc_cache;
 };
 
-static std::shared_ptr<rpc_command_queue> get_command_queue(const std::string & endpoint) {
-    struct connection_attempt {
-        std::condition_variable              cv;
-        std::shared_ptr<rpc_command_queue>   queue;
-        bool                                 done = false;
-    };
+struct rpc_connection_attempt {
+    std::condition_variable            cv;
+    std::shared_ptr<rpc_command_queue> queue;
+    bool                               keep_alive = false;
+    bool                               done       = false;
+};
 
-    static std::mutex                                                           mutex;
-    static std::unordered_map<std::string, std::weak_ptr<rpc_command_queue>>    queues;
-    static std::unordered_map<std::string, std::shared_ptr<connection_attempt>> connecting;
+struct rpc_connection_cache {
+    std::mutex                                                                  mutex;
+    std::unordered_map<std::string, std::weak_ptr<rpc_command_queue>>           queues;
+    std::unordered_map<std::string, std::shared_ptr<rpc_command_queue>>         prefetched;
+    std::unordered_map<std::string, std::shared_ptr<rpc_connection_attempt>>    connecting;
+};
 
-    auto cached = [&]() -> std::shared_ptr<rpc_command_queue> {
-        auto it = queues.find(endpoint);
-        if (it != queues.end()) {
-            if (auto queue = it->second.lock()) {
-                if (!queue->is_failed()) {
-                    return queue;
+static rpc_connection_cache & get_connection_cache() {
+    static rpc_connection_cache cache;
+    return cache;
+}
+
+static std::shared_ptr<rpc_command_queue> get_cached_command_queue_locked(rpc_connection_cache & cache, const std::string & endpoint, bool keep_alive) {
+    auto prefetch_it = cache.prefetched.find(endpoint);
+    if (prefetch_it != cache.prefetched.end()) {
+        if (!prefetch_it->second->is_failed()) {
+            auto queue = prefetch_it->second;
+            if (!keep_alive) {
+                cache.prefetched.erase(prefetch_it);
+            }
+            return queue;
+        }
+        cache.prefetched.erase(prefetch_it);
+    }
+
+    auto it = cache.queues.find(endpoint);
+    if (it != cache.queues.end()) {
+        if (auto queue = it->second.lock()) {
+            if (!queue->is_failed()) {
+                if (keep_alive) {
+                    cache.prefetched[endpoint] = queue;
                 }
+                return queue;
             }
         }
-        return nullptr;
-    };
+    }
+    return nullptr;
+}
 
-    std::shared_ptr<connection_attempt> attempt;
-    bool                                is_connector = false;
+static std::shared_ptr<rpc_command_queue> get_command_queue(const std::string & endpoint, bool keep_alive = false) {
+    auto & cache = get_connection_cache();
+
+    std::shared_ptr<rpc_connection_attempt> attempt;
+    bool                                    is_connector = false;
     {
-        std::unique_lock<std::mutex> lock(mutex);
-        if (auto queue = cached()) {
+        std::unique_lock<std::mutex> lock(cache.mutex);
+        if (auto queue = get_cached_command_queue_locked(cache, endpoint, keep_alive)) {
             return queue;
         }
 
-        auto it = connecting.find(endpoint);
-        if (it == connecting.end()) {
-            attempt = std::make_shared<connection_attempt>();
-            connecting.emplace(endpoint, attempt);
+        auto it = cache.connecting.find(endpoint);
+        if (it == cache.connecting.end()) {
+            attempt = std::make_shared<rpc_connection_attempt>();
+            attempt->keep_alive = keep_alive;
+            cache.connecting.emplace(endpoint, attempt);
             is_connector = true;
         } else {
             attempt = it->second;
+            attempt->keep_alive = attempt->keep_alive || keep_alive;
         }
     }
 
     if (!is_connector) {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(cache.mutex);
         attempt->cv.wait(lock, [&] { return attempt->done; });
-        return attempt->queue;
+        auto queue = attempt->queue;
+        if (queue && !keep_alive) {
+            cache.prefetched.erase(endpoint);
+        }
+        return queue;
     }
 
     auto queue = rpc_command_queue::create(endpoint);
 
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::lock_guard<std::mutex> lock(cache.mutex);
         if (queue) {
-            queues[endpoint] = queue;
+            cache.queues[endpoint] = queue;
+            if (attempt->keep_alive) {
+                cache.prefetched[endpoint] = queue;
+            }
         }
         attempt->queue = queue;
         attempt->done  = true;
-        connecting.erase(endpoint);
+        cache.connecting.erase(endpoint);
     }
     attempt->cv.notify_all();
     return queue;
+}
+
+static void release_prefetched_command_queue(const std::string & endpoint) {
+    auto & cache = get_connection_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.prefetched.erase(endpoint);
 }
 
 static void normalize_alloc_cache_tensor(rpc_tensor & tensor) {
@@ -3685,7 +3726,7 @@ static const ggml_backend_reg_i ggml_backend_rpc_reg_interface = {
 // Establishes the connection without registering a backend. This lets callers
 // warm many endpoints in parallel, then register them in deterministic order.
 bool ggml_backend_rpc_prefetch_connection(const char * endpoint) {
-    return get_command_queue(endpoint) != nullptr;
+    return get_command_queue(endpoint, true) != nullptr;
 }
 
 ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
@@ -3694,6 +3735,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     static uint32_t dev_id = 0;
     std::lock_guard<std::mutex> lock(mutex);
     if (reg_map.find(endpoint) != reg_map.end()) {
+        release_prefetched_command_queue(endpoint);
         return reg_map[endpoint];
     }
     uint32_t dev_count = ggml_backend_rpc_get_device_count(endpoint);
