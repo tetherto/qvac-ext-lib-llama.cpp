@@ -1640,11 +1640,19 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
 #endif //defined(GGML_CUDA_USE_PDL)
 
 // PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
-# if (defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
+//
+// Must NOT depend on __CUDA_ARCH__: this appears in __global__ template
+// signatures, and nvcc builds the host launch stub for those from the device
+// pass, so an arch-dependent expansion makes the stub stop matching its own
+// declaration. It only breaks when the arch list spans generations, which
+// ggml's own default list does. GGML_CUDA_USE_PDL is already per-build, so
+// keying off it alone keeps the two exclusive with one uniform expansion. Cost
+// is losing __restrict__ on pre-Hopper in a PDL build, a hint, not correctness.
+# if defined(GGML_CUDA_USE_PDL)
 # define GGML_CUDA_RESTRICT
 # else
 # define GGML_CUDA_RESTRICT __restrict__
-# endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+# endif // defined(GGML_CUDA_USE_PDL)
 
 template<typename Kernel, typename... Args>
 static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
