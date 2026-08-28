@@ -248,6 +248,32 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_XDNA)
+    llama_build(test-xdna-production.cpp)
+    target_link_libraries(test-xdna-production PRIVATE ggml-xdna)
+
+    add_test(NAME test-xdna-production-micro
+        COMMAND ${CMAKE_COMMAND} -E env
+            GGML_XDNA_NPU=1
+            GGML_XDNA_OWN_GRAPH=1
+            $<TARGET_FILE:test-xdna-production> micro)
+    add_test(NAME test-xdna-production-fallback
+        COMMAND ${CMAKE_COMMAND} -E env
+            GGML_XDNA_NPU=1
+            GGML_XDNA_OWN_GRAPH=1
+            $<TARGET_FILE:test-xdna-production> fallback)
+    add_test(NAME test-xdna-production-no-npu
+        COMMAND ${CMAKE_COMMAND} -E env
+            GGML_XDNA_NPU=0
+            GGML_XDNA_OWN_GRAPH=1
+            $<TARGET_FILE:test-xdna-production> no-npu)
+    set_tests_properties(
+        test-xdna-production-micro
+        test-xdna-production-fallback
+        test-xdna-production-no-npu
+        PROPERTIES LABELS "xdna" SKIP_RETURN_CODE 77)
+endif()
+
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
 # GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
 # path on hardware that only exposes one native subgroup size. Auto-skips when no
