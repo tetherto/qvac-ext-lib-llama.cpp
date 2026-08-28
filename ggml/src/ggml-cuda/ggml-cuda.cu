@@ -5202,7 +5202,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32)
                         return false;
                 }
-                
+
                 const ggml_tensor * q     = op->src[0];
                 const ggml_tensor * k     = op->src[1];
                 const ggml_tensor * v     = op->src[2];
