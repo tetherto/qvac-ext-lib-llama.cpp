@@ -26,6 +26,9 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
+struct ggml_tensor * ggml_metal_op_get_node(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_node_graph_idx(ggml_metal_op_t ctx, int idx);
+
 //
 // available ops:
 //

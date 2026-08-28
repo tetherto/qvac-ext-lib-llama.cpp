@@ -11,6 +11,7 @@
 #import <TargetConditionals.h>
 
 #import <Metal/Metal.h>
+#include <stdio.h>
 
 #undef MIN
 #undef MAX
@@ -43,6 +44,7 @@ struct ggml_metal {
 
     int debug_graph;
     int debug_fusion;
+    int op_profile;
 
     // how many times a given op was fused
     uint64_t fuse_cnt[GGML_OP_COUNT];
@@ -151,6 +153,11 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     {
         const char * val = getenv("GGML_METAL_FUSION_DEBUG");
         res->debug_fusion = val ? atoi(val) : 0;
+    }
+
+    {
+        const char * val = getenv("GGML_METAL_OP_PROFILE");
+        res->op_profile = val ? atoi(val) : 0;
     }
 
     res->use_graph_optimize = true;
@@ -483,6 +490,103 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     @autoreleasepool {
         ctx->gf = gf;
+
+        if (ctx->op_profile > 0) {
+            if (ctx->cmd_buf_last) {
+                [ctx->cmd_buf_last waitUntilCompleted];
+                ctx->cmd_buf_last = nil;
+            }
+
+            id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+            NSMutableDictionary * tot = [NSMutableDictionary dictionary];
+            NSMutableDictionary * by_op = [NSMutableDictionary dictionary];
+            double gpu_tot = 0.0;
+            int n_launch = 0;
+            int i = 0;
+
+            while (i < gf->n_nodes) {
+                id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+                ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                    ctx->dev, cmd_buf, gf, i, gf->n_nodes,
+                    ctx->use_fusion, false, false, 0, 0);
+                if (ggml_metal_op_n_nodes(ctx_op) <= 0) {
+                    ggml_metal_op_free(ctx_op);
+                    break;
+                }
+
+                struct ggml_tensor * node = ggml_metal_op_get_node(ctx_op, 0);
+                const int res = ggml_metal_op_encode(ctx_op, 0);
+                const int n_left = ggml_metal_op_n_nodes(ctx_op);
+                const int next_i = (res > 0 && res < n_left)
+                    ? ggml_metal_op_node_graph_idx(ctx_op, res)
+                    : gf->n_nodes;
+                ggml_metal_op_free(ctx_op);
+
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+
+                const double ms = 1e3 * ([cmd_buf GPUEndTime] - [cmd_buf GPUStartTime]);
+                gpu_tot += ms;
+                n_launch += 1;
+
+                NSString * name = @(ggml_get_name(node) ? ggml_get_name(node) : "");
+                name = [name stringByReplacingOccurrencesOfString:@"-[0-9]+$"
+                                                       withString:@""
+                                                          options:NSRegularExpressionSearch
+                                                            range:NSMakeRange(0, name.length)];
+                const struct ggml_tensor * w = node->src[0];
+                NSString * key = [NSString stringWithFormat:@"%-14s %-22s %-5s [%lldx%lld]%s",
+                    ggml_op_name(node->op),
+                    name.UTF8String,
+                    w ? ggml_type_name(w->type) : "-",
+                    w ? w->ne[0] : 0,
+                    w ? w->ne[1] : 0,
+                    res > 1 ? " fused" : ""];
+                NSString * opk = @(ggml_op_name(node->op));
+
+                void (^add)(NSMutableDictionary *, NSString *, double) = ^(NSMutableDictionary * d, NSString * k, double v) {
+                    NSNumber * old = d[k];
+                    d[k] = @((old ? old.doubleValue : 0.0) + v);
+                };
+                add(tot, key, ms);
+                add(by_op, opk, ms);
+
+                i = next_i > i ? next_i : i + 1;
+                if (res <= 0) {
+                    break;
+                }
+            }
+
+            NSArray * keys = [tot keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber * a, NSNumber * b) {
+                return [b compare:a];
+            }];
+            FILE * fp = fopen("/tmp/metal-op-profile.txt", "a");
+            if (!fp) {
+                fp = stderr;
+            }
+            fprintf(fp, "op-profile graph nodes=%d launches=%d gpu=%.2f ms\n",
+                gf->n_nodes, n_launch, gpu_tot);
+            for (NSString * k in keys) {
+                const double ms = [tot[k] doubleValue];
+                fprintf(fp, "  %6.2f ms  %5.1f%%  %s\n",
+                    ms, 100.0 * ms / (gpu_tot > 0 ? gpu_tot : 1), k.UTF8String);
+            }
+            NSArray * opkeys = [by_op keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber * a, NSNumber * b) {
+                return [b compare:a];
+            }];
+            fprintf(fp, "by op:\n");
+            for (NSString * k in opkeys) {
+                const double ms = [by_op[k] doubleValue];
+                fprintf(fp, "  %6.2f ms  %5.1f%%  %s\n",
+                    ms, 100.0 * ms / (gpu_tot > 0 ? gpu_tot : 1), k.UTF8String);
+            }
+            fprintf(fp, "----\n");
+            if (fp != stderr) {
+                fclose(fp);
+            }
+
+            return GGML_STATUS_SUCCESS;
+        }
 
         ctx->n_nodes_0 = MIN(n_main, gf->n_nodes);
         ctx->n_nodes_1 = gf->n_nodes - ctx->n_nodes_0;
