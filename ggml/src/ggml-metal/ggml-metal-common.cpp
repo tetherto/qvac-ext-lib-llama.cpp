@@ -189,6 +189,9 @@ struct node_info {
 
     std::vector<ggml_tensor *> fused;
 
+    // outputs of the fused group other than dst() (e.g. the ids of a fused topk-moe)
+    std::vector<ggml_tensor *> extra_dsts;
+
     ggml_op op() const {
         return node->op;
     }
@@ -228,6 +231,12 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
+        for (const auto * d : node.extra_dsts) {
+            if (!ggml_mem_ranges_add_dst(mrs, d)) {
+                return false;
+            }
+        }
+
         return ggml_mem_ranges_add_dst(mrs, node.dst());
     };
 
@@ -248,6 +257,12 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
                         return false;
                     }
                 }
+            }
+        }
+
+        for (const auto * d : node.extra_dsts) {
+            if (!ggml_mem_ranges_check_dst(mrs, d)) {
+                return false;
             }
         }
 
@@ -372,24 +387,99 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
+static bool ggml_metal_is_view_or_noop(const ggml_tensor * t) {
+    return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
+           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+}
+
+// match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
+// (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
+int ggml_metal_try_gdn_cache_fusion(
+        const ggml_cgraph * gf, int node_idx, const ggml_tensor ** cache, int64_t * slot_stride) {
+    const ggml_tensor * gdn = gf->nodes[node_idx];
+    // the kernel skips the snapshot tail, so the gdn output must not be a graph output
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * src_v     = gdn->src[2];
+    const int64_t       S_v       = src_v->ne[0];
+    const int64_t       H         = src_v->ne[1];
+    const int64_t       n_tokens  = src_v->ne[2];
+    const int64_t       n_seqs    = src_v->ne[3];
+    const int64_t       D         = S_v * S_v * H;
+    const int64_t       K         = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       n_written = n_tokens < K ? n_tokens : K;
+
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+
+    const ggml_tensor * cpy  = nullptr;
+    int                 skip = 0;
+    for (int j = node_idx + 1; j < gf->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = gf->nodes[j];
+        if (ggml_metal_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * src = cpy->src[0];
+    const ggml_tensor * dst = cpy->src[1];
+
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
+        !ggml_is_contiguous(src)) {
+        return 0;
+    }
+
+    // dst is the [D, n_seqs, n_written] cache view; require nb[1] == D (the per-seq stride the kernel assumes)
+    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 ||
+        dst->ne[0] != D || dst->ne[1] != n_seqs || dst->ne[2] != n_written || dst->ne[3] != 1 ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != ggml_row_size(GGML_TYPE_F32, D)) {
+        return 0;
+    }
+
+    if (cache) {
+        *cache = dst;
+    }
+    if (slot_stride) {
+        *slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    }
+    return skip;
+}
+
 // extra nodes to keep with gf->nodes[i] so later reorder cannot split a metal fusion
-static int ggml_metal_graph_optimize_pack(const ggml_cgraph * gf, int i) {
+// extra_dsts receives the outputs of the pack other than the last node (see node_info::extra_dsts)
+static int ggml_metal_graph_optimize_pack(const ggml_cgraph * gf, int i, std::vector<ggml_tensor *> & extra_dsts) {
     const int n = gf->n_nodes;
     ggml_tensor ** nodes = gf->nodes;
 
+    if (nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
+        return ggml_metal_try_gdn_cache_fusion(gf, i, nullptr, nullptr);
+    }
+
     if (nodes[i]->op == GGML_OP_SOFT_MAX) {
+        // keep in sync with ggml_metal_op_try_topk_moe
         static const ggml_op topk_ops[] = {
             GGML_OP_SOFT_MAX, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS,
             GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE,
             GGML_OP_SCALE,
         };
-        const int lens[] = { 11, 10, 5 };
+        const int lens[] = { 11, 10, 6, 5 };
         for (int n_ops : lens) {
             if (i + n_ops > n) {
                 continue;
             }
             const int outs[] = { i + 3, i + n_ops - 1 };
             if (ggml_can_fuse_subgraph(gf, i, n_ops, topk_ops, outs, 2)) {
+                extra_dsts.push_back(nodes[outs[0]]);
                 return n_ops - 1;
             }
         }
@@ -465,6 +555,7 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
         node_info node = {
             /*.node =*/ gf->nodes[i],
             /*.fused =*/ {},
+            /*.extra_dsts =*/ {},
         };
 
         int n_extra = 0;
@@ -499,7 +590,7 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
 
             n_extra = f > 1 ? f - 1 : 0;
         } else {
-            n_extra = ggml_metal_graph_optimize_pack(gf, i);
+            n_extra = ggml_metal_graph_optimize_pack(gf, i, node.extra_dsts);
         }
 
         for (int k = 0; k < n_extra; k++) {

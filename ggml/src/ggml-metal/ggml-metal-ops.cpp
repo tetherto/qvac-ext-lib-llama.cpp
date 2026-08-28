@@ -168,6 +168,14 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
     return ctx->n_nodes();
 }
 
+struct ggml_tensor * ggml_metal_op_get_node(ggml_metal_op_t ctx, int idx) {
+    return ctx->node(idx);
+}
+
+int ggml_metal_op_node_graph_idx(ggml_metal_op_t ctx, int idx) {
+    return ctx->graph_idx(idx);
+}
+
 static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
     if (!ctx->mem_ranges) {
         return true;
@@ -895,6 +903,11 @@ static int ggml_metal_op_try_unary_mul(ggml_metal_op_t ctx, int idx) {
 
     ggml_tensor * mul = nodes[gi + 1];
     if (mul->src[0] != unary && mul->src[1] != unary) {
+        return 0;
+    }
+
+    // mul(unary, unary) would read the unary result that the fusion skips
+    if (mul->src[0] == mul->src[1]) {
         return 0;
     }
 
@@ -1848,6 +1861,11 @@ static int ggml_metal_op_try_topk_moe(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    // the kernel applies only the clamp min
+    if (with_norm && ggml_get_op_params_f32(clamp, 1) != std::numeric_limits<float>::infinity()) {
+        with_norm = false;
+    }
+
     if (!with_norm) {
         node_idx = gi + 5;
         clamp = nullptr;
@@ -1910,6 +1928,9 @@ static int ggml_metal_op_try_topk_moe(ggml_metal_op_t ctx, int idx) {
     if (softmax->src[1] || softmax->src[2]) {
         return 0;
     }
+    if (logits->ne[2] != 1 || logits->ne[3] != 1) {
+        return 0;
+    }
 
     float sm_scale = 1.0f;
     float max_bias = 0.0f;
@@ -1929,6 +1950,13 @@ static int ggml_metal_op_try_topk_moe(ggml_metal_op_t ctx, int idx) {
 
     const int n_rows        = (int) logits->ne[1];
     const int n_expert_used = (int) weights->ne[1];
+
+    // the kernel writes n_rows rows of n_expert_used weights and ids
+    if (n_expert_used > n_experts ||
+            weights->ne[0] != 1 || (int) weights->ne[2] != n_rows || weights->ne[3] != 1 ||
+            (int) ids->ne[1] != n_rows || ids->ne[2] != 1 || ids->ne[3] != 1) {
+        return 0;
+    }
 
     float scale_val = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
     float clamp_val = clamp ? ggml_get_op_params_f32(clamp, 0) : -std::numeric_limits<float>::infinity();
@@ -2265,6 +2293,8 @@ static int ggml_metal_op_try_mul_mv_glu(ggml_metal_op_t ctx, int idx) {
                     gate_up->ne[0] % 2 == 0) {
                 const int64_t n_ff = gate_up->ne[0] / 2;
                 if (v0->ne[0] == n_ff && v1->ne[0] == n_ff &&
+                        v0->ne[1] == gate_up->ne[1] && v0->ne[2] == gate_up->ne[2] && v0->ne[3] == gate_up->ne[3] &&
+                        v1->ne[1] == gate_up->ne[1] && v1->ne[2] == gate_up->ne[2] && v1->ne[3] == gate_up->ne[3] &&
                         v0->view_offs == 0 &&
                         v1->view_offs == (size_t) n_ff * gate_up->nb[0] &&
                         ggml_metal_mul_mv_glu_decode_ok(gate_up)) {
@@ -2303,6 +2333,11 @@ static int ggml_metal_op_try_mul_mv_id_mul(ggml_metal_op_t ctx, int idx) {
         return 0;
     }
 
+    // mul(mm, mm) would read the matvec result that the fusion skips
+    if (mul->src[0] == mul->src[1]) {
+        return 0;
+    }
+
     ggml_tensor * scale = (mul->src[0] == mm) ? mul->src[1] : mul->src[0];
     if (!scale || scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) {
         return 0;
@@ -2318,6 +2353,11 @@ static int ggml_metal_op_try_mul_mv_id_mul(ggml_metal_op_t ctx, int idx) {
         if (scale->ne[i] != 1 && scale->ne[i] != mul->ne[i]) {
             return 0;
         }
+    }
+
+    // the kernel reads scale after writing dst, so dst must not be able to alias scale (inplace mul)
+    if (ggml_are_same_layout(scale, mul)) {
+        return 0;
     }
 
     const ggml_metal_device_props * props = ggml_metal_device_get_props(ctx->dev);
@@ -2768,6 +2808,27 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
+    const ggml_tensor * cache = nullptr;
+    int64_t slot_stride = 0;
+    int n_fuse = 1;
+    int fuse_cache = 0;
+
+    if (ctx->use_fusion) {
+        const int gi = ctx->graph_idx(idx);
+        const int skip = ggml_metal_try_gdn_cache_fusion(ctx->graph(), gi, &cache, &slot_stride);
+        const int n_graph_ops = skip + 1;
+        if (skip > 0 && cache && cache->data && ctx->graph_span_in_split(gi, n_graph_ops)) {
+            n_fuse = ctx->n_fuse_span(idx, n_graph_ops);
+            if (n_fuse > 1) {
+                fuse_cache = 1;
+                ggml_metal_op_fusion_concurrency(ctx, idx, n_fuse);
+                if (ctx->debug_fusion > 0) {
+                    GGML_LOG_INFO("%s: fused GATED_DELTA_NET + CPY\n", __func__);
+                }
+            }
+        }
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
 
     int ida = 0;
@@ -2808,6 +2869,8 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
         /*.nb3  =*/ nb3,
+        /*.ns_cache   =*/ fuse_cache ? (uint64_t) slot_stride : 0,
+        /*.fuse_cache =*/ fuse_cache,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2819,12 +2882,13 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(fuse_cache ? cache : op), ida++); // cache
 
     const int nsg = pipeline.nsg;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (op->src[2]->ne[0] + nsg - 1)/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {

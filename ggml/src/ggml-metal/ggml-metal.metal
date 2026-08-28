@@ -3742,6 +3742,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * b,
         device const char * s,
         device       char * dst,
+        device       char * cache,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -3786,6 +3787,10 @@ kernel void kernel_gated_delta_net_impl(
     const uint state_size_per_snap = S_v * S_v * args.ne21 * args.ne23;
     const uint state_out_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
 
+    device float * state_base = args.fuse_cache ?
+        (device float *) cache :
+        (device float *) dst + attn_size;
+
     const short ntok = FC_gated_delta_net_nt > 0 ? FC_gated_delta_net_nt : args.ne22;
 
     for (short t = 0; t < ntok; t++) {
@@ -3818,16 +3823,17 @@ kernel void kernel_gated_delta_net_impl(
         g_ptr += args.ne21*G;
 
         if (K > 1) {
+            const uint64_t ns_slot = args.fuse_cache ? args.ns_cache : state_size_per_snap;
             const int target_slot = (int) ntok - 1 - (int) t;
             if (target_slot >= 0 && target_slot < (int) K) {
-                device T * dst_state = (device T *) ((device float *) (dst) + attn_size + (uint) target_slot * state_size_per_snap + state_out_base);
+                device T * dst_state = (device T *) (state_base + (uint64_t) target_slot * ns_slot + state_out_base);
                 dst_state[tx] = ls;
             }
         }
     }
 
     if (K == 1) {
-        device T * dst_state = (device T *) ((device float *) (dst) + attn_size + state_out_base);
+        device T * dst_state = (device T *) (state_base + state_out_base);
         dst_state[tx] = ls;
     }
 
@@ -8381,7 +8387,8 @@ static inline void topk_moe_softmax(thread float * vals, ushort lane) {
             vals[i] = val;
             sum += val;
         } else {
-            vals[i] = 0.f;
+            // keep pads below the -FLT_MAX that NaN logits become, so they are never selected
+            vals[i] = -INFINITY;
         }
     }
     sum = simd_sum(sum);
