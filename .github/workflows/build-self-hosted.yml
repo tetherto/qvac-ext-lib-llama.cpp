@@ -58,8 +58,13 @@ permissions:
   contents: read
 
 jobs:
+  # QVAC-23796: RTX 4000 Ada. Builds CUDA natively via ci/run.sh, which needs a
+  # real toolkit on the host - the image originally shipped the driver only and
+  # this failed with "CUDA Toolkit not found". devops added the toolkit
+  # (/usr/local/cuda/bin/nvcc) on 2026-08-21 and the job now passes, 46/46
+  # debug and 49/49 release.
   gpu-cuda:
-    runs-on: [self-hosted, Linux, NVIDIA]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -73,7 +78,7 @@ jobs:
           GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm:
-    runs-on: [self-hosted, Linux, NVIDIA]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -87,7 +92,7 @@ jobs:
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm2:
-    runs-on: [self-hosted, Linux, NVIDIA, COOPMAT2]
+    runs-on: qvac-ubuntu2204-x64-gpu
 
     steps:
       - name: Clone
@@ -100,8 +105,15 @@ jobs:
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
+  # QVAC-23796: must stay on 24.04. The Dawn release asset fetched below is the
+  # "ubuntu-latest" (24.04) build, so it needs that libstdc++. Linking it on
+  # qvac-ubuntu2204-x64-gpu (Ubuntu 22.04 / GCC 11) fails with
+  #   libggml-webgpu.so: undefined reference to `std::ios_base_library_init()'
+  #   libggml-webgpu.so: undefined reference to `..._M_replace_cold(...)'
+  # both of which are GCC 13+ symbols. Running it here also spreads GPU load
+  # across both boxes instead of serialising everything on 2204.
   gpu-webgpu-nvidia:
-    runs-on: [self-hosted, Linux, NVIDIA, X64]
+    runs-on: qvac-ubuntu2404-x64-gpu
 
     steps:
       - name: Clone
@@ -174,7 +186,7 @@ jobs:
   #         GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-metal:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -187,7 +199,7 @@ jobs:
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-apple:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -214,7 +226,7 @@ jobs:
             bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-apple:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: qvac-macos26-arm64-gpu
 
     steps:
       - name: Clone
@@ -227,7 +239,11 @@ jobs:
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
+  # QVAC-23796: no Intel-GPU box in the qvac self-hosted fleet, so this keeps
+  # the upstream ggml-org label and stays permanently queued here. Either
+  # provision Intel hardware or drop the job.
   gpu-vulkan-intel-linux:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel]
 
     steps:
@@ -243,7 +259,12 @@ jobs:
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
+  # QVAC-23796: Intel-GPU specific and MSYS2-based. The fleet's Windows box
+  # (qvac-win25-x64-gpu) is NVIDIA and its MSYS2 availability is unverified, so
+  # repointing it would silently change what this job tests. Left as-is;
+  # Windows Vulkan *build* coverage now runs via build-cpu.yml (x64-vulkan).
   gpu-vulkan-intel-windows:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Windows, X64, Intel]
 
     steps:
@@ -264,7 +285,9 @@ jobs:
           # a valid python environment for testing
           LLAMA_FATAL_WARNINGS=OFF GG_BUILD_NINJA=1 GG_BUILD_VULKAN=1 GG_BUILD_LOW_PERF=1 ./ci/run.sh ./results/llama.cpp ./mnt/llama.cpp
 
+  # QVAC-23796: needs Intel + OpenVINO hardware, not present in the fleet.
   gpu-openvino-low-perf:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
 
     env:
@@ -297,7 +320,7 @@ jobs:
           GG_BUILD_OPENVINO=1 GGML_OPENVINO_DEVICE=GPU GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-x64-high-perf:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: qvac-ubuntu2204-x64
 
     steps:
       - name: Clone
@@ -309,7 +332,10 @@ jobs:
         run: |
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
+  # QVAC-23796: arm64 Graviton label from upstream; the qvac fleet has no
+  # arm64 Linux box, so these two jobs stay permanently queued.
   cpu-arm64-high-perf-graviton4:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_22_04-c8g_8x
 
     steps:
@@ -349,6 +375,7 @@ jobs:
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_NO_BF16=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-arm64-graviton4-kleidiai:
+    if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_22_04-c8g_8x
 
     steps:
