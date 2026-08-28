@@ -16,7 +16,33 @@ llama-debug \
   --save-logits \
   --verbose
 ```
-The tensor data is logged as debug and required the --verbose flag. The reason
+
+Pass `--n-predict N` to greedily decode additional tokens and inspect tensors
+from the token-generation graphs:
+
+```shell
+llama-debug \
+  --model model.gguf \
+  --prompt "Hello" \
+  --n-predict 32 \
+  --tensor-filter 'ffn_moe_topk' \
+  --no-warmup \
+  --verbose > trace.log 2>&1
+```
+
+The resulting MoE routing trace can be summarized with:
+
+```shell
+python3 examples/debug/analyze-moe-trace.py trace.log \
+  --capacities 128,256,512,1024,2048
+```
+
+Multiple trace paths can be passed and are treated as independent cold-cache runs.
+Set `GGML_MOE_TRACE=1` to print selected-expert copy bytes and ID readback time when testing the scheduler's selected-slice offload path.
+Set `GGML_MOE_COMPACT=1` to use compact transient expert banks for single-token graphs.
+`GGML_DEBUG_FULL=1` prints all values of matching tensors for numerical comparisons.
+
+The tensor data is logged as debug and requires the --verbose flag. The reason
 for this is that while useful for a model with many layers there can be a lot of
 output. You can filter the tensor names using the `--tensor-filter` option.
 

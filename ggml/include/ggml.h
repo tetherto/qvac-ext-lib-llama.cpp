@@ -1507,6 +1507,11 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // allow -1 expert IDs and write zero for their output rows
+    GGML_API void ggml_mul_mat_id_set_allow_inactive(
+            struct ggml_tensor * a,
+            bool                 allow_inactive);
+
     // Backward of ggml_mul_mat_id w.r.t. `as` (expert weight stack).
     GGML_API struct ggml_tensor * ggml_mul_mat_id_back_a(
             struct ggml_context * ctx,

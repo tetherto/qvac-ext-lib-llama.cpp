@@ -15,6 +15,7 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -808,6 +809,14 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_moe_compact {
+    int split_id;
+    struct ggml_tensor * input;
+    struct ggml_tensor * ids;
+    struct ggml_tensor * ids_copies[GGML_SCHED_MAX_COPIES];
+    int64_t n_slots;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -836,6 +845,10 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_split * splits;
     int n_splits;
     int splits_capacity;
+
+    struct ggml_backend_sched_moe_compact * moe_compact;
+    int n_moe_compact;
+    int moe_compact_capacity;
 
     // pipeline parallelism support
     int n_copies;
@@ -898,6 +911,31 @@ static void ggml_backend_sched_graph_inputs_grow(ggml_backend_sched_t sched) {
     }
     sched->graph_inputs = pnew;
     sched->graph_inputs_capacity = new_cap;
+}
+
+static struct ggml_backend_sched_moe_compact * ggml_backend_sched_moe_compact_add(ggml_backend_sched_t sched) {
+    if (sched->n_moe_compact >= sched->moe_compact_capacity) {
+        const int new_cap = sched->moe_compact_capacity > 0 ? 2*sched->moe_compact_capacity : 16;
+        auto * pnew = (struct ggml_backend_sched_moe_compact *) realloc(
+            sched->moe_compact, new_cap * sizeof(struct ggml_backend_sched_moe_compact));
+        if (pnew == NULL) {
+            GGML_ABORT("failed to grow compact MoE container");
+        }
+        sched->moe_compact = pnew;
+        sched->moe_compact_capacity = new_cap;
+    }
+
+    struct ggml_backend_sched_moe_compact * entry = &sched->moe_compact[sched->n_moe_compact++];
+    memset(entry, 0, sizeof(*entry));
+    return entry;
+}
+
+static struct ggml_tensor * ggml_backend_sched_moe_compact_tensor(
+        struct ggml_context * ctx, const struct ggml_tensor * tensor, int64_t n_slots) {
+    struct ggml_tensor * compact = ggml_dup_tensor_layout(ctx, tensor);
+    compact->ne[2] = n_slots;
+    compact->nb[3] = compact->nb[2] * compact->ne[2];
+    return compact;
 }
 
 // returns the priority of the backend, lower id is higher priority
@@ -1097,6 +1135,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
+    sched->n_moe_compact = 0;
     sched->is_reset = false;
 
     struct ggml_init_params params = {
@@ -1324,6 +1363,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
+    const bool enable_moe_compact = getenv("GGML_MOE_COMPACT") != NULL;
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;
@@ -1342,6 +1383,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
+            struct ggml_backend_sched_moe_compact * compact_entry = NULL;
+            struct ggml_tensor * original_ids = node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : NULL;
 
             if (ggml_is_view_op(node->op)) {
                 continue;
@@ -1438,11 +1481,29 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    const bool compact_input =
+                        enable_moe_compact &&
+                        j == 0 &&
+                        node->op == GGML_OP_MUL_MAT_ID &&
+                        original_ids != NULL &&
+                        original_ids->type == GGML_TYPE_I32 &&
+                        original_ids->ne[1] == 1 &&
+                        src->buffer != NULL &&
+                        src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        ggml_backend_buffer_is_host(src->buffer) &&
+                        ggml_n_dims(src) == 3 &&
+                        src->ne[2] > original_ids->ne[0] &&
+                        (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[cur_backend_id])) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                         ggml_backend_dev_type(ggml_backend_get_device(sched->backends[cur_backend_id])) == GGML_BACKEND_DEVICE_TYPE_IGPU);
+
                     // create a copy of the input in the split's backend
+                    ggml_backend_t backend = sched->backends[cur_backend_id];
+                    GGML_ASSERT(!compact_input || tensor_id_copy(src_id, cur_backend_id, 0) == NULL);
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
-                        ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                            struct ggml_tensor * tensor_copy = compact_input ?
+                                ggml_backend_sched_moe_compact_tensor(sched->ctx, src, original_ids->ne[0]) :
+                                ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
@@ -1457,8 +1518,28 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                         split->inputs[n_inputs] = src;
                     }
+                    if (compact_input) {
+                        GGML_ASSERT(compact_entry == NULL);
+                        compact_entry = ggml_backend_sched_moe_compact_add(sched);
+                        compact_entry->split_id = i_split;
+                        compact_entry->input = src;
+                        compact_entry->ids = original_ids;
+                        compact_entry->n_slots = original_ids->ne[0];
+                        for (int c = 0; c < sched->n_copies; ++c) {
+                            compact_entry->ids_copies[c] = ggml_dup_tensor_layout(sched->ctx, original_ids);
+                            ggml_format_name(compact_entry->ids_copies[c], "%s#%s#compact#%d",
+                                ggml_backend_name(backend), original_ids->name, c);
+                            if (sched->n_copies > 1) {
+                                ggml_set_input(compact_entry->ids_copies[c]);
+                                ggml_set_output(compact_entry->ids_copies[c]);
+                            }
+                        }
+                    }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
+            }
+            if (compact_entry != NULL) {
+                node->src[2] = compact_entry->ids_copies[sched->cur_copy];
             }
         }
         split->i_end = graph->n_nodes;
@@ -1484,7 +1565,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies;
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) +
+        total_inputs * 2 * sched->n_copies +
+        sched->n_moe_compact * (sched->n_copies + 1);
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1509,6 +1592,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // Optimize this split of the graph. This needs to happen before we make graph_copy,
         // so they are in sync.
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph);
+
+        for (int j = 0; j < sched->n_moe_compact; ++j) {
+            struct ggml_backend_sched_moe_compact * entry = &sched->moe_compact[j];
+            if (entry->split_id != i) {
+                continue;
+            }
+            sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+            graph_copy->nodes[graph_copy->n_nodes++] = entry->ids_copies[sched->cur_copy];
+        }
 
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split
         for (int j = 0; j < split->n_inputs; j++) {
@@ -1562,6 +1654,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     assert(graph_copy->size > graph_copy->n_leafs);
                     graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
                 }
+            }
+        }
+
+        for (int i = 0; i < sched->n_moe_compact; ++i) {
+            struct ggml_backend_sched_moe_compact * entry = &sched->moe_compact[i];
+            const int backend_id = sched->splits[entry->split_id].backend_id;
+            for (int c = 0; c < sched->n_copies; ++c) {
+                sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
+                assert(graph_copy->size > graph_copy->n_leafs);
+                graph_copy->leafs[graph_copy->n_leafs++] = entry->ids_copies[c];
             }
         }
     }
@@ -1632,12 +1734,34 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static struct ggml_backend_sched_moe_compact * ggml_backend_sched_moe_compact_find(
+        ggml_backend_sched_t sched, int split_id, const struct ggml_tensor * input) {
+    for (int i = 0; i < sched->n_moe_compact; ++i) {
+        struct ggml_backend_sched_moe_compact * entry = &sched->moe_compact[i];
+        if (entry->split_id == split_id && entry->input == input) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    const bool moe_trace = getenv("GGML_MOE_TRACE") != nullptr;
+    int64_t moe_id_read_us = 0;
+    size_t moe_selected_bytes = 0;
+    size_t moe_compact_bytes = 0;
+    size_t moe_compact_max_bytes = 0;
+    int32_t moe_compact_tensors = 0;
+    int32_t moe_id_reads = 0;
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
+    std::vector<int32_t> remapped_ids;
+    std::vector<int32_t> slot_for_id;
+    std::vector<int32_t> selected_ids;
     std::vector<ggml_bitset_t> used_ids;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1650,6 +1774,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            struct ggml_backend_sched_moe_compact * compact_entry =
+                ggml_backend_sched_moe_compact_find(sched, split_id, input);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1682,23 +1808,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(input_backend);
 
                     // get the ids
-                    ggml_tensor * ids_tensor = node->src[2];
-                    ggml_backend_t ids_backend = split_backend;
+                    ggml_tensor * ids_tensor = compact_entry ? compact_entry->ids : node->src[2];
+                    ggml_backend_t ids_backend = compact_entry ?
+                        ggml_backend_sched_get_tensor_backend(sched, ids_tensor) :
+                        split_backend;
 
                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
                     // in that case, we use the original ids tensor
-                    for (int i = input_id + 1; i < split->n_inputs; i++) {
-                        if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
-                            ids_tensor = split->inputs[i];
-                            ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
-                            break;
+                    if (!compact_entry) {
+                        for (int i = input_id + 1; i < split->n_inputs; i++) {
+                            if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                                ids_tensor = split->inputs[i];
+                                ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
+                                break;
+                            }
                         }
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
+                        const int64_t id_read_start_us = ggml_time_us();
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
+                        moe_id_read_us += ggml_time_us() - id_read_start_us;
+                        moe_id_reads++;
 
                         // find the used experts
                         used_ids.clear();
@@ -1714,44 +1847,92 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    // group consecutive experts and copy them together
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                    if (compact_entry) {
+                        GGML_ASSERT(ids_tensor->ne[1] == 1);
+                        GGML_ASSERT(input_cpy->ne[2] == compact_entry->n_slots);
+                        moe_compact_bytes += ggml_nbytes(input_cpy);
+                        moe_compact_max_bytes = std::max(moe_compact_max_bytes, ggml_nbytes(input_cpy));
+                        moe_compact_tensors++;
+
+                        remapped_ids.assign(ggml_nbytes(ids_tensor) / sizeof(int32_t), 0);
+                        slot_for_id.assign(n_expert, -1);
+                        selected_ids.clear();
+
+                        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
+                            const size_t ids_index = i0 * ids_tensor->nb[0] / sizeof(int32_t);
+                            const int32_t expert_id = ids[ids_index];
+                            int32_t slot = slot_for_id[expert_id];
+                            if (slot == -1) {
+                                slot = selected_ids.size();
+                                GGML_ASSERT(slot < compact_entry->n_slots);
+                                slot_for_id[expert_id] = slot;
+                                selected_ids.push_back(expert_id);
+                            }
+                            remapped_ids[ids_index] = slot;
+                        }
+
+                        struct ggml_tensor * compact_ids = compact_entry->ids_copies[sched->cur_copy];
+                        ggml_backend_tensor_set_async(
+                            split_backend, compact_ids, remapped_ids.data(), 0, ggml_nbytes(compact_ids));
+
                         const size_t padding = std::min<size_t>(expert_size, 512);
-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                        for (size_t slot = 0; slot < selected_ids.size(); ++slot) {
+                            const size_t src_offset = selected_ids[slot] * expert_size;
+                            const size_t dst_offset = slot * expert_size;
+                            const size_t src_available = ggml_nbytes(input) - src_offset;
+                            const size_t dst_available = ggml_nbytes(input_cpy) - dst_offset;
+                            const size_t copy_size = std::min(
+                                std::min(expert_size + padding, src_available), dst_available);
 
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
-                    };
-
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
-                    }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
-
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
+                            ggml_backend_tensor_set_async(
+                                split_backend,
+                                input_cpy,
+                                (const uint8_t *) input->data + src_offset, dst_offset,
+                                copy_size);
+                            moe_selected_bytes += copy_size;
                         }
+                    } else {
+                        // group consecutive experts and copy them together
+                        auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                            const size_t expert_offset = first_id * expert_size;
+                            const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                            const size_t padding = std::min<size_t>(expert_size, 512);
+                            const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                            const size_t copy_size = expert_size_copy + padding_end;
 
-                        if (id == last_id + 1) {
+                            ggml_backend_tensor_set_async(split_backend,
+                                input_cpy,
+                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                                // this is necessary for MMQ in the CUDA backend
+                                copy_size);
+                            moe_selected_bytes += copy_size;
+                        };
+
+                        int id = 0;
+                        while (!ggml_bitset_get(used_ids.data(), id)) {
+                            id++;
+                        }
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
+
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
+
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            copy_experts(first_id, last_id);
+
+                            first_id = id;
                             last_id = id;
-                            continue;
                         }
-
                         copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
                     }
-                    copy_experts(first_id, last_id);
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1815,6 +1996,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    if (moe_trace && moe_id_reads > 0) {
+        fprintf(stderr, "%s: moe selected bytes = %zu, compact bytes = %zu (max %zu, %d tensors), id read = %" PRId64 " us (%d reads)\n",
+                __func__, moe_selected_bytes, moe_compact_bytes, moe_compact_max_bytes, moe_compact_tensors,
+                moe_id_read_us, moe_id_reads);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1864,7 +2051,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
 
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
+    sched->context_buffer_size =
+        (ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2 + graph_size*sched->n_copies) * sizeof(struct ggml_tensor) +
+        ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
 
     const int initial_splits_capacity = 16;
@@ -1910,6 +2099,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         free(sched->splits[i].inputs);
     }
     free(sched->splits);
+    free(sched->moe_compact);
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);

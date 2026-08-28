@@ -3,3 +3,7 @@
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
         int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream);
+
+void ggml_cuda_launch_mmid_scatter_f32(
+        const float * src, const int32_t * dst_rows, float * dst,
+        int64_t ncols, int64_t nrows, int64_t dst_row_stride, cudaStream_t stream);

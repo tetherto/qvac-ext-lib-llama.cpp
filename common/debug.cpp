@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <regex>
 #include <string>
 #include <vector>
@@ -13,6 +14,22 @@ struct common_debug_cb_user_data::impl {
     std::vector<std::regex> tensor_filters;
     bool                    abort_on_nan{false};
 };
+
+static bool common_debug_matches_filter(
+        const common_debug_cb_user_data::impl * pimpl,
+        const ggml_tensor *                     t) {
+    if (pimpl->tensor_filters.empty()) {
+        return true;
+    }
+
+    for (const auto & filter : pimpl->tensor_filters) {
+        if (std::regex_search(t->name, filter)) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 common_debug_cb_user_data::common_debug_cb_user_data() : pimpl(std::make_unique<impl>()) {}
 common_debug_cb_user_data::~common_debug_cb_user_data() = default;
@@ -146,20 +163,10 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     const struct ggml_tensor * src0 = t->src[0];
     const struct ggml_tensor * src1 = t->src[1];
+    const bool matches_filter = common_debug_matches_filter(pimpl, t);
 
     if (ask) {
-        return true;  // Always retrieve data
-    }
-
-    bool matches_filter = pimpl->tensor_filters.empty();
-
-    if (!matches_filter) {
-        for (const auto & filter : pimpl->tensor_filters) {
-            if (std::regex_search(t->name, filter)) {
-                matches_filter = true;
-                break;
-            }
-        }
+        return matches_filter;
     }
 
     char src1_str[128] = { 0 };
@@ -183,7 +190,8 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
-        common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        const int64_t n = getenv("GGML_DEBUG_FULL") || ggml_nelements(t) <= 64 ? ggml_nelements(t) : 3;
+        common_debug_print_tensor(data, t->type, t->ne, t->nb, n, pimpl->abort_on_nan);
     }
 
     return true;
