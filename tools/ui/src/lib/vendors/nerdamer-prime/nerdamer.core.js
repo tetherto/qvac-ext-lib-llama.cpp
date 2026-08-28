@@ -6663,7 +6663,8 @@ const LaTeX = {
             } else if (fname === 'imagpart') {
                 v[index] = `\\operatorname{Im}${this.brackets(input[0])}`;
             } else {
-                const name = fname === '' ? '' : `\\mathrm${this.braces(fname.replace(/_/gu, '\\_'))}`;
+                const safeName = fname.replace(/\\/gu, '\\textbackslash{}').replace(/_/gu, '\\_');
+                const name = fname === '' ? '' : `\\mathrm${this.braces(safeName)}`;
                 if (/** @type {NerdamerSymbolType} */ (symbol).isConversion) {
                     v[index] = name + this.brackets(input.join(''), 'parens');
                 } else {
