@@ -47,7 +47,7 @@ jobs:
   ui-checks:
     name: Checks
     needs: ui-build
-    runs-on: [self-hosted, PLAYWRIGHT]
+    runs-on: qvac-ubuntu2404-x64
     continue-on-error: true
     timeout-minutes: 30
     steps:
@@ -60,6 +60,11 @@ jobs:
       - name: Install dependencies
         id: setup
         run: npm ci
+        working-directory: tools/ui
+
+      - name: Install Playwright browser
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npx playwright install chromium
         working-directory: tools/ui
 
       - name: Download built UI artifacts
@@ -91,7 +96,7 @@ jobs:
   e2e-tests:
     name: E2E Tests
     needs: ui-build
-    runs-on: [self-hosted, PLAYWRIGHT]
+    runs-on: qvac-ubuntu2404-x64
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -103,6 +108,11 @@ jobs:
       - name: Install dependencies
         id: setup
         run: npm ci
+        working-directory: tools/ui
+
+      - name: Install Playwright browser
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npx playwright install chromium
         working-directory: tools/ui
 
       - name: Download built UI artifacts
