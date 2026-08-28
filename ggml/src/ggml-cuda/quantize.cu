@@ -10,7 +10,7 @@ struct __builtin_align__(32) float8 {
 };
 #endif
 
-#if CUDART_VERSION >= 12080
+#if defined(BLACKWELL_MMA_AVAILABLE) && CUDART_VERSION >= 12080
 static __device__ __forceinline__ float nvfp4_native_scale_error(
         const float vals[QK_NVFP4_SUB], const float inv_col_scale, const float inv_scale, const float scale) {
     const float scale_dequant = 2.0f * scale;
@@ -48,7 +48,7 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 
     return err;
 }
-#endif // CUDART_VERSION >= 12080
+#endif // defined(BLACKWELL_MMA_AVAILABLE) && CUDART_VERSION >= 12080
 
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
