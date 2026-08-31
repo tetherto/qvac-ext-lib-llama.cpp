@@ -815,6 +815,8 @@ struct ggml_backend_sched_moe_compact {
     struct ggml_tensor * ids;
     struct ggml_tensor * ids_copies[GGML_SCHED_MAX_COPIES];
     int64_t n_slots;
+    void * cache_entry;
+    bool persistent;
 };
 
 struct ggml_backend_sched {
@@ -863,6 +865,11 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+
+    ggml_backend_sched_moe_cache_resolve_callback callback_moe_cache_resolve;
+    ggml_backend_sched_moe_cache_begin_callback callback_moe_cache_begin;
+    ggml_backend_sched_moe_cache_prepare_callback callback_moe_cache_prepare;
+    void * callback_moe_cache_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1481,8 +1488,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                    const bool compact_input =
-                        enable_moe_compact &&
+                    const bool compact_candidate =
                         j == 0 &&
                         node->op == GGML_OP_MUL_MAT_ID &&
                         original_ids != NULL &&
@@ -1498,14 +1504,31 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
                     // create a copy of the input in the split's backend
                     ggml_backend_t backend = sched->backends[cur_backend_id];
+                    struct ggml_tensor * persistent_tensor = NULL;
+                    void * persistent_entry = NULL;
+                    const bool persistent_input =
+                        compact_candidate &&
+                        sched->n_copies == 1 &&
+                        sched->callback_moe_cache_resolve != NULL &&
+                        sched->callback_moe_cache_resolve(
+                            sched->callback_moe_cache_user_data, src, backend,
+                            &persistent_tensor, &persistent_entry);
+                    const bool compact_input = compact_candidate && (persistent_input || enable_moe_compact);
+
+                    GGML_ASSERT(!persistent_input || persistent_tensor != NULL);
+                    GGML_ASSERT(!persistent_input || persistent_tensor->buffer != NULL);
+                    GGML_ASSERT(!persistent_input || persistent_tensor->ne[0] == src->ne[0]);
+                    GGML_ASSERT(!persistent_input || persistent_tensor->ne[1] == src->ne[1]);
+                    GGML_ASSERT(!persistent_input || persistent_tensor->ne[2] >= original_ids->ne[0]);
                     GGML_ASSERT(!compact_input || tensor_id_copy(src_id, cur_backend_id, 0) == NULL);
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = compact_input ?
-                                ggml_backend_sched_moe_compact_tensor(sched->ctx, src, original_ids->ne[0]) :
+                            struct ggml_tensor * tensor_copy =
+                                persistent_input ? persistent_tensor :
+                                compact_input ? ggml_backend_sched_moe_compact_tensor(sched->ctx, src, original_ids->ne[0]) :
                                 ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
+                            if (!persistent_input && sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -1524,7 +1547,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         compact_entry->split_id = i_split;
                         compact_entry->input = src;
                         compact_entry->ids = original_ids;
-                        compact_entry->n_slots = original_ids->ne[0];
+                        compact_entry->n_slots = tensor_id_copy(src_id, cur_backend_id, 0)->ne[2];
+                        compact_entry->cache_entry = persistent_entry;
+                        compact_entry->persistent = persistent_input;
                         for (int c = 0; c < sched->n_copies; ++c) {
                             compact_entry->ids_copies[c] = ggml_dup_tensor_layout(sched->ctx, original_ids);
                             ggml_format_name(compact_entry->ids_copies[c], "%s#%s#compact#%d",
@@ -1756,13 +1781,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t moe_compact_max_bytes = 0;
     int32_t moe_compact_tensors = 0;
     int32_t moe_id_reads = 0;
+    size_t moe_cache_fill_bytes = 0;
+    int64_t moe_cache_hits = 0;
+    int64_t moe_cache_misses = 0;
+    int64_t moe_cache_evictions = 0;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<int32_t> remapped_ids;
+    std::vector<int32_t> cache_ids;
     std::vector<int32_t> slot_for_id;
     std::vector<int32_t> selected_ids;
     std::vector<ggml_bitset_t> used_ids;
+
+    if (sched->callback_moe_cache_begin != NULL) {
+        sched->callback_moe_cache_begin(sched->callback_moe_cache_user_data);
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1850,47 +1884,78 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (compact_entry) {
                         GGML_ASSERT(ids_tensor->ne[1] == 1);
                         GGML_ASSERT(input_cpy->ne[2] == compact_entry->n_slots);
-                        moe_compact_bytes += ggml_nbytes(input_cpy);
-                        moe_compact_max_bytes = std::max(moe_compact_max_bytes, ggml_nbytes(input_cpy));
-                        moe_compact_tensors++;
 
                         remapped_ids.assign(ggml_nbytes(ids_tensor) / sizeof(int32_t), 0);
-                        slot_for_id.assign(n_expert, -1);
-                        selected_ids.clear();
-
-                        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
-                            const size_t ids_index = i0 * ids_tensor->nb[0] / sizeof(int32_t);
-                            const int32_t expert_id = ids[ids_index];
-                            int32_t slot = slot_for_id[expert_id];
-                            if (slot == -1) {
-                                slot = selected_ids.size();
-                                GGML_ASSERT(slot < compact_entry->n_slots);
-                                slot_for_id[expert_id] = slot;
-                                selected_ids.push_back(expert_id);
+                        if (compact_entry->persistent) {
+                            GGML_ASSERT(sched->callback_moe_cache_prepare != NULL);
+                            selected_ids.resize(ids_tensor->ne[0]);
+                            cache_ids.resize(ids_tensor->ne[0]);
+                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
+                                const size_t ids_index = i0 * ids_tensor->nb[0] / sizeof(int32_t);
+                                selected_ids[i0] = ids[ids_index];
                             }
-                            remapped_ids[ids_index] = slot;
+
+                            struct ggml_backend_sched_moe_cache_stats stats = {};
+                            if (!sched->callback_moe_cache_prepare(
+                                    sched->callback_moe_cache_user_data,
+                                    compact_entry->cache_entry,
+                                    selected_ids.data(), selected_ids.size(),
+                                    cache_ids.data(), &stats)) {
+                                GGML_LOG_ERROR("%s: failed to prepare persistent MoE cache\n", __func__);
+                                return GGML_STATUS_FAILED;
+                            }
+
+                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
+                                const size_t ids_index = i0 * ids_tensor->nb[0] / sizeof(int32_t);
+                                remapped_ids[ids_index] = cache_ids[i0];
+                            }
+
+                            moe_cache_fill_bytes += stats.fill_bytes;
+                            moe_cache_hits += stats.hits;
+                            moe_cache_misses += stats.misses;
+                            moe_cache_evictions += stats.evictions;
+                        } else {
+                            moe_compact_bytes += ggml_nbytes(input_cpy);
+                            moe_compact_max_bytes = std::max(moe_compact_max_bytes, ggml_nbytes(input_cpy));
+                            moe_compact_tensors++;
+
+                            slot_for_id.assign(n_expert, -1);
+                            selected_ids.clear();
+
+                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
+                                const size_t ids_index = i0 * ids_tensor->nb[0] / sizeof(int32_t);
+                                const int32_t expert_id = ids[ids_index];
+                                int32_t slot = slot_for_id[expert_id];
+                                if (slot == -1) {
+                                    slot = selected_ids.size();
+                                    GGML_ASSERT(slot < compact_entry->n_slots);
+                                    slot_for_id[expert_id] = slot;
+                                    selected_ids.push_back(expert_id);
+                                }
+                                remapped_ids[ids_index] = slot;
+                            }
+
+                            const size_t padding = std::min<size_t>(expert_size, 512);
+                            for (size_t slot = 0; slot < selected_ids.size(); ++slot) {
+                                const size_t src_offset = selected_ids[slot] * expert_size;
+                                const size_t dst_offset = slot * expert_size;
+                                const size_t src_available = ggml_nbytes(input) - src_offset;
+                                const size_t dst_available = ggml_nbytes(input_cpy) - dst_offset;
+                                const size_t copy_size = std::min(
+                                    std::min(expert_size + padding, src_available), dst_available);
+
+                                ggml_backend_tensor_set_async(
+                                    split_backend,
+                                    input_cpy,
+                                    (const uint8_t *) input->data + src_offset, dst_offset,
+                                    copy_size);
+                                moe_selected_bytes += copy_size;
+                            }
                         }
 
                         struct ggml_tensor * compact_ids = compact_entry->ids_copies[sched->cur_copy];
                         ggml_backend_tensor_set_async(
                             split_backend, compact_ids, remapped_ids.data(), 0, ggml_nbytes(compact_ids));
-
-                        const size_t padding = std::min<size_t>(expert_size, 512);
-                        for (size_t slot = 0; slot < selected_ids.size(); ++slot) {
-                            const size_t src_offset = selected_ids[slot] * expert_size;
-                            const size_t dst_offset = slot * expert_size;
-                            const size_t src_available = ggml_nbytes(input) - src_offset;
-                            const size_t dst_available = ggml_nbytes(input_cpy) - dst_offset;
-                            const size_t copy_size = std::min(
-                                std::min(expert_size + padding, src_available), dst_available);
-
-                            ggml_backend_tensor_set_async(
-                                split_backend,
-                                input_cpy,
-                                (const uint8_t *) input->data + src_offset, dst_offset,
-                                copy_size);
-                            moe_selected_bytes += copy_size;
-                        }
                     } else {
                         // group consecutive experts and copy them together
                         auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -1997,8 +2062,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (moe_trace && moe_id_reads > 0) {
-        fprintf(stderr, "%s: moe selected bytes = %zu, compact bytes = %zu (max %zu, %d tensors), id read = %" PRId64 " us (%d reads)\n",
+        fprintf(stderr, "%s: moe selected bytes = %zu, compact bytes = %zu (max %zu, %d tensors), cache = %" PRId64 "/%" PRId64 " hits/misses, %" PRId64 " evictions, %zu fill bytes, id read = %" PRId64 " us (%d reads)\n",
                 __func__, moe_selected_bytes, moe_compact_bytes, moe_compact_max_bytes, moe_compact_tensors,
+                moe_cache_hits, moe_cache_misses, moe_cache_evictions, moe_cache_fill_bytes,
                 moe_id_read_us, moe_id_reads);
     }
 
@@ -2217,6 +2283,21 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_moe_cache(
+        ggml_backend_sched_t                            sched,
+        ggml_backend_sched_moe_cache_resolve_callback  resolve,
+        ggml_backend_sched_moe_cache_begin_callback    begin,
+        ggml_backend_sched_moe_cache_prepare_callback  prepare,
+        void *                                         user_data) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT((resolve == NULL && begin == NULL && prepare == NULL) ||
+                (resolve != NULL && begin != NULL && prepare != NULL));
+    sched->callback_moe_cache_resolve = resolve;
+    sched->callback_moe_cache_begin = begin;
+    sched->callback_moe_cache_prepare = prepare;
+    sched->callback_moe_cache_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
