@@ -23,7 +23,8 @@ import type {
 	SettingsSectionEntry,
 	SettingsSection
 } from '$lib/types';
-import { CLI_FLAGS, DEFAULT_MCP_CONFIG } from '$lib/constants';
+import { CLI_FLAGS } from './cli-flags';
+import { DEFAULT_MCP_CONFIG } from './mcp';
 import { SETTINGS_KEYS } from './settings-keys';
 import { ROUTES, SETTINGS_SECTION_SLUGS } from './routes';
 import { TITLE_GENERATION } from './title-generation';
