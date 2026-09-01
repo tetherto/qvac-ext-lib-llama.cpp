@@ -944,11 +944,6 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
         return nullptr;
     }
 
-    if (ggml_backend_cuda_reg_find_device(device) == nullptr) {
-        GGML_LOG_ERROR("%s: device %d has no kernels compiled for its compute capability\n", __func__, device);
-        return nullptr;
-    }
-
     static ggml_backend_buffer_type ggml_backend_cuda_buffer_types[GGML_CUDA_MAX_DEVICES];
 
     static bool ggml_backend_cuda_buffer_type_initialized = false;
@@ -962,6 +957,21 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
             };
         }
         ggml_backend_cuda_buffer_type_initialized = true;
+    }
+
+    // Read the cached mapping rather than re-deriving it. The table above is
+    // filled for every device id below the unfiltered count, so a null .device
+    // is exactly "this id was skipped at registration".
+    //
+    // Deliberately after the init block, not before it: this function is called
+    // per tensor copy through the GGML_ASSERT in set_tensor_async and friends,
+    // and GGML_ASSERT is not compiled out, so calling
+    // ggml_backend_cuda_reg_find_device() here would take a second global mutex
+    // and rescan the registry on every host<->device transfer. The answer never
+    // changes once registration has run.
+    if (ggml_backend_cuda_buffer_types[device].device == nullptr) {
+        GGML_LOG_ERROR("%s: device %d has no kernels compiled for its compute capability\n", __func__, device);
+        return nullptr;
     }
 
     return &ggml_backend_cuda_buffer_types[device];
