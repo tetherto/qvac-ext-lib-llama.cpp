@@ -10903,7 +10903,12 @@ static vk_pipeline ggml_vk_get_q8_0_bk64_pipeline(ggml_backend_vk_context * ctx,
     if (!aligned || !ctx->device->coopmat_support || ctx->device->coopmat2 || !ggml_vk_is_gfx1151(ctx->device)) {
         return nullptr;
     }
-    if (m < 512 || n < 128 || k < 1024 || batch < 1) {
+    // Per-shape GGML_VK_PERF_LOGGER sweep on GFX1151 (2026-09-03): BK64 beats
+    // the regular l tile by 5-6% whenever m <= 1152 at any k (up to 6912), and
+    // for any m at k <= 1536; it loses 8-40% only when both m >= 2048 and
+    // k >= 2048 (worst at 2560x9728). Crossover sits between 1152 and 2048 on
+    // both axes; gate at 1536.
+    if (m < 512 || n < 128 || k < 1024 || (k > 1536 && m > 1536) || batch < 1) {
         return nullptr;
     }
 
