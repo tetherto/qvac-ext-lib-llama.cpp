@@ -1493,7 +1493,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         node->op == GGML_OP_MUL_MAT_ID &&
                         original_ids != NULL &&
                         original_ids->type == GGML_TYPE_I32 &&
-                        original_ids->ne[1] == 1 &&
                         src->buffer != NULL &&
                         src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                         ggml_backend_buffer_is_host(src->buffer) &&
@@ -1506,14 +1505,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     ggml_backend_t backend = sched->backends[cur_backend_id];
                     struct ggml_tensor * persistent_tensor = NULL;
                     void * persistent_entry = NULL;
-                    const bool persistent_input =
+                    bool persistent_input =
                         compact_candidate &&
                         sched->n_copies == 1 &&
                         sched->callback_moe_cache_resolve != NULL &&
                         sched->callback_moe_cache_resolve(
                             sched->callback_moe_cache_user_data, src, backend,
                             &persistent_tensor, &persistent_entry);
-                    const bool compact_input = compact_candidate && (persistent_input || enable_moe_compact);
+
+                    // A batched MUL_MAT_ID can select any expert in the bank. Only use the
+                    // persistent cache when it can pin a complete layer working set; smaller
+                    // caches retain the selected-slice fallback used before cache support.
+                    if (persistent_input && original_ids->ne[1] > 1 && persistent_tensor->ne[2] < src->ne[2]) {
+                        persistent_input  = false;
+                        persistent_tensor = NULL;
+                        persistent_entry  = NULL;
+                    }
+
+                    // The transient compact path only supports single-token graphs. The
+                    // persistent cache also supports batched prompt and verification graphs.
+                    const bool compact_input = persistent_input ||
+                        (compact_candidate && original_ids->ne[1] == 1 && enable_moe_compact);
 
                     GGML_ASSERT(!persistent_input || persistent_tensor != NULL);
                     GGML_ASSERT(!persistent_input || persistent_tensor->buffer != NULL);
@@ -1883,17 +1895,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (compact_entry) {
-                        GGML_ASSERT(ids_tensor->ne[1] == 1);
+                        GGML_ASSERT(compact_entry->persistent || ids_tensor->ne[1] == 1);
                         GGML_ASSERT(input_cpy->ne[2] == compact_entry->n_slots);
 
                         remapped_ids.assign(ggml_nbytes(ids_tensor) / sizeof(int32_t), 0);
                         if (compact_entry->persistent) {
                             GGML_ASSERT(sched->callback_moe_cache_prepare != NULL);
-                            selected_ids.resize(ids_tensor->ne[0]);
-                            cache_ids.resize(ids_tensor->ne[0]);
-                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
-                                const size_t ids_index = i0 * ids_tensor->nb[0] / sizeof(int32_t);
-                                selected_ids[i0] = ids[ids_index];
+                            const size_t n_selected = size_t(ids_tensor->ne[0]) * size_t(ids_tensor->ne[1]);
+                            selected_ids.resize(n_selected);
+                            cache_ids.resize(n_selected);
+                            size_t selected_index = 0;
+                            for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; ++i1) {
+                                for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
+                                    const size_t ids_index =
+                                        i1 * ids_tensor->nb[1] / sizeof(int32_t) +
+                                        i0 * ids_tensor->nb[0] / sizeof(int32_t);
+                                    selected_ids[selected_index++] = ids[ids_index];
+                                }
                             }
 
                             struct ggml_backend_sched_moe_cache_stats stats = {};
@@ -1906,9 +1924,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 return GGML_STATUS_FAILED;
                             }
 
-                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
-                                const size_t ids_index = i0 * ids_tensor->nb[0] / sizeof(int32_t);
-                                remapped_ids[ids_index] = cache_ids[i0];
+                            selected_index = 0;
+                            for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; ++i1) {
+                                for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
+                                    const size_t ids_index =
+                                        i1 * ids_tensor->nb[1] / sizeof(int32_t) +
+                                        i0 * ids_tensor->nb[0] / sizeof(int32_t);
+                                    remapped_ids[ids_index] = cache_ids[selected_index++];
+                                }
                             }
 
                             moe_cache_fill_bytes += stats.fill_bytes;
