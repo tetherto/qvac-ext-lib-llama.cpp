@@ -940,7 +940,12 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
 
-    if (device >= ggml_backend_cuda_get_device_count()) {
+    // The lower bound is explicit rather than implied. The arch-availability
+    // check below also rejects a negative id, but it indexes the array to do
+    // so, and memory safety should not rest on a guard whose stated purpose is
+    // unrelated and which could reasonably be moved. Matches the bound
+    // ggml_backend_cuda_init already has.
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         return nullptr;
     }
 
@@ -950,9 +955,16 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 
     if (!ggml_backend_cuda_buffer_type_initialized) {
         for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_cuda_reg_find_device(i);
+            if (dev == nullptr) {
+                // Skipped at registration. Leave the slot zero-initialised
+                // rather than building a plausible-looking buffer type with a
+                // null device and a context nothing will ever free.
+                continue;
+            }
             ggml_backend_cuda_buffer_types[i] = {
                 /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
-                /* .device   = */ ggml_backend_cuda_reg_find_device(i),
+                /* .device   = */ dev,
                 /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i)},
             };
         }
@@ -1325,6 +1337,19 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+    // QVAC-23763: on a host whose every CUDA device was skipped the registry is
+    // empty, which could not happen before this change. ggml_backend_reg_dev_get
+    // would then hit its GGML_ASSERT and abort - the exact failure mode this
+    // change exists to remove. Returning null lets the caller fall back to an
+    // unpinned host buffer instead.
+    //
+    // Not reachable through ggml_backend_dev_host_buffer_type(), which needs a
+    // device and so implies the registry is non-empty; reachable through this
+    // function's own GGML_BACKEND_API export in a statically linked build.
+    if (ggml_backend_reg_dev_count(ggml_backend_cuda_reg()) == 0) {
+        return nullptr;
+    }
+
     static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host = {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_cuda_host_buffer_type_name,
@@ -5486,8 +5511,13 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 const int physical_id = info.devices[i].physical_device;
                 const int cc = info.devices[i].cc;
 
-                // all virtual devices on one card read the same props, so they
-                // share a cc and are skipped or kept as a group
+                // QVAC-23763: skip a device with no compiled kernels for its
+                // compute capability, so it never enumerates and the consumer's
+                // backend cascade falls through instead of aborting at the
+                // first kernel launch. See tetherto/qvac#4171.
+                //
+                // All virtual devices on one card read the same props, so they
+                // share a cc and are skipped or kept as a group.
                 if (!ggml_cuda_compiled_code_available(cc)) {
                     GGML_LOG_WARN("%s: skipping device %d (%s): no kernels compiled for compute capability %d.%d\n",
                                   __func__, i, ggml_cuda_device_description(i).c_str(), cc / 100, (cc % 100) / 10);

@@ -182,6 +182,10 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 }
 #endif // __CUDA_ARCH_LIST__
 
+// QVAC-23763: refuse a device the build has no kernels for, so it never reaches
+// ggml_backend_dev_count() and consumers fall through to the next backend. See
+// tetherto/qvac#4171.
+//
 // Floor test, not a loadability test: __CUDA_ARCH_LIST__ cannot tell -real from
 // -virtual, so this assumes the lowest entry is virtual and the driver can JIT
 // forward from its PTX.
