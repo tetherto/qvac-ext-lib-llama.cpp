@@ -77,9 +77,27 @@ int main() {
 
     // The whole point of skipping at registration: a host whose every CUDA
     // device is uncovered must still have somewhere to run.
-    if (n_cuda == 0 && n_total == 0) {
-        fprintf(stderr, "FAIL: CUDA registered no devices and nothing else did either\n");
-        fails++;
+    //
+    // Checking n_total == 0 would be dead code - the CPU backend registers
+    // unconditionally, so ggml_backend_dev_count() is never 0 and the assertion
+    // could not fail however badly registration broke. Look for a device that
+    // can actually take the work instead.
+    if (n_cuda == 0) {
+        bool have_fallback = false;
+        for (size_t i = 0; i < n_total; i++) {
+            // 'enum' tag required: the accessor function shadows the enum name.
+            const enum ggml_backend_dev_type t = ggml_backend_dev_type(ggml_backend_dev_get(i));
+            if (t == GGML_BACKEND_DEVICE_TYPE_CPU || t == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                have_fallback = true;
+                break;
+            }
+        }
+        if (!have_fallback) {
+            fprintf(stderr, "FAIL: every CUDA device was skipped and no CPU or GPU device remains\n");
+            fails++;
+        } else {
+            printf("all CUDA devices skipped; a non-CUDA fallback device is present\n");
+        }
     }
 
     std::map<std::string, size_t> per_card;
@@ -108,12 +126,49 @@ int main() {
                 i, props.name);
             fails++;
         }
+
+        // The other index-resolving site, and the riskier one. Before the fix,
+        // ggml_backend_cuda_init() range-checked against the UNFILTERED device
+        // count and then indexed the filtered registry, so on a host with a
+        // skipped device 0 and a kept device 1 it passed the check and aborted
+        // inside ggml_backend_cuda_reg_get_device's GGML_ASSERT. A null buffer
+        // type would not have caught that.
+        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+        if (backend == nullptr) {
+            fprintf(stderr, "FAIL: device %zu (%s) failed to initialise a backend\n", i, props.name);
+            fails++;
+        } else {
+            if (ggml_backend_get_device(backend) != dev) {
+                fprintf(stderr, "FAIL: device %zu (%s) backend is bound to a different device\n",
+                    i, props.name);
+                fails++;
+            }
+            ggml_backend_free(backend);
+        }
     }
 
     // GGML_CUDA_DEVICES splits each physical card into virtual devices. They all
     // read the same properties, so they share a compute capability and must be
     // skipped or kept as a group - never split. Round-robin assignment allows a
     // difference of one between cards.
+    //
+    // Know what this does NOT catch, because the shape is weaker than it looks.
+    // Skipped devices leave the registry entirely, so only survivors are
+    // countable, and the check is a spread over those. With one physical card
+    // the map has a single key and lo == hi unconditionally, so it cannot fail -
+    // and one card is the ordinary dev and CI configuration. With two cards the
+    // round-robin tolerance of one is exactly the size of the smallest real
+    // failure (one card losing a single virtual device), so that case passes
+    // too. It catches a gross split, not a subtle one.
+    //
+    // Making this tight needs the skipped count to be observable rather than
+    // inferred - e.g. a SKIPPED_DEVICES entry in ggml_backend_get_features, so
+    // the test can assert n_cuda + skipped == ggml_backend_cuda_get_device_count()
+    // and check each card against its full expected count. Worth doing when
+    // there is CUDA hardware in CI to run it on; today both ctest cases skip
+    // with 77 on every runner (build-cuda-ubuntu.yml builds in a GPU-less
+    // container and runs no ctest step), so this fixture has no CI value yet
+    // and is here for the manual runs on the QVAC-23763 hosts.
     if (!per_card.empty()) {
         size_t lo = SIZE_MAX, hi = 0;
         for (const auto & kv : per_card) {

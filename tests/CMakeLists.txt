@@ -332,9 +332,12 @@ llama_build_and_test(test-copy-tbq-subgroups.cpp)
 llama_build_and_test(test-opencl-fa-chunking.cpp)
 
 # QVAC-23763: the CUDA arch-availability registration guard. Self-skips with 77
-# when no CUDA registry is present. The second registration runs the same binary
-# with virtual devices on, which pins that all virtual devices backed by one
-# physical card are skipped or kept together.
+# when no CUDA registry is present, which today is every runner - there is no
+# CUDA hardware in CI, so both cases below skip and this is a fixture for manual
+# runs, not a gate. The second registration runs the same binary with virtual
+# devices on, which exercises the group-skip path; see the comment in the test
+# for what that check can and cannot detect (it catches a gross split, not the
+# one-device case).
 llama_build_and_test(test-cuda-arch-registration.cpp)
 set_tests_properties(test-cuda-arch-registration PROPERTIES SKIP_RETURN_CODE 77)
 llama_test(test-cuda-arch-registration NAME test-cuda-arch-registration-virtual)
