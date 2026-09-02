@@ -1550,6 +1550,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         compact_entry->n_slots = tensor_id_copy(src_id, cur_backend_id, 0)->ne[2];
                         compact_entry->cache_entry = persistent_entry;
                         compact_entry->persistent = persistent_input;
+                        ggml_set_output(original_ids); // keep logical IDs alive until scheduler remapping
                         for (int c = 0; c < sched->n_copies; ++c) {
                             compact_entry->ids_copies[c] = ggml_dup_tensor_layout(sched->ctx, original_ids);
                             ggml_format_name(compact_entry->ids_copies[c], "%s#%s#compact#%d",
