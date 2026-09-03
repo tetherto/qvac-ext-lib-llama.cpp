@@ -56,24 +56,7 @@ python3 examples/debug/run-moe-cache-corpus.py \
 ```
 
 Use `--regime code`, `--id cpp-lru`, or `--limit 2` for a smaller run. Raw output and a machine-readable `summary.json` with per-case and per-regime results are written to `moe-cache-corpus-results`.
-
-For a larger corpus, use the persistent-server runner to load the model only once per mode rather than once per prompt:
-
-```shell
-python3 examples/debug/run-moe-cache-server-corpus.py \
-  --model model.gguf \
-  --binary build/bin/llama-server \
-  --n-predict 128 \
-  --moe-cache-mib 2048 \
-  -- \
-  -dev CUDA0 -sm none -ngl 999 -cmoe --load-mode none -t 16 -fit off
-```
-
-The server runner disables KV prompt reuse between requests while deliberately keeping the context-owned MoE cache alive across the corpus. `--mode both` starts one baseline server and one cache server, so the full comparison loads the model twice total. Use separate baseline/cache invocations when their tensor-placement arguments differ. Generated text hashes are recorded but do not fail the run unless `--require-output-match` is passed.
-
-Set `GGML_MOE_PREFILL_OVERLAP=1` to try pipelined cache fills during multi-token prompt processing. This requires expert weights in the device's pinned host buffer (`--load-mode none`) and a cache large enough for two complete expert layers. Batches that select at least 95% of the experts use two full-layer buffers; less dense batches copy only selected experts and pipeline the projection copies. Override the full-layer threshold with `GGML_MOE_PREFILL_MIN_DENSITY` in the range `(0, 1]`.
-
-This can be combined with `--fit`: fully resident expert layers continue to execute directly from GPU weights, complete host-resident layers use the cache, and a fractional placement-boundary layer uses ordinary offload. Full-layer prefill buffers borrow two physical cache ranges without becoming LRU entries, so the rest of the decode working set survives the transition. The most recently routed prompt experts are promoted from staging into the preserved LRU with device-to-device copies before decode.
+Append validated benchmark results to `moe-cache-results.md`.
 
 The tensor data is logged as debug and requires the --verbose flag. The reason
 for this is that while useful for a model with many layers there can be a lot of
