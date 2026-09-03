@@ -33,10 +33,7 @@ public:
             size_t n_ids,
             int32_t * remapped_ids,
             std::vector<llama_moe_cache_lru_fill> & fills,
-            llama_moe_cache_lru_stats & stats,
-            int32_t first_slot = 0);
-
-    bool invalidate_slots(int32_t first_slot, int32_t n_slots);
+            llama_moe_cache_lru_stats & stats);
 
     void clear();
 

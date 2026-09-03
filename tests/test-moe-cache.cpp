@@ -134,54 +134,11 @@ static void test_clear_and_capacity() {
     GGML_ASSERT(!lru.plan(0, too_many, 3, remapped, fills, stats));
 }
 
-static void test_invalidate_slots() {
-    llama_moe_cache_lru lru(3, 4, 6);
-    const int32_t selected[] = { 0, 1 };
-    int32_t remapped[4];
-    std::vector<llama_moe_cache_lru_fill> fills;
-    llama_moe_cache_lru_stats stats;
-
-    GGML_ASSERT(lru.plan(0, selected, 2, remapped, fills, stats));
-    GGML_ASSERT(remapped[0] == 0 && remapped[1] == 1);
-    GGML_ASSERT(lru.plan(1, selected, 2, remapped, fills, stats));
-    GGML_ASSERT(remapped[0] == 2 && remapped[1] == 3);
-
-    GGML_ASSERT(lru.invalidate_slots(1, 2));
-    GGML_ASSERT(lru.plan(0, selected, 2, remapped, fills, stats));
-    GGML_ASSERT(stats.hits == 1);
-    GGML_ASSERT(stats.misses == 1);
-    GGML_ASSERT(remapped[0] == 0);
-    GGML_ASSERT(lru.plan(1, selected, 2, remapped, fills, stats));
-    GGML_ASSERT(stats.hits == 1);
-    GGML_ASSERT(stats.misses == 1);
-    GGML_ASSERT(remapped[1] == 3);
-
-    GGML_ASSERT(!lru.invalidate_slots(-1, 1));
-    GGML_ASSERT(!lru.invalidate_slots(5, 2));
-}
-
-static void test_reserved_slots() {
-    llama_moe_cache_lru lru(2, 4, 6);
-    const int32_t selected[] = { 0, 1 };
-    int32_t remapped[2];
-    std::vector<llama_moe_cache_lru_fill> fills;
-    llama_moe_cache_lru_stats stats;
-
-    GGML_ASSERT(lru.plan(0, selected, 2, remapped, fills, stats, 2));
-    GGML_ASSERT(remapped[0] == 2 && remapped[1] == 3);
-    GGML_ASSERT(lru.plan(1, selected, 2, remapped, fills, stats, 2));
-    GGML_ASSERT(remapped[0] == 4 && remapped[1] == 5);
-    GGML_ASSERT(!lru.plan(0, selected, 2, remapped, fills, stats, 5));
-    GGML_ASSERT(!lru.plan(0, selected, 2, remapped, fills, stats, 7));
-}
-
 int main() {
     test_cold_and_hit();
     test_duplicate_ids();
     test_global_lru();
     test_current_plan_pinning();
     test_clear_and_capacity();
-    test_invalidate_slots();
-    test_reserved_slots();
     return 0;
 }
