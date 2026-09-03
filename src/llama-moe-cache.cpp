@@ -34,9 +34,7 @@ bool llama_moe_cache_lru::plan(
     std::vector<bool> selected(n_experts, false);
     size_t n_selected = 0;
     for (size_t i = 0; i < n_ids; ++i) {
-        if (ids[i] < 0 || ids[i] >= n_experts) {
-            return false;
-        }
+        GGML_ASSERT(ids[i] >= 0 && ids[i] < n_experts);
         if (!selected[ids[i]]) {
             selected[ids[i]] = true;
             n_selected++;
@@ -116,10 +114,10 @@ int32_t llama_moe_cache_lru::capacity() const {
 namespace {
 
 enum class projection_kind {
-    gate,
-    up,
-    down,
-    gate_up,
+    GATE,
+    UP,
+    DOWN,
+    GATE_UP,
 };
 
 using projection_list = std::vector<std::pair<projection_kind, ggml_tensor *>>;
@@ -132,29 +130,19 @@ struct layer_source {
 static projection_list get_layer_projections(const llama_layer & layer) {
     projection_list result;
     if (layer.ffn_gate_up_exps != nullptr) {
-        result.push_back({ projection_kind::gate_up, layer.ffn_gate_up_exps });
+        result.push_back({ projection_kind::GATE_UP, layer.ffn_gate_up_exps });
     } else {
         if (layer.ffn_gate_exps != nullptr) {
-            result.push_back({ projection_kind::gate, layer.ffn_gate_exps });
+            result.push_back({ projection_kind::GATE, layer.ffn_gate_exps });
         }
         if (layer.ffn_up_exps != nullptr) {
-            result.push_back({ projection_kind::up, layer.ffn_up_exps });
+            result.push_back({ projection_kind::UP, layer.ffn_up_exps });
         }
     }
     if (layer.ffn_down_exps != nullptr) {
-        result.push_back({ projection_kind::down, layer.ffn_down_exps });
+        result.push_back({ projection_kind::DOWN, layer.ffn_down_exps });
     }
     return result;
-}
-
-static bool same_layout(const ggml_tensor * a, const ggml_tensor * b) {
-    return a->type == b->type &&
-        a->ne[0] == b->ne[0] &&
-        a->ne[1] == b->ne[1] &&
-        a->ne[2] == b->ne[2] &&
-        a->nb[0] == b->nb[0] &&
-        a->nb[1] == b->nb[1] &&
-        a->nb[2] == b->nb[2];
 }
 
 static bool same_projection_layout(
@@ -164,19 +152,13 @@ static bool same_projection_layout(
         return false;
     }
     for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].first != b[i].first || !same_layout(a[i].second, b[i].second)) {
+        if (a[i].first != b[i].first ||
+            a[i].second->type != b[i].second->type ||
+            !ggml_are_same_shape(a[i].second, b[i].second)) {
             return false;
         }
     }
     return true;
-}
-
-static ggml_tensor * dup_tensor_layout(ggml_context * ctx, const ggml_tensor * tensor) {
-    ggml_tensor * result = ggml_dup_tensor(ctx, tensor);
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        result->nb[i] = tensor->nb[i];
-    }
-    return result;
 }
 
 }
@@ -320,6 +302,8 @@ struct llama_moe_cache::impl {
         auto allocation_size = [&](int32_t n_slots) {
             size_t result = 0;
             for (const auto & item : reference) {
+                // CUDA MMQ can read padding beyond the last expert slice. The
+                // cached tensor views expose n_slots and leave this guard hidden.
                 result += GGML_PAD(item.second->nb[2] * size_t(n_slots + 1), alignment);
             }
             return result;
@@ -351,7 +335,7 @@ struct llama_moe_cache::impl {
 
         projections.reserve(reference.size());
         for (const auto & item : reference) {
-            ggml_tensor * bank = dup_tensor_layout(ctx, item.second);
+            ggml_tensor * bank = ggml_dup_tensor_layout(ctx, item.second);
             bank->ne[2] = n_slots + 1;
             bank->nb[3] = bank->nb[2] * bank->ne[2];
             ggml_format_name(bank, "moe_cache.%s", item.second->name);
@@ -422,8 +406,9 @@ struct llama_moe_cache::impl {
     }
 
     void begin() {
-        epoch++;
-        if (epoch == 0) {
+        if (++epoch == 0) {
+            // Only possible after uint64_t rollover. Invalidate the initial zero
+            // epochs before reserving a non-zero value for the next plan.
             epoch = 1;
             for (layer & cache_layer : layers) {
                 cache_layer.planned_epoch = 0;

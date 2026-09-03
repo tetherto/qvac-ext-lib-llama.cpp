@@ -770,15 +770,6 @@ void ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml
     }
 }
 
-// creates a copy of the tensor with the same memory layout
-static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, const struct ggml_tensor * tensor) {
-    struct ggml_tensor * dup = ggml_dup_tensor(ctx, tensor);
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        dup->nb[i] = tensor->nb[i];
-    }
-    return dup;
-}
-
 static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
