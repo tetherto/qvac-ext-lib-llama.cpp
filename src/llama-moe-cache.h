@@ -6,16 +6,9 @@
 #include <cstdint>
 #include <map>
 #include <memory>
-#include <utility>
 #include <vector>
 
 struct llama_model;
-
-struct llama_moe_cache_lru_stats {
-    int64_t hits = 0;
-    int64_t misses = 0;
-    int64_t evictions = 0;
-};
 
 struct llama_moe_cache_lru_fill {
     int32_t layer;
@@ -32,10 +25,7 @@ public:
             const int32_t * ids,
             size_t n_ids,
             int32_t * remapped_ids,
-            std::vector<llama_moe_cache_lru_fill> & fills,
-            llama_moe_cache_lru_stats & stats);
-
-    void clear();
+            std::vector<llama_moe_cache_lru_fill> & fills);
 
     int32_t capacity() const;
 
@@ -62,10 +52,6 @@ public:
             size_t size);
     ~llama_moe_cache();
 
-    void clear();
-
-    int32_t capacity() const;
-    size_t size() const;
     ggml_backend_t backend() const;
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -81,12 +67,9 @@ public:
             void * cache_entry,
             const int32_t * ids,
             size_t n_ids,
-            int32_t * remapped_ids,
-            ggml_backend_sched_moe_cache_stats * stats);
+            int32_t * remapped_ids);
 
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
-
-using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;

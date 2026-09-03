@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <climits>
 #include <stdexcept>
+#include <utility>
 #include <unordered_map>
 
 llama_moe_cache_lru::llama_moe_cache_lru(int32_t n_layers, int32_t n_experts, int32_t n_slots) :
@@ -23,14 +24,12 @@ bool llama_moe_cache_lru::plan(
         const int32_t * ids,
         size_t n_ids,
         int32_t * remapped_ids,
-        std::vector<llama_moe_cache_lru_fill> & fills,
-        llama_moe_cache_lru_stats & stats) {
+        std::vector<llama_moe_cache_lru_fill> & fills) {
     if (layer < 0 || layer >= n_layers || ids == nullptr || remapped_ids == nullptr) {
         return false;
     }
 
     fills.clear();
-    stats = {};
 
     std::vector<bool> selected(n_experts, false);
     size_t n_selected = 0;
@@ -59,7 +58,6 @@ bool llama_moe_cache_lru::plan(
         }
         pinned[slot_id] = true;
         slots[slot_id].last_used = ++clock;
-        stats.hits++;
     }
 
     for (int32_t expert = 0; expert < n_experts; ++expert) {
@@ -94,7 +92,6 @@ bool llama_moe_cache_lru::plan(
         if (dst.layer >= 0) {
             const size_t old_key = size_t(dst.layer) * n_experts + dst.expert;
             slot_for_expert[old_key] = -1;
-            stats.evictions++;
         }
 
         dst.layer = layer;
@@ -103,7 +100,6 @@ bool llama_moe_cache_lru::plan(
         slot_for_expert[key] = victim;
         pinned[victim] = true;
         fills.push_back({ layer, expert, victim });
-        stats.misses++;
     }
 
     for (size_t i = 0; i < n_ids; ++i) {
@@ -111,12 +107,6 @@ bool llama_moe_cache_lru::plan(
         remapped_ids[i] = slot_for_expert[key];
     }
     return true;
-}
-
-void llama_moe_cache_lru::clear() {
-    clock = 0;
-    std::fill(slot_for_expert.begin(), slot_for_expert.end(), -1);
-    std::fill(slots.begin(), slots.end(), slot {});
 }
 
 int32_t llama_moe_cache_lru::capacity() const {
@@ -192,10 +182,7 @@ static ggml_tensor * dup_tensor_layout(ggml_context * ctx, const ggml_tensor * t
 }
 
 struct llama_moe_cache::impl {
-    struct projection {
-        size_t expert_size;
-        ggml_tensor * bank = nullptr;
-    };
+    struct projection { ggml_tensor * bank = nullptr; };
 
     struct binding {
         int32_t layer;
@@ -212,7 +199,6 @@ struct llama_moe_cache::impl {
     };
 
     ggml_backend_t backend;
-    ggml_backend_buffer_type_t buft;
     bool no_alloc;
     uint64_t epoch = 0;
     llama_moe_cache_lru lru;
@@ -220,7 +206,8 @@ struct llama_moe_cache::impl {
     std::vector<binding> bindings;
     std::vector<layer> layers;
     std::unordered_map<const ggml_tensor *, size_t> binding_for_source;
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    ggml_context_ptr context;
+    ggml_backend_buffer_ptr buffer;
 
     impl(
             const llama_model & model,
@@ -228,7 +215,6 @@ struct llama_moe_cache::impl {
             ggml_backend_buffer_type_t buft,
             size_t requested_size) :
         backend(backend),
-        buft(buft),
         no_alloc(model.hparams.no_alloc),
         lru(model.layers.size(), model.hparams.n_expert, 1),
         layers(model.layers.size()) {
@@ -369,7 +355,7 @@ struct llama_moe_cache::impl {
             bank->ne[2] = n_slots + 1;
             bank->nb[3] = bank->nb[2] * bank->ne[2];
             ggml_format_name(bank, "moe_cache.%s", item.second->name);
-            projections.push_back({ item.second->nb[2], bank });
+            projections.push_back({ bank });
         }
 
         bindings.reserve(source_layers.size() * reference.size());
@@ -389,31 +375,32 @@ struct llama_moe_cache::impl {
             binding_for_source.emplace(bindings[ib].source, ib);
         }
 
-        ggml_backend_buffer_ptr buffer;
+        ggml_backend_buffer_ptr buffer_ptr;
         if (no_alloc) {
-            buffer.reset(ggml_backend_buft_alloc_buffer(buft, 0));
-            if (!buffer) {
+            buffer_ptr.reset(ggml_backend_buft_alloc_buffer(buft, 0));
+            if (!buffer_ptr) {
                 throw std::runtime_error("failed to create dummy MoE cache buffer");
             }
             for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr; tensor = ggml_get_next_tensor(ctx, tensor)) {
-                tensor->buffer = buffer.get();
+                tensor->buffer = buffer_ptr.get();
             }
         } else {
-            buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft));
-            if (!buffer) {
+            buffer_ptr.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft));
+            if (!buffer_ptr) {
                 throw std::runtime_error("failed to allocate MoE cache buffer");
             }
-            if (ggml_backend_buffer_get_size(buffer.get()) > requested_size) {
+            if (ggml_backend_buffer_get_size(buffer_ptr.get()) > requested_size) {
                 throw std::runtime_error("allocated MoE cache exceeds its budget");
             }
-            ggml_backend_buffer_clear(buffer.get(), 0);
+            ggml_backend_buffer_clear(buffer_ptr.get(), 0);
         }
 
         LLAMA_LOG_INFO("llama_moe_cache: %10s MoE cache size = %8.2f MiB, slots = %d\n",
-            ggml_backend_buffer_name(buffer.get()),
-            (no_alloc ? allocation_size(n_slots) : ggml_backend_buffer_get_size(buffer.get())) / (1024.0 * 1024.0),
+            ggml_backend_buffer_name(buffer_ptr.get()),
+            (no_alloc ? allocation_size(n_slots) : ggml_backend_buffer_get_size(buffer_ptr.get())) / (1024.0 * 1024.0),
             n_slots);
-        ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(buffer));
+        context = std::move(ctx_ptr);
+        buffer = std::move(buffer_ptr);
     }
 
     bool resolve(
@@ -448,9 +435,8 @@ struct llama_moe_cache::impl {
             binding * entry,
             const int32_t * ids,
             size_t n_ids,
-            int32_t * remapped_ids,
-            ggml_backend_sched_moe_cache_stats * stats) {
-        if (entry == nullptr || ids == nullptr || remapped_ids == nullptr || stats == nullptr) {
+            int32_t * remapped_ids) {
+        if (entry == nullptr || ids == nullptr || remapped_ids == nullptr) {
             return false;
         }
         layer & cache_layer = layers[entry->layer];
@@ -460,20 +446,17 @@ struct llama_moe_cache::impl {
                 return false;
             }
             std::copy(cache_layer.remapped_ids.begin(), cache_layer.remapped_ids.end(), remapped_ids);
-            *stats = {};
             return true;
         }
 
         cache_layer.planned_ids.assign(ids, ids + n_ids);
         cache_layer.remapped_ids.resize(n_ids);
         std::vector<llama_moe_cache_lru_fill> fills;
-        llama_moe_cache_lru_stats lru_stats;
         if (!lru.plan(
-                entry->layer, ids, n_ids, cache_layer.remapped_ids.data(), fills, lru_stats)) {
+                entry->layer, ids, n_ids, cache_layer.remapped_ids.data(), fills)) {
             return false;
         }
 
-        size_t fill_bytes = 0;
         for (size_t binding_id : cache_layer.bindings) {
             const binding & source_binding = bindings[binding_id];
             const projection & cache_projection = projections[source_binding.projection];
@@ -485,7 +468,7 @@ struct llama_moe_cache::impl {
                     return false;
                 }
                 const size_t src_available = src_size - src_offset;
-                const size_t copy_size = std::min(cache_projection.expert_size, src_available);
+                const size_t copy_size = std::min(cache_projection.bank->nb[2], src_available);
                 if (copy_size == 0) {
                     return false;
                 }
@@ -495,39 +478,24 @@ struct llama_moe_cache::impl {
                     static_cast<const uint8_t *>(source_binding.source->data) + src_offset,
                     dst_offset,
                     copy_size);
-                fill_bytes += copy_size;
             }
         }
 
         cache_layer.planned_epoch = epoch;
         std::copy(cache_layer.remapped_ids.begin(), cache_layer.remapped_ids.end(), remapped_ids);
-        stats->fill_bytes = fill_bytes;
-        stats->hits = lru_stats.hits;
-        stats->misses = lru_stats.misses;
-        stats->evictions = lru_stats.evictions;
         return true;
-    }
-
-    void clear() {
-        lru.clear();
-        epoch = 0;
-        for (layer & cache_layer : layers) {
-            cache_layer.planned_epoch = 0;
-            cache_layer.planned_ids.clear();
-            cache_layer.remapped_ids.clear();
-        }
     }
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const {
         std::map<ggml_backend_buffer_type_t, size_t> result;
-        for (const auto & item : ctxs_bufs) {
-            const ggml_backend_buffer_type_t buffer_type = ggml_backend_buffer_get_type(item.second.get());
-            if (no_alloc) {
-                result[buffer_type] += ggml_backend_alloc_ctx_tensors_from_buft_size(item.first.get(), buffer_type);
-            } else {
-                result[buffer_type] += ggml_backend_buffer_get_size(item.second.get());
-            }
+        if (!buffer) {
+            return result;
         }
+
+        const ggml_backend_buffer_type_t buffer_type = ggml_backend_buffer_get_type(buffer.get());
+        result[buffer_type] = no_alloc
+            ? ggml_backend_alloc_ctx_tensors_from_buft_size(context.get(), buffer_type)
+            : ggml_backend_buffer_get_size(buffer.get());
         return result;
     }
 };
@@ -541,22 +509,6 @@ llama_moe_cache::llama_moe_cache(
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
-
-void llama_moe_cache::clear() {
-    pimpl->clear();
-}
-
-int32_t llama_moe_cache::capacity() const {
-    return pimpl->bindings.empty() ? 0 : pimpl->lru.capacity();
-}
-
-size_t llama_moe_cache::size() const {
-    size_t result = 0;
-    for (const auto & item : pimpl->memory_breakdown()) {
-        result += item.second;
-    }
-    return result;
-}
 
 ggml_backend_t llama_moe_cache::backend() const {
     return pimpl->backend;
@@ -585,8 +537,7 @@ bool llama_moe_cache::sched_prepare(
         void * cache_entry,
         const int32_t * ids,
         size_t n_ids,
-        int32_t * remapped_ids,
-        ggml_backend_sched_moe_cache_stats * stats) {
+        int32_t * remapped_ids) {
     return static_cast<llama_moe_cache *>(user_data)->pimpl->prepare(
-        static_cast<impl::binding *>(cache_entry), ids, n_ids, remapped_ids, stats);
+        static_cast<impl::binding *>(cache_entry), ids, n_ids, remapped_ids);
 }

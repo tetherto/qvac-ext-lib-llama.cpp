@@ -317,13 +317,6 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
-    struct ggml_backend_sched_moe_cache_stats {
-        size_t  fill_bytes;
-        int64_t hits;
-        int64_t misses;
-        int64_t evictions;
-    };
-
     typedef bool (*ggml_backend_sched_moe_cache_resolve_callback)(
             void *                user_data,
             const struct ggml_tensor * weight,
@@ -334,12 +327,11 @@ extern "C" {
     typedef void (*ggml_backend_sched_moe_cache_begin_callback)(void * user_data);
 
     typedef bool (*ggml_backend_sched_moe_cache_prepare_callback)(
-            void *                                       user_data,
-            void *                                       cache_entry,
-            const int32_t *                              ids,
-            size_t                                       n_ids,
-            int32_t *                                    remapped_ids,
-            struct ggml_backend_sched_moe_cache_stats *  stats);
+            void *          user_data,
+            void *          cache_entry,
+            const int32_t * ids,
+            size_t          n_ids,
+            int32_t *       remapped_ids);
 
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);

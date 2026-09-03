@@ -1036,9 +1036,6 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
-    // Clear persistent MoE expert residency without releasing its buffers
-    LLAMA_API void llama_moe_cache_clear(struct llama_context * ctx);
-
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.

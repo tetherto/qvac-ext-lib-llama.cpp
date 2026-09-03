@@ -785,13 +785,6 @@ void llama_context::synchronize() {
     t_compute_start_us = 0;
 }
 
-void llama_context::moe_cache_clear() {
-    synchronize();
-    if (moe_cache) {
-        moe_cache->clear();
-    }
-}
-
 const llama_model & llama_context::get_model() const {
     return model;
 }
@@ -3983,10 +3976,6 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
-}
-
-void llama_moe_cache_clear(llama_context * ctx) {
-    ctx->moe_cache_clear();
 }
 
 float * llama_get_logits(llama_context * ctx) {
