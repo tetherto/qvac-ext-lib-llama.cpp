@@ -52,7 +52,7 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used >= 0 && expert_used < expert;
+                nex_prev += expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -77,7 +77,7 @@ static __global__ void mm_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used >= 0 && expert_used < expert;
+            nex_prev += expert_used < expert;
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -177,31 +177,4 @@ void ggml_cuda_launch_mm_ids_helper(
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
     }
-}
-
-static __global__ void mmid_scatter_f32(
-        const float * __restrict__ src, const int32_t * __restrict__ dst_rows, float * __restrict__ dst,
-        const int64_t ncols, const int64_t nelements, const int64_t dst_row_stride) {
-    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= nelements) {
-        return;
-    }
-
-    const int64_t src_row = i / ncols;
-    const int64_t col = i % ncols;
-    dst[int64_t(dst_rows[src_row]) * dst_row_stride + col] = src[i];
-}
-
-void ggml_cuda_launch_mmid_scatter_f32(
-        const float * src, const int32_t * dst_rows, float * dst,
-        int64_t ncols, int64_t nrows, int64_t dst_row_stride, cudaStream_t stream) {
-    const int64_t nelements = ncols * nrows;
-    if (nelements == 0) {
-        return;
-    }
-
-    const int block_size = 256;
-    const int num_blocks = (nelements + block_size - 1) / block_size;
-    mmid_scatter_f32<<<num_blocks, block_size, 0, stream>>>(
-        src, dst_rows, dst, ncols, nelements, dst_row_stride);
 }

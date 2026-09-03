@@ -4804,7 +4804,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, bool inactive = false) {
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -4817,11 +4817,6 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, bool inactiv
                     data[i] = i % n_mats;
                 }
                 std::shuffle(data.begin(), data.end(), rng);
-                if (inactive) {
-                    for (int i = 0; i < t->ne[0]; i += 3) {
-                        data[i] = -1;
-                    }
-                }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
@@ -4918,10 +4913,9 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
-    const bool inactive;
 
     std::string vars() override {
-        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, inactive);
+        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
     }
 
     double max_nmse_err() override {
@@ -4943,9 +4937,9 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool inactive = false)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), inactive(inactive) {
+            m(m), n(n), k(k) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -4965,14 +4959,13 @@ struct test_mul_mat_id : public test_case {
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
-        ggml_mul_mat_id_set_allow_inactive(out, inactive);
         ggml_set_name(out, "out");
 
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats, inactive);
+        init_mul_mat_id_tensors(ctx, n_mats);
     }
 };
 
@@ -5128,10 +5121,9 @@ struct test_mul_mat_id_fusion : public test_case {
     const int64_t k;
     const uint32_t o; // number of outputs
     const bool mul;
-    const bool inactive;
 
     std::string vars() override {
-        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul, inactive);
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, o, mul);
     }
 
     double max_nmse_err() override {
@@ -5145,9 +5137,9 @@ struct test_mul_mat_id_fusion : public test_case {
 
     test_mul_mat_id_fusion(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1, bool mul = false, bool inactive = false)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, uint32_t o = 1, bool mul = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), o(o), mul(mul), inactive(inactive) {
+            m(m), n(n), k(k), o(o), mul(mul) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -5167,13 +5159,11 @@ struct test_mul_mat_id_fusion : public test_case {
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
-        ggml_mul_mat_id_set_allow_inactive(out, inactive);
         ggml_set_name(out, "out");
 
         for (uint32_t i = 1; i < o; ++i) {
             ggml_tensor * a2 = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
             ggml_tensor * out2 = ggml_mul_mat_id(ctx, a2, b, ids);
-            ggml_mul_mat_id_set_allow_inactive(out2, inactive);
             ggml_set_name(out2, "out2");
             out = ggml_add(ctx, out, out2);
         }
@@ -5189,7 +5179,7 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats, inactive);
+        init_mul_mat_id_tensors(ctx, n_mats);
     }
 
     bool run_whole_graph() override { return true; }
@@ -10314,15 +10304,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
-
-    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
-        for (int n : {1, 5}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 64, n, 256, true));
-        }
-    }
-    test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 8, 4, false, 64, 1, 256, 3, false, true));
-    test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, false, 64, 1, 256, 1, true, true));
-    test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q4_K, GGML_TYPE_F32, 8, 4, false, 64, 5, 256, 1, true, true));
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
