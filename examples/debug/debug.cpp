@@ -20,10 +20,6 @@ static void print_usage(int /*argc*/, char ** argv) {
 
           {prog} -m model.gguf -p "Hello my name is" --verbose
 
-          Print tensors while greedily decoding 32 tokens:
-
-          {prog} -m model.gguf -p "Hello my name is" -n 32 --verbose
-
           The tensors to be printed can be filtered with --tensor-filter option.
 
           Save logits/embeddings:
@@ -214,25 +210,6 @@ static bool run(llama_context * ctx, const common_params & params) {
         } catch (const std::exception & e) {
             LOG_ERR("%s : error saving logits: %s\n", __func__, e.what());
         }
-    }
-
-    if (params.n_predict > 0 && !params.embedding) {
-        llama_sampler_ptr sampler(llama_sampler_init_greedy());
-
-        for (int32_t i = 0; i < params.n_predict; ++i) {
-            llama_token token = llama_sampler_sample(sampler.get(), ctx, -1);
-            if (llama_vocab_is_eog(vocab, token)) {
-                break;
-            }
-
-            LOG("%s", common_token_to_piece(vocab, token, true).c_str());
-
-            if (llama_decode(ctx, llama_batch_get_one(&token, 1))) {
-                LOG_ERR("%s : failed to decode generated token\n", __func__);
-                return false;
-            }
-        }
-        LOG("\n");
     }
 
     return true;
