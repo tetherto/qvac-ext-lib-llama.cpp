@@ -320,7 +320,7 @@ struct llama_moe_cache::impl {
         }
         const size_t n_layout_mismatch_layers = complete_source_layers.size() - source_layers.size();
         if (n_layout_mismatch_layers > 0) {
-            LLAMA_LOG_INFO(
+            LLAMA_LOG_WARN(
                 "llama_moe_cache: %zu expert layers with non-dominant tensor layouts use ordinary offload\n",
                 n_layout_mismatch_layers);
         }
