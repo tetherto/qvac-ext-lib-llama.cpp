@@ -643,6 +643,7 @@ void llama_context::sched_reserve() {
         if (moe_cache) {
             ggml_backend_sched_set_moe_cache(
                 sched.get(),
+                moe_cache->backend(),
                 llama_moe_cache::sched_resolve,
                 llama_moe_cache::sched_begin,
                 llama_moe_cache::sched_prepare,

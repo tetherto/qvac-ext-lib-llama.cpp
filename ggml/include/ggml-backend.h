@@ -380,6 +380,7 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_moe_cache(
             ggml_backend_sched_t                            sched,
+            ggml_backend_t                                  backend,
             ggml_backend_sched_moe_cache_resolve_callback  resolve,
             ggml_backend_sched_moe_cache_begin_callback    begin,
             ggml_backend_sched_moe_cache_prepare_callback  prepare,

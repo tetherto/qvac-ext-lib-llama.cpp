@@ -870,6 +870,7 @@ struct ggml_backend_sched {
     ggml_backend_sched_moe_cache_begin_callback callback_moe_cache_begin;
     ggml_backend_sched_moe_cache_prepare_callback callback_moe_cache_prepare;
     void * callback_moe_cache_user_data;
+    ggml_backend_t moe_cache_backend;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1038,6 +1039,14 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    if (i == 0 && tensor->op == GGML_OP_MUL_MAT_ID && sched->moe_cache_backend != NULL) {
+                        const int cache_backend_id = ggml_backend_sched_backend_id(sched, sched->moe_cache_backend);
+                        GGML_ASSERT(cache_backend_id >= 0 && cache_backend_id < src_backend_id);
+                        if (ggml_backend_supports_op(sched->moe_cache_backend, tensor)) {
+                            SET_CAUSE(tensor, "1.moe");
+                            return cache_backend_id;
+                        }
+                    }
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
@@ -2311,13 +2320,17 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 
 void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t                            sched,
+        ggml_backend_t                                  backend,
         ggml_backend_sched_moe_cache_resolve_callback  resolve,
         ggml_backend_sched_moe_cache_begin_callback    begin,
         ggml_backend_sched_moe_cache_prepare_callback  prepare,
         void *                                         user_data) {
     GGML_ASSERT(sched);
-    GGML_ASSERT((resolve == NULL && begin == NULL && prepare == NULL) ||
-                (resolve != NULL && begin != NULL && prepare != NULL));
+    GGML_ASSERT((backend == NULL && resolve == NULL && begin == NULL && prepare == NULL) ||
+                (backend != NULL && resolve != NULL && begin != NULL && prepare != NULL));
+    const int backend_id = backend == NULL ? -1 : ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend == NULL || (backend_id >= 0 && backend_id < sched->n_backends - 1));
+    sched->moe_cache_backend = backend;
     sched->callback_moe_cache_resolve = resolve;
     sched->callback_moe_cache_begin = begin;
     sched->callback_moe_cache_prepare = prepare;

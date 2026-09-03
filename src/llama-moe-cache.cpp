@@ -913,6 +913,10 @@ size_t llama_moe_cache::size() const {
     return result;
 }
 
+ggml_backend_t llama_moe_cache::backend() const {
+    return pimpl->backend;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
     return pimpl->memory_breakdown();
 }

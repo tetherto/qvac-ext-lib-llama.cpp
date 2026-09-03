@@ -69,6 +69,7 @@ public:
 
     int32_t capacity() const;
     size_t size() const;
+    ggml_backend_t backend() const;
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     static bool sched_resolve(
