@@ -24,12 +24,14 @@ bool llama_moe_cache_lru::plan(
         const int32_t * ids,
         size_t n_ids,
         int32_t * remapped_ids,
-        std::vector<llama_moe_cache_lru_fill> & fills) {
+        std::vector<llama_moe_cache_lru_fill> & fills,
+        llama_moe_cache_lru_stats & stats) {
     if (layer < 0 || layer >= n_layers || ids == nullptr || remapped_ids == nullptr) {
         return false;
     }
 
     fills.clear();
+    stats = {};
 
     std::vector<bool> selected(n_experts, false);
     size_t n_selected = 0;
@@ -56,6 +58,7 @@ bool llama_moe_cache_lru::plan(
         }
         pinned[slot_id] = true;
         slots[slot_id].last_used = ++clock;
+        stats.hits++;
     }
 
     for (int32_t expert = 0; expert < n_experts; ++expert) {
@@ -90,6 +93,7 @@ bool llama_moe_cache_lru::plan(
         if (dst.layer >= 0) {
             const size_t old_key = size_t(dst.layer) * n_experts + dst.expert;
             slot_for_expert[old_key] = -1;
+            stats.evictions++;
         }
 
         dst.layer = layer;
@@ -98,6 +102,7 @@ bool llama_moe_cache_lru::plan(
         slot_for_expert[key] = victim;
         pinned[victim] = true;
         fills.push_back({ layer, expert, victim });
+        stats.misses++;
     }
 
     for (size_t i = 0; i < n_ids; ++i) {
@@ -164,6 +169,13 @@ static bool same_projection_layout(
 }
 
 struct llama_moe_cache::impl {
+    struct cache_stats {
+        size_t hits = 0;
+        size_t misses = 0;
+        size_t evictions = 0;
+        size_t fill_bytes = 0;
+    };
+
     struct projection { ggml_tensor * bank = nullptr; };
 
     struct binding {
@@ -183,6 +195,7 @@ struct llama_moe_cache::impl {
     ggml_backend_t backend;
     bool no_alloc;
     uint64_t epoch = 0;
+    cache_stats stats;
     llama_moe_cache_lru lru;
     std::vector<projection> projections;
     std::vector<binding> bindings;
@@ -406,6 +419,7 @@ struct llama_moe_cache::impl {
     }
 
     void begin() {
+        stats = {};
         if (++epoch == 0) {
             // Only possible after uint64_t rollover. Invalidate the initial zero
             // epochs before reserving a non-zero value for the next plan.
@@ -437,11 +451,13 @@ struct llama_moe_cache::impl {
         cache_layer.planned_ids.assign(ids, ids + n_ids);
         cache_layer.remapped_ids.resize(n_ids);
         std::vector<llama_moe_cache_lru_fill> fills;
+        llama_moe_cache_lru_stats lru_stats;
         if (!lru.plan(
-                entry->layer, ids, n_ids, cache_layer.remapped_ids.data(), fills)) {
+                entry->layer, ids, n_ids, cache_layer.remapped_ids.data(), fills, lru_stats)) {
             return false;
         }
 
+        size_t fill_bytes = 0;
         for (size_t binding_id : cache_layer.bindings) {
             const binding & source_binding = bindings[binding_id];
             const projection & cache_projection = projections[source_binding.projection];
@@ -463,12 +479,28 @@ struct llama_moe_cache::impl {
                     static_cast<const uint8_t *>(source_binding.source->data) + src_offset,
                     dst_offset,
                     copy_size);
+                fill_bytes += copy_size;
             }
         }
 
+        stats.hits += lru_stats.hits;
+        stats.misses += lru_stats.misses;
+        stats.evictions += lru_stats.evictions;
+        stats.fill_bytes += fill_bytes;
         cache_layer.planned_epoch = epoch;
         std::copy(cache_layer.remapped_ids.begin(), cache_layer.remapped_ids.end(), remapped_ids);
         return true;
+    }
+
+    void log_stats() const {
+        const size_t accesses = stats.hits + stats.misses;
+        if (accesses == 0) {
+            return;
+        }
+        LLAMA_LOG_INFO(
+            "llama_moe_cache: hits = %zu, misses = %zu, hit rate = %.2f%%, evictions = %zu, transferred = %.2f MiB\n",
+            stats.hits, stats.misses, 100.0 * stats.hits / accesses, stats.evictions,
+            stats.fill_bytes / (1024.0 * 1024.0));
     }
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const {
@@ -501,6 +533,10 @@ ggml_backend_t llama_moe_cache::backend() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
     return pimpl->memory_breakdown();
+}
+
+void llama_moe_cache::log_stats() const {
+    pimpl->log_stats();
 }
 
 bool llama_moe_cache::sched_resolve(

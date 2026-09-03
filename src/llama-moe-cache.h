@@ -16,6 +16,12 @@ struct llama_moe_cache_lru_fill {
     int32_t slot;
 };
 
+struct llama_moe_cache_lru_stats {
+    size_t hits = 0;
+    size_t misses = 0;
+    size_t evictions = 0;
+};
+
 class llama_moe_cache_lru {
 public:
     llama_moe_cache_lru(int32_t n_layers, int32_t n_experts, int32_t n_slots);
@@ -25,7 +31,8 @@ public:
             const int32_t * ids,
             size_t n_ids,
             int32_t * remapped_ids,
-            std::vector<llama_moe_cache_lru_fill> & fills);
+            std::vector<llama_moe_cache_lru_fill> & fills,
+            llama_moe_cache_lru_stats & stats);
 
     int32_t capacity() const;
 
@@ -54,6 +61,7 @@ public:
 
     ggml_backend_t backend() const;
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+    void log_stats() const;
 
     static bool sched_resolve(
             void * user_data,
