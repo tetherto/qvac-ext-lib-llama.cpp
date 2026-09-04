@@ -47,21 +47,13 @@
 #
 set -euo pipefail
 
-# --- Model presets ---
+# --- Shared harness helpers (model presets, download, ref impl, CSV/log) ---
 
-declare -A MODEL_PRESETS_NAME MODEL_PRESETS_URL
-MODEL_PRESETS_NAME[mistral-q8]="Mistral-7B-Instruct-v0.3-Q8_0.gguf"
-MODEL_PRESETS_URL[mistral-q8]="https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q8_0.gguf"
-MODEL_PRESETS_NAME[llama-q8]="Llama-3.1-8B-Instruct-Q8_0.gguf"
-MODEL_PRESETS_URL[llama-q8]="https://huggingface.co/second-state/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Llama-3.1-8B-Instruct-Q8_0.gguf"
-MODEL_PRESETS_NAME[qwen25-05b-q8]="Qwen2.5-0.5B-Instruct-Q8_0.gguf"
-MODEL_PRESETS_URL[qwen25-05b-q8]="https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q8_0.gguf"
-MODEL_PRESETS_NAME[qwen35-4b-q8]="Qwen3.5-4B-Q8_0.gguf"
-MODEL_PRESETS_URL[qwen35-4b-q8]="https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q8_0.gguf"
-MODEL_PRESETS_NAME[qwen36-35b-a3b-ud-q4km]="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-MODEL_PRESETS_URL[qwen36-35b-a3b-ud-q4km]="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-
-ALL_MODEL_PRESETS=("mistral-q8" "llama-q8" "qwen25-05b-q8" "qwen35-4b-q8" "qwen36-35b-a3b-ud-q4km")
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KVQ_PREFIX="kv-perf"
+KVQ_TOOL="llama-bench"
+# shellcheck source=kv_quant_common.sh
+source "${SCRIPT_DIR}/kv_quant_common.sh"
 
 # --- Parse arguments ---
 
@@ -211,23 +203,7 @@ if [ "$RUN_ALL" = true ]; then
     fi
     [ -n "${BUILD_DIR:-}" ] && PASS_ARGS+=("$BUILD_DIR")
 
-    echo "=========================================="
-    echo " Running all model presets sequentially"
-    echo "=========================================="
-    echo ""
-    for preset in "${ALL_MODEL_PRESETS[@]}"; do
-        echo ">>> Starting: $preset (${MODEL_PRESETS_NAME[$preset]})"
-        echo ""
-        "$SELF" -m "$preset" "${PASS_ARGS[@]}" || echo ">>> FAILED: $preset"
-        echo ""
-        echo ">>> Finished: $preset"
-        echo ""
-    done
-    echo "=========================================="
-    echo " All model presets complete. Log files:"
-    echo "=========================================="
-    ls -1t kv-perf_*.txt 2>/dev/null | head -20
-    exit 0
+    _kvq_run_all_presets "$SELF" "${PASS_ARGS[@]}"
 fi
 
 BUILD_DIR="${BUILD_DIR:-build}"
@@ -235,54 +211,10 @@ BENCH="$BUILD_DIR/bin/llama-bench"
 
 # --- Reference implementation setup ---
 
-REF_BENCH=""
-REF_CONFIGS=()
-REF_GIT_INFO=""
-REF_GIT_BRANCH=""
-REF_GIT_DIRTY=""
-REF_GIT_ORIGIN=""
+_kvq_setup_ref_impl
 
-REF_IMPL="${REF_IMPL:-../llama-cpp-turboquant}"
-[ ${#REF_KS[@]} -eq 0 ] && REF_KS=("turbo3" "turbo4")
-[ ${#REF_VS[@]} -eq 0 ] && REF_VS=("turbo3" "turbo4")
-
-if [ ! -d "$REF_IMPL" ]; then
-    echo "Note: reference implementation not found at $REF_IMPL — skipping ref rows."
-elif [ ! -f "$REF_IMPL/build/bin/llama-bench" ]; then
-    echo "Note: reference bench binary not found at $REF_IMPL/build/bin/llama-bench — skipping ref rows."
-else
-    REF_BENCH="$REF_IMPL/build/bin/llama-bench"
-
-    for rk in "${REF_KS[@]}"; do
-        for rv in "${REF_VS[@]}"; do
-            REF_CONFIGS+=("${rk}:${rv}")
-        done
-    done
-
-    if command -v git &> /dev/null && git -C "$REF_IMPL" rev-parse --git-dir &> /dev/null; then
-        REF_GIT_INFO=$(git -C "$REF_IMPL" log --oneline -3 2>/dev/null || true)
-        REF_GIT_BRANCH=$(git -C "$REF_IMPL" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-        REF_GIT_DIRTY=$(git -C "$REF_IMPL" diff --quiet 2>/dev/null && echo "" || echo " (dirty)")
-        REF_GIT_ORIGIN=$(git -C "$REF_IMPL" remote get-url origin 2>/dev/null || echo "")
-    fi
-
-fi
-
-MODEL_DIR="${MODEL_DIR:-models}"
-
-if [ -n "$MODEL_PRESET" ]; then
-    if [ -z "${MODEL_PRESETS_NAME[$MODEL_PRESET]:-}" ]; then
-        echo "Error: unknown model preset '$MODEL_PRESET'"
-        echo "Available: ${ALL_MODEL_PRESETS[*]}"
-        exit 1
-    fi
-    MODEL_NAME="${MODEL_PRESETS_NAME[$MODEL_PRESET]}"
-    MODEL_URL="${MODEL_PRESETS_URL[$MODEL_PRESET]}"
-else
-    MODEL_NAME="${MODEL_NAME:-Mistral-7B-Instruct-v0.3-Q8_0.gguf}"
-    MODEL_URL="${MODEL_URL:-https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q8_0.gguf}"
-fi
-MODEL_PATH="$MODEL_DIR/$MODEL_NAME"
+_kvq_resolve_model "Mistral-7B-Instruct-v0.3-Q8_0.gguf" \
+    "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q8_0.gguf"
 
 SKIP_COOPMAT_COMPARE="${SKIP_COOPMAT_COMPARE:-0}"
 if [ "$SKIP_SCALAR" = "1" ]; then
@@ -398,74 +330,11 @@ if [ -n "$SPLIT_MODE" ]; then
     SPLIT_ARGS=(--split-mode "$SPLIT_MODE")
 fi
 
-mkdir -p "$MODEL_DIR"
+_kvq_download_model
 
-if [ ! -f "$MODEL_PATH" ] || [ "$(stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)" -lt 1000000 ]; then
-    [ -f "$MODEL_PATH" ] && rm -f "$MODEL_PATH"
-    echo "Downloading model: $MODEL_NAME ..."
-    if command -v curl &> /dev/null; then
-        curl -L --fail -C - -o "$MODEL_PATH" "$MODEL_URL"
-    elif command -v wget &> /dev/null; then
-        wget -O "$MODEL_PATH" "$MODEL_URL"
-    else
-        echo "Error: neither curl nor wget found"
-        exit 1
-    fi
-    FILE_SIZE=$(stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)
-    if [ "$FILE_SIZE" -lt 1000000 ]; then
-        echo "Error: downloaded file is only $FILE_SIZE bytes."
-        rm -f "$MODEL_PATH"
-        exit 1
-    fi
-    echo "Model downloaded to $MODEL_PATH ($((FILE_SIZE / 1048576)) MB)"
-else
-    echo "Model already exists: $MODEL_PATH"
-fi
+# --- GPU detection + CSV/log setup ---
 
-# --- GPU device detection ---
-
-detect_gpu_device() {
-    local gpu_info=""
-
-    if [ -f "$BENCH" ]; then
-        gpu_info=$("$BENCH" --list-devices 2>&1 | grep -E '^\s+(Vulkan|CUDA|Metal|SYCL|ROCm)' | head -1 | sed 's/^[[:space:]]*//' || true)
-    fi
-
-    if [ -z "$gpu_info" ]; then
-        if command -v nvidia-smi &> /dev/null; then
-            gpu_info=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
-        elif command -v vulkaninfo &> /dev/null; then
-            gpu_info=$(vulkaninfo 2>/dev/null | grep "deviceName" | head -1 | sed 's/.*= //' || true)
-        fi
-    fi
-
-    echo "${gpu_info:-unknown}"
-}
-
-GPU_DEVICE=$(detect_gpu_device)
-
-# Auto-generate CSV filename unless explicitly provided or disabled (CSV=0)
-CSV_FINAL=""
-if [ -z "$CSV_FILE" ] && [ "${CSV:-1}" != "0" ]; then
-    sanitize() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g; s/__*/_/g; s/^_//; s/_$//'; }
-    GPU_SHORT=$(echo "$GPU_DEVICE" | sed 's/^[A-Za-z]*[0-9]*: //; s/ ([0-9].*//')
-    GPU_TAG=$(sanitize "$GPU_SHORT")
-    MODEL_TAG=$(sanitize "${MODEL_NAME%.gguf}")
-    CFG_TAG=$(printf '%s-' "${CONFIGS[@]}" | sed 's/-$//')
-    CSV_FILE="kv-perf_${GPU_TAG}_${MODEL_TAG}_${CFG_TAG}_$(date +%Y%m%d_%H%M%S).csv"
-fi
-if [ -n "$CSV_FILE" ]; then
-    CSV_FINAL="$CSV_FILE"
-    CSV_FILE=$(mktemp /tmp/kv-perf-XXXXXX.csv)
-fi
-
-# --- Log file setup (same name as CSV, .txt extension) ---
-
-LOG_FILE=""
-if [ -n "$CSV_FINAL" ]; then
-    LOG_FILE="${CSV_FINAL%.csv}.txt"
-    exec > >(tee -a "$LOG_FILE") 2>&1
-fi
+_kvq_setup_csv_and_log
 
 # --- Detect coopmat support ---
 
@@ -618,7 +487,7 @@ probe_kv_sizes() {
             v_type="${pair##*:}"
             ref_key="ref-${k_type}:ref-${v_type}"
             local output
-            output=$("$REF_BENCH" -v \
+            output=$("$REF_BIN" -v \
                 "${SPLIT_ARGS[@]}" \
                 -m "$MODEL_PATH" \
                 --cache-type-k "$k_type" \
@@ -823,7 +692,7 @@ fi
 if [ ${#REF_CONFIGS[@]} -gt 0 ]; then
     echo " ──────────────────────────────────────"
     echo " Ref impl:    $(readlink -f "$REF_IMPL")"
-    echo " Ref bin:     $REF_BENCH"
+    echo " Ref bin:     $REF_BIN"
     if [ -n "$REF_GIT_INFO" ]; then
         [ -n "$REF_GIT_ORIGIN" ] && echo " Ref origin:  $REF_GIT_ORIGIN"
         echo " Ref branch:  ${REF_GIT_BRANCH}${REF_GIT_DIRTY}"
@@ -951,7 +820,7 @@ for cfg in "${CONFIGS[@]}"; do
             if [ "$RUN_SCALAR_TESTS" = "1" ]; then
                 eta=$(fmt_eta "$completed_jobs" "$total_jobs" "$bench_start_time")
                 echo "[$((completed_jobs+1))/$total_jobs, ETA $eta] Running: K=ref-$k_type V=ref-$v_type (ref impl, $cfg) ..."
-                result=$(run_bench "$k_type" "$v_type" "" "ref" "$PROMPT_LEN_CFG" "$GEN_LEN_CFG" "$REPS_CFG" "$REF_BENCH") || { completed_jobs=$((completed_jobs + 1)); continue; }
+                result=$(run_bench "$k_type" "$v_type" "" "ref" "$PROMPT_LEN_CFG" "$GEN_LEN_CFG" "$REPS_CFG" "$REF_BIN") || { completed_jobs=$((completed_jobs + 1)); continue; }
                 pp_scalar["$ref_key"]=$(echo "$result" | awk '{print $1}')
                 ppsd_scalar["$ref_key"]=$(echo "$result" | awk '{print $2}')
                 tg_scalar["$ref_key"]=$(echo "$result" | awk '{print $3}')
@@ -966,7 +835,7 @@ for cfg in "${CONFIGS[@]}"; do
                     local_env=$(coopmat_env_for "$lvl")
                     eta=$(fmt_eta "$completed_jobs" "$total_jobs" "$bench_start_time")
                     echo "[$((completed_jobs+1))/$total_jobs, ETA $eta] Running: K=ref-$k_type V=ref-$v_type ($local_label ref, $cfg) ..."
-                    result=$(run_bench "$k_type" "$v_type" "$local_env" "$local_label" "$PROMPT_LEN_CFG" "$GEN_LEN_CFG" "$REPS_CFG" "$REF_BENCH") || { completed_jobs=$((completed_jobs + 1)); continue; }
+                    result=$(run_bench "$k_type" "$v_type" "$local_env" "$local_label" "$PROMPT_LEN_CFG" "$GEN_LEN_CFG" "$REPS_CFG" "$REF_BIN") || { completed_jobs=$((completed_jobs + 1)); continue; }
                     eval "pp_${lvl}[\"$ref_key\"]=$(echo "$result" | awk '{print $1}')"
                     eval "ppsd_${lvl}[\"$ref_key\"]=$(echo "$result" | awk '{print $2}')"
                     eval "tg_${lvl}[\"$ref_key\"]=$(echo "$result" | awk '{print $3}')"

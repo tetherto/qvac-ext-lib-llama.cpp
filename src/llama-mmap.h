@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 #include <cstdio>
 #include "uint8-buff-stream.h"
@@ -36,6 +37,9 @@ struct llama_file {
 
     virtual size_t read_alignment() const { return 1; }
     virtual bool has_direct_io() const { return false; }
+
+    /// @return contiguous in-memory contents, or nullptr if not memory-backed
+    virtual const void * data_ptr() const { return nullptr; }
 };
 
 struct llama_file_disk : public llama_file {
@@ -88,6 +92,8 @@ template <bool Writable> struct llama_file_buffer : public llama_file {
     /// @throw std::runtime_error if the buffer is read-only
     void write_u32(uint32_t val) const override;
 
+    const void * data_ptr() const override;
+
     std::unique_ptr<std::basic_streambuf<char>> streambuf;
 };
 
@@ -130,8 +136,12 @@ using llama_future_file_buffer_ro = llama_future_file_buffer<false>;
 using llama_future_file_buffer_rw = llama_future_file_buffer<true>;
 
 struct llama_mmap {
+    // list of [first, last) byte ranges within a file
+    using ranges = std::vector<std::pair<size_t, size_t>>;
+
     llama_mmap(const llama_mmap &) = delete;
-    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false);
+    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
+               const ranges & lazy_ranges = {});
     ~llama_mmap();
 
     size_t size() const;

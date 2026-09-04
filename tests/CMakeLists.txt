@@ -87,7 +87,7 @@ function(llama_build_and_test source)
     set(multiValueArgs ARGS)
     cmake_parse_arguments(LLAMA_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS} get-model.cpp)
+    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS})
 
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
@@ -144,9 +144,41 @@ if (NOT WIN32)
     )
 endif()
 
+# POC vector-index smoke test: no model required, no llama runtime touched.
+if (TARGET ggml-vector-index)
+    add_executable(test-vector-index test-vector-index.cpp)
+    target_compile_features(test-vector-index PRIVATE cxx_std_17)
+    target_include_directories(test-vector-index PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-vector-index PRIVATE ggml-vector-index)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-vector-index RUNTIME)
+    endif()
+    llama_test(test-vector-index)
+
+    add_executable(test-vector-index-hooks test-vector-index.cpp)
+    target_compile_features(test-vector-index-hooks PRIVATE cxx_std_17)
+    target_include_directories(test-vector-index-hooks PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-vector-index-hooks PRIVATE GGML_VEC_INDEX_TEST_HOOKS)
+    target_link_libraries(test-vector-index-hooks PRIVATE ggml-vector-index-test)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-vector-index-hooks RUNTIME)
+    endif()
+    llama_test(test-vector-index-hooks ARGS --internal-hooks)
+
+    add_executable(test-vector-index-faults test-vector-index-faults.cpp)
+    target_compile_features(test-vector-index-faults PRIVATE cxx_std_17)
+    target_link_libraries(test-vector-index-faults PRIVATE ggml-vector-index-test)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-vector-index-faults RUNTIME)
+    endif()
+    llama_test(test-vector-index-faults)
+endif()
+
 if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
+
+llama_build(test-recurrent-state-rollback.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -155,6 +187,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-parser.cpp)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
+    llama_build_and_test(test-batch-alloc.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -192,6 +225,31 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+
+    set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
+    file(MAKE_DIRECTORY "${MODEL_DIR}")
+
+    llama_test(
+        test-llama-archs
+        NAME test-generate-models
+        LABEL main
+        ARGS -o "${MODEL_DIR}"
+    )
+    set_tests_properties(test-generate-models PROPERTIES
+        FIXTURES_SETUP generate-models
+    )
+
+    # WebGPU excludes QWEN35 in arch_supported() (test-llama-archs.cpp)
+    if (NOT GGML_WEBGPU)
+        llama_test(
+            test-recurrent-state-rollback
+            LABEL main
+            ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+        )
+        set_tests_properties(test-recurrent-state-rollback PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endif()
     llama_build_and_test(test-kv-cells.cpp)
     target_include_directories(test-kv-cells PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-kv-cache.cpp)
@@ -240,13 +298,25 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 llama_build(test-multi-instance-repro.cpp)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-model-resolution.cpp)
+# the test serves its repos from an httplib server, and the library links it privately
+target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
-llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-unified-memory-props.cpp)
+if (GGML_METAL)
+    # only a Metal build can enumerate a Metal device
+    target_compile_definitions(test-unified-memory-props PRIVATE LLAMA_TEST_EXPECT_METAL)
+endif()
+llama_build_and_test(test-fit-params.cpp)
+if (GGML_RPC)
+    llama_build_and_test(test-rpc.cpp)
+    set_tests_properties(test-rpc PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+endif()
 
 # Vulkan TBQ/PQ copy-to-quant subgroup-size sweep. Spawns itself with different
 # GGML_VK_TBQ_COPY_SG_SIZE values to exercise the shader's cross-subgroup stitch
@@ -274,12 +344,13 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-llama_build_and_test(test-recurrent-state-rollback.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED test-download-model)
-
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+if (APPLE)
+    llama_build(test-rset-release.cpp)
+endif()
 
 # Test sequence token-count memory API
 llama_build_and_test(test-memory-seq-token-count.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
@@ -308,6 +379,37 @@ if (LLAMA_MTMD)
     target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
     target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
     unset(LLAMA_TEST_NAME)
+
+    # QVAC-23075: legacy projector alias resolution, which must stay gated on general.name.
+    # Resolution is inline in clip-impl.h, so this one links on every platform.
+    set(LLAMA_TEST_NAME test-clip-projector-alias)
+    llama_build_and_test(test-clip-projector-alias.cpp)
+    target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+    target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    unset(LLAMA_TEST_NAME)
+
+    if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+        # Same reason as the llama tests above, and as the note at clip.h's
+        # clip_fa_effective_min_kv: these reach mtmd_calc_idefics3_sizing, clip_init and
+        # clip_log_set_callback, which carry no MTMD_API decoration and so are not exported
+        # across the Windows mtmd.dll boundary. They still run on every other platform, and on
+        # Windows itself in a static build.
+
+        # QVAC-23075: idefics3-family refined size and slice grid against the reference rule
+        # (pure CPU, no model).
+        set(LLAMA_TEST_NAME test-mtmd-preproc-sizing)
+        llama_build_and_test(test-mtmd-preproc-sizing.cpp)
+        target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+        target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+        unset(LLAMA_TEST_NAME)
+
+        # QVAC-23075: preprocessing metadata rejected at load, on generated metadata-only mmprojs.
+        set(LLAMA_TEST_NAME test-clip-preproc-metadata)
+        llama_build_and_test(test-clip-preproc-metadata.cpp)
+        target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
+        target_include_directories(${LLAMA_TEST_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd)
+        unset(LLAMA_TEST_NAME)
+    endif()
 endif()
 
 # GGUF model data fetcher library for tests that need real model metadata
@@ -336,11 +438,15 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
-llama_build_and_test(test-alloc.cpp)
-target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    # Needs non-public ggml-impl.h
+    llama_build_and_test(test-gguf.cpp)
+
+    # Needs non-public ggml{,-backend}-impl.h
+    llama_build_and_test(test-alloc.cpp)
+endif()
 
 llama_build(test-export-graph-ops.cpp)
-target_include_directories(test-export-graph-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)

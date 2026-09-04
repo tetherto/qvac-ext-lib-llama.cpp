@@ -429,15 +429,16 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_TBQ3_0    = 42, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
-        GGML_TYPE_TBQ4_0    = 43, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
-        GGML_TYPE_TBQ3_0_64 = 44, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
-        GGML_TYPE_TBQ4_0_64 = 45, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
-        GGML_TYPE_PQ3_0     = 46, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
-        GGML_TYPE_PQ3_0_64  = 47, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
-        GGML_TYPE_PQ4_0     = 48, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
-        GGML_TYPE_PQ4_0_64  = 49, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
-        GGML_TYPE_COUNT     = 50,
+        GGML_TYPE_Q2_0    = 42,
+        GGML_TYPE_TBQ3_0    = 43, // TurboQuant 3-bit + QJL Stage 2, block=128 (4.25 bpw)
+        GGML_TYPE_TBQ4_0    = 44, // TurboQuant 4-bit + QJL Stage 2, block=128 (5.25 bpw)
+        GGML_TYPE_TBQ3_0_64 = 45, // TurboQuant 3-bit + QJL Stage 2, block=64  (4.5 bpw)
+        GGML_TYPE_TBQ4_0_64 = 46, // TurboQuant 4-bit + QJL Stage 2, block=64  (5.5 bpw)
+        GGML_TYPE_PQ3_0     = 47, // PolarQuant 3-bit (Stage 1 only), block=128 (3.125 bpw)
+        GGML_TYPE_PQ3_0_64  = 48, // PolarQuant 3-bit (Stage 1 only), block=64  (3.25 bpw)
+        GGML_TYPE_PQ4_0     = 49, // PolarQuant 4-bit (Stage 1 only), block=128 (4.125 bpw)
+        GGML_TYPE_PQ4_0_64  = 50, // PolarQuant 4-bit (Stage 1 only), block=64  (4.25 bpw)
+        GGML_TYPE_COUNT     = 51,
     };
 
     // precision
@@ -481,6 +482,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
     };
 
     // available tensor operations:
@@ -800,6 +802,10 @@ extern "C" {
     GGML_API bool ggml_is_contiguous_0(const struct ggml_tensor * tensor); // same as ggml_is_contiguous()
     GGML_API bool ggml_is_contiguous_1(const struct ggml_tensor * tensor); // contiguous for dims >= 1
     GGML_API bool ggml_is_contiguous_2(const struct ggml_tensor * tensor); // contiguous for dims >= 2
+
+    GGML_API bool ggml_is_contiguous_to_1(const struct ggml_tensor * tensor); // contiguous for dims < 1
+    GGML_API bool ggml_is_contiguous_to_2(const struct ggml_tensor * tensor); // contiguous for dims < 2
+    GGML_API bool ggml_is_contiguous_to_3(const struct ggml_tensor * tensor); // contiguous for dims < 3
 
     // returns whether the tensor elements are allocated as one contiguous block of memory (no gaps, but permutation ok)
     GGML_API bool ggml_is_contiguously_allocated(const struct ggml_tensor * tensor);
@@ -1244,7 +1250,7 @@ extern "C" {
            struct ggml_context * ctx,
            struct ggml_tensor  * grad,
            struct ggml_tensor  * g);
-    
+
     // a - dy
     // b - x
     GGML_API struct ggml_tensor * ggml_sigmoid_back(
@@ -2834,7 +2840,7 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // logits
-            struct ggml_tensor  * b,  // labels  
+            struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // mask (1 for assistant tokens, 0 for masked)
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked_back(
             struct ggml_context * ctx,
@@ -2894,6 +2900,12 @@ extern "C" {
             int                   idx);
 
     GGML_API void ggml_build_forward_expand(
+            struct ggml_cgraph * cgraph,
+            struct ggml_tensor * tensor);
+
+    // add the tensor and its parents to the graph without marking them for compute
+    // the flag is set later, when the tensor is reached from a node that computes
+    GGML_API void ggml_build_forward_order(
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
 

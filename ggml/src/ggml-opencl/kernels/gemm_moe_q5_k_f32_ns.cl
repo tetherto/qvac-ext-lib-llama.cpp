@@ -10,19 +10,20 @@
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
-inline void get_scale_min_k4(
-    int j,
-    global const uchar * q,
-    uchar * d,
-    uchar * m
-) {
+// Returns the 6-bit sub-block scale in bits 0-7 and the min in bits 8-15.
+// Writing the results through pointers to private scalars is miscompiled by the
+// Adreno E031.47 shader compiler, which yields corrupted scales, so this stays
+// pointer-free and scalar.
+inline uint get_scale_min_k4_packed(int j, global const uchar * q) {
+    uint d, m;
     if (j < 4) {
-        *d = q[j]   & 63;
-        *m = q[j+4] & 63;
+        d = q[j]   & 63u;
+        m = q[j+4] & 63u;
     } else {
-        *d = (q[j+4] & 0x0F) | ((q[j-4] & 0xC0) >> 2);
-        *m = ((q[j+4] >> 4) & 0x0F) | ((q[j]   & 0xC0) >> 2);
+        d = (q[j+4] & 0x0Fu) | ((q[j-4] & 0xC0u) >> 2);
+        m = ((q[j+4] >> 4) & 0x0Fu) | ((q[j] & 0xC0u) >> 2);
     }
+    return d | (m << 8);
 }
 
 #define dequantize_q5_k(qs5x16, qh5x16, a_f16, scale, m) \
@@ -114,6 +115,46 @@ inline void get_scale_min_k4(
     c_reg.lo += convert_float8(acc.lo); \
     c_reg.hi += convert_float8(acc.hi); \
 
+// Quarter-tile variant: computes 8 output columns (one skip-group) into a float8
+// accumulator. Same reduction order / flush cadence as dotx16_reduce8, so the
+// non-skipped path is byte-identical; it just lets the caller skip empty
+// 8-column groups at finer granularity. Uses a private half8 `acc8`.
+#define dotx8_reduce4(a_reg, b_lm, c_reg, lm_offset) \
+    acc8.s0 = dot(a_reg.s0123, b_lm[lm_offset + 0]); \
+    acc8.s1 = dot(a_reg.s0123, b_lm[lm_offset + 1]); \
+    acc8.s2 = dot(a_reg.s0123, b_lm[lm_offset + 2]); \
+    acc8.s3 = dot(a_reg.s0123, b_lm[lm_offset + 3]); \
+    acc8.s4 = dot(a_reg.s0123, b_lm[lm_offset + 4]); \
+    acc8.s5 = dot(a_reg.s0123, b_lm[lm_offset + 5]); \
+    acc8.s6 = dot(a_reg.s0123, b_lm[lm_offset + 6]); \
+    acc8.s7 = dot(a_reg.s0123, b_lm[lm_offset + 7]); \
+    acc8.s0 += dot(a_reg.s4567, b_lm[lm_offset + 32]); \
+    acc8.s1 += dot(a_reg.s4567, b_lm[lm_offset + 33]); \
+    acc8.s2 += dot(a_reg.s4567, b_lm[lm_offset + 34]); \
+    acc8.s3 += dot(a_reg.s4567, b_lm[lm_offset + 35]); \
+    acc8.s4 += dot(a_reg.s4567, b_lm[lm_offset + 36]); \
+    acc8.s5 += dot(a_reg.s4567, b_lm[lm_offset + 37]); \
+    acc8.s6 += dot(a_reg.s4567, b_lm[lm_offset + 38]); \
+    acc8.s7 += dot(a_reg.s4567, b_lm[lm_offset + 39]); \
+    c_reg += convert_float8(acc8); \
+    acc8.s0 = dot(a_reg.s89ab, b_lm[lm_offset + 64]); \
+    acc8.s1 = dot(a_reg.s89ab, b_lm[lm_offset + 65]); \
+    acc8.s2 = dot(a_reg.s89ab, b_lm[lm_offset + 66]); \
+    acc8.s3 = dot(a_reg.s89ab, b_lm[lm_offset + 67]); \
+    acc8.s4 = dot(a_reg.s89ab, b_lm[lm_offset + 68]); \
+    acc8.s5 = dot(a_reg.s89ab, b_lm[lm_offset + 69]); \
+    acc8.s6 = dot(a_reg.s89ab, b_lm[lm_offset + 70]); \
+    acc8.s7 = dot(a_reg.s89ab, b_lm[lm_offset + 71]); \
+    acc8.s0 += dot(a_reg.scdef, b_lm[lm_offset + 96]); \
+    acc8.s1 += dot(a_reg.scdef, b_lm[lm_offset + 97]); \
+    acc8.s2 += dot(a_reg.scdef, b_lm[lm_offset + 98]); \
+    acc8.s3 += dot(a_reg.scdef, b_lm[lm_offset + 99]); \
+    acc8.s4 += dot(a_reg.scdef, b_lm[lm_offset + 100]); \
+    acc8.s5 += dot(a_reg.scdef, b_lm[lm_offset + 101]); \
+    acc8.s6 += dot(a_reg.scdef, b_lm[lm_offset + 102]); \
+    acc8.s7 += dot(a_reg.scdef, b_lm[lm_offset + 103]); \
+    c_reg += convert_float8(acc8); \
+
 
 __attribute__((qcom_wave_pair_mode(1)))
 kernel void kernel_gemm_moe_q5_k_f32_ns(
@@ -128,7 +169,9 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
         __write_only image1d_buffer_t dst,
         __global     int *            total_tiles,
         uint ne00,
-        uint ne01
+        uint ne01,
+        uint is_ragged,
+        uint skip_gran
 ) {
     uint block_id_m = get_global_id(1); // m_tile
     uint block_id_n = get_global_id(2); // n_tile
@@ -137,6 +180,28 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
     if (block_id_n >= total_tiles[0]) {
         return;
     }
+
+    // Ragged tile-skip: when is_ragged and the upper 16 token-slots of this tile are all
+    // padding (router 0xFFFFFFFF), skip the second (reg_c.hi) dotx16_reduce8 half -> ~half
+    // the GEMM dot for sparse tiles. Numerically identical (the skipped lanes are padding).
+    // Ragged tile-skip: tokens are packed contiguously per expert (moe_scatter fills
+    // lanes 0..V-1, moe_fill pre-pads the rest), so router padding (0xFFFFFFFF) is always
+    // trailing. Find the valid-token count V and round it UP to the skip granularity
+    // skip_gran (columns per skip-group: 8 = quarter, 16 = half/legacy, 32 = disabled).
+    // A 8-column group g is all-padding iff its first column (8*g) >= n_active, so its
+    // dotx8_reduce4 is skipped. Numerically identical (skipped lanes are padding).
+    uint n_active = TILESIZE_N;
+    if (is_ragged && skip_gran < TILESIZE_N) {
+        uint n_valid = TILESIZE_N;
+        for (uint _t = 0; _t < TILESIZE_N; ++_t) {
+            if (src2[block_id_n * TILESIZE_N + _t] == 0xFFFFFFFFu) { n_valid = _t; break; }
+        }
+        n_active = min((uint)TILESIZE_N, ((n_valid + skip_gran - 1) / skip_gran) * skip_gran);
+    }
+    // Group 0 (cols 0-7) always runs; groups 1-3 skip when fully padding.
+    bool skip_g1 = (8u  >= n_active);
+    bool skip_g2 = (16u >= n_active);
+    bool skip_g3 = (24u >= n_active);
 
     __private half16 reg_a;
     __private float32 reg_c = (float32)(0);
@@ -172,11 +237,10 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
 
         // Load sub-block scale and min
         global const uchar * sc = src0_s + (expert_id * ne01 + row_idx) * scales_per_row + sb * K_SCALE_SIZE;
-        uchar sv, mn;
-        get_scale_min_k4(j, sc, &sv, &mn);
+        uint sm = get_scale_min_k4_packed(j, sc);
 
-        float scale = (float)d_val * (float)sv;
-        float minv = -(float)dm_val * (float)mn;
+        float scale = (float)d_val * (float)(sm & 0xFFu);
+        float minv = -(float)dm_val * (float)(sm >> 8);
 
         // qh is stored at sub-block granularity
         uint qh_offset = row + sub * ne01 + expert_id * num_superblocks * 8 * ne01 + get_global_id(0);
@@ -204,9 +268,11 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
 
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
-        half16 acc;
-        dotx16_reduce8(reg_a, shared_b, reg_c.lo, 0);
-        dotx16_reduce8(reg_a, shared_b, reg_c.hi, 16);
+        half8 acc8;
+        dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
+        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8); }
+        if (!skip_g2) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16); }
+        if (!skip_g3) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24); }
 
         // Second half
         uint half_step = step + TILESIZE_K;
@@ -226,8 +292,10 @@ kernel void kernel_gemm_moe_q5_k_f32_ns(
 
         sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
-        dotx16_reduce8(reg_a, shared_b, reg_c.lo, 0);
-        dotx16_reduce8(reg_a, shared_b, reg_c.hi, 16);
+        dotx8_reduce4(reg_a, shared_b, reg_c.lo.lo, 0);
+        if (!skip_g1) { dotx8_reduce4(reg_a, shared_b, reg_c.lo.hi, 8); }
+        if (!skip_g2) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.lo, 16); }
+        if (!skip_g3) { dotx8_reduce4(reg_a, shared_b, reg_c.hi.hi, 24); }
     }
 
     if ((get_global_id(0) + block_id_m * TILESIZE_M) >= ne01) {

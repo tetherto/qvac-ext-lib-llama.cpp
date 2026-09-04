@@ -10,6 +10,9 @@
 # # with CUDA support
 # GG_BUILD_CUDA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
+# # with ROCm support
+# GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
 # # with SYCL support
 # GG_BUILD_SYCL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
@@ -54,6 +57,16 @@ sd=`dirname $0`
 cd $sd/../
 SRC=`pwd`
 
+# nproc is used for -j and quantize thread counts; macOS often lacks GNU coreutils
+if ! command -v nproc >/dev/null 2>&1; then
+    if command -v sysctl >/dev/null 2>&1; then
+        nproc() { sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu; }
+    else
+        echo "Error: nproc not found. Install coreutils (provides nproc)."
+        exit 1
+    fi
+fi
+
 CMAKE_EXTRA="-DLLAMA_FATAL_WARNINGS=${LLAMA_FATAL_WARNINGS:-ON} -DLLAMA_OPENSSL=OFF -DGGML_SCHED_NO_REALLOC=ON"
 CTEST_EXTRA=""
 
@@ -89,7 +102,7 @@ if [ ! -z ${GG_BUILD_CUDA} ]; then
 fi
 
 if [ ! -z ${GG_BUILD_ROCM} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_HIP=ON"
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang -DGGML_HIP=ON -DGGML_HIP_ROCWMMA_FATTN=ON"
     if [ -z ${GG_BUILD_AMDGPU_TARGETS} ]; then
         echo "Missing GG_BUILD_AMDGPU_TARGETS, please set it to your GPU architecture (e.g. gfx90a, gfx1100, etc.)"
         exit 1
@@ -688,6 +701,10 @@ function gg_check_build_requirements {
     if ! command -v ctest &> /dev/null; then
         gg_printf 'ctest not found, please install'
     fi
+
+    if ! command -v nproc &> /dev/null; then
+        gg_printf 'nproc not found, please install coreutils'
+    fi
 }
 
 function gg_run_test_backend_ops_cpu {
@@ -734,6 +751,11 @@ if [ -z ${GG_BUILD_LOW_PERF} ]; then
 
     pip install -r ${SRC}/requirements.txt --disable-pip-version-check
     pip install --editable gguf-py --disable-pip-version-check
+    pip install jinja2 --disable-pip-version-check
+    if ! python3 -c "import jinja2"; then
+        echo "Error: jinja2 is not importable after pip install"
+        exit 1
+    fi
 fi
 
 ret=0

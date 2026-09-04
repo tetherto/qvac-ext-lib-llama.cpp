@@ -7,7 +7,7 @@
 // rewrite) and unmasked (the bidirectional vision-tower shape that crashes
 // Adreno 830 at 16k patches without the fix).
 //
-// SKIPS (exit 0) when no OpenCL device is present — it runs where the
+// SKIPS (exit 0) when no OpenCL device is present - it runs where the
 // backend exists (Adreno devices, desktop OpenCL, PoCL).
 
 #include "ggml.h"
@@ -15,12 +15,10 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
-#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <vector>
 
 #ifdef _WIN32
@@ -41,7 +39,7 @@ static float frand() {
     return ((g_rng >> 8) & 0xffffff) / (float) 0x1000000 * 2.0f - 1.0f;  // [-1, 1)
 }
 
-static const int D    = 64;  // head size (dk == dv == 64 — supported on OpenCL FA)
+static const int D    = 64;  // head size (dk == dv == 64 - supported on OpenCL FA)
 static const int NH   = 4;   // heads (no GQA)
 static const int N_KV = 256;
 
@@ -124,18 +122,19 @@ int main() {
     set_env("GGML_OPENCL_FA_MAX_NQ", "64");
     set_env("GGML_OPENCL_FLUSH_WORK_MB", "1");
 
+    ggml_backend_load_all();
+
     ggml_backend_dev_t ocl_dev = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        std::string name = ggml_backend_dev_name(dev);
-        for (auto & ch : name) ch = (char) tolower(ch);
-        if (name.find("opencl") != std::string::npos) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (std::strcmp(ggml_backend_reg_name(reg), "OpenCL") == 0) {
             ocl_dev = dev;
             break;
         }
     }
     if (!ocl_dev) {
-        std::printf("no OpenCL device found — test skipped\n");
+        std::printf("no OpenCL device found - test skipped\n");
         return 0;
     }
 

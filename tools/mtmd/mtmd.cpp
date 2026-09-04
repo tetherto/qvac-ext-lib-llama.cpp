@@ -263,8 +263,9 @@ mtmd_context_params mtmd_context_params_default() {
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
         /* backend_device    */ nullptr,
-        /* image_tile_mode   */ 1, // 0=batched, 1=sequential (default), 2=disabled
+        /* image_tile_mode   */ 1, // 0=batched, 1=sequential (default, matches common_params), 2=disabled
         /* image_max_tiles   */ -1,
+        /* image_no_upscale  */ -1, // -1=model default, 0=off, 1=on
     };
     return params;
 }
@@ -273,6 +274,13 @@ struct mtmd_context {
     struct clip_ctx * ctx_v; // vision
     struct clip_ctx * ctx_a; // audio
     std::vector<float> out_embd; // image embedding vector
+
+    // generation context
+    struct clip_ctx * ctx_gen_a; // audio
+    std::vector<int32_t> gen_out_codes; // this frame's 16 sampled codes (GEN_CODE)
+    std::vector<float>   gen_out_embd;  // next-step hidden state fed back to backbone (GEN_CODE)
+    std::vector<float>   gen_out_audio; // decoded PCM samples for the current frame (GEN_WAV)
+    std::vector<uint8_t> gen_out_state; // state to feed into the next GEN_WAV call
 
     bool print_timings;
     int n_threads;
@@ -300,9 +308,17 @@ struct mtmd_context {
     std::vector<llama_token> tok_row_end;       // end of row
     bool tok_row_end_trail = false;
     bool ov_img_first      = false;
+    // When the slice grid is 1x1 the overview and the single slice are the same
+    // crop, so emit the overview alone instead of the image twice.
+    bool skip_slices_if_single_tile = false;
 
     // string template for slice image delimiters with row/col (idefics3)
     std::string sli_img_start_tmpl;
+
+    // string template labelling each image with its ordinal, emitted only when a prompt
+    // carries more than one image. Plain text, not a special token, so it is tokenized
+    // the same way the reference processor's f-string is.
+    std::string ord_img_tmpl;
 
     std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
     std::unique_ptr<mtmd_image_preprocessor> image_preproc;
@@ -365,11 +381,13 @@ struct mtmd_context {
             /* backend_device    */ ctx_params.backend_device,
             /* image_tile_mode   */ ctx_params.image_tile_mode,
             /* image_max_tiles   */ ctx_params.image_max_tiles,
+            /* image_no_upscale  */ ctx_params.image_no_upscale,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
+        ctx_gen_a = res.ctx_gen_a;
         if (!ctx_v && !ctx_a) {
             throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
@@ -393,6 +411,15 @@ struct mtmd_context {
                 "mismatch between text model (n_embd = %d) and mmproj (n_embd = %d)\n"
                 "hint: you may be using wrong mmproj\n",
                 n_embd_text, n_embd_clip));
+        }
+        if (ctx_gen_a) {
+            int n_embd_gen = clip_n_mmproj_embd(ctx_gen_a);
+            if (n_embd_text > 0 && n_embd_text != n_embd_gen) {
+                throw std::runtime_error(string_format(
+                    "mismatch between text model (n_embd = %d) and gen-audio mmproj (n_embd = %d)\n"
+                    "hint: you may be using wrong mmproj\n",
+                    n_embd_text, n_embd_gen));
+            }
         }
         if (ctx_v) {
             init_vision();
@@ -467,7 +494,7 @@ struct mtmd_context {
                     tok_row_end       = {lookup_token("\n")};
                     tok_row_end_trail = false; // no trailing end-of-row token
                     ov_img_first      = true;
-                    image_preproc     = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
+                    image_preproc     = std::make_unique<mtmd_image_preprocessor_minicpmv>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_QWEN2VL:
             case PROJECTOR_TYPE_QWEN25VL:
@@ -476,6 +503,13 @@ struct mtmd_context {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
                     img_beg = "<|vision_start|>";
                     img_end = "<|vision_end|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                } break;
+            case PROJECTOR_TYPE_MINIMAX_M3:
+                {
+                    // ]<]start of image[>[ ... (image embeddings) ... ]<]end of image[>[
+                    img_beg = "]<]start of image[>[";
+                    img_end = "]<]end of image[>[";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_QWEN3VL:
@@ -533,6 +567,32 @@ struct mtmd_context {
                     sli_img_start_tmpl = "<fake_token_around_image><row_%d_col_%d>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_idefics3>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_VISIONPSY:
+                {
+                    // Same llava-uhd slicing as idefics3, but the overview image comes
+                    // first and there are no fake_token / row-end delimiters.
+                    slice_tmpl         = MTMD_SLICE_TMPL_IDEFICS3;
+                    // lookup_token() returns LLAMA_TOKEN_NULL on a miss, which would
+                    // silently splice a garbage id into the prompt. Fail loudly instead,
+                    // but only when there is a vocab to look in: mtmd_get_memory_usage
+                    // builds a context with no text model, and every token misses there.
+                    const llama_token tok_global_image = lookup_token("<|global_image|>");
+                    if (tok_global_image == LLAMA_TOKEN_NULL) {
+                        if (vocab != nullptr) {
+                            throw std::runtime_error("visionpsy: text model vocab is missing <|global_image|>");
+                        }
+                    } else {
+                        tok_ov_img_start = { tok_global_image };
+                    }
+                    sli_img_start_tmpl = "<row_%d_col_%d>";
+                    // get_image_string() prefixes every image with its 0-based ordinal once
+                    // a prompt carries more than one, so a question can still refer to "the
+                    // second image". Not in the vocab, so it goes through BPE as text.
+                    ord_img_tmpl       = "<image: %zu>";
+                    ov_img_first       = true;
+                    skip_slices_if_single_tile = true;
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_idefics3>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_PIXTRAL:
                 {
                     // https://github.com/huggingface/transformers/blob/1cd110c6cb6a6237614130c470e9a902dbc1a4bd/docs/source/en/model_doc/pixtral.md
@@ -587,9 +647,17 @@ struct mtmd_context {
                 } break;
             case PROJECTOR_TYPE_KIMIK25:
                 {
-                    // <|media_begin|> ... (image embeddings) ... <|media_end|>
-                    img_beg = "<|media_begin|>";
-                    img_end = "<|media_end|>";
+                    // GLM-5.2-V reuses the Kimi-K2.5 vision encoder and projector, but marks
+                    // images with its own tokens, so decide based on the text model vocab
+                    if (lookup_token("<|begin_of_image|>") != LLAMA_TOKEN_NULL) {
+                        // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
+                        img_beg = "<|begin_of_image|>";
+                        img_end = "<|end_of_image|>";
+                    } else {
+                        // <|media_begin|> ... (image embeddings) ... <|media_end|>
+                        img_beg = "<|media_begin|>";
+                        img_end = "<|media_end|>";
+                    }
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_LIGHTONOCR:
@@ -650,15 +718,10 @@ struct mtmd_context {
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR:
-                {
-                    img_end = "\n"; // prevent empty batch on llama-server
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(ctx_v);
-                    ov_img_first = false;
-                } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR2:
                 {
                     img_end = "\n"; // prevent empty batch on llama-server
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr2>(ctx_v);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(ctx_v);
                     ov_img_first = false;
                 } break;
             case PROJECTOR_TYPE_HUNYUANVL:
@@ -746,11 +809,25 @@ struct mtmd_context {
                     aud_end = "<audio|>";
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_gemma4a>(ctx_a);
                 } break;
+            case PROJECTOR_TYPE_PARAKEET:
+                {
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_parakeet>(ctx_a);
+                } break;
             case PROJECTOR_TYPE_GEMMA4UA:
                 {
                     aud_beg = "<|audio>";
                     aud_end = "<audio|>";
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_gemma4ua>(ctx_a);
+                } break;
+            case PROJECTOR_TYPE_MIMO_AUDIO:
+                {
+                    aud_beg = "<|mimo_audio_start|>";
+                    aud_end = "<|mimo_audio_end|>";
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_mimo_audio>(ctx_a);
+                } break;
+            case PROJECTOR_TYPE_QWEN3TTS_SPKENC:
+                {
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_qwen3tts_spk>(ctx_a);
                 } break;
             default:
                 throw std::runtime_error(string_format("%s: unexpected audio projector type %d\n", __func__, proj));
@@ -792,6 +869,7 @@ struct mtmd_context {
     ~mtmd_context() {
         clip_free(ctx_a);
         clip_free(ctx_v);
+        clip_free(ctx_gen_a);
     }
 
 private:
@@ -850,7 +928,7 @@ void mtmd_log_set_llama_callback(ggml_log_callback llama_cb, void * llama_user_d
 struct mtmd_tokenizer {
     mtmd_context * ctx;
 
-    std::string input_text;
+    std::string input_text; // note: can contain null bytes; do not use c_str()
     bool add_special;
     bool parse_special;
     const llama_vocab * vocab;
@@ -880,8 +958,9 @@ struct mtmd_tokenizer {
             size_t n_bitmaps) : ctx(ctx) {
         add_special   = text->add_special;
         parse_special = text->parse_special;
-        input_text    = text->text;
         vocab         = ctx->vocab;
+
+        input_text.assign(text->text, text->text_len);
 
         std::vector<const mtmd_bitmap *> bitmaps(bmps, bmps + n_bitmaps);
         auto parts_str = split_text(input_text, ctx->media_marker);
@@ -998,6 +1077,11 @@ struct mtmd_tokenizer {
                     LOG_ERR("%s: error: number of bitmaps (%zu) does not match number of markers (%zu)\n",
                             __func__, merged_bitmaps.size(), parts.size() - 1);
                     return 1;
+                }
+                // Ordinal label before the image, matching the reference processor, which
+                // only emits it when the call carries more than one image.
+                if (!ctx->ord_img_tmpl.empty() && merged_bitmaps.size() > 1) {
+                    add_text(string_format(ctx->ord_img_tmpl.c_str(), i_bm), false);
                 }
                 auto bmps = merged_bitmaps[i_bm++];
                 int32_t res = add_media(bmps);
@@ -1130,6 +1214,7 @@ struct mtmd_tokenizer {
                     preproc_out.grid_x = tmp_preproc_out.grid_x;
                     preproc_out.grid_y = tmp_preproc_out.grid_y;
                     preproc_out.overview = std::move(tmp_preproc_out.overview);
+                    preproc_out.overview_in_entries = tmp_preproc_out.overview_in_entries;
                 }
             }
 
@@ -1155,18 +1240,37 @@ struct mtmd_tokenizer {
                 // NOTE: preproc_out is invalidated after this point, do not use it anymore
 
                 // split_batch_to_chunk must always put the overview image first
+                const bool single_tile = ctx->skip_slices_if_single_tile && n_row == 1 && n_col == 1;
+
+                // On a 1x1 grid the overview and the lone slice cover the same crop at the
+                // same size, so only one of the two is sent. Send the SLICE. The reference
+                // pipeline returns the split patch untouched for this grid
+                // (GlobalAndSplitImages.forward returns early, before it resizes a global
+                // patch), and the two paths do not share a resize kernel: the slice is
+                // rendered with image_resize_algo_rf (bicubic) and the overview with
+                // image_resize_algo_ov (bilinear).
+                if (single_tile && chunks.size() > 1) {
+                    std::swap(chunks[0], chunks[1]);
+                }
+
                 auto ov_chunk = std::move(chunks.front());
                 chunks.erase(chunks.begin());
 
                 // add overview image (first)
                 if (ctx->ov_img_first) {
+                    // Logged because the delimiters around it are token ids, not text, so this is
+                    // the only trace of where the overview went. On a 1x1 grid this chunk is the
+                    // refined slice, swapped in above.
+                    LOG_DBG("%s: adding %s image first\n", __func__,
+                            single_tile ? "single-tile refined" : "overview");
                     add_text(ctx->tok_ov_img_start);
                     cur.entries.emplace_back(std::move(ov_chunk));
                     add_text(ctx->tok_ov_img_end);
                 }
 
                 // add slices (or tiles)
-                if (!chunks.empty()) {
+                if (!chunks.empty() && !single_tile) {
+                    LOG_DBG("%s: adding %d slices (%d rows x %d cols)\n", __func__, (int)chunks.size(), n_row, n_col);
                     GGML_ASSERT((int)chunks.size() == n_row * n_col);
                     add_text(ctx->tok_slices_start);
                     for (int y = 0; y < n_row; y++) {
@@ -1205,11 +1309,12 @@ struct mtmd_tokenizer {
 
                 // add overview image (last)
                 if (!ctx->ov_img_first) {
+                    LOG_DBG("%s: adding %s image last\n", __func__,
+                            single_tile ? "single-tile refined" : "overview");
                     add_text(ctx->tok_ov_img_start);
                     cur.entries.emplace_back(std::move(ov_chunk));
                     add_text(ctx->tok_ov_img_end);
                 }
-
             } else {
 
                 if (preproc_out.entries.size() == 0) {
@@ -1221,9 +1326,9 @@ struct mtmd_tokenizer {
                 batch_f32.is_audio = false;
                 batch_f32.grid_x = preproc_out.grid_x;
                 batch_f32.grid_y = preproc_out.grid_y;
+                // qwen3vl multi-tile: the preprocessor prepends the overview thumbnail as entries[0]
+                const bool has_overview_entry = preproc_out.overview_in_entries;
                 batch_f32.entries = std::move(preproc_out.entries);
-                batch_f32.has_overview = ctx->proj_type_v() == PROJECTOR_TYPE_QWEN3VL
-                    && batch_f32.grid_x > 0 && batch_f32.grid_y > 0;
                 // do NOT use preproc_out from this point on, it is moved
 
                 // Build one image chunk from a batch with explicit grid dims, then append it.
@@ -1282,14 +1387,13 @@ struct mtmd_tokenizer {
 
                 const int gx = batch_f32.grid_x > 0 ? batch_f32.grid_x : 1;
                 const int gy = batch_f32.grid_y > 0 ? batch_f32.grid_y : 1;
-                if (batch_f32.has_overview) {
+                if (has_overview_entry) {
                     // Qwen3VL multi-tile with a global overview: emit the downscaled full image
                     // (entries[0]) as its own 1x1 chunk first, then the tile grid as a second chunk.
                     GGML_ASSERT(!batch_f32.entries.empty());
                     clip_image_f32_batch ov_batch;
                     ov_batch.entries.push_back(std::move(batch_f32.entries.front()));
                     batch_f32.entries.erase(batch_f32.entries.begin());
-                    batch_f32.has_overview = false; // overview consumed; entries[0] is now a tile
                     GGML_ASSERT((int) batch_f32.entries.size() == gx * gy &&
                                 "overview split left an unexpected tile count");
                     emit_image_chunk(std::move(ov_batch), 1, 1);
@@ -1593,6 +1697,125 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
 
 float * mtmd_get_output_embd(mtmd_context * ctx) {
     return ctx->out_embd.data();
+}
+
+//
+// audio generation
+//
+
+mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx) {
+    mtmd_gen_audio_info info;
+    if (!ctx->ctx_gen_a) {
+        info.type = MTMD_GEN_AUDIO_TYPE_NONE;
+        return info;
+    }
+    switch (clip_get_projector_type(ctx->ctx_gen_a)) {
+        case PROJECTOR_TYPE_QWEN3TTS_GEN:
+            info.type = MTMD_GEN_AUDIO_TYPE_QWEN3TTS;
+            info.sample_rate = 24000;
+            break;
+        default:
+            info.type = MTMD_GEN_AUDIO_TYPE_NONE;
+            break;
+    }
+    return info;
+}
+
+static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_inp * inp, mtmd_gen_out * out) {
+    clip_ctx * ctx_clip = ctx->ctx_gen_a;
+    if (!ctx_clip) {
+        LOG_ERR("%s: model does not support audio generation\n", __func__);
+        return 1;
+    }
+
+    if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_CODE) {
+        const size_t n_embd = (size_t) clip_n_mmproj_embd(ctx_clip);
+
+        clip_image_f32 hidden_state;
+        hidden_state.set_size({(int) n_embd, 1}, false, true);
+        hidden_state.cpy_buf(std::vector<float>(inp->embd, inp->embd + n_embd));
+
+        clip_image_f32_batch batch;
+        batch.is_audio = true;
+        batch.entries.push_back(std::move(hidden_state));
+
+        std::vector<float>   out_embd(n_embd);
+        std::vector<int32_t> out_codes;
+
+        clip_encode_params params;
+        params.imgs        = &batch;
+        params.n_threads   = ctx->n_threads;
+        params.gen_process = CLIP_GEN_PROCESS_GEN_CODE;
+        params.out_embd    = &out_embd;
+        params.out_codes   = &out_codes;
+        params.code0       = inp->code0;
+        params.top_k       = inp->top_k;
+        params.top_p       = inp->top_p;
+
+        if (!clip_encode(ctx_clip, &params)) {
+            LOG_ERR("%s: clip_encode failed (gen_code)\n", __func__);
+            return 1;
+        }
+
+        ctx->gen_out_embd  = std::move(out_embd);
+        ctx->gen_out_codes = std::move(out_codes);
+
+        out->embd    = ctx->gen_out_embd.data();
+        out->codes   = ctx->gen_out_codes.data();
+        out->n_codes = ctx->gen_out_codes.size();
+        return 0;
+    }
+
+    // MTMD_GEN_PROCESS_TYPE_GEN_WAV
+    if (!inp->codes || inp->n_codes == 0) {
+        LOG_ERR("%s: codes required for gen_wav\n", __func__);
+        return 1;
+    }
+    std::vector<int32_t> in_codes(inp->codes, inp->codes + inp->n_codes);
+    std::vector<uint8_t> in_state;
+    if (inp->state_data) {
+        in_state.assign(inp->state_data, inp->state_data + inp->state_size);
+    }
+
+    // gen_wav has no hidden-state input, the batch entry is an unused placeholder
+    // TODO @ngxson : some models in the future may require hidden-state input, need to update this code later
+    clip_image_f32 dummy;
+    dummy.set_size({1, 1}, false, true);
+    dummy.cpy_buf(std::vector<float>(1, 0.0f));
+
+    clip_image_f32_batch batch;
+    batch.is_audio = true;
+    batch.entries.push_back(std::move(dummy));
+
+    clip_encode_params params;
+    params.imgs        = &batch;
+    params.n_threads   = ctx->n_threads;
+    params.gen_process = CLIP_GEN_PROCESS_GEN_WAV;
+    params.codes       = &in_codes;
+    params.out_audio   = &ctx->gen_out_audio;
+    params.state_in    = inp->state_data ? &in_state : nullptr;
+    params.state_out   = &ctx->gen_out_state;
+
+    if (!clip_encode(ctx_clip, &params)) {
+        LOG_ERR("%s: clip_encode failed (code2wav)\n", __func__);
+        return 1;
+    }
+
+    out->audio      = ctx->gen_out_audio.data();
+    out->n_samples  = ctx->gen_out_audio.size();
+    out->state_data = (const char *) ctx->gen_out_state.data();
+    out->state_size = ctx->gen_out_state.size();
+
+    return 0;
+}
+
+int32_t mtmd_gen_audio_process(mtmd_context * ctx, const struct mtmd_gen_inp * inp, struct mtmd_gen_out * out) {
+    try {
+        return mtmd_gen_audio_process_impl(ctx, inp, out);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error: %s\n", __func__, e.what());
+        return 1;
+    }
 }
 
 mtmd_batch * mtmd_batch_init(mtmd_context * ctx) {

@@ -1,8 +1,7 @@
+# shellcheck shell=bash
 # Shared bash helpers for the KV-cache eval bench scripts.
 #
-# Sourced by tests/{longbench,zeroscrolls,leval}-bench.sh. RULER's bench
-# script has a different structure (driven by NVIDIA's RULER harness) and
-# does not source this file.
+# Sourced by tests/{longbench,zeroscrolls,leval,ruler}-bench.sh.
 #
 # Per-cell state lives in a small set of KV_SERVER_* globals — there is only
 # one llama-server alive per cell, so a single namespace is enough.
@@ -184,6 +183,10 @@ _kv_detect_tokenizer() {
             echo "Qwen/Qwen2.5-7B-Instruct" ;;
         *qwen*)
             echo "Qwen/Qwen2-7B-Instruct" ;;
+        *llama-2*|*llama2*)
+            echo "meta-llama/Llama-2-7b-chat-hf" ;;
+        *phi*)
+            echo "microsoft/Phi-3-mini-128K-instruct" ;;
         *)
             echo "NousResearch/Meta-Llama-3.1-8B-Instruct" ;;
     esac

@@ -462,12 +462,14 @@ template <bool Writable> int llama_file_buffer<Writable>::file_id() const {
 }
 
 template <bool Writable> void llama_file_buffer<Writable>::seek(size_t offset, int whence) const {
-    static std::map<int, std::ios_base::seekdir> whence_to_dir = {
-        { SEEK_SET, std::ios_base::beg },
-        { SEEK_CUR, std::ios_base::cur },
-        { SEEK_END, std::ios_base::end }
-    };
-    auto result = streambuf->pubseekoff(offset, whence_to_dir.at(whence));
+    std::ios_base::seekdir dir;
+    switch (whence) {
+        case SEEK_SET: dir = std::ios_base::beg; break;
+        case SEEK_CUR: dir = std::ios_base::cur; break;
+        case SEEK_END: dir = std::ios_base::end; break;
+        default:       throw std::out_of_range("invalid whence");
+    }
+    auto result = streambuf->pubseekoff(offset, dir);
     if (result == std::streampos(-1)) {
         throw std::runtime_error("seek failed");
     }
@@ -493,10 +495,7 @@ template <> void llama_file_buffer<false>::write_raw([[maybe_unused]] const void
 }
 
 template <> void llama_file_buffer<false>::write_u32(uint32_t val) const {
-    if (val > 0) {
-        // Cannot directly set [[noreturn]] for a function since it was defined without it.
-        throw std::runtime_error("buffer is not writable");
-    }
+    write_raw(&val, sizeof(val));
 }
 
 template <> void llama_file_buffer<true>::write_raw(const void * ptr, size_t len) const {
@@ -504,6 +503,11 @@ template <> void llama_file_buffer<true>::write_raw(const void * ptr, size_t len
     if (bytes_written != static_cast<std::streamsize>(len)) {
         throw std::runtime_error("write beyond end of buffer");
     }
+}
+
+template <bool Writable> const void * llama_file_buffer<Writable>::data_ptr() const {
+    const auto * buf = dynamic_cast<const Uint8BufferStreamBuf *>(streambuf.get());
+    return buf != nullptr ? buf->data_ptr() : nullptr;
 }
 
 template <> void llama_file_buffer<true>::write_u32(uint32_t val) const {
@@ -597,12 +601,9 @@ bool llama_future_file_buffer<Writable>::fulfill_promise(const std::string & pro
                                                          std::unique_ptr<llama_file_buffer<Writable>> && value) {
     std::string key = final_key(promise_key, context);
     auto        it  = ensure_promise_registry<Writable>(key);
-    if (it != promise_registry<Writable>().end()) {
-        LLAMA_LOG_CMAKE_DEBUG("fulfilling future file buffer %p for %s\n", (void *) &(*it), key.c_str());
-        it->second.set_value(std::move(value));
-        return true;
-    }
-    return false;
+    LLAMA_LOG_CMAKE_DEBUG("fulfilling future file buffer %p for %s\n", (void *) &(*it), key.c_str());
+    it->second.set_value(std::move(value));
+    return true;
 }
 
 template <bool Writable>
@@ -622,11 +623,34 @@ template struct llama_future_file_buffer<true>;
 
 // llama_mmap
 
+#if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
+// merge `ranges` and return their complement within [0, limit)
+static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t limit) {
+    llama_mmap::ranges res;
+    std::sort(ranges.begin(), ranges.end());
+
+    size_t pos = 0;
+    for (const auto & range : ranges) {
+        const size_t beg = std::min(range.first,  limit);
+        const size_t end = std::min(range.second, limit);
+        if (beg > pos) {
+            res.emplace_back(pos, beg);
+        }
+        pos = std::max(pos, end);
+    }
+    if (pos < limit) {
+        res.emplace_back(pos, limit);
+    }
+
+    return res;
+}
+#endif
+
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
@@ -636,18 +660,34 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        if (prefetch) { flags |= MAP_POPULATE; }
+        // MAP_POPULATE would fault in the lazy ranges too
+        if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
-        if (prefetch > 0) {
-            if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
-                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
-                        strerror(errno));
+        // page-aligned madvise over [beg, end), clamped to the file
+        auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
+            const size_t page_size = sysconf(_SC_PAGESIZE);
+            beg = beg & ~(page_size - 1);
+            end = std::min((end + page_size - 1) & ~(page_size - 1), file->size());
+            if (beg >= end) {
+                return;
             }
+            if (posix_madvise((char *) addr + beg, end - beg, advice)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., %s) failed: %s\n", name, strerror(errno));
+            }
+        };
+
+        if (prefetch > 0) {
+            for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
+                advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
+            }
+        }
+        for (const auto & range : lazy_ranges) {
+            advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
         if (numa) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
@@ -717,7 +757,7 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         GGML_UNUSED(numa);
 
         size = file->size();
@@ -747,10 +787,15 @@ struct llama_mmap::impl {
             pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
 
             if (pPrefetchVirtualMemory) {
-                WIN32_MEMORY_RANGE_ENTRY range;
-                range.VirtualAddress = addr;
-                range.NumberOfBytes = (SIZE_T) std::min(size, prefetch);
-                if (!pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+                std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+                for (const auto & range : ranges_complement(lazy_ranges, std::min(size, prefetch))) {
+                    WIN32_MEMORY_RANGE_ENTRY entry;
+                    entry.VirtualAddress = (char *) addr + range.first;
+                    entry.NumberOfBytes  = (SIZE_T) (range.second - range.first);
+                    entries.push_back(entry);
+                }
+                if (!entries.empty() &&
+                        !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
                     LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
                             llama_format_win_err(GetLastError()).c_str());
                 }
@@ -781,10 +826,11 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
+        GGML_UNUSED(lazy_ranges);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -801,7 +847,8 @@ struct llama_mmap::impl {
     size_t size;
 };
 
-llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {}
+llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
+        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }

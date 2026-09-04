@@ -255,6 +255,7 @@ export class ChatService {
 			}),
 			stream,
 			return_progress: stream ? true : undefined,
+			sse_ping_interval: stream ? 1 : undefined,
 			tools: tools && tools.length > 0 ? tools : undefined
 		};
 
@@ -270,10 +271,14 @@ export class ChatService {
 		const reasoningBudgetTokens =
 			enableThinking && reasoningEffort ? (REASONING_EFFORT_TOKENS[reasoningEffort] ?? -1) : -1;
 
-		requestBody.chat_template_kwargs = {
-			...(requestBody.chat_template_kwargs ?? {}),
-			enable_thinking: enableThinking
-		};
+		// an explicit user choice injects the kwarg, otherwise it is omitted so
+		// the server default applies (--reasoning flag or chat template)
+		if (enableThinking !== undefined) {
+			requestBody.chat_template_kwargs = {
+				...(requestBody.chat_template_kwargs ?? {}),
+				enable_thinking: enableThinking
+			};
+		}
 
 		if (reasoningBudgetTokens >= 0) {
 			requestBody.thinking_budget_tokens = reasoningBudgetTokens;
@@ -338,7 +343,11 @@ export class ChatService {
 			// model the ::model suffix keeps the per model session distinct
 			if (stream && conversationId) {
 				headers['X-Conversation-Id'] = streamIdentity(conversationId, options.model);
+				// persist the pending stream before the fetch: a reload during the model load or
+				// the prompt processing must still find its way back to the session once it exists
+				ChatService.saveStreamState(conversationId, 0, options.model ?? null);
 			}
+
 			const response = await fetch(API_CHAT.COMPLETIONS, {
 				method: 'POST',
 				headers,
@@ -347,6 +356,11 @@ export class ChatService {
 			});
 
 			if (!response.ok) {
+				// a rejected request (including one cancelled by a stop during the model load)
+				// leaves nothing to resume
+				if (conversationId) {
+					ChatService.clearStreamState(conversationId);
+				}
 				const error = await ChatService.parseErrorResponse(response);
 
 				if (onError) {
@@ -506,7 +520,7 @@ export class ChatService {
 		if (!conversationId) return;
 		try {
 			const id = streamIdentity(conversationId, model);
-			await fetch(`${API_STREAM.BASE}/${encodeURIComponent(id)}`, {
+			await fetch(`${API_STREAM.BASE}?conv_id=${encodeURIComponent(id)}`, {
 				method: 'DELETE',
 				headers: getAuthHeaders()
 			});
@@ -599,6 +613,26 @@ export class ChatService {
 	 * existing SSE parser drains it like a fresh stream. The server returns 200 on success, 404 if
 	 * no session exists for the conv_id, and 400 if the offset is below the dropped prefix.
 	 */
+	// probe the resume route status without consuming the stream: the SSE route has no HEAD,
+	// so issue the GET and abort it right after the status line. 0 on network error
+	static async probeResumeStatus(streamId: string): Promise<number> {
+		if (!streamId) return 0;
+		const ac = new AbortController();
+		try {
+			const resp = await fetch(
+				`${API_STREAM.BASE}?conv_id=${encodeURIComponent(streamId)}&from=0`,
+				{
+					headers: getAuthHeaders(),
+					signal: ac.signal
+				}
+			);
+			ac.abort();
+			return resp.status;
+		} catch {
+			return 0;
+		}
+	}
+
 	static async resumeStream(
 		conversationId: string,
 		signal?: AbortSignal,
@@ -608,7 +642,7 @@ export class ChatService {
 		const state = ChatService.getStreamState(conversationId);
 		const from = state?.bytesReceived ?? 0;
 		const id = streamIdentity(conversationId, model);
-		const url = `${API_STREAM.BASE}/${encodeURIComponent(id)}?from=${from}`;
+		const url = `${API_STREAM.BASE}?conv_id=${encodeURIComponent(id)}&from=${from}`;
 		return await fetch(url, { method: 'GET', signal, headers: getAuthHeaders() });
 	}
 
@@ -1010,7 +1044,7 @@ export class ChatService {
 	 *
 	 * @param response - The fetch Response object containing the JSON data
 	 * @param onComplete - Optional callback invoked when response is successfully parsed
-	 * @param onError - Optional callback invoked if an error occurs during parsing
+	 * @param onError - Optional callback invoked if an error occurs while parsing
 	 * @returns {Promise<string>} Promise that resolves to the generated content string
 	 * @throws {Error} if the response cannot be parsed or is malformed
 	 */

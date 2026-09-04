@@ -35,9 +35,6 @@ env:
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
-permissions:
-  contents: read
-
 jobs:
   cuda:
     runs-on: ubuntu-24.04

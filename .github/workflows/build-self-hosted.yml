@@ -6,7 +6,7 @@ on:
     branches:
       - master
     paths: [
-      '.github/workflows/build.yml',
+      '.github/workflows/build-self-hosted.yml',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -47,15 +47,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
+  # note: this is dud token to avoid rate limiting (https://github.com/ggml-org/llama.cpp/pull/25706#issuecomment-4979941302)
+  HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
   GGML_NLOOP: 3
   GGML_N_THREADS: 1
   LLAMA_ARG_LOG_COLORS: 1
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
-
-permissions:
-  contents: read
 
 jobs:
   runner_names:
@@ -77,6 +79,27 @@ jobs:
         run: |
           nvidia-smi
           GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
+
+  gpu-rocm:
+    if: false  # QVAC-23796: no matching hardware
+    runs-on: [self-hosted, Linux, AMD]
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Test
+        id: ggml-ci
+        # HIP_LAUNCH_BLOCKING=1: workaround for an async-execution correctness
+        # issue on integrated RDNA3.5 (gfx1151) where batched inference returns
+        # incorrect output (perplexity ~88 vs ~9.4). Serializing kernel launches
+        # restores correctness. Remove once the underlying ROCm/HIP issue is fixed.
+        env:
+          HIP_LAUNCH_BLOCKING: "1"
+        run: |
+          rocminfo
+          GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm:
     needs: runner_names
@@ -108,13 +131,6 @@ jobs:
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
-  # QVAC-23796: must stay on 24.04. The Dawn release asset fetched below is the
-  # "ubuntu-latest" (24.04) build, so it needs that libstdc++. Linking it on
-  # qvac-ubuntu2204-x64-gpu (Ubuntu 22.04 / GCC 11) fails with
-  #   libggml-webgpu.so: undefined reference to `std::ios_base_library_init()'
-  #   libggml-webgpu.so: undefined reference to `..._M_replace_cold(...)'
-  # both of which are GCC 13+ symbols. Running it here also spreads GPU load
-  # across both boxes instead of serialising everything on 2204.
   gpu-webgpu-nvidia:
     needs: runner_names
     runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64_gpu }}
@@ -246,9 +262,6 @@ jobs:
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
-  # QVAC-23796: no Intel-GPU box in the qvac self-hosted fleet, so this keeps
-  # the upstream ggml-org label and stays permanently queued here. Either
-  # provision Intel hardware or drop the job.
   gpu-vulkan-intel-linux:
     if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel]
@@ -266,10 +279,6 @@ jobs:
           vulkaninfo --summary
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
-  # QVAC-23796: Intel-GPU specific and MSYS2-based. The fleet's Windows box
-  # (qvac-win25-x64-gpu) is NVIDIA and its MSYS2 availability is unverified, so
-  # repointing it would silently change what this job tests. Left as-is;
-  # Windows Vulkan *build* coverage now runs via build-cpu.yml (x64-vulkan).
   gpu-vulkan-intel-windows:
     if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Windows, X64, Intel]
@@ -292,7 +301,6 @@ jobs:
           # a valid python environment for testing
           LLAMA_FATAL_WARNINGS=OFF GG_BUILD_NINJA=1 GG_BUILD_VULKAN=1 GG_BUILD_LOW_PERF=1 ./ci/run.sh ./results/llama.cpp ./mnt/llama.cpp
 
-  # QVAC-23796: needs Intel + OpenVINO hardware, not present in the fleet.
   gpu-openvino-low-perf:
     if: false  # QVAC-23796: no matching hardware
     runs-on: [self-hosted, Linux, Intel, OpenVINO]
@@ -340,8 +348,6 @@ jobs:
         run: |
           LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
-  # QVAC-23796: arm64 Graviton label from upstream; the qvac fleet has no
-  # arm64 Linux box, so these two jobs stay permanently queued.
   cpu-arm64-high-perf-graviton4:
     if: false  # QVAC-23796: no matching hardware
     runs-on: ah-ubuntu_22_04-c8g_8x
@@ -359,6 +365,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
           apt-get install -y \
           build-essential \
+          coreutils \
           python3-venv \
           gpg \
           wget \
@@ -376,6 +383,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/kitware.list
           sudo apt-get update
           sudo apt-get install -y cmake
+
+          command -v nproc
 
       - name: Test
         id: ggml-ci
@@ -399,6 +408,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
           apt-get install -y \
           build-essential \
+          coreutils \
           python3-venv \
           gpg \
           wget \
@@ -417,9 +427,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake
 
+          command -v nproc
+
       - name: Test
         id: ggml-ci
         run: |
           GG_BUILD_KLEIDIAI=1 \
           GG_BUILD_EXTRA_TESTS_0=1 \
-          bash ./ci/run.sh ./tmp/results ./tmp/mnt
+          bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp

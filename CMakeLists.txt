@@ -85,6 +85,14 @@ else()
     set(LLAMA_TOOLS_INSTALL_DEFAULT ${LLAMA_STANDALONE})
 endif()
 
+# subprocess spawning isn't a supported/sandbox-friendly operation on mobile OSes or in WASM
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Android" OR ANDROID
+        OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
+    set(LLAMA_SUBPROCESS_DEFAULT OFF)
+else()
+    set(LLAMA_SUBPROCESS_DEFAULT ON)
+endif()
+
 #
 # option list
 #
@@ -121,6 +129,7 @@ option(LLAMA_MTMD "llama: multimodal support" ${LLAMA_BUILD_TOOLS})
 
 # 3rd party libs
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
+option(LLAMA_SUBPROCESS "llama-common: use subprocess, required by server tools and server router mode" ${LLAMA_SUBPROCESS_DEFAULT})
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
 # profiling
@@ -216,6 +225,7 @@ add_subdirectory(src)
 include(GNUInstallDirs)
 set(LLAMA_INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR}/llama CACHE PATH "Location of header files")
 
+set(LLAMA_CPP_HTTPLIB_SYSTEM_OPENSSL OFF)
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
     add_subdirectory(vendor/cpp-httplib)
@@ -266,7 +276,7 @@ foreach(FILE_PATH ${EXTRA_LICENSES})
     license_add_file("${NAME}" "${FILE_PATH}")
 endforeach()
 
-if (LLAMA_BUILD_COMMON)
+if (LLAMA_BUILD_COMMON AND TARGET llama-common)
     license_generate(llama-common)
 endif()
 
@@ -351,6 +361,23 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/llama-config.cmake
 install(
     PROGRAMS convert_hf_to_gguf.py vulkan_profiling_analyzer.py
     DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if (IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+    set(LLAMA_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+    set(LLAMA_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+else()
+    set(_LLAMA_PC_PREFIX_BASE "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-prefix")
+    file(RELATIVE_PATH LLAMA_PC_PREFIX_RELATIVE
+        "${_LLAMA_PC_PREFIX_BASE}/${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+        "${_LLAMA_PC_PREFIX_BASE}")
+    set(LLAMA_PC_PREFIX "\${pcfiledir}/${LLAMA_PC_PREFIX_RELATIVE}")
+    set(LLAMA_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+endif()
+if (IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+    set(LLAMA_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+else()
+    set(LLAMA_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
 
 configure_file(cmake/llama.pc.in
         "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"

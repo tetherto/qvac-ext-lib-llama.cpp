@@ -229,6 +229,5 @@ bool IncrementalSplitsTensorLoad::SplitInfo::all_tensors_loaded() const {
 bool IncrementalSplitsTensorLoad::tensor_ignored(const std::optional<IncrementalSplitsTensorLoad> & splits_tensor_load,
                                                  const char *                                       tensor_name) {
     return !splits_tensor_load.has_value() ||
-           (splits_tensor_load.has_value() &&
-            splits_tensor_load->expected_tensors.find(tensor_name) == splits_tensor_load->expected_tensors.end());
+           splits_tensor_load->expected_tensors.find(tensor_name) == splits_tensor_load->expected_tensors.end();
 }

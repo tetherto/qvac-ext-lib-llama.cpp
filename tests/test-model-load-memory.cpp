@@ -2,12 +2,12 @@
 #include <cstdlib>
 #include <vector>
 
-#include "get-model.h"
+#include "common.h"
 #include "llama-cpp.h"
 #include "load_into_memory.h"
 
 int main(int argc, char * argv[]) {
-    auto * model_path = get_model_or_exit(argc, argv);
+    auto * model_path = common_get_model_or_exit(argc, argv);
 
     if (is_split_file(model_path)) {
         printf("Skipping split model %s\n", model_path);
@@ -19,7 +19,7 @@ int main(int argc, char * argv[]) {
 
     llama_backend_init();
     auto params              = llama_model_default_params();
-    params.use_mmap          = false;
+    params.load_mode         = LLAMA_LOAD_MODE_NONE;
     params.progress_callback = [](float progress, void * ctx) {
         (void) ctx;
         fprintf(stderr, "%.2f%% ", progress * 100.0f);

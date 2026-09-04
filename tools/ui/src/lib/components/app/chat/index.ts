@@ -241,13 +241,18 @@ export { default as ChatFormActionAddToolsSubmenu } from './ChatForm/ChatFormAct
 export { default as ChatFormActionAddMcpServersSubmenu } from './ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddMcpServersSubmenu.svelte';
 
 /**
- * **ChatFormReasoningToggle** - Thinking toggle button with effort dropdown
+ * Dropdown submenu for selecting reasoning effort level.
  *
- * A toggle button with lightbulb icon that indicates thinking status.
- * Shows the reasoning effort dropdown when clicked.
+ * Shows a "Reasoning" sub-menu item with a lightbulb icon indicating
+ * thinking status, and a nested list of effort levels.
  * Only visible when the current model supports thinking.
  */
-export { default as ChatFormReasoningToggle } from './ChatForm/ChatFormActions/ChatFormReasoningToggle.svelte';
+export { default as ChatFormActionAddReasoningSubmenu } from './ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddReasoningSubmenu.svelte';
+
+/**
+ * Compact context-usage gauge with per-turn and cumulative breakdown in the tooltip.
+ */
+export { default as ChatFormContextGauge } from './ChatForm/ChatFormContextGauge/ChatFormContextGauge.svelte';
 
 /**
  * Hidden file input element for programmatic file selection.
@@ -266,6 +271,16 @@ export { default as ChatFormMcpResourcesList } from './ChatForm/ChatFormMcpResou
  * end before processing Enter key). Exposes focus() and resetHeight() methods.
  */
 export { default as ChatFormTextarea } from './ChatForm/ChatFormTextarea.svelte';
+
+/**
+ * Working directory selector for agent mode. Renders a chip below the chat
+ * form; clicking it opens a popover with a directory picker backed by the
+ * server's `file_glob_search` built-in tool (POST /tools). The picked
+ * directory is exposed via `bind:directory`; changing it records a
+ * synthetic "Set working directory to ..." user message into chat history
+ * and is enforced on tool calls via the `x-tool-cwd` request header.
+ */
+export { default as ChatFormWorkingDirectory } from './ChatForm/ChatFormWorkingDirectory.svelte';
 
 /**
  * **ChatFormPickerMcpPrompts** - MCP prompt selection interface
@@ -553,6 +568,22 @@ export { default as ChatMessageStatisticsBadge } from './ChatMessages/ChatMessag
 export { default as ChatMessageMcpPrompt } from './ChatMessages/ChatMessage/ChatMessageMcpPrompt/ChatMessageMcpPrompt.svelte';
 
 /**
+ * Synthetic working-directory-change message. Rendered in place of a user
+ * bubble when the message content parses as a cwd message (see
+ * parseCwdMessage); shows the new cwd with the same folder-row treatment
+ * the tool-call UI used.
+ */
+export { default as ChatMessageCwdChange } from './ChatMessages/ChatMessage/ChatMessageCwdChange.svelte';
+
+/**
+ * Generic wrapper for UI-generated (synthetic) messages. Routes the
+ * working-directory change to ChatMessageCwdChange and renders a muted
+ * fallback for any other synthetic text, so no synthetic message ever
+ * surfaces as a user bubble.
+ */
+export { default as ChatMessageSynthetic } from './ChatMessages/ChatMessage/ChatMessageSynthetic.svelte';
+
+/**
  * Formatted content display for MCP prompt messages. Renders the full prompt
  * content with arguments in a readable format. Used within ChatMessageMcpPrompt
  * for the expanded view.
@@ -566,6 +597,10 @@ export { default as ChatMessageMcpPromptContent } from './ChatMessages/ChatMessa
  * Handles streaming state with real-time content updates.
  */
 export { default as ChatMessageAssistant } from './ChatMessages/ChatMessage/ChatMessageAssistant/ChatMessageAssistant.svelte';
+export { default as ChatMessageAssistantModel } from './ChatMessages/ChatMessage/ChatMessageAssistant/ChatMessageAssistantModel.svelte';
+export { default as ChatMessageAssistantProcessingInfo } from './ChatMessages/ChatMessage/ChatMessageAssistant/ChatMessageAssistantProcessingInfo.svelte';
+export { default as ChatMessageAssistantRawOutput } from './ChatMessages/ChatMessage/ChatMessageAssistant/ChatMessageAssistantRawOutput.svelte';
+export { default as ChatMessageAssistantStatistics } from './ChatMessages/ChatMessage/ChatMessageAssistant/ChatMessageAssistantStatistics.svelte';
 
 /**
  * Inline message editing form. Provides textarea for editing message content with
@@ -668,14 +703,6 @@ export { default as ChatScreenDragOverlay } from './ChatScreen/ChatScreenDragOve
  * the visual container styling for the input area.
  */
 export { default as ChatScreenForm } from './ChatScreen/ChatScreenForm.svelte';
-
-/**
- * Processing info display during generation. Shows real-time statistics:
- * tokens per second, prompt/completion token counts, and elapsed time.
- * Data sourced from slotsService polling during active generation.
- * Only visible when `isCurrentConversationLoading` is true.
- */
-export { default as ChatScreenProcessingInfo } from './ChatScreen/ChatScreenProcessingInfo.svelte';
 
 /**
  * Server error alert displayed when the server is unreachable.

@@ -41,7 +41,7 @@ if (LLAMA_BUILD_BORINGSSL)
     set(FIPS OFF CACHE BOOL "Enable FIPS (BoringSSL)")
 
     set(BORINGSSL_GIT "https://boringssl.googlesource.com/boringssl" CACHE STRING "BoringSSL git repository")
-    set(BORINGSSL_VERSION "0.20260616.0" CACHE STRING "BoringSSL version")
+    set(BORINGSSL_VERSION "0.20260803.0" CACHE STRING "BoringSSL version")
 
     message(STATUS "Fetching BoringSSL version ${BORINGSSL_VERSION}")
 
@@ -146,6 +146,7 @@ elseif (LLAMA_OPENSSL)
         if (OPENSSL_VERSION_SUPPORTED)
             message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
             set(CPPHTTPLIB_OPENSSL_SUPPORT TRUE)
+            set(LLAMA_CPP_HTTPLIB_SYSTEM_OPENSSL ON PARENT_SCOPE)
             target_link_libraries(${TARGET} PUBLIC OpenSSL::SSL OpenSSL::Crypto)
         endif()
     else()

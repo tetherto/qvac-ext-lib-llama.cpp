@@ -27,6 +27,8 @@ class GGML_CLASS_API Uint8BufferStreamBuf : public std::basic_streambuf<char> {
   public:
     Uint8BufferStreamBuf(std::vector<uint8_t> && _data);
 
+    const uint8_t * data_ptr() const { return data.data(); }
+
   protected:
     int_type underflow() override;
 

@@ -2,12 +2,15 @@
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
+#import "ggml-metal-impl.h"
 
 #include <Foundation/Foundation.h>
 
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+
 #include <Metal/Metal.h>
 
-#include <limits.h>
 #include <stdatomic.h>
 
 #ifndef TARGET_OS_VISION
@@ -94,6 +97,12 @@ void ggml_metal_pipeline_free(ggml_metal_pipeline_t pipeline) {
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline) {
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
 }
+
+// simdgroup / subgroup / wave size
+int ggml_metal_pipeline_thread_execution_width(struct ggml_metal_pipeline_with_params pipeline) {
+    return pipeline.pipeline->obj.threadExecutionWidth;
+}
+
 
 struct ggml_metal_library {
     id<MTLLibrary> obj;
@@ -358,6 +367,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.nth      =*/ 0,
     };
 
     res.pipeline = ggml_metal_pipelines_get(lib->pipelines, name);
@@ -376,6 +386,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.nth      =*/ 0,
     };
 
     [lib->lock lock];
@@ -558,7 +569,32 @@ struct ggml_metal_rsets {
     dispatch_group_t d_group;
 };
 
-ggml_metal_rsets_t ggml_metal_rsets_init(void) {
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+static void ggml_metal_dummy_work(ggml_metal_device_t dev) {
+    if (dev->mtl_queue == nil) {
+        return;
+    }
+
+    @autoreleasepool {
+        // perform a minimal dummy operation on the GPU
+        id<MTLBuffer> buf = [dev->mtl_device newBufferWithLength:1 options:MTLResourceStorageModePrivate];
+        id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBuffer];
+
+        {
+            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+            [encoder fillBuffer:buf range:NSMakeRange(0, 1) value:0];
+
+            [encoder endEncoding];
+        }
+
+        [cmd_buf commit];
+        [buf release];
+    }
+}
+#endif
+
+ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     ggml_metal_rsets_t res = calloc(1, sizeof(struct ggml_metal_rsets));
 
     res->lock = [[NSLock alloc] init];
@@ -615,6 +651,15 @@ ggml_metal_rsets_t ggml_metal_rsets_init(void) {
         }
 #endif
     });
+
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+    if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+        // workaround for residency set memory not being released if no GPU operation occurs
+        // https://developer.apple.com/forums/thread/839089
+        // https://github.com/ggml-org/llama.cpp/issues/25937
+        ggml_metal_dummy_work(dev);
+    }
+#endif
 
     return res;
 }
@@ -947,7 +992,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             }
 
             if (dev->props.use_residency_sets) {
-                dev->rsets = ggml_metal_rsets_init();
+                dev->rsets = ggml_metal_rsets_init(dev);
             } else {
                 dev->rsets = nil;
             }
@@ -1125,6 +1170,33 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     if (@available(macOS 10.12, iOS 16.0, *)) {
         *total = dev->mtl_device.recommendedMaxWorkingSetSize;
         *free  = *total - dev->mtl_device.currentAllocatedSize;
+
+        // currentAllocatedSize only counts this process. On unified memory the
+        // device budget is the same physical RAM every other process is using,
+        // so clamp by what the host can still make available — otherwise a
+        // fresh process (e.g. a fit/preflight subprocess) sees an idle device
+        // no matter how much is already wired system-wide.
+        //
+        // "Available" here is physical memory minus what cannot be evicted:
+        // wired pages (other processes' GPU buffers included) and the
+        // compressor's own footprint. Anonymous and file-backed pages are NOT
+        // subtracted — the kernel compresses or evicts them under pressure, and
+        // an estimate like free+inactive that ignores this rejects loads that
+        // demonstrably run.
+        if (dev->mtl_device.hasUnifiedMemory) {
+            vm_statistics64_data_t vm_stats;
+            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+            int64_t total_mem = 0;
+            size_t total_len = sizeof(total_mem);
+            if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm_stats, &count) == KERN_SUCCESS &&
+                sysctlbyname("hw.memsize", &total_mem, &total_len, NULL, 0) == 0) {
+                const size_t unavailable = ((size_t) vm_stats.wire_count + (size_t) vm_stats.compressor_page_count) * (size_t) vm_kernel_page_size;
+                const size_t host_available = (size_t) total_mem > unavailable ? (size_t) total_mem - unavailable : 0;
+                if (host_available < *free) {
+                    *free = host_available;
+                }
+            }
+        }
     } else {
         *free = 0;
         *total = 0;
@@ -1135,8 +1207,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
-    const int64_t max_dispatch_dim     = INT_MAX;
-    const int64_t max_grid_id          = UINT_MAX;
 
     if (!has_simdgroup_reduction) {
         return false;
@@ -1192,6 +1262,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 default:
                     return false;
             }
+        case GGML_OP_SILU_BACK:
+            return (op->src[0]->type == GGML_TYPE_F32) &&
+                (op->src[1]->type == GGML_TYPE_F32) &&
+                (op->type == GGML_TYPE_F32) &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op) &&
+                ggml_are_same_shape(op->src[0], op->src[1]);
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
                 case GGML_GLU_OP_REGLU:
@@ -1248,6 +1326,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_ADD_ID:
+            return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) && (op->src[0]->type == op->src[1]->type);
         case GGML_OP_ACC:
             return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_OUT_PROD:
@@ -1275,101 +1354,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 }
             }
             return false;
-        case GGML_OP_LIGHTNING_INDEXER:
-            {
-                const struct ggml_tensor * q       = op->src[0];
-                const struct ggml_tensor * k       = op->src[1];
-                const struct ggml_tensor * weights = op->src[2];
-                const struct ggml_tensor * mask    = op->src[3];
-
-                size_t k_align;
-                switch (k->type) {
-                    case GGML_TYPE_F32:
-                        k_align = 16;
-                        break;
-                    case GGML_TYPE_F16:
-                        k_align = 8;
-                        break;
-                    case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_Q5_1:
-                    case GGML_TYPE_Q5_0:
-                    case GGML_TYPE_Q4_1:
-                    case GGML_TYPE_Q4_0:
-                        k_align = 2;
-                        break;
-                    default:
-                        return false;
-                }
-
-                const bool aligned =
-                    (uintptr_t) q->data       % sizeof(float) == 0 &&
-                    (uintptr_t) k->data       % k_align       == 0 &&
-                    (uintptr_t) weights->data % sizeof(float) == 0 &&
-                    (uintptr_t) mask->data    % sizeof(ggml_fp16_t) == 0 &&
-                    (uintptr_t) op->data      % sizeof(float) == 0 &&
-                    q->nb[1] % sizeof(float) == 0 && q->nb[2] % sizeof(float) == 0 && q->nb[3] % sizeof(float) == 0 &&
-                    k->nb[2] % k_align == 0 && k->nb[3] % k_align == 0 &&
-                    weights->nb[1] % sizeof(float) == 0 && weights->nb[3] % sizeof(float) == 0 &&
-                    mask->nb[1] % sizeof(ggml_fp16_t) == 0 && mask->nb[3] % sizeof(ggml_fp16_t) == 0 &&
-                    op->nb[1] % sizeof(float) == 0 && op->nb[3] % sizeof(float) == 0;
-
-                return has_simdgroup_reduction && aligned &&
-                       q->type == GGML_TYPE_F32 &&
-                       weights->type == GGML_TYPE_F32 && mask->type == GGML_TYPE_F16 &&
-                       op->type == GGML_TYPE_F32 &&
-                       q->ne[0] == 128 && (q->ne[1] == 32 || q->ne[1] == 64) &&
-                       q->ne[2] > 0 && q->ne[2] <= max_dispatch_dim &&
-                       q->ne[3] > 0 && q->ne[3] <= max_dispatch_dim &&
-                       k->ne[0] == q->ne[0] && k->ne[1] == 1 &&
-                       k->ne[2] > 0 && k->ne[2] <= max_dispatch_dim &&
-                       k->ne[3] == q->ne[3] &&
-                       weights->ne[0] == q->ne[1] && weights->ne[1] == q->ne[2] &&
-                       weights->ne[2] == 1 && weights->ne[3] == q->ne[3] &&
-                       mask->ne[0] == k->ne[2] && mask->ne[1] == q->ne[2] &&
-                       mask->ne[2] == 1 && mask->ne[3] > 0 &&
-                       weights->ne[3] % mask->ne[3] == 0 &&
-                       op->ne[0] == k->ne[2] && op->ne[1] == q->ne[2] &&
-                       op->ne[2] == 1 && op->ne[3] == q->ne[3] &&
-                       q->nb[0] == ggml_type_size(q->type) &&
-                       k->ne[0] % ggml_blck_size(k->type) == 0 &&
-                       k->nb[0] == ggml_type_size(k->type) &&
-                       k->nb[1] == ggml_row_size(k->type, k->ne[0]) &&
-                       weights->nb[0] == ggml_type_size(weights->type) &&
-                       mask->nb[0] == ggml_type_size(mask->type) &&
-                       op->nb[0] == ggml_type_size(op->type);
-            }
-        case GGML_OP_DSV4_HC_COMB:
-            return op->src[0]->ne[1] > 0 && op->src[0]->ne[1] <= max_grid_id &&
-                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   op->src[0]->ne[0] == 24 && op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
-                   op->src[1]->ne[0] >= 3 && op->src[1]->ne[1] == 1 &&
-                   op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
-                   op->src[2]->ne[0] == 24 && op->src[2]->ne[1] == 1 &&
-                   op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
-                   op->ne[0] == 4 && op->ne[1] == 4 &&
-                   op->ne[2] == op->src[0]->ne[1] && op->ne[3] == 1 &&
-                   ggml_get_op_params_i32(op, 1) > 0;
-        case GGML_OP_DSV4_HC_PRE:
-            return ggml_nelements(op) <= max_grid_id &&
-                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32 &&
-                   op->src[0]->ne[0] > 0 && op->src[0]->ne[1] > 0 &&
-                   op->src[0]->ne[2] > 0 && op->src[0]->ne[3] == 1 &&
-                   op->src[1]->ne[0] == op->src[0]->ne[1] &&
-                   op->src[1]->ne[1] == op->src[0]->ne[2] &&
-                   op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
-                   op->ne[0] == op->src[0]->ne[0] && op->ne[1] == op->src[0]->ne[2] &&
-                   op->ne[2] == 1 && op->ne[3] == 1;
-        case GGML_OP_DSV4_HC_POST:
-            return ggml_nelements(op) <= max_grid_id &&
-                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
-                   op->src[1]->ne[0] == op->src[0]->ne[0] && op->src[1]->ne[2] == op->src[0]->ne[1] && op->src[1]->ne[3] == 1 &&
-                   op->src[2]->ne[0] == op->src[1]->ne[1] && op->src[2]->ne[1] == op->src[0]->ne[1] && op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1 &&
-                   op->src[3]->ne[0] == op->src[1]->ne[1] && op->src[3]->ne[1] == op->src[1]->ne[1] && op->src[3]->ne[2] == op->src[0]->ne[1] && op->src[3]->ne[3] == 1 &&
-                   op->ne[0] == op->src[0]->ne[0] && op->ne[1] == op->src[1]->ne[1] && op->ne[2] == op->src[0]->ne[1] && op->ne[3] == 1;
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
@@ -1378,6 +1362,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_COL2IM_1D:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) &&
+                op->type == op->src[0]->type &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op);
         case GGML_OP_CONV_3D:
             return ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op->src[1]) &&
@@ -1387,16 +1376,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && ggml_is_contiguous(op->src[0]);
         case GGML_OP_TRI:
             return ggml_is_contiguous_rows(op->src[0]);
-        case GGML_OP_SILU_BACK:
-            return op->type == GGML_TYPE_F32 &&
-                   op->src[0] != NULL && op->src[1] != NULL &&
-                   op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[1]->type == GGML_TYPE_F32 &&
-                   ggml_is_contiguous_1(op->src[0]) &&
-                   ggml_is_contiguous_1(op->src[1]) &&
-                   ggml_is_contiguous_1(op) &&
-                   ggml_are_same_shape(op, op->src[0]) &&
-                   ggml_are_same_shape(op, op->src[1]);
         case GGML_OP_SUM_ROWS:
         case GGML_OP_CUMSUM:
         case GGML_OP_MEAN:
@@ -1514,12 +1493,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->type == GGML_TYPE_F32 &&
                    (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
         case GGML_OP_CONV_2D_DW:
-            // The kernel addresses both weights and input by byte-stride, so a
-            // permuted (CWHN) weight is fine — no contiguity requirement. f32
-            // weights only (matches the CPU reference).
-            return op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[1]->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32;
+            return op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
         case GGML_OP_UPSCALE:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_POOL_1D:
@@ -1536,8 +1512,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    (ggml_get_op_params_i32(op, 4) == 0) && (ggml_get_op_params_i32(op, 6) == 0);
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_TIMESTEP_EMBEDDING:
-        case GGML_OP_LEAKY_RELU:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_LEAKY_RELU:
+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_ARANGE:
@@ -1582,6 +1559,72 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_LIGHTNING_INDEXER:
+            if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK ||
+                op->src[0]->ne[1] != OP_LIGHTNING_INDEXER_NH) {
+                return false;
+            }
+            if (!has_simdgroup_mm ||
+                op->src[0]->type != GGML_TYPE_F32 ||
+                op->src[2]->type != GGML_TYPE_F32 ||
+                op->src[3]->type != GGML_TYPE_F16 ||
+                op->type         != GGML_TYPE_F32 ||
+                !ggml_is_contiguous_rows(op->src[0]) ||
+                !ggml_is_contiguous_rows(op->src[1]) ||
+                !ggml_is_contiguous_rows(op->src[2]) ||
+                !ggml_is_contiguous_rows(op->src[3])) {
+                return false;
+            }
+            switch (op->src[1]->type) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                    return true;
+                case GGML_TYPE_BF16:
+                    return has_bfloat;
+                default:
+                    return false;
+            }
+        case GGML_OP_DSV4_HC_COMB:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] == 24 &&
+                op->src[1]->ne[0] >= 3 &&
+                op->src[2]->ne[0] == 24 &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous_rows(op->src[2]);
+        case GGML_OP_DSV4_HC_PRE:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[1] == 4 &&
+                op->src[1]->ne[0] == 4 &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_DSV4_HC_POST:
+            return has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[3]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[1]->ne[1] == 4 &&
+                op->src[2]->ne[0] == 4 &&
+                op->src[3]->ne[0] == 4 &&
+                op->src[3]->ne[1] == 4 &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous_rows(op->src[2]) &&
+                ggml_is_contiguous_rows(op->src[3]);
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
@@ -1607,6 +1650,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_BF16:
                            case GGML_TYPE_Q8_0:
                            case GGML_TYPE_Q1_0:
+                           case GGML_TYPE_Q2_0:
                            case GGML_TYPE_Q4_0:
                            case GGML_TYPE_Q4_1:
                            case GGML_TYPE_Q5_0:
@@ -1634,6 +1678,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                                 return false;
                         }
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -1799,6 +1844,7 @@ static void ggml_metal_buffer_rset_free(ggml_metal_buffer_t buf) {
         if (buf->rset) {
             [buf->rset endResidency];
             [buf->rset removeAllAllocations];
+            [buf->rset commit];
             [buf->rset release];
         }
     }

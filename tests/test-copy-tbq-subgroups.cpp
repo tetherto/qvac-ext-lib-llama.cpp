@@ -179,20 +179,18 @@ static void fill_normal(std::vector<float> & v, uint32_t seed) {
     }
 }
 
-// Pick a non-CPU backend; return nullptr if none. Accept GPU, IGPU, and
-// ACCEL device types -- Vulkan on integrated graphics (e.g. AMD gfx1150)
-// reports as IGPU, not GPU.
-static ggml_backend_t pick_gpu_backend(std::string & name_out) {
+// Pick a Vulkan backend; return nullptr if none.
+static ggml_backend_t pick_vulkan_backend(std::string & name_out) {
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        const auto         t   = ggml_backend_dev_type(dev);
-        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU ||
-            t == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-            ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
-            if (b) {
-                name_out = ggml_backend_dev_name(dev);
-                return b;
-            }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (std::strcmp(ggml_backend_reg_name(reg), "Vulkan") != 0) {
+            continue;
+        }
+        ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
+        if (b) {
+            name_out = ggml_backend_dev_name(dev);
+            return b;
         }
     }
     return nullptr;
@@ -331,7 +329,7 @@ static ChildResult run_one(ggml_backend_t backend, ggml_type qtype, int64_t ne0,
 static int probe_main() {
     ggml_backend_load_all();
     std::string    backend_name;
-    ggml_backend_t backend = pick_gpu_backend(backend_name);
+    ggml_backend_t backend = pick_vulkan_backend(backend_name);
     if (!backend) {
         std::printf("PROBE ok=0\n");
         return 0;
@@ -358,7 +356,7 @@ static int child_main(int argc, char ** argv) {
 
     ggml_backend_load_all();
     std::string    backend_name;
-    ggml_backend_t backend = pick_gpu_backend(backend_name);
+    ggml_backend_t backend = pick_vulkan_backend(backend_name);
     if (!backend) {
         std::printf("RESULT ok=0 supp=0 skip=no_gpu\n");
         return 0;
@@ -463,11 +461,19 @@ static ProbeResult probe_sg(const std::string & self_path, uint32_t sg) {
     pr.requested = sg;
 
     char cmd[2048];
+#if defined(_WIN32)
+    if (sg == 0) {
+        std::snprintf(cmd, sizeof(cmd), "set \"GGML_VK_TBQ_COPY_SG_SIZE=\" && \"%s\" --probe 2>&1", self_path.c_str());
+    } else {
+        std::snprintf(cmd, sizeof(cmd), "set \"GGML_VK_TBQ_COPY_SG_SIZE=%u\" && \"%s\" --probe 2>&1", sg, self_path.c_str());
+    }
+#else
     if (sg == 0) {
         std::snprintf(cmd, sizeof(cmd), "unset GGML_VK_TBQ_COPY_SG_SIZE; \"%s\" --probe 2>&1", self_path.c_str());
     } else {
         std::snprintf(cmd, sizeof(cmd), "GGML_VK_TBQ_COPY_SG_SIZE=%u \"%s\" --probe 2>&1", sg, self_path.c_str());
     }
+#endif
 
     FILE * f = POPEN(cmd, "r");
     if (!f) {
@@ -513,6 +519,15 @@ static ParsedLine run_child(const std::string & self_path, uint32_t sg, int qi, 
     // Build the command. We re-exec ourselves with --child to force child_main.
     // Env var sg==0 means "don't set the var at all".
     char cmd[2048];
+#if defined(_WIN32)
+    if (sg == 0) {
+        std::snprintf(cmd, sizeof(cmd), "set \"GGML_VK_TBQ_COPY_SG_SIZE=\" && \"%s\" --child %d %d 2>&1", self_path.c_str(),
+                      qi, si);
+    } else {
+        std::snprintf(cmd, sizeof(cmd), "set \"GGML_VK_TBQ_COPY_SG_SIZE=%u\" && \"%s\" --child %d %d 2>&1", sg, self_path.c_str(),
+                      qi, si);
+    }
+#else
     if (sg == 0) {
         std::snprintf(cmd, sizeof(cmd), "unset GGML_VK_TBQ_COPY_SG_SIZE; \"%s\" --child %d %d 2>&1", self_path.c_str(),
                       qi, si);
@@ -520,6 +535,7 @@ static ParsedLine run_child(const std::string & self_path, uint32_t sg, int qi, 
         std::snprintf(cmd, sizeof(cmd), "GGML_VK_TBQ_COPY_SG_SIZE=%u \"%s\" --child %d %d 2>&1", sg, self_path.c_str(),
                       qi, si);
     }
+#endif
 
     FILE * f = POPEN(cmd, "r");
     if (!f) {
@@ -618,13 +634,13 @@ static std::vector<size_t> resolve_type_filter(const std::string & csv) {
 }
 
 static int parent_main(const std::string & self_path, const std::vector<size_t> & type_filter) {
-    // Sanity: make sure a GPU backend is actually available at all.
+    // Sanity: make sure a Vulkan backend is actually available at all.
     {
         ggml_backend_load_all();
         std::string    nm;
-        ggml_backend_t b = pick_gpu_backend(nm);
+        ggml_backend_t b = pick_vulkan_backend(nm);
         if (!b) {
-            std::fprintf(stdout, "no GPU backend available -- skipping\n");
+            std::fprintf(stdout, "SKIPPED: no Vulkan backend available\n");
             return 0;
         }
         std::fprintf(stdout, "using backend: %s\n", nm.c_str());
@@ -794,7 +810,7 @@ static int parent_main(const std::string & self_path, const std::vector<size_t> 
                 max_nmse = std::max(max_nmse, p.nmse_gvsc);
             }
             n_skipped += n_skipped_local;
-            if (any_applied && !any_ok) {
+            if (!any_applied || !any_ok) {
                 std::fprintf(stderr, "  FAIL: no SG produced a valid result\n");
                 ++n_fail;
             }

@@ -37,13 +37,9 @@ concurrency:
   group: release
   queue: max
 
-permissions:
-  contents: read
-
 jobs:
   check-release:
     runs-on: ubuntu-slim
-    permissions: {}
 
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
@@ -97,13 +93,13 @@ jobs:
           - build: 'arm64'
             arch: 'arm64'
             os: macos-26
-            defines: "-DGGML_METAL_USE_BF16=ON -DGGML_METAL_EMBED_LIBRARY=ON"
+            defines: "-DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
           # TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23780)
           #       in order to enable it again, we have to provision dedicated runners  to run it
           #- build: 'arm64-kleidiai'
           #  arch: 'arm64'
           #  os: macos-14
-          #  defines: "-DGGML_METAL_USE_BF16=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_CPU_KLEIDIAI=ON"
+          #  defines: "-DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DGGML_CPU_KLEIDIAI=ON"
           - build: 'x64'
             arch: 'x64'
             os: macos-15-intel
@@ -114,7 +110,6 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     permissions:
-      contents: read
       actions: write
 
     steps:
@@ -187,7 +182,6 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     permissions:
-      contents: read
       actions: write
 
     steps:
@@ -274,7 +268,6 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     permissions:
-      contents: read
       actions: write
 
     steps:
@@ -446,7 +439,6 @@ jobs:
     runs-on: ubuntu-24.04
 
     permissions:
-      contents: read
       actions: write
 
     outputs:
@@ -564,10 +556,6 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
-
-    permissions:
-      contents: read
-      actions: write
 
     outputs:
       openvino_version: ${{ steps.openvino_version.outputs.value }}
@@ -699,7 +687,6 @@ jobs:
     runs-on: windows-2025-vs2026
 
     permissions:
-      contents: read
       actions: write
 
     strategy:
@@ -768,11 +755,11 @@ jobs:
     runs-on: windows-2025
 
     permissions:
-      contents: read
+      actions: write
 
     env:
       OPENBLAS_VERSION: 0.3.23
-      VULKAN_VERSION: 1.4.313.2
+      VULKAN_VERSION: 1.4.357.0
 
     strategy:
       matrix:
@@ -867,7 +854,6 @@ jobs:
     runs-on: windows-2022
 
     permissions:
-      contents: read
       actions: write
 
     strategy:
@@ -953,10 +939,6 @@ jobs:
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
 
     runs-on: windows-2022
-
-    permissions:
-      contents: read
-      actions: write
 
     defaults:
       run:
@@ -1077,10 +1059,6 @@ jobs:
 
     runs-on: ubuntu-24.04
 
-    permissions:
-      contents: read
-      actions: write
-
     env:
       ONEAPI_ROOT: /opt/intel/oneapi/
       ONEAPI_INSTALLER_VERSION: "2025.3.3"
@@ -1131,6 +1109,8 @@ jobs:
             -DGGML_SYCL=ON \
             -DCMAKE_C_COMPILER=icx \
             -DCMAKE_CXX_COMPILER=icpx \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DLLAMA_OPENSSL=OFF \
             -DGGML_NATIVE=OFF \
             -DGGML_SYCL_F16=${{ matrix.fp16 }}
@@ -1164,7 +1144,6 @@ jobs:
     runs-on: ubuntu-22.04
 
     permissions:
-      contents: read
       actions: write
 
     strategy:
@@ -1286,7 +1265,6 @@ jobs:
     runs-on: windows-2022
 
     permissions:
-      contents: read
       actions: write
 
     env:
@@ -1424,7 +1402,6 @@ jobs:
         run: |
           sysctl -a
           cmake -B build -G Xcode \
-            -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_OPENSSL=OFF \
             -DLLAMA_BUILD_APP=OFF \
@@ -1674,6 +1651,9 @@ jobs:
             ${{ github.event.head_commit.message }}
 
             </details>
+
+            **Website:**
+            - <https://llama.app>
 
             **macOS/iOS:**
             - [macOS Apple Silicon (arm64)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-arm64.tar.gz)

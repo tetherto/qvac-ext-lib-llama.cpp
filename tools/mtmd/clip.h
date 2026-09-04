@@ -40,6 +40,7 @@ struct clip_image_f32_batch;
 enum clip_modality {
     CLIP_MODALITY_VISION,
     CLIP_MODALITY_AUDIO,
+    CLIP_MODALITY_GEN_AUDIO,
 };
 
 enum clip_flash_attn_type {
@@ -76,11 +77,18 @@ struct clip_context_params {
     const char * backend_device; // optional, if null will use env var or default GPU backend
     int image_tile_mode;   // 0=batched, 1=sequential (default), 2=disabled. NOTE: 0 (batched) is the zero value but NOT the default — init via mtmd_context_params_default() or set explicitly.
     int image_max_tiles;   // override preproc_max_tiles; -1 or 0 = use GGUF/model default (only a positive value overrides)
+    // override preproc_no_upscale (idefics3-style preprocessing); -1 = use GGUF/model
+    // default, 0 = off, 1 = on. WARNING: a zero-initialized struct lands on 0 (off), not
+    // -1 (model default), the one case that silently forces base-style preprocessing
+    // on a Flash-style model. Do not rely on zero-init: use mtmd_context_params_default()
+    // or set this field explicitly.
+    int image_no_upscale;
 };
 
 struct clip_init_result {
     struct clip_ctx * ctx_v; // vision context
     struct clip_ctx * ctx_a; // audio context
+    struct clip_ctx * ctx_gen_a; // audio generation context
 };
 
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params);
@@ -103,6 +111,33 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx);
 // TODO: remove clip_image_encode() and always use batched version
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, std::vector<float> & out_batch_embd);
+
+enum clip_gen_process_type {
+    CLIP_GEN_PROCESS_GEN_UNKNOWN,
+    CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
+    CLIP_GEN_PROCESS_GEN_WAV,  // codes to raw PCM audio
+};
+struct clip_encode_params {
+    int n_threads = 1;
+    const clip_image_f32_batch * imgs = nullptr;
+    std::vector<float> * out_embd = nullptr;
+
+    // for audio gen, imgs has exactly one entry: hidden state from backbone (GEN_CODE) or unused (GEN_WAV)
+    clip_gen_process_type gen_process = CLIP_GEN_PROCESS_GEN_UNKNOWN;
+
+    // GEN_CODE: out_embd receives the embd to feed back to the backbone
+    int32_t code0 = 0; // semantic code sampled by the backbone
+    int32_t top_k = 50;
+    float   top_p = 1.0f;
+    std::vector<int32_t> * out_codes = nullptr; // this frame's 16 sampled codes
+
+    // GEN_WAV
+    const std::vector<int32_t> * codes = nullptr;     // this frame's 16 RVQ codes
+    std::vector<float> * out_audio = nullptr;         // decoded PCM samples, F32
+    const std::vector<uint8_t> * state_in  = nullptr; // state from previous call, null or wrong size means cold start
+    std::vector<uint8_t> *       state_out = nullptr; // state for the next call
+};
+bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
 
 bool clip_is_llava(const struct clip_ctx * ctx);
 // note for contributor: this clip_is_(model) pattern is deprecated

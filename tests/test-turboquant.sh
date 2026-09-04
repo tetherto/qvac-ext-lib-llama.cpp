@@ -89,7 +89,7 @@ run_sg_leg() {
     # swallow the exit with || so we keep going and can render the table.
     "$@" 2>&1 | tee "$log" || true
     local status_line
-    status_line=$(grep -E '^(PASSED|FAILED):' "$log" | tail -1 || true)
+    status_line=$(grep -E '^(PASSED|FAILED|SKIPPED):' "$log" | tail -1 || true)
     local result="MISSING"
     if [ -n "$status_line" ]; then
         result="$status_line"
@@ -125,6 +125,46 @@ run_qjl_sg_leg() {
         num_failed=$((num_failed + 1))
     fi
     coverage_rows+=("${leg}	${sg}	${nsg}	${result}")
+    rm -f "$log"
+}
+
+# Run a FLASH_ATTN_EXT leg of test-backend-ops and fail if the -p filter
+# selected no cases at all.
+#
+# test-backend-ops 'test' mode exits 0 when every generated case reports
+# "not supported", printing "0/0 tests passed" and a green OK. For the
+# fp16-disabled PQ leg below that is a legitimate outcome -- supports_op
+# rejecting the op so the scheduler falls back to CPU is one of the two
+# accepted fixes named in its comment -- so we deliberately do NOT require a
+# non-zero pass count here (that would fail the leg for behaving correctly).
+#
+# What we do require is that the leg still *generated* cases. A -p filter that
+# silently stops matching (a renamed PQ type, a reworked FA case generator)
+# also yields "0/0 tests passed" and a green OK, and is indistinguishable from
+# the intended outcome by exit code alone. Counting the emitted case lines
+# separates "the gate rejected N cases" from "there was nothing to reject".
+run_fa_leg() {
+    local leg="$1"
+    shift
+    local log
+    log=$(mktemp)
+    # set +e around the pipeline for the same reason run_qjl_sg_leg does it:
+    # this script runs under `set -euo pipefail`, so a failing leg would abort
+    # the run outright instead of being counted and reported in the summary.
+    set +e
+    "$@" 2>&1 | tee "$log"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    local cases
+    cases=$(grep -c 'FLASH_ATTN_EXT(' "$log" || true)
+    if [ "$rc" -ne 0 ]; then
+        num_failed=$((num_failed + 1))
+    elif [ "${cases:-0}" -eq 0 ]; then
+        echo "FAILED: $leg selected 0 cases -- the -p filter matched nothing, so this leg tested nothing"
+        num_failed=$((num_failed + 1))
+    else
+        echo "($leg: $cases case(s) selected)"
+    fi
     rm -f "$log"
 }
 
@@ -392,9 +432,9 @@ echo ""
 # and pushing PPL to ~1600 on the f16/f16 row of the perplexity sweep.
 echo "=== test-backend-ops (f16 FLASH_ATTN_EXT, shared FA shader sanity) ==="
 if [ -f "$B/bin/test-backend-ops" ]; then
-    "$B/bin/test-backend-ops" test -o FLASH_ATTN_EXT \
-        -p 'hsk=128,hsv=128,nh=4,nr23=\[1,1\],kv=(113|512),nb=(3|32),mask=1,sinks=0,max_bias=0\..*,logit_softcap=0\..*,prec=(f32|def),type_K=f16,type_V=f16,permute=\[0,1,2,3\]' \
-        || num_failed=$((num_failed + 1))
+    run_fa_leg "f16 FLASH_ATTN_EXT" \
+        "$B/bin/test-backend-ops" test -o FLASH_ATTN_EXT \
+        -p 'hsk=128,hsv=128,nh=4,nr23=\[1,1\],kv=(113|512),nb=(3|32),mask=1,sinks=0,max_bias=0\..*,logit_softcap=0\..*,prec=(f32|def),type_K=f16,type_V=f16,permute=\[0,1,2,3\]'
 else
     echo "SKIP: $B/bin/test-backend-ops not found"
 fi
@@ -409,9 +449,9 @@ echo ""
 # the scheduler falls back to CPU, or fp32 PQ FA pipelines must be added.
 echo "=== test-backend-ops (homogeneous PQ FLASH_ATTN_EXT, GGML_VK_DISABLE_F16=1) ==="
 if [ -f "$B/bin/test-backend-ops" ]; then
-    GGML_VK_DISABLE_F16=1 "$B/bin/test-backend-ops" test -o FLASH_ATTN_EXT \
-        -p 'type_K=(pq3_0|pq4_0|pq3_0_64|pq4_0_64),type_V=\1' \
-        || num_failed=$((num_failed + 1))
+    run_fa_leg "homogeneous PQ FLASH_ATTN_EXT (fp16 disabled)" \
+        env GGML_VK_DISABLE_F16=1 "$B/bin/test-backend-ops" test -o FLASH_ATTN_EXT \
+        -p 'type_K=(pq3_0|pq4_0|pq3_0_64|pq4_0_64),type_V=\1'
 else
     echo "SKIP: $B/bin/test-backend-ops not found"
 fi

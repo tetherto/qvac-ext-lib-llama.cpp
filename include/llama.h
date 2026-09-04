@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 9
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 2
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -155,9 +155,13 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
+
+    // Get the model file type (quantization) as a string, e.g. "Q8_0" or "Q4_K - Medium"
+    LLAMA_API const char * llama_ftype_name(enum llama_ftype ftype);
 
     enum llama_rope_scaling_type {
         LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED = -1,
@@ -196,6 +200,23 @@ extern "C" {
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
         LLAMA_SPLIT_MODE_ROW    = 2, // split layers and KV across GPUs, use tensor parallelism if supported
         LLAMA_SPLIT_MODE_TENSOR = 3,
+    };
+
+    enum llama_load_mode {
+        LLAMA_LOAD_MODE_NONE       = 0, // no special loading mode
+        LLAMA_LOAD_MODE_MMAP       = 1, // memory map the model
+        LLAMA_LOAD_MODE_MLOCK      = 2, // force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_MMAP_MLOCK = 3, // mmap + force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_DIRECT_IO  = 4, // use direct I/O if available
+    };
+
+    LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
+    LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
+
+    enum llama_tensor_read_lazy {
+        LLAMA_TENSOR_READ_LAZY_OFF  = 0, // always read the whole tensor up front
+        LLAMA_TENSOR_READ_LAZY_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_TENSOR_READ_LAZY_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
     };
 
     enum llama_context_type {
@@ -297,6 +318,9 @@ extern "C" {
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
+        enum llama_load_mode  load_mode;  // how to load the model
+
+        enum llama_tensor_read_lazy tensor_read_lazy; // on-demand reading of tensors marked by the arch
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -317,13 +341,11 @@ extern "C" {
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
-        bool use_mmap;        // use mmap if possible
-        bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
-        bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool load_mtp;        // whether to load MTP layers
     };
 
     struct llama_sampler_seq_config {
@@ -529,27 +551,6 @@ extern "C" {
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
 
-    enum llama_params_fit_status {
-        LLAMA_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
-        LLAMA_PARAMS_FIT_STATUS_FAILURE = 1, // could not find allocations that are projected to fit
-        LLAMA_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
-    };
-
-    // fits mparams and cparams to free device memory (assumes system memory is unlimited)
-    //   - returns SUCCESS if the parameters could be successfully modified to fit device memory
-    //   - this function is NOT thread safe because it modifies the global llama logger state
-    //   - only parameters that have the same value as in llama_default_model_params are modified
-    //     with the exception of the context size which is modified if and only if equal to 0
-    LLAMA_API enum llama_params_fit_status llama_params_fit(
-                                   const char   * path_model,
-                    struct llama_model_params   * mparams,
-                    struct llama_context_params * cparams,
-                                          float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
-        struct llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
-                                         size_t * margins,               // margins of memory to leave per device in bytes
-                                       uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
-                            enum ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
-
     LLAMA_API int64_t llama_time_us(void);
 
     LLAMA_API size_t llama_max_devices(void);
@@ -632,6 +633,9 @@ extern "C" {
 
     // Get a string describing the model type
     LLAMA_API int32_t llama_model_desc(const struct llama_model * model, char * buf, size_t buf_size);
+
+    // Get the model file type (quantization), e.g. LLAMA_FTYPE_MOSTLY_Q8_0
+    LLAMA_API enum llama_ftype llama_model_ftype(const struct llama_model * model);
 
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
@@ -1122,6 +1126,9 @@ extern "C" {
     LLAMA_API bool llama_vocab_get_add_eos(const struct llama_vocab * vocab);
     LLAMA_API bool llama_vocab_get_add_sep(const struct llama_vocab * vocab);
 
+    // model-specific suppress tokens (gguf key: tokenizer.ggml.suppress_tokens)
+    LLAMA_API const llama_token * llama_vocab_get_suppress_tokens(const struct llama_vocab * vocab, int32_t * n_suppress_tokens);
+
     LLAMA_API llama_token llama_vocab_fim_pre(const struct llama_vocab * vocab);
     LLAMA_API llama_token llama_vocab_fim_suf(const struct llama_vocab * vocab);
     LLAMA_API llama_token llama_vocab_fim_mid(const struct llama_vocab * vocab);
@@ -1440,19 +1447,19 @@ extern "C" {
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(
-                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty, -1 = context size)
-                               float   penalty_repeat,   // 1.0 = disabled
-                               float   penalty_freq,     // 0.0 = disabled
-                               float   penalty_present); // 0.0 = disabled
+                             int32_t   n_vocab,
+                             int32_t   penalty_last_n,   // last n tokens to penalize (0 = disable penalty)
+                               float   penalty_repeat,   // must be > 0.0, 1.0 = disabled
+                               float   penalty_freq,     // must be finite, 0.0 = disabled
+                               float   penalty_present); // must be finite, 0.0 = disabled
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
             const struct llama_vocab *  vocab,
-                             int32_t    n_ctx_train,
                                float    dry_multiplier,
                                float    dry_base,
                              int32_t    dry_allowed_length,
-                             int32_t    dry_penalty_last_n,
+                             int32_t    dry_penalty_last_n, // last n tokens to penalize (0 = disable penalty)
                           const char ** seq_breakers,
                               size_t    num_breakers);
 
@@ -1609,7 +1616,7 @@ extern "C" {
         // Optional checkpoint loading
         const char * checkpoint_path;        // path to checkpoint file to load optimizer state from (nullptr = don't load)
         bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
-        
+
         bool assistant_loss_only;
     };
 
@@ -1673,7 +1680,7 @@ extern "C" {
         uint32_t target_modules;
         int32_t  rank;
         float    alpha;
-        float    dropout;    // reserved, not yet implemented 
+        float    dropout;    // reserved, not yet implemented
         float    init_std;
         uint32_t seed;       // seed for reproducible weight initialization (0 = non-deterministic)
     };
@@ -1688,7 +1695,7 @@ extern "C" {
 
     // LoRA parameter filter (returns true for LoRA tensors only)
     LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
-    
+
     LLAMA_API int64_t llama_opt_get_iter(struct llama_context * ctx);
 
     LLAMA_API bool llama_lora_save_adapter(
@@ -1696,7 +1703,7 @@ extern "C" {
         const char * filename,
         const struct llama_model * model
     );
-    
+
     LLAMA_API bool llama_lora_save_checkpoint(
         const struct llama_adapter_lora * adapter,
         const char * filename,

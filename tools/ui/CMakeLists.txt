@@ -17,16 +17,32 @@ if(DEFINED LLAMA_WEBUI_HF_BUCKET)
     message(DEPRECATION "LLAMA_WEBUI_HF_BUCKET is deprecated, use LLAMA_UI_HF_BUCKET instead")
 endif()
 
-# Resolve HF asset version: explicit env var > derived from build number > unset
+# Resolve HF asset version: explicit env var > upstream base tag > derived from build number > unset
 if(DEFINED ENV{HF_WEBUI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_WEBUI_VERSION}")
     message(DEPRECATION "HF_WEBUI_VERSION env var is deprecated, use HF_UI_VERSION instead")
 elseif(DEFINED ENV{HF_UI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_UI_VERSION}")
-elseif(DEFINED LLAMA_BUILD_NUMBER)
-    set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
 else()
-    set(HF_UI_VERSION "")
+    # In this fork LLAMA_BUILD_NUMBER counts the downstream commits too, so
+    # "b${LLAMA_BUILD_NUMBER}" names a bucket tag upstream never published; the download
+    # then 404s and falls back to 'latest', whose newer-era dist is missing assets this
+    # tree's llama-ui-embed requires (loading.html) and the build fails. Pin to the
+    # nearest reachable upstream release tag instead; the build-number derivation stays
+    # as the fallback for tarball/tagless checkouts.
+    execute_process(
+        COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" describe --tags --abbrev=0 --match "b[0-9]*"
+        OUTPUT_VARIABLE UPSTREAM_BASE_TAG
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT "${UPSTREAM_BASE_TAG}" STREQUAL "")
+        set(HF_UI_VERSION "${UPSTREAM_BASE_TAG}")
+    elseif(DEFINED LLAMA_BUILD_NUMBER)
+        set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
+    else()
+        set(HF_UI_VERSION "")
+    endif()
 endif()
 
 if(NOT "${HF_UI_VERSION}" STREQUAL "" AND NOT HF_UI_VERSION MATCHES "^[A-Za-z0-9._-]+$")
@@ -61,12 +77,30 @@ if(CMAKE_CROSSCOMPILING)
     # phony target to tie it into the dependency graph
     add_custom_target(llama-ui-embed DEPENDS "${LLAMA_UI_EMBED_EXE}")
 else()
+    # exclude llama-ui-embed from sanitizer flags,
+    # it's a build-time-only tool, no need to instrument it
+    # this is to fix TSan "memory layout is incompatible" error on CI
+    get_directory_property(_llama_ui_dir_co COMPILE_OPTIONS)
+    get_directory_property(_llama_ui_dir_ll LINK_LIBRARIES)
+    set(_llama_ui_embed_co ${_llama_ui_dir_co})
+    set(_llama_ui_embed_ll ${_llama_ui_dir_ll})
+    list(FILTER _llama_ui_embed_co EXCLUDE REGEX ".*-fsanitize=.*")
+    list(FILTER _llama_ui_embed_ll EXCLUDE REGEX ".*-fsanitize=.*")
+    set_directory_properties(PROPERTIES
+        COMPILE_OPTIONS "${_llama_ui_embed_co}"
+        LINK_LIBRARIES  "${_llama_ui_embed_ll}")
+
     add_executable(llama-ui-embed embed.cpp)
     target_compile_features(llama-ui-embed PRIVATE cxx_std_17)
     set_target_properties(llama-ui-embed PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     )
     set(LLAMA_UI_EMBED_EXE "$<TARGET_FILE:llama-ui-embed>")
+
+    # restore so the llama-ui library below keeps sanitizer instrumentation
+    set_directory_properties(PROPERTIES
+        COMPILE_OPTIONS "${_llama_ui_dir_co}"
+        LINK_LIBRARIES  "${_llama_ui_dir_ll}")
 endif()
 
 # Run the provisioning script every build so source changes in tools/ui/ are

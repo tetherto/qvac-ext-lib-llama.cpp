@@ -22,6 +22,15 @@
  * WARNING: This API is experimental and subject to many BREAKING CHANGES.
  *          Issues related to API usage may receive lower priority support.
  *
+ * WARNING: consumers MUST be rebuilt against these headers on every libmtmd update.
+ *          mtmd_context_params is passed and returned BY VALUE, and fields get appended to
+ *          it, so its size changes without a SOVERSION bump (SOVERSION stays 0 in
+ *          tools/mtmd/CMakeLists.txt). Linking a binary compiled against an older layout
+ *          against a newer libmtmd lets mtmd_context_params_default() write past the
+ *          caller's struct and mtmd_init_from_file() read uninitialized bytes past it.
+ *          Build from source against a pinned commit; do not treat libmtmd as a stable
+ *          drop-in shared object.
+ *
  * For the usage, see an example in mtmd-cli.cpp
  *
  * For contributors:
@@ -67,6 +76,7 @@ struct mtmd_batch;
 
 struct mtmd_input_text {
     const char * text;
+    size_t text_len;
     bool add_special;
     bool parse_special;
 };
@@ -126,6 +136,13 @@ struct mtmd_context_params {
     // keeps the model default instead of forcing single-tile.
     // needed for 8B+ models whose GGUFs may lack the clip.vision.preproc_max_tiles key
     int image_max_tiles;
+
+    // override clip.vision.preproc_no_upscale for idefics3-style preprocessing:
+    // -1 = use the GGUF/model default, 0 = force off, 1 = force on.
+    // On: the long side is rounded up to a whole number of slices and capped, rather
+    // than always stretched to the cap. Changes the number of output tokens, so a
+    // checkpoint whose GGUF omits the key needs this set to preprocess correctly.
+    int image_no_upscale;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -347,6 +364,60 @@ struct mtmd_caps {
     bool inp_audio;
 };
 MTMD_API struct mtmd_caps mtmd_get_cap_from_file(const char * mmproj_fname);
+
+/////////////////////////////////////////
+// EXPERIMENTAL API for audio generation, subjected to breaking changes
+
+// represent the pipeline type
+enum mtmd_gen_audio_type {
+    MTMD_GEN_AUDIO_TYPE_NONE, // not supported
+    MTMD_GEN_AUDIO_TYPE_QWEN3TTS,
+};
+struct mtmd_gen_audio_info {
+    enum mtmd_gen_audio_type type;
+    int32_t sample_rate; // in Hz, for example 24000 for qwen3tts
+};
+MTMD_API struct mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx);
+
+enum mtmd_gen_process_type {
+    MTMD_GEN_PROCESS_TYPE_GEN_CODE, // h_state to semantic (codes, mel-spectrogram, etc.)
+    MTMD_GEN_PROCESS_TYPE_GEN_WAV,  // convert semantic to PCM audio
+                                    // for qwen3tts, this is code2wav
+};
+struct mtmd_gen_inp {
+    enum mtmd_gen_process_type type;
+
+    // for MTMD_GEN_PROCESS_TYPE_GEN_CODE
+    int32_t code0;  // the sampled codebook 0 entry from backbone
+    float * embd;   // the hidden state from backbone, must have n_text_embd elements
+    int32_t top_k;
+    float   top_p;
+
+    // for MTMD_GEN_PROCESS_TYPE_GEN_WAV
+    int32_t * codes;
+    size_t    n_codes;
+    const char * state_data;
+    size_t       state_size;
+};
+struct mtmd_gen_out {
+    // note: output memory is allocated by the context, valid until next process() call
+
+    // for MTMD_GEN_PROCESS_TYPE_GEN_CODE
+    const int32_t * codes;
+    size_t n_codes;
+    const float * embd; // the generated hidden state, to be fed back to backbone
+                        // it must have n_text_embd elements
+
+    // for MTMD_GEN_PROCESS_TYPE_GEN_WAV
+    const float * audio;
+    size_t        n_samples;
+    const char * state_data;
+    size_t       state_size;
+};
+// note: this API is stateless, caller must handle state management and audio frame accumulation
+MTMD_API int32_t mtmd_gen_audio_process(mtmd_context * ctx,
+                                const struct mtmd_gen_inp * inp,
+                                struct mtmd_gen_out * out);
 
 /////////////////////////////////////////
 

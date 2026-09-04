@@ -121,8 +121,9 @@ llama_context::llama_context(
     cparams.training                = params.training;
     cparams.warmup                  = false;
 
-    cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
-    embd_layer_inp.resize(hparams.n_layer());
+    // +1: id n_layer() taps the output of the last layer ("input" of the head)
+    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -249,10 +250,10 @@ llama_context::llama_context(
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
-    cparams.auto_fgdn    = true;
+    cparams.auto_fgdn    = false;
 
-    cparams.fused_lid    = true;
-    cparams.auto_flid    = true;
+    cparams.fused_lid = true;
+    cparams.auto_flid = false;
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
@@ -435,9 +436,16 @@ llama_context::llama_context(
         if (pipeline_parallel) {
             for (auto & backend : backends) {
                 auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
-                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    // ignore CPU backend
-                    // TODO: should we ignore ACCEL types too?
+                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU || dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                    // ignore CPU and ACCEL backends: they are helper backends that never
+                    // form a pipeline stage, so their lack of async/events must not veto
+                    // pipelining for the compute devices that do.
+                    //
+                    // ACCEL devices are added unconditionally above, so leaving them in
+                    // this check disabled pipeline parallelism outright on any build with
+                    // one present - e.g. Accelerate on macOS, which reports
+                    // caps.async = caps.events = false. That happened silently: only the
+                    // enabled path logs.
                     continue;
                 }
                 auto * dev = ggml_backend_get_device(backend.get());
@@ -478,6 +486,9 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // wait for any pending asynchronous copies into the output buffers before they are freed
+    synchronize();
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1165,7 +1176,7 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
-    GGML_ASSERT(lid < model.hparams.n_layer());
+    GGML_ASSERT(lid <= model.hparams.n_layer());
 
     cparams.embeddings_layer_inp[lid] = enable;
 
@@ -1421,12 +1432,16 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
 
+    // TODO: this clear of the buffer can easily be forgotten - need something better
+    // sync first so any in-flight async copies into embd_seq complete before it is freed
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
+    embd_seq.clear();
+
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
-
-    // TODO: this clear of the buffer can easily be forgotten - need something better
-    embd_seq.clear();
 
     sched_reserve();
 
@@ -1713,7 +1728,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const int64_t n_embd  = hparams.n_embd_inp();
+    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
+    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -1766,13 +1782,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    // TODO: this clear of the buffer can easily be forgotten - need something better
+    // sync first so any in-flight async copies into embd_seq complete before it is freed
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
+    embd_seq.clear();
+
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n_tokens_all;
 
-    // TODO: this clear of the buffer can easily be forgotten - need something better
-    embd_seq.clear();
     output_swaps.clear();
 
     sched_reserve();
@@ -2269,8 +2290,9 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 }
 
 void llama_context::output_reorder() {
-    const uint64_t n_vocab = model.vocab.n_tokens();
-    const uint64_t n_embd  = model.hparams.n_embd;
+    const uint64_t n_vocab     = model.vocab.n_tokens();
+    const uint64_t n_embd      = model.hparams.n_embd;
+    const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
@@ -2283,14 +2305,14 @@ void llama_context::output_reorder() {
         }
 
         if (embd.size > 0) {
-            for (uint64_t k = 0; k < n_embd; k++) {
-                std::swap(embd.data[i0*n_embd + k], embd.data[i1*n_embd + k]);
+            for (uint64_t k = 0; k < n_embd_out; k++) {
+                std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
             }
         }
 
         if (embd_nextn.size > 0) {
-            for (uint64_t k = 0; k < n_embd; k++) {
-                std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
+            for (uint64_t k = 0; k < n_embd_out; k++) {
+                std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
             }
         }
 
@@ -2344,7 +2366,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
-        model.arch == LLM_ARCH_DEEPSEEK4) {
+        model.arch == LLM_ARCH_QWEN4EXP ||
+        model.arch == LLM_ARCH_DEEPSEEK4 ||
+        (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
+        model.arch == LLM_ARCH_NANBEIGE ||
+        model.arch == LLM_ARCH_MINIMAX_M3) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     // Note: inference mode would only need (1024u, 8u*n_tensors), but these values
@@ -2476,11 +2502,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
-        // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+        // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && strcmp(name, "norm") == 0) {
+            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
@@ -3318,7 +3345,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 
     for (struct llama_layer & layer : model->layers) {
         static_assert(sizeof(llama_layer) % sizeof(ggml_tensor *) == 0,
-            "llama_layer has unexpected padding — reinterpret_cast iteration is unsafe");
+            "llama_layer has unexpected padding - reinterpret_cast iteration is unsafe");
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
         }
@@ -3730,6 +3757,22 @@ llama_context * llama_init_from_model(
         }
     }
 
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
+            return nullptr;
+        }
+    }
+
     // TurboQuant: auto-select block=64 variant when head_dim=64
     // TODO(tbq-rebase): PR used `model->hparams.n_embd_head_k() == 64` as a plain scalar comparison;
     // upstream qvac-b8828 made n_embd_head_k/_v indexed accessors. The simple unindexed compare
@@ -3776,11 +3819,6 @@ llama_context * llama_init_from_model(
                 return nullptr;
             }
         }
-    }
-
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-        LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
-        return nullptr;
     }
 
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&

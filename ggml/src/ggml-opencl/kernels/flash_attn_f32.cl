@@ -11,7 +11,12 @@
 #define DK_VEC (DK/4)
 #define DV_VEC (DV/4)
 #define WG_SIZE (BLOCK_M)
-#define Q1_WG_SIZE 64
+// q1 reduces over a Q1_WG_SIZE-wide WG via work-group barriers; the launch WG
+// must match. Defaults to the Adreno sg (64); host passes -D FA_SG=32 on Intel.
+#ifndef FA_SG
+#define FA_SG 64
+#endif
+#define Q1_WG_SIZE FA_SG
 
 // The kernels are built with -cl-finite-math-only. On some older Adreno GPUs,
 // infinite operand can cause undefined behavior and miscompilation for exp.
@@ -141,7 +146,10 @@ __kernel void flash_attn_f32(
         // l_k/l_v while active lanes are still reading them. That shared-memory
         // race silently corrupts the K/V tiles for any sequence spanning more
         // than one BLOCK_N tile (e.g. the bidirectional Qwen3-VL vision tower,
-        // n_kv=247), degrading the encode. Guard the score loop instead.
+        // n_kv=247), degrading the encode. Empirically this fires even on a
+        // single 64-wide Adreno subgroup (Adreno 830), so it is guarded
+        // unconditionally, not only for FA_SG < 64. Guard the score loop
+        // instead of continuing.
         if (my_query_row < n_q) {
         for (int j = 0; j < BLOCK_N; j += 4) {
             const int k_row0 = k_start + j;

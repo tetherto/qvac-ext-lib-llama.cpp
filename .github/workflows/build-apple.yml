@@ -8,21 +8,35 @@ on:
     paths: [
       '.github/workflows/build-apple.yml',
       '**/CMakeLists.txt',
-      '**/.cmake',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.pc.in',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
       '**/*.cpp',
       '**/*.swift',
       '**/*.m',
-      '**/*.metal'
+      '**/*.metal',
+      'scripts/vector-index-package-smoke.sh'
     ]
 
   pull_request:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-apple.yml',
-      'ggml/src/ggml-metal/**'
+      '**/CMakeLists.txt',
+      '**/*.cmake',
+      '**/*.cmake.in',
+      '**/*.pc.in',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.swift',
+      '**/*.m',
+      '**/*.metal',
+      'scripts/vector-index-package-smoke.sh'
     ]
 
 concurrency:
@@ -35,9 +49,6 @@ env:
   LLAMA_ARG_LOG_COLORS: 1
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
-
-permissions:
-  contents: read
 
 jobs:
   macos-latest-arm64:
@@ -63,10 +74,11 @@ jobs:
             -DCMAKE_BUILD_RPATH="@loader_path" \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
-            -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=OFF \
             -DGGML_METAL_SHADER_DEBUG=ON \
-            -DGGML_RPC=ON
+            -DGGML_VECTOR_INDEX=ON \
+            -DGGML_RPC=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
           time cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
           leaks -atExit -- ./build/bin/test-thread-safety -hf ggml-org/gemma-3-270m-qat-GGUF -ngl 99 -p "$(printf 'hello %.0s' {1..128})" -n 16 -c 512 -ub 32 -np 2 -t 2 -lv 1
 
@@ -102,6 +114,7 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
             -DGGML_METAL=OFF \
+            -DGGML_VECTOR_INDEX=ON \
             -DGGML_RPC=ON \
             -DGGML_BLAS=OFF \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3
@@ -112,6 +125,39 @@ jobs:
         run: |
           cd build
           ctest -L main --verbose --timeout 900
+
+      - name: Vector-index static pkg-config smoke
+        id: vector_index_static_pkg_config
+        run: |
+          STATIC_PREFIX="$RUNNER_TEMP/vector-index-static-install"
+          cmake -S ggml -B build-vector-index-package-static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$STATIC_PREFIX" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DGGML_VECTOR_INDEX=ON
+          cmake --build build-vector-index-package-static -j $(sysctl -n hw.logicalcpu)
+          cmake --install build-vector-index-package-static
+          PREFIX="$STATIC_PREFIX" \
+            CONSUMER_DIR=vector-index-pkg-config-static \
+            RUN_CMAKE=0 \
+            PKG_CONFIG_STATIC=1 \
+            bash scripts/vector-index-package-smoke.sh
+          cat > ggml-pkg-config-static.c <<'EOF'
+          #include "ggml.h"
+
+          int main(void) {
+              ggml_time_init();
+              return ggml_time_us() < 0;
+          }
+          EOF
+          PKG_CONFIG_PATH="$STATIC_PREFIX/lib/pkgconfig" \
+            cc ggml-pkg-config-static.c \
+              $(PKG_CONFIG_PATH="$STATIC_PREFIX/lib/pkgconfig" \
+                pkg-config --cflags --libs --static ggml) \
+              -o ggml-pkg-config-static
+          ./ggml-pkg-config-static
 
   macos-latest-ios-xcode:
     runs-on: macos-latest
@@ -130,7 +176,6 @@ jobs:
         run: |
           sysctl -a
           cmake -B build -G Xcode \
-            -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_OPENSSL=OFF \
             -DLLAMA_BUILD_APP=OFF \
@@ -181,7 +226,6 @@ jobs:
         run: |
           sysctl -a
           cmake -B build -G Xcode \
-            -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_BUILD_COMMON=OFF \
             -DLLAMA_BUILD_APP=OFF \
@@ -215,7 +259,6 @@ jobs:
         run: |
           sysctl -a
           cmake -B build -G Xcode \
-            -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_BUILD_COMMON=OFF \
             -DLLAMA_BUILD_APP=OFF \
@@ -260,7 +303,6 @@ jobs:
         run: |
           sysctl -a
           cmake -B build -G Xcode \
-            -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_OPENSSL=OFF \
             -DLLAMA_BUILD_APP=OFF \

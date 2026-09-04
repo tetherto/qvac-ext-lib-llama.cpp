@@ -1,10 +1,10 @@
 #include "llama.h"
-#include "get-model.h"
+#include "common.h"
 
 #include <cstdlib>
 
 int main(int argc, char *argv[] ) {
-    auto * model_path = get_model_or_exit(argc, argv);
+    auto * model_path = common_get_model_or_exit(argc, argv);
     auto * file = fopen(model_path, "r");
     if (file == nullptr) {
         fprintf(stderr, "no model at '%s' found\n", model_path);
@@ -15,8 +15,8 @@ int main(int argc, char *argv[] ) {
     fclose(file);
 
     llama_backend_init();
-    auto params     = llama_model_default_params();
-    params.use_mmap = false;
+    auto params      = llama_model_default_params();
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.progress_callback = [](float progress, void * ctx){
         (void) ctx;
         return progress > 0.50;

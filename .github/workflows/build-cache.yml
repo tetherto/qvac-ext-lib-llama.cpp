@@ -9,9 +9,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
   ubuntu-24-vulkan-cache:
     runs-on: ubuntu-24.04

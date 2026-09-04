@@ -14,28 +14,10 @@ endif()
 # Desktop builds get SPIRV-Headers (and Vulkan-Hpp) from the Vulkan SDK. The
 # Android NDK ships neither, so on Android they are fetched in the ANDROID block
 # below; don't hard-require the system package there.
-find_package(SPIRV-Headers CONFIG QUIET)
-
-set(GGML_VULKAN_SPIRV_HEADERS_OK FALSE)
-if (TARGET SPIRV-Headers::SPIRV-Headers)
-    set(GGML_VULKAN_SPIRV_HEADERS_OK TRUE)
-    get_target_property(_ggml_spirv_incs SPIRV-Headers::SPIRV-Headers INTERFACE_INCLUDE_DIRECTORIES)
-    foreach(_ggml_spirv_inc IN LISTS _ggml_spirv_incs)
-        if (NOT EXISTS "${_ggml_spirv_inc}")
-            message(WARNING "Ignoring SPIRV-Headers package: include dir ${_ggml_spirv_inc} does not exist")
-            set(GGML_VULKAN_SPIRV_HEADERS_OK FALSE)
-        endif()
-    endforeach()
-endif()
-if (NOT ANDROID AND NOT GGML_VULKAN_SPIRV_HEADERS_OK)
-    # Fall back to locating the headers directly; the Vulkan SDK ships them
-    # next to the Vulkan headers.
-    find_path(GGML_VULKAN_SPIRV_INCLUDE_DIR spirv/unified1/spirv.hpp
-        HINTS ${Vulkan_INCLUDE_DIRS} ENV VULKAN_SDK
-        PATH_SUFFIXES include)
-    if (NOT GGML_VULKAN_SPIRV_INCLUDE_DIR)
-        message(FATAL_ERROR "SPIRV-Headers not found: need spirv/unified1/spirv.hpp (install SPIRV-Headers or the Vulkan SDK)")
-    endif()
+if (ANDROID)
+    find_package(SPIRV-Headers CONFIG QUIET)
+else()
+    find_package(SPIRV-Headers CONFIG REQUIRED)
 endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
@@ -134,19 +116,19 @@ if (Vulkan_FOUND)
         "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"
     )
 
+    test_shader_extension_support(
+        "GL_EXT_float_e2m1"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/float_e2m1.comp"
+        "GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT"
+    )
+
+    test_shader_extension_support(
+        "GL_EXT_float_e4m3"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/float_e4m3.comp"
+        "GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT"
+    )
+
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
-    if (GGML_VULKAN_SPIRV_HEADERS_OK)
-        # Provides <spirv/unified1/spirv.hpp> on platforms (e.g. Android NDK)
-        # whose Vulkan package does not bundle the SPIRV headers. It is a
-        # header-only dependency needed only to compile ggml-vulkan.cpp, so wrap
-        # it in BUILD_INTERFACE: as a static lib the PRIVATE link would otherwise
-        # leak into the installed ggml-targets export and break downstream
-        # find_package(ggml) on platforms whose Vulkan SDK ships the config
-        # target (e.g. Windows), which never call find_package(SPIRV-Headers).
-        target_link_libraries(ggml-vulkan PRIVATE $<BUILD_INTERFACE:SPIRV-Headers::SPIRV-Headers>)
-    elseif (GGML_VULKAN_SPIRV_INCLUDE_DIR)
-        target_include_directories(ggml-vulkan PRIVATE "${GGML_VULKAN_SPIRV_INCLUDE_DIR}")
-    endif()
     target_include_directories(ggml-vulkan
         PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR}

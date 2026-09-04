@@ -65,6 +65,7 @@ set(${TARGET}_HEADERS
     console.h
     debug.h
     download.h
+    finetune.h
     fit.h   # qvac: declarations for the fit helpers (memory_breakdown_print, get_device_memory_data)
     hf-cache.h
     http.h
@@ -79,6 +80,8 @@ set(${TARGET}_HEADERS
     reasoning-budget.h
     sampling.h
     speculative.h
+    subproc.h
+    trie.h
     unicode.h
 )
 
@@ -106,6 +109,7 @@ add_library(${TARGET} STATIC
     console.cpp
     debug.cpp
     download.cpp
+    finetune.cpp
     fit.cpp
     hf-cache.cpp
     imatrix-loader.cpp
@@ -120,6 +124,8 @@ add_library(${TARGET} STATIC
     reasoning-budget.cpp
     sampling.cpp
     speculative.cpp
+    subproc.cpp
+    trie.cpp
     unicode.cpp
     jinja/lexer.cpp
     jinja/parser.cpp
@@ -140,6 +146,10 @@ set_target_properties(${TARGET} PROPERTIES
 set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${${TARGET}_HEADERS}")
 install(FILES ${${TARGET}_JINJA_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llama/common/jinja)
+
+if (LLAMA_SUBPROCESS)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)

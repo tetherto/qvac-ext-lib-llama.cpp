@@ -2,7 +2,6 @@
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "gguf.h"
-#include "uint8-buff-stream.h"
 
 #include <cinttypes>
 #include <cstddef>
@@ -13,6 +12,7 @@
 #include <map>
 #include <new>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -230,7 +230,6 @@ struct gguf_context {
 
 struct gguf_bytes_reader {
     virtual size_t read(void * buffer, size_t size, size_t count) = 0;
-    virtual size_t align(size_t alignment) = 0;
     virtual ~gguf_bytes_reader() = 0;
 };
 
@@ -466,111 +465,9 @@ struct gguf_bytes_buffer_reader : public gguf_bytes_reader {
         return bytes_read;
     }
 
-    size_t align(size_t alignment) override {
-        size_t new_offset  = GGML_PAD(offset, alignment);
-        size_t seek_offset = new_offset - offset;
-
-        auto result = streambuf.pubseekoff(seek_offset, std::ios_base::cur, std::ios_base::in);
-        if (result == std::streampos(-1)) {
-            return 0;
-        }
-        offset = new_offset;
-        return offset;
-    }
-
   private:
     std::basic_streambuf<char> & streambuf;
     size_t                       offset;
-};
-
-struct gguf_bytes_file_reader : public gguf_bytes_reader {
-    gguf_bytes_file_reader(FILE * file) : file(file) {}
-
-    ~gguf_bytes_file_reader() {}
-
-    size_t read(void * buffer, size_t size, size_t count) override { return fread(buffer, 1, size * count, file); }
-
-    size_t align(size_t alignment) override {
-        if (fseek(file, GGML_PAD(ftell(file), alignment), SEEK_SET) != 0) {
-            return 0;
-        }
-        return ftell(file);
-    }
-
-  private:
-    FILE * file;
-};
-
-// raw-pointer in-memory reader
-struct gguf_bytes_mem_reader : public gguf_bytes_reader {
-    gguf_bytes_mem_reader(const void * data, size_t size)
-        : data(static_cast<const uint8_t *>(data)), size(size), offset(0) {}
-
-    ~gguf_bytes_mem_reader() {}
-
-    size_t read(void * buffer, size_t size_elem, size_t count) override {
-        const size_t want = size_elem * count;
-        if (offset > size) return 0;
-        const size_t avail = size - offset;
-        const size_t got   = want < avail ? want : avail;
-        if (got > 0) memcpy(buffer, data + offset, got);
-        offset += got;
-        return got;
-    }
-
-    size_t align(size_t alignment) override {
-        offset = GGML_PAD(offset, alignment);
-        return offset;
-    }
-
-  private:
-    const uint8_t * data;
-    size_t          size;
-    size_t          offset;
-};
-
-// callback-based reader for streaming GGUF parses
-struct gguf_bytes_callback_reader : public gguf_bytes_reader {
-    gguf_bytes_callback_reader(gguf_reader_callback_t cb,
-                               void *               userdata,
-                               size_t               chunk_size,
-                               uint64_t             max_size)
-        : cb(cb), userdata(userdata), chunk_size(chunk_size == 0 ? 4096 : chunk_size),
-          max_size(max_size), offset(0) {}
-
-    ~gguf_bytes_callback_reader() {}
-
-    size_t read(void * buffer, size_t size_elem, size_t count) override {
-        const size_t want = size_elem * count;
-        if (want == 0) return 0;
-        if (offset >= max_size) return 0;
-
-        const uint64_t avail64 = max_size - offset;
-        const size_t   cap     = want < avail64 ? want : static_cast<size_t>(avail64);
-
-        uint8_t * out = static_cast<uint8_t *>(buffer);
-        size_t    got = 0;
-        while (got < cap) {
-            const size_t step = (cap - got) < chunk_size ? (cap - got) : chunk_size;
-            const size_t n    = cb(userdata, out + got, offset, step);
-            if (n == 0) break;
-            got    += n;
-            offset += n;
-        }
-        return got;
-    }
-
-    size_t align(size_t alignment) override {
-        offset = GGML_PAD(offset, alignment);
-        return offset;
-    }
-
-  private:
-    gguf_reader_callback_t cb;
-    void *               userdata;
-    size_t               chunk_size;
-    uint64_t             max_size;
-    uint64_t             offset;
 };
 
 struct gguf_context * gguf_init_empty(void) {
@@ -710,6 +607,10 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                 ok = false;
             } catch (std::bad_alloc &) {
                 GGML_LOG_ERROR("%s: encountered bad_alloc error while reading key %" PRIi64 "\n", __func__, i);
+                ok = false;
+            }
+            if (ok && key.empty()) {
+                GGML_LOG_ERROR("%s: key %" PRIi64 " is empty\n", __func__, i);
                 ok = false;
             }
             for (size_t j = 0; ok && j < ctx->kv.size(); ++j) {
@@ -1348,6 +1249,11 @@ const char * gguf_get_tensor_name(const struct gguf_context * ctx, int64_t tenso
     return ctx->info[tensor_id].t.name;
 }
 
+const int64_t * gguf_get_tensor_ne(const struct gguf_context * ctx, int64_t tensor_id) {
+    GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
+    return ctx->info[tensor_id].t.ne;
+}
+
 enum ggml_type gguf_get_tensor_type(const struct gguf_context * ctx, int64_t tensor_id) {
     GGML_ASSERT(tensor_id >= 0 && tensor_id < gguf_get_n_tensors(ctx));
     return ctx->info[tensor_id].t.type;
@@ -1581,7 +1487,7 @@ void gguf_set_tensor_data(struct gguf_context * ctx, const char * name, const vo
 struct gguf_writer_base {
     size_t written_bytes {0u};
 
-    ~gguf_writer_base(void) = default;
+    virtual ~gguf_writer_base(void) = default;
 
     // we bet on devirtualization
     virtual void write(int8_t val) = 0;

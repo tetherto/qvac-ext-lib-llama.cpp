@@ -14,14 +14,12 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import csv
-import logging
 import math
-import os
-import sys
 from collections import defaultdict
 from typing import TypedDict
+
+from kv_quant_agg_common import render_table, run_aggregation, safe_float
 
 
 class PerpGroup(TypedDict):
@@ -55,13 +53,6 @@ OUTPUT_HEADER = [
     "ppl_vs_f16_pct", "ppl_vs_f16_pct_stdev",
     "time_vs_f16_x", "time_vs_f16_x_stdev",
 ]
-
-
-def safe_float(v):
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return None
 
 
 def format_passthrough_value(v):
@@ -349,86 +340,31 @@ def compute_ratios(groups):
     return results
 
 
-def render_table(rows):
-    """Render rows as a fixed-width text table."""
-    if not rows:
-        return ""
-
-    display_cols = [
-        ("cache_k", "K", 10),
-        ("cache_v", "V", 10),
-        ("norm_correction", "NC", 4),
-        ("bpw_avg", "BPW", 6),
-        ("n_runs", "Runs", 5),
-        ("ppl_mean", "PPL mean", 10),
-        ("ppl_stdev", "PPL sd", 8),
-        ("ppl_vs_f16_pct", "vs f16%", 8),
-        ("ppl_vs_f16_pct_stdev", "±%", 6),
-        ("time_mean_s", "Time(s)", 8),
-        ("time_stdev_s", "Time sd", 8),
-        ("time_vs_f16_x", "t/f16x", 7),
-    ]
-
-    lines = []
-    header = "  ".join(f"{title:>{w}}" for _, title, w in display_cols)
-    lines.append(header)
-    lines.append("  ".join("-" * w for _, _, w in display_cols))
-
-    for row in rows:
-        line = "  ".join(f"{row.get(k, ''):>{w}}" for k, _, w in display_cols)
-        lines.append(line)
-
-    return "\n".join(lines)
+DISPLAY_COLS = [
+    ("cache_k", "K", 10),
+    ("cache_v", "V", 10),
+    ("norm_correction", "NC", 4),
+    ("bpw_avg", "BPW", 6),
+    ("n_runs", "Runs", 5),
+    ("ppl_mean", "PPL mean", 10),
+    ("ppl_stdev", "PPL sd", 8),
+    ("ppl_vs_f16_pct", "vs f16%", 8),
+    ("ppl_vs_f16_pct_stdev", "±%", 6),
+    ("time_mean_s", "Time(s)", 8),
+    ("time_stdev_s", "Time sd", 8),
+    ("time_vs_f16_x", "t/f16x", 7),
+]
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Aggregate KV cache quantization perplexity CSVs")
-    parser.add_argument("inputs", nargs="+", help="Input CSV files")
-    parser.add_argument("-o", "--output", required=True,
-                        help="Output CSV file path")
-    args = parser.parse_args()
-
-    log = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    missing = [f for f in args.inputs if not os.path.isfile(f)]
-    if missing:
-        log.error("Error: files not found: %s", ", ".join(missing))
-        sys.exit(1)
-
-    groups = aggregate(args.inputs)
-    results = compute_ratios(groups)
-
-    out_csv = args.output
-    out_txt = os.path.splitext(out_csv)[0] + ".txt"
-
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=OUTPUT_HEADER,
-                                quoting=csv.QUOTE_NONNUMERIC)
-        writer.writeheader()
-        writer.writerows(results)
-
-    table = render_table(results)
-    with open(out_txt, "w") as f:
-        f.write("=" * 80 + "\n")
-        f.write(" KV Cache Quantization Perplexity — Aggregated Results\n")
-        f.write("=" * 80 + "\n\n")
-        f.write(table + "\n\n")
-        f.write("=" * 80 + "\n")
-        f.write(f" Aggregated from {len(args.inputs)} file(s):\n")
-        for fpath in args.inputs:
-            f.write(f"   - {os.path.abspath(fpath)}\n")
-        f.write("=" * 80 + "\n")
-
-    log.info("CSV: %s (%s rows)", os.path.abspath(out_csv), len(results))
-    log.info("TXT: %s", os.path.abspath(out_txt))
-    log.info("")
-    log.info(table)
-    log.info("")
-    log.info("Aggregated from %s file(s):", len(args.inputs))
-    for fpath in args.inputs:
-        log.info("  - %s", fpath)
+    run_aggregation(
+        description="Aggregate KV cache quantization perplexity CSVs",
+        title=" KV Cache Quantization Perplexity — Aggregated Results",
+        output_header=OUTPUT_HEADER,
+        aggregate=aggregate,
+        compute_ratios=compute_ratios,
+        render=lambda rows: render_table(rows, DISPLAY_COLS),
+    )
 
 
 if __name__ == "__main__":

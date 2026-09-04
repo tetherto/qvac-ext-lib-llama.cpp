@@ -70,6 +70,9 @@ struct img_tool {
                 case RESIZE_ALGO_BICUBIC_PILLOW:
                     resize_bicubic_pillow(src, dst, target_resolution.width, target_resolution.height);
                     break;
+                case RESIZE_ALGO_LANCZOS:
+                    resize_lanczos_pillow(src, dst, target_resolution.width, target_resolution.height);
+                    break;
                 default:
                     throw std::runtime_error("Unsupported resize algorithm");
             }
@@ -98,6 +101,9 @@ struct img_tool {
                     break;
                 case RESIZE_ALGO_BICUBIC_PILLOW:
                     resize_bicubic_pillow(src, resized_image, new_width, new_height);
+                    break;
+                case RESIZE_ALGO_LANCZOS:
+                    resize_lanczos_pillow(src, resized_image, new_width, new_height);
                     break;
                 default:
                     throw std::runtime_error("Unsupported resize algorithm");
@@ -144,13 +150,18 @@ struct img_tool {
             return {0, 0};
         }
 
-        float scale = std::min(static_cast<float>(longest_edge) / inp_size.width,
-                               static_cast<float>(longest_edge) / inp_size.height);
+        // double, not float: the reference processors do this in Python floats, and where the
+        // true product lands on a multiple of align_size, float32 rounding pushes it just past
+        // and the ceil buys a whole extra row or column of slices. 960x720 at align 512 and
+        // longest_edge 2048 is the common case: 1536 in double, 2048 in float32, so a 4x3 grid
+        // becomes 4x4 and the image gains 4 slices the reference never emits.
+        double scale = std::min(static_cast<double>(longest_edge) / inp_size.width,
+                                static_cast<double>(longest_edge) / inp_size.height);
 
-        float target_width_f  = static_cast<float>(inp_size.width)  * scale;
-        float target_height_f = static_cast<float>(inp_size.height) * scale;
+        double target_width_f  = static_cast<double>(inp_size.width)  * scale;
+        double target_height_f = static_cast<double>(inp_size.height) * scale;
 
-        auto ceil_by_factor = [f = align_size](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
+        auto ceil_by_factor = [f = align_size](double x) { return static_cast<int>(std::ceil(x / static_cast<double>(f))) * f; };
         int aligned_width  = ceil_by_factor(target_width_f);
         int aligned_height = ceil_by_factor(target_height_f);
 
@@ -339,22 +350,50 @@ private:
         }
     }
 
-    // Bicubic resize function using Pillow's ImagingResample algorithm
+    // Pillow-compatible separable resampling (Bicubic and Lanczos)
     // Adapted from https://github.com/python-pillow/Pillow/blob/main/src/libImaging/Resample.c
     //
-    // Key Difference with resize_bicubic:
-    // 1. Uses separable filtering: horizontal pass followed by vertical pass
+    // Key properties:
+    // 1. Separable filtering: horizontal pass followed by vertical pass
     // 2. Pre-computes normalized filter coefficients for each output pixel
-    // 3. Applies convolution using fixed-point integer arithmetic for performance
+    // 3. Fixed-point integer arithmetic (22 fractional bits) for speed and determinism
     static bool resize_bicubic_pillow(const clip_image_u8 & img, clip_image_u8 & dst, int target_width, int target_height) {
+        return resize_pillow(img, dst, target_width, target_height, /*use_lanczos=*/false);
+    }
+
+    // Lanczos-3 (support radius 3), matches Pillow's Image.LANCZOS
+    static bool resize_lanczos_pillow(const clip_image_u8 & img, clip_image_u8 & dst, int target_width, int target_height) {
+        return resize_pillow(img, dst, target_width, target_height, /*use_lanczos=*/true);
+    }
+
+    static bool resize_pillow(
+            const clip_image_u8 & img,
+            clip_image_u8 & dst,
+            int target_width,
+            int target_height,
+            bool use_lanczos) {
         // Fixed-point precision: 22 bits = 32 (int32_t) - 8 (uint8_t pixels) - 2 (headroom for accumulation)
         // This allows encoding fractional weights as integers: weight * 2^22
         const int PRECISION_BITS = 32 - 8 - 2;
 
-        // Bicubic filter function with a = -0.5 (Note that GGML/PyTorch takes a = -0.75)
+        // Resample filter: Lanczos-3 (support [-3, 3]) or bicubic with a = -0.5 (support [-2, 2])
+        // Note: GGML/PyTorch bicubic uses a = -0.75, Pillow uses a = -0.5
         // Returns filter weight for distance x from pixel center
-        // Support: [-2, 2], meaning the filter influences pixels within 2 units of distance
-        auto bicubic_filter = [](double x) -> double {
+        auto resample_filter = [use_lanczos](double x) -> double {
+            if (use_lanczos) {
+                if (-3.0 <= x && x < 3.0) {
+                    auto sinc = [](double v) {
+                        if (v == 0.0) {
+                            return 1.0;
+                        }
+                        const double pi_v = v * 3.141592653589793238462643383279502884;
+                        return std::sin(pi_v) / pi_v;
+                    };
+                    return sinc(x) * sinc(x / 3.0);
+                }
+                return 0.0;
+            }
+
             constexpr double a = -0.5;
             if (x < 0.0) {
                 x = -x;
@@ -368,8 +407,8 @@ private:
             return 0.0;  // Zero outside [-2, 2]
         };
 
-        // Filter support radius: bicubic extends 2 pixels in each direction
-        constexpr double filter_support = 2.0;
+        // Filter support radius: 2 for bicubic, 3 for lanczos
+        const double filter_support = use_lanczos ? 3.0 : 2.0;
 
         // Clipping function for 8-bit values
         auto clip8 = [](int val) -> uint8_t {
@@ -436,7 +475,7 @@ private:
                 // Compute filter weights for each contributing input pixel
                 for (x = 0; x < xmax; x++) {
                     // Distance from input pixel center to output pixel center in input space
-                    double w = bicubic_filter((x + xmin - center + 0.5) * ss);
+                    double w = resample_filter((x + xmin - center + 0.5) * ss);
                     pre_weights[xx * ksize + x] = w;
                     ww += w;  // Accumulate for normalization
                 }
@@ -465,6 +504,12 @@ private:
             const double fxp_scale = std::ldexp(1.0, PRECISION_BITS); // 1.0 * 2^PRECISION_BITS
 
             for (int i = 0; i < outSize * ksize; i++) {
+                if (use_lanczos) {
+                    // Pillow adds +/- 0.5 then truncates toward zero; std::round would round twice
+                    const double rounded = pre_weights[i] * fxp_scale + (pre_weights[i] < 0 ? -0.5 : 0.5);
+                    weights[i] = static_cast<int32_t>(rounded);
+                    continue;
+                }
                 double tmp_val = pre_weights[i] * fxp_scale;
                 if (pre_weights[i] < 0) {
                     tmp_val -= 0.5;
@@ -1047,6 +1092,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_qwen3vl::preprocess(const clip_im
         thumb_f32.from_u8(thumb_u8);
         thumb_f32.normalize(hparams.image_mean, hparams.image_std);
         output.entries.insert(output.entries.begin(), std::move(thumb_f32));
+        output.overview_in_entries = true;
     }
 
     output.grid_x = use_col;
@@ -1074,6 +1120,26 @@ mtmd_image_preproc_out mtmd_image_preprocessor_longest_edge::preprocess(const cl
     mtmd_image_preproc_out output;
     output.append(hparams, resized_image, true);
     return output;
+}
+
+//
+// mtmd_image_preprocessor_minicpmv
+//
+
+mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_minicpmv::get_slice_instructions(const clip_image_size & original_size) {
+    if (hparams.n_merge == 2) {
+        const int   slice_size = hparams.image_size;
+        const float ratio      = (float)original_size.width * original_size.height / (slice_size * slice_size);
+        if (ratio <= 1.0f) {
+            mtmd_image_preprocessor_llava_uhd::slice_instructions inst;
+            const int patch_size = hparams.patch_size * hparams.n_merge;
+            inst.overview_size = get_best_resize(original_size, slice_size, patch_size, true);
+            inst.refined_size  = clip_image_size{0, 0};
+            inst.grid_size     = clip_image_size{0, 0};
+            return inst;
+        }
+    }
+    return mtmd_image_preprocessor_llava_uhd::get_slice_instructions(original_size);
 }
 
 //
@@ -1183,28 +1249,102 @@ clip_image_size mtmd_image_preprocessor_lfm2::get_grid_layout(int height, int wi
 // mtmd_image_preprocessor_idefics3
 //
 
+// Sizing rule for the no-upscale variant, a direct port of DynamicResize._get_new_hw() with
+// resize_to_max_side_len=False from the reference processor. `p` is the slice size
+// (vit_img_size) and `m` the cap (max_img_size); the reference's min_side_len is
+// FLASH_MIN_SIDE_LEN, which is the same 512 as vit_img_size, so it is not a separate knob.
+//
+// CITE: https://huggingface.co/qvac/VisionPsy-Nano-460M-Flash/blob/main/custom_transforms.py
+//
+// Note both branches return multiples of `p`, exactly like the upscaling path: the reference
+// splitter hard-errors on anything else. So this changes HOW MANY slices an image becomes,
+// never their size.
+static clip_image_size calc_size_no_upscale(const clip_image_size & inp_size, int p, int m) {
+    GGML_ASSERT(p > 0 && m > 0);
+    if (inp_size.width <= 0 || inp_size.height <= 0) {
+        return {0, 0};
+    }
+    // integer ceil, mirroring the reference's -(-a // b). Stays in int64_t all the way
+    // through the multiply-back-by-p: an extreme aspect ratio (e.g. a very wide, very
+    // thin image) can push that product past INT32_MAX, which would silently wrap
+    // negative in 32-bit arithmetic and defeat the std::min/std::max clamps below.
+    auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+
+    const int64_t long_side  = std::max(inp_size.width, inp_size.height);
+    const int64_t short_side = std::min(inp_size.width, inp_size.height);
+    const int64_t p64 = p;
+    const int64_t m64 = m;
+
+    int64_t target_long;
+    int64_t target_short;
+    if (short_side < p64) {
+        // Short side below one slice: pin it to exactly p and give the long side however many
+        // whole slices the aspect ratio asks for. This is the one case that DOES enlarge.
+        const int64_t den = short_side * p64;
+        target_long  = std::min(m64, ceil_div(long_side * p64, den) * p64);
+        target_short = std::max(ceil_div(short_side * p64, den) * p64, p64);
+    } else {
+        target_long = std::min(m64, ceil_div(long_side, p64) * p64);
+        // double, not float, and deliberately not exact integer arithmetic: the reference is
+        // `math.ceil(short * scale / p)` on Python floats, and its rounding is part of the
+        // rule the model was trained under. Where the true quotient lands on an integer the
+        // three disagree by a whole slice row. Over every size pair up to 3000x3000, float32
+        // differs from the reference in 171 cases and exact integers in 92; double in none.
+        const double scale = (double) target_long / (double) long_side;
+        target_short       = std::max((int64_t) std::ceil((double) short_side * scale / (double) p64) * p64, p64);
+    }
+
+    // Defensive clamp: both branches are designed to land in [p, m], but this guards the
+    // narrowing cast below against ever producing a value outside that range.
+    target_long  = std::clamp(target_long, p64, m64);
+    target_short = std::clamp(target_short, p64, m64);
+
+    return inp_size.width >= inp_size.height
+        ? clip_image_size{(int) target_long, (int) target_short}
+        : clip_image_size{(int) target_short, (int) target_long};
+}
+
+// The refined size has two steps:
+// 1. Resize w/ aspect-ratio preserving such that the longer side is
+//      the preprocessor longest size
+// 2. Resize w/out preserving aspect ratio such that both sides are
+//      multiples of image_size (always rounding up)
+//
+// CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
+//
+// no_upscale replaces step 1 only; step 2 is shared, so both variants land on a
+// multiple of image_size in each dimension.
+mtmd_idefics3_sizing mtmd_calc_idefics3_sizing(const clip_image_size & original_size,
+                                               int image_size,
+                                               int image_longest_edge,
+                                               bool no_upscale) {
+    mtmd_idefics3_sizing out;
+    out.refined_size = no_upscale
+        ? calc_size_no_upscale(original_size, image_size, image_longest_edge)
+        : img_tool::calc_size_preserved_ratio(original_size, image_size, image_longest_edge);
+    out.grid_size = clip_image_size{
+        static_cast<int>(std::ceil(static_cast<float>(out.refined_size.width) / image_size)),
+        static_cast<int>(std::ceil(static_cast<float>(out.refined_size.height) / image_size)),
+    };
+    out.n_slices = out.grid_size.width * out.grid_size.height;
+    return out;
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_idefics3::preprocess(const clip_image_u8 & img) {
-    // The refined size has two steps:
-    // 1. Resize w/ aspect-ratio preserving such that the longer side is
-    //      the preprocessor longest size
-    // 2. Resize w/out preserving aspect ratio such that both sides are
-    //      multiples of image_size (always rounding up)
-    //
-    // CITE: https://github.com/huggingface/transformers/blob/main/src/transformers/models/idefics3/image_processing_idefics3.py#L737
     const clip_image_size original_size = img.get_size();
-    const clip_image_size refined_size = img_tool::calc_size_preserved_ratio(
-        original_size, hparams.image_size, hparams.image_longest_edge);
+    const mtmd_idefics3_sizing sizing = mtmd_calc_idefics3_sizing(
+        original_size, hparams.image_size, hparams.image_longest_edge, hparams.image_no_upscale);
+    const clip_image_size refined_size = sizing.refined_size;
     // LOG_INF("%s: original size: %d x %d, refined size: %d x %d\n",
     //         __func__, original_size.width, original_size.height,
     //         refined_size.width, refined_size.height);
 
     mtmd_image_preprocessor_llava_uhd::slice_instructions instructions;
-    instructions.overview_size = clip_image_size{hparams.image_size, hparams.image_size};
     instructions.refined_size = refined_size;
-    instructions.grid_size = clip_image_size{
-        static_cast<int>(std::ceil(static_cast<float>(refined_size.width) / hparams.image_size)),
-        static_cast<int>(std::ceil(static_cast<float>(refined_size.height) / hparams.image_size)),
-    };
+    instructions.grid_size = sizing.grid_size;
+    // Square, in both variants: the reference resizes the global image to (p, p) regardless
+    // of no_upscale (GlobalAndSplitImages in custom_transforms.py).
+    instructions.overview_size = clip_image_size{hparams.image_size, hparams.image_size};
     for (int y = 0; y < refined_size.height; y += hparams.image_size) {
         for (int x = 0; x < refined_size.width; x += hparams.image_size) {
             // LOG_INF("%s: adding slice at x=%d, y=%d\n", __func__, x, y);
@@ -1251,44 +1391,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_internvl::preprocess(const clip_i
 // mtmd_image_preprocessor_deepseekocr
 //
 
-mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr::preprocess(const clip_image_u8 & img) {
-    static constexpr int native_resolutions[] = { 1024 /* base */, 1280 /* large */ };
-    // TODO: support 512 (tiny) and 640 (small) once we have eval data for them
-
-    const int64_t orig_area = static_cast<int64_t>(img.get_size().area());
-
-    size_t  mode_i   = 0;
-    int64_t min_diff = std::numeric_limits<int64_t>::max();
-    for (size_t i = 0; i < std::size(native_resolutions); i++) {
-        const int64_t r    = native_resolutions[i];
-        const int64_t diff = std::abs(orig_area - r * r);
-        if (diff < min_diff) {
-            mode_i   = i;
-            min_diff = diff;
-        }
-    }
-    const int image_size = native_resolutions[mode_i];
-
-    // Aspect-preserving fit-and-pad. Pillow bicubic + PAD_NEAREST for
-    // byte-parity with the upstream deepseek-ai/DeepSeek-OCR HF preprocessor.
-    clip_image_u8 padded;
-    img_tool::resize(img, padded, {image_size, image_size}, RESIZE_ALGO_BICUBIC_PILLOW,
-                     PAD_NEAREST, hparams.image_pad_color);
-    mtmd_image_preproc_out output;
-    output.append_overview(hparams, padded, true);
-    output.grid_x = 0;
-    output.grid_y = 0;
-    // TODO @ngxson : support slicing for DeepSeek-OCR, to do in another PR
-    return output;
-}
-
-//
-// mtmd_image_preprocessor_deepseekocr2
-//
-
-// candidate tile grids (cols, rows) with min_tiles <= cols*rows <= max_tiles
-// sorted by tile count
-std::vector<clip_image_size> mtmd_image_preprocessor_deepseekocr2::get_target_ratios() {
+std::vector<clip_image_size> mtmd_image_preprocessor_deepseekocr::get_target_ratios() const {
     std::vector<clip_image_size> ratios;
     for (int n = min_tiles; n <= max_tiles; n++) {
         for (int w = 1; w <= n; w++) {
@@ -1315,13 +1418,11 @@ std::vector<clip_image_size> mtmd_image_preprocessor_deepseekocr2::get_target_ra
     return ratios;
 }
 
-// pick the grid whose aspect ratio is closest to the image
-// on a tie, prefer the larger grid when the image fits
-clip_image_size mtmd_image_preprocessor_deepseekocr2::find_closest_aspect_ratio(
+clip_image_size mtmd_image_preprocessor_deepseekocr::find_closest_aspect_ratio(
     float                                aspect_ratio,
     const std::vector<clip_image_size> & target_ratios,
     int                                  width,
-    int                                  height) {
+    int                                  height) const {
     float           best_ratio_diff = std::numeric_limits<float>::max();
     clip_image_size best_ratio      = { 1, 1 };
     const float     area            = static_cast<float>(width * height);
@@ -1342,37 +1443,69 @@ clip_image_size mtmd_image_preprocessor_deepseekocr2::find_closest_aspect_ratio(
     return best_ratio;
 }
 
-mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr2::preprocess(const clip_image_u8 & img) {
-    // emit 768x768 local tiles when the image is larger than a tile in either
-    // dimension, then always a 1024x1024 global view. order: [tiles..., global].
-
+mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr::preprocess(const clip_image_u8 & img) {
     mtmd_image_preproc_out output;
+    int grid_w = 0;
+    int grid_h = 0;
     const auto img_size = img.get_size();
+
+    // global view: aspect-preserving fit-and-pad to base_size
+    clip_image_u8 padded;
+    img_tool::resize(img, padded,
+                    { base_size, base_size },
+                    RESIZE_ALGO_BICUBIC_PILLOW,
+                    PAD_NEAREST,
+                    hparams.image_pad_color);
+    output.append_overview(hparams, padded, true);
+    output.overview.add_viewsep = true;
+
+    // if this condition doesn't hold, the output is overview only, no tiles
     if (img_size.width > tile_size || img_size.height > tile_size) {
         const float           aspect_ratio  = static_cast<float>(img_size.width) / img_size.height;
         const auto            target_ratios = get_target_ratios();
-        const clip_image_size grid          = find_closest_aspect_ratio(aspect_ratio, target_ratios, img_size.width, img_size.height);
+        const clip_image_size grid =
+            find_closest_aspect_ratio(aspect_ratio, target_ratios, img_size.width, img_size.height);
+        grid_w = grid.width;
+        grid_h = grid.height;
 
-        // stretch onto the grid (no aspect preserve), then crop tiles row-major.
         clip_image_u8 refined;
-        img_tool::resize(img, refined, { tile_size * grid.width, tile_size * grid.height },
-                         RESIZE_ALGO_BICUBIC_PILLOW, PAD_NONE);
+        img_tool::resize(img, refined, { tile_size * grid_w, tile_size * grid_h }, RESIZE_ALGO_BICUBIC_PILLOW,
+                         PAD_NONE);
 
-        for (int row = 0; row < grid.height; row++) {
-            for (int col = 0; col < grid.width; col++) {
-                clip_image_u8 tile;
-                img_tool::crop(refined, tile, col * tile_size, row * tile_size, tile_size, tile_size);
-                output.append(hparams, tile, true);
+        for (int row = 0; row < grid_h; row++) {
+            if (fuse_row) {
+                // concat all tiles in this row into a single image, along the H axis
+                // output image size: w = tile_size, h = tile_size * grid_w
+                // this is to ensure the whole row is always processed together
+                clip_image_u8 row_img;
+                row_img.set_size({tile_size, tile_size * grid_w}, false);
+                for (int col = 0; col < grid_w; col++) {
+                    for (int py = 0; py < tile_size; py++) {
+                        for (int px = 0; px < tile_size; px++) {
+                            row_img.set_pixel(px, col * tile_size + py,
+                                              refined.get_pixel(col * tile_size + px, row * tile_size + py));
+                        }
+                    }
+                }
+                output.append(hparams, row_img, true);
+            } else {
+                for (int col = 0; col < grid_w; col++) {
+                    clip_image_u8 tile;
+                    img_tool::crop(refined, tile, col * tile_size, row * tile_size, tile_size, tile_size);
+                    output.append(hparams, tile, true);
+                }
             }
+        }
+        if (fuse_row) {
+            grid_w = 1; // each fused row is one image; a single output column
         }
     }
 
-    // global view: aspect-preserving fit-and-pad to base_size.
-    clip_image_u8 padded;
-    img_tool::resize(img, padded, { base_size, base_size }, RESIZE_ALGO_BICUBIC_PILLOW,
-                     PAD_NEAREST, hparams.image_pad_color);
-    output.append_overview(hparams, padded, true);
-    output.overview.add_viewsep = true;
+    LOG_DBG("%s: grid size: %d x %d (%d tiles) + global view\n", __func__, grid_w, grid_h, grid_w * grid_h);
+    LOG_DBG("%s: overview size: %d x %d\n", __func__, padded.get_size().width, padded.get_size().height);
+
+    output.grid_x = grid_w;
+    output.grid_y = grid_h;
     return output;
 }
 

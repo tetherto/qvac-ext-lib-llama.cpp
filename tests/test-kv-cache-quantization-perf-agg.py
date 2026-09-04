@@ -14,14 +14,12 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import csv
-import logging
 import math
-import os
-import sys
 from collections import defaultdict
 from typing import TypedDict
+
+from kv_quant_agg_common import render_table, run_aggregation, safe_float
 
 
 class PerfGroup(TypedDict):
@@ -65,13 +63,6 @@ OUTPUT_HEADER = [
     "n_runs", "pp_avg", "pp_stdev", "tg_avg", "tg_stdev",
     "pp_vs_f16_x", "tg_vs_f16_x", "pp_speedup_vs_scalar", "tg_speedup_vs_scalar",
 ]
-
-
-def safe_float(v):
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return None
 
 
 def combined_mean_stdev(means, stdevs):
@@ -339,96 +330,35 @@ CM_SHORT = {
 }
 
 
-def render_table(rows):
-    """Render rows as a fixed-width text table."""
-    if not rows:
-        return ""
-
-    display_cols = [
-        ("coopmat_mode", "CM", 5),
-        ("cache_k", "K", 10),
-        ("cache_v", "V", 10),
-        ("compression_vs_f16", "Compr", 7),
-        ("n_runs", "Runs", 5),
-        ("pp_avg", "pp avg", 10),
-        ("pp_stdev", "pp sd", 8),
-        ("tg_avg", "tg avg", 10),
-        ("tg_stdev", "tg sd", 8),
-        ("pp_vs_f16_x", "pp/f16", 11),
-        ("tg_vs_f16_x", "tg/f16", 11),
-        ("pp_speedup_vs_scalar", "pp/scl", 11),
-        ("tg_speedup_vs_scalar", "tg/scl", 11),
-    ]
-
-    lines = []
-    header = "  ".join(f"{title:>{w}}" for _, title, w in display_cols)
-    lines.append(header)
-    lines.append("  ".join("-" * w for _, _, w in display_cols))
-
-    for row in rows:
-        vals = []
-        for k, _, w in display_cols:
-            v = row.get(k, "")
-            if k == "coopmat_mode":
-                v = CM_SHORT.get(v, v)
-            vals.append(f"{v:>{w}}")
-        lines.append("  ".join(vals))
-
-    return "\n".join(lines)
+DISPLAY_COLS = [
+    ("coopmat_mode", "CM", 5),
+    ("cache_k", "K", 10),
+    ("cache_v", "V", 10),
+    ("compression_vs_f16", "Compr", 7),
+    ("n_runs", "Runs", 5),
+    ("pp_avg", "pp avg", 10),
+    ("pp_stdev", "pp sd", 8),
+    ("tg_avg", "tg avg", 10),
+    ("tg_stdev", "tg sd", 8),
+    ("pp_vs_f16_x", "pp/f16", 11),
+    ("tg_vs_f16_x", "tg/f16", 11),
+    ("pp_speedup_vs_scalar", "pp/scl", 11),
+    ("tg_speedup_vs_scalar", "tg/scl", 11),
+]
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Aggregate KV cache quantization performance CSVs")
-    parser.add_argument("inputs", nargs="+", help="Input CSV files")
-    parser.add_argument("-o", "--output", required=True,
-                        help="Output CSV file path")
-    args = parser.parse_args()
-
-    log = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    missing = [f for f in args.inputs if not os.path.isfile(f)]
-    if missing:
-        log.error("Error: files not found: %s", ", ".join(missing))
-        sys.exit(1)
-
-    groups = aggregate(args.inputs)
-    results = compute_ratios(groups)
-
-    out_csv = args.output
-    out_txt = os.path.splitext(out_csv)[0] + ".txt"
-
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=OUTPUT_HEADER,
-                                quoting=csv.QUOTE_NONNUMERIC)
-        writer.writeheader()
-        writer.writerows(results)
-
-    table = render_table(results)
-    with open(out_txt, "w") as f:
-        f.write("=" * 80 + "\n")
-        f.write(" KV Cache Quantization Performance — Aggregated Results\n")
-        f.write("=" * 80 + "\n\n")
-        f.write(table + "\n\n")
-        f.write("=" * 80 + "\n")
-        f.write(f" Aggregated from {len(args.inputs)} file(s):\n")
-        for fpath in args.inputs:
-            f.write(f"   - {os.path.abspath(fpath)}\n")
-        f.write("=" * 80 + "\n")
-        f.write("\n")
-        f.write(LEGEND)
-
-    log.info("CSV: %s (%s rows)", os.path.abspath(out_csv), len(results))
-    log.info("TXT: %s", os.path.abspath(out_txt))
-    log.info("")
-    log.info(table)
-    log.info("")
-    log.info("Aggregated from %s file(s):", len(args.inputs))
-    for fpath in args.inputs:
-        log.info("  - %s", fpath)
-    log.info("")
-    log.info(LEGEND)
+    run_aggregation(
+        description="Aggregate KV cache quantization performance CSVs",
+        title=" KV Cache Quantization Performance — Aggregated Results",
+        output_header=OUTPUT_HEADER,
+        aggregate=aggregate,
+        compute_ratios=compute_ratios,
+        render=lambda rows: render_table(
+            rows, DISPLAY_COLS,
+            transform=lambda k, v: CM_SHORT.get(v, v) if k == "coopmat_mode" else v),
+        legend=LEGEND,
+    )
 
 
 if __name__ == "__main__":

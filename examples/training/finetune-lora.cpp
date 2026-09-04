@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "finetune.h"
 #include "log.h"
 #include "llama.h"
 #include "ggml-backend.h"
@@ -30,8 +31,8 @@ enum class lora_lr_schedule_type : std::uint8_t {
     LINEAR,
 };
 
-// TODO: Ideally, training configuration variables should be added to common.h and 
-// parsed using the existing common_params_parse (or loaded from a config file) 
+// TODO: Ideally, training configuration variables should be added to common.h and
+// parsed using the existing common_params_parse (or loaded from a config file)
 // to reuse the existing parser and reduce boilerplate CLI parsing code.
 struct lora_lr_scheduler_state {
     lora_lr_schedule_type schedule = lora_lr_schedule_type::CONSTANT;
@@ -155,7 +156,7 @@ static uint32_t parse_lora_modules(const std::string& modules_str) {
     if (modules_str.empty()) {
         return LLAMA_LORA_TARGET_ATTN_Q | LLAMA_LORA_TARGET_ATTN_K | LLAMA_LORA_TARGET_ATTN_V | LLAMA_LORA_TARGET_ATTN_O;
     }
-    
+
     static const std::map<std::string, uint32_t> module_map = {
         {"attn_q",           LLAMA_LORA_TARGET_ATTN_Q},
         {"attn_k",           LLAMA_LORA_TARGET_ATTN_K},
@@ -175,15 +176,15 @@ static uint32_t parse_lora_modules(const std::string& modules_str) {
                              LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS},
         {"all",              LLAMA_LORA_TARGET_ALL}
     };
-    
+
     uint32_t target_modules = 0;
     std::stringstream ss(modules_str);
     std::string module;
-    
+
     while (std::getline(ss, module, ',')) {
         module.erase(0, module.find_first_not_of(" \t"));
         module.erase(module.find_last_not_of(" \t") + 1);
-        
+
         auto it = module_map.find(module);
         if (it != module_map.end()) {
             target_modules |= it->second;
@@ -194,7 +195,7 @@ static uint32_t parse_lora_modules(const std::string& modules_str) {
             return 0;
         }
     }
-    
+
     return target_modules;
 }
 
@@ -317,10 +318,10 @@ static std::string find_latest_checkpoint(const std::string& checkpoint_dir) {
     if (!std::filesystem::exists(checkpoint_dir)) {
         return "";
     }
-    
+
     std::string latest_checkpoint;
     int64_t latest_step = -1;
-    
+
     for (const auto& entry : std::filesystem::directory_iterator(checkpoint_dir)) {
         if (entry.is_directory()) {
             std::string dirname = entry.path().filename().string();
@@ -338,7 +339,7 @@ static std::string find_latest_checkpoint(const std::string& checkpoint_dir) {
             }
         }
     }
-    
+
     return latest_checkpoint;
 }
 
@@ -349,7 +350,7 @@ static bool save_checkpoint(llama_context* ctx, llama_adapter_lora* adapter,  co
             return false;
         }
     }
-    
+
     if (!llama_lora_save_checkpoint(adapter, checkpoint_dir.c_str(), llama_get_model(ctx), ctx)) {
         LOG_ERR("Failed to save LoRA checkpoint\n");
         return false;
@@ -367,19 +368,19 @@ static bool save_checkpoint(llama_context* ctx, llama_adapter_lora* adapter,  co
         LOG_ERR("Failed to save checkpoint metadata\n");
         return false;
     }
-    
+
     LOG_INF("Checkpoint saved successfully to %s\n", checkpoint_dir.c_str());
     return true;
 }
 
 static bool validate_checkpoint_metadata(const std::string& checkpoint_path, checkpoint_metadata& metadata) {
     std::string checkpoint_dir = checkpoint_path;
-    
+
     if (!std::filesystem::exists(checkpoint_dir)) {
         LOG_ERR("Checkpoint directory does not exist: %s\n", checkpoint_dir.c_str());
         return false;
     }
-    
+
     LOG_INF("Loading checkpoint from: %s\n", checkpoint_dir.c_str());
 
     std::string meta_path = checkpoint_dir + "/metadata.txt";
@@ -392,7 +393,7 @@ static bool validate_checkpoint_metadata(const std::string& checkpoint_path, che
                 if (eq_pos != std::string::npos) {
                     std::string key = line.substr(0, eq_pos);
                     std::string value = line.substr(eq_pos + 1);
-                    
+
                     if (key == "epoch") {
                         metadata.epoch = std::stoi(value);
                     } else if (key == "lora_rank") {
@@ -413,7 +414,7 @@ static bool validate_checkpoint_metadata(const std::string& checkpoint_path, che
         LOG_ERR("Checkpoint metadata file not found: %s\n", meta_path.c_str());
         return false;
     }
-    
+
     LOG_INF("Checkpoint loaded successfully\n");
     return true;
 }
@@ -445,11 +446,11 @@ static void checkpoint_progress_callback(
         int64_t            ibatch_max,
         int64_t            t_start_us) {
     ggml_opt_epoch_callback_progress_bar(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
-    
+
     if (!train) return;
-    
+
     checkpoint_callback_data* cb_data = g_checkpoint_data;
-    
+
     if (!cb_data) {
         LOG_ERR("Checkpoint callback data is null!\n");
         return;
@@ -462,29 +463,29 @@ static void checkpoint_progress_callback(
     if (cb_data->checkpoint_save_steps <= 0) {
         return;
     }
-    
+
     cb_data->global_step++;
-    
+
     if (cb_data->global_step % cb_data->checkpoint_save_steps == 0) {
         if (!cb_data->ctx) {
             LOG_ERR("Context is null in checkpoint callback!\n");
             return;
         }
-        
+
         if (!cb_data->adapter) {
             LOG_ERR("LoRA adapter is null in checkpoint callback!\n");
             return;
         }
-        
+
         checkpoint_metadata meta = {
             /*epoch          =*/ cb_data->current_epoch,
             /*lora_rank      =*/ cb_data->lora_rank,
             /*lora_alpha     =*/ cb_data->lora_alpha,
             /*target_modules =*/ cb_data->target_modules,
         };
-        
+
         std::string checkpoint_path = get_checkpoint_filename(cb_data->checkpoint_save_dir, cb_data->global_step);
-        
+
         if (!save_checkpoint(cb_data->ctx, cb_data->adapter, meta, checkpoint_path)) {
             LOG_ERR("Failed to save checkpoint at step %" PRId64 "\n", cb_data->global_step);
         }
@@ -621,7 +622,7 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
             print_lora_usage();
         }
     }
-    
+
     return true;
 }
 
@@ -668,7 +669,7 @@ int main(int argc, char ** argv) {
 
     LOG_INF("Using LoRA parameters: rank=%d, alpha=%.1f, seed=%u\n", ft_params.lora_rank, ft_params.lora_alpha, ft_params.lora_seed);
     LOG_INF("Training for %d epochs\n", ft_params.num_epochs);
-    
+
     // Handle checkpoint auto-resume before model initialization
     if (ft_params.auto_resume && ft_params.resume_from_checkpoint.empty()) {
         std::string latest_checkpoint = find_latest_checkpoint(ft_params.checkpoint_save_dir);
@@ -677,16 +678,16 @@ int main(int argc, char ** argv) {
             LOG_INF("Auto-resume: found checkpoint %s\n", ft_params.resume_from_checkpoint.c_str());
         }
     }
-    
+
     if (!ft_params.resume_from_checkpoint.empty()) {
         params.warmup = false;
     }
-    
+
     // Load checkpoint LoRA adapter from directory structure (model.gguf)
     if (!ft_params.resume_from_checkpoint.empty()) {
         std::filesystem::path checkpoint_dir(ft_params.resume_from_checkpoint);
         std::filesystem::path model_path = checkpoint_dir / "model.gguf";
-        
+
         LOG_INF("Loading checkpoint LoRA adapter: %s\n", model_path.c_str());
         common_adapter_lora_info lora_adapter;
         lora_adapter.path = model_path.string();
@@ -697,9 +698,10 @@ int main(int argc, char ** argv) {
         LOG_INF("Checkpoint LoRA adapter added to params\n");
     }
 
-    if (params.use_mmap) {
+    if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
         LOG_INF("%s: force disabling memory mapping because it would result in-read-only pointers to the weights\n", __func__);
-        params.use_mmap = false;
+        params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK
+                                                                          : LLAMA_LOAD_MODE_NONE;
     }
     const bool supports_out_prod_f16 = training_supports_out_prod_f16(params);
     if (!supports_out_prod_f16) {
@@ -748,7 +750,7 @@ int main(int argc, char ** argv) {
 
     bool has_existing_lora = !params.lora_adapters.empty();
     struct llama_adapter_lora * trained_adapter = nullptr;
-    
+
     if (has_existing_lora) {
         LOG_INF("Finetuning existing LoRA adapters\n");
         LOG_INF("Found %zu existing LoRA adapters to train\n", params.lora_adapters.size());
@@ -772,7 +774,7 @@ int main(int argc, char ** argv) {
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_UP_EXPS) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_DOWN_EXPS) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS) ? "yes" : "no");
-        
+
         LOG_INF("LoRA configuration: rank=%d, alpha=%.1f (scaling=%.3f)\n",
                 lora_params.rank, lora_params.alpha, lora_params.alpha / lora_params.rank);
 
@@ -786,7 +788,7 @@ int main(int argc, char ** argv) {
     constexpr float val_split = 0.05f;
 
     ggml_opt_dataset_t dataset;
-    
+
     if (ft_params.assistant_loss_only) {
         LOG_INF("Using JSON dataset with chat template and assistant-only loss\n");
         dataset = common_opt_sft_dataset_init(ctx, params.prompt, llama_n_ctx(ctx)/2, ft_params.chat_template_path);
@@ -795,7 +797,7 @@ int main(int argc, char ** argv) {
         LOG_INF("Using standard next-token prediction mode\n");
         dataset = common_opt_dataset_init(ctx, tokens, llama_n_ctx(ctx)/2);
     }
-    
+
     if (dataset == nullptr) {
         LOG_ERR("Failed to create dataset. Please check your input file and parameters.\n");
         return 1;
@@ -854,12 +856,12 @@ int main(int argc, char ** argv) {
     int64_t start_step = 0;
     checkpoint_metadata checkpoint_meta = {};
     bool checkpoint_loaded = false;
-    
+
     if (!ft_params.resume_from_checkpoint.empty()) {
         if (validate_checkpoint_metadata(ft_params.resume_from_checkpoint, checkpoint_meta)) {
             start_epoch = checkpoint_meta.epoch;
             checkpoint_loaded = true;
-            
+
             if (checkpoint_meta.lora_rank != ft_params.lora_rank) {
                 LOG_ERR("Checkpoint LoRA rank (%d) doesn't match current rank (%d). Use --resume-from to manually specify a compatible checkpoint.\n",
                         checkpoint_meta.lora_rank, ft_params.lora_rank);
@@ -874,7 +876,7 @@ int main(int argc, char ** argv) {
                 LOG_ERR("Checkpoint target_modules doesn't match current target_modules\n");
                 return 1;
             }
-            
+
         } else {
             LOG_ERR("Failed to load checkpoint, starting from scratch\n");
         }
@@ -895,7 +897,7 @@ int main(int argc, char ** argv) {
     lopt_params.assistant_loss_only  = ft_params.assistant_loss_only;
 
     llama_opt_init(ctx, model, lopt_params);
-    
+
     if (checkpoint_loaded) {
         start_step = llama_opt_get_iter(ctx);
     }
@@ -942,15 +944,13 @@ int main(int argc, char ** argv) {
         }
         LOG_INF("Starting epoch %d (step %lld, lr=%.4e)\n", epoch, (long long)cb_data.global_step, cb_data.learning_rate);
         cb_data.current_epoch = epoch;
-        
+
         int64_t resume_batch = 0;
         if (start_step > 0 && epoch == start_epoch) {
             resume_batch = start_step % training_batches_per_epoch;
         }
 
-        ggml_opt_epoch_callback train_callback = (ft_params.checkpoint_save_steps <= 0) ?
-            ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
-        ggml_opt_epoch_callback eval_callback = (ft_params.checkpoint_save_steps <= 0) ?
+        ggml_opt_epoch_callback epoch_callback = (ft_params.checkpoint_save_steps <= 0) ?
             ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
 
         if (resume_batch > 0) {
@@ -962,7 +962,7 @@ int main(int argc, char ** argv) {
         }
 
         llama_opt_epoch_resume(ctx, dataset, result_train, result_eval, idata_split,
-            train_callback, eval_callback, resume_batch);
+            epoch_callback, epoch_callback, resume_batch);
         fprintf(stderr, "\n");
 
         ggml_opt_result_reset(result_train);
@@ -989,7 +989,7 @@ int main(int argc, char ** argv) {
             std::ifstream adapter_file(adapter_filename, std::ios::binary | std::ios::ate);
             if (adapter_file.is_open()) {
                 std::streamsize adapter_size = adapter_file.tellg();
-                LOG_INF("LoRA adapter saved: %s (%.2f MB)\n", 
+                LOG_INF("LoRA adapter saved: %s (%.2f MB)\n",
                         adapter_filename.c_str(), adapter_size / (1024.0 * 1024.0));
                 adapter_file.close();
             }

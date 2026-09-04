@@ -35,9 +35,6 @@ env:
   LLAMA_ARG_LOG_PREFIX: 1
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
-permissions:
-  contents: read
-
 jobs:
   ubuntu-arm64:
     runs-on: ubuntu-24.04-arm
@@ -122,6 +119,7 @@ jobs:
         run: |
           source ./vulkan_sdk/setup-env.sh
           cmake -B build \
+            -DGGML_NATIVE=OFF \
             -DGGML_VULKAN=ON
           cmake --build build --config Release -j $(nproc)
 

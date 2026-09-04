@@ -104,7 +104,9 @@ void qjl_project_q_block(uint32_t q_offset, uint32_t qjl_block_start, uint32_t t
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
-    init_iq_shmem(gl_WorkGroupSize);
+    if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
 #endif
 
     init_indices();

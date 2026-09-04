@@ -35,9 +35,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
   server:
     runs-on: [self-hosted, CPU, Linux, llama-server]

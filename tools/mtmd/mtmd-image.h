@@ -15,6 +15,8 @@ struct mtmd_image_preproc_out {
     clip_image_f32 overview; // overview image (downscaled image)
     int grid_x = 0;
     int grid_y = 0;
+    // when true, entries[0] is an overview thumbnail and entries[1..] are the grid_x*grid_y tiles
+    bool overview_in_entries = false;
 
     void append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized = true);
     void append(const clip_hparams & hparams, const std::vector<clip_image_u8> & imgs, bool normalized = true);
@@ -74,7 +76,6 @@ struct mtmd_image_preprocessor_llava_uhd : mtmd_image_preprocessor {
         std::vector<slice_coordinates> slices;
     };
 
-    // LFM2 override this function to implement its custom slicing logic
     virtual slice_instructions get_slice_instructions(const clip_image_size & original_size);
 
     struct slice_output {
@@ -83,9 +84,10 @@ struct mtmd_image_preprocessor_llava_uhd : mtmd_image_preprocessor {
     };
     slice_output slice_image(const clip_image_u8 & img, const slice_instructions & inst);
 
-private:
+protected:
     clip_image_size get_best_resize(const clip_image_size & original_size, int scale_resolution, int patch_size, bool allow_upscale = false);
 
+private:
     clip_image_size resize_maintain_aspect_ratio(const clip_image_size & orig, const clip_image_size & target_max);
 
     /**
@@ -143,6 +145,12 @@ struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 };
 
+// custom llava-uhd slicing logic for MiniCPM-V
+struct mtmd_image_preprocessor_minicpmv : mtmd_image_preprocessor_llava_uhd {
+    using mtmd_image_preprocessor_llava_uhd::mtmd_image_preprocessor_llava_uhd;
+    slice_instructions get_slice_instructions(const clip_image_size & original_size) override;
+};
+
 // custom llava-uhd slicing logic for LFM2
 // ref: https://github.com/huggingface/transformers/blob/v5.1.0/src/transformers/models/lfm2_vl/image_processing_lfm2_vl_fast.py
 struct mtmd_image_preprocessor_lfm2 : mtmd_image_preprocessor_llava_uhd {
@@ -164,6 +172,22 @@ private:
     clip_image_size get_grid_layout(int height, int width);
 };
 
+// What an image becomes under the idefics3-family sizing rule, before any pixel is touched.
+// The slice grid follows from the refined size, so these three travel together.
+struct mtmd_idefics3_sizing {
+    clip_image_size refined_size;
+    clip_image_size grid_size;
+    int n_slices;
+};
+
+// The sizing rule on its own, so it can be checked against the reference processor without a
+// model: `no_upscale` picks the Flash rule (round the long side up to whole slices and cap it)
+// over the base one (always stretch the long side to the cap).
+mtmd_idefics3_sizing mtmd_calc_idefics3_sizing(const clip_image_size & original_size,
+                                               int image_size,
+                                               int image_longest_edge,
+                                               bool no_upscale);
+
 struct mtmd_image_preprocessor_idefics3 : mtmd_image_preprocessor_llava_uhd {
     mtmd_image_preprocessor_idefics3(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
@@ -174,29 +198,29 @@ struct mtmd_image_preprocessor_internvl : mtmd_image_preprocessor_llava_uhd {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 };
 
+// DeepSeek-OCR (v1/v2) global view + optional local tile grid
 struct mtmd_image_preprocessor_deepseekocr : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_deepseekocr(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
-    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
-};
-
-// DeepSeek-OCR-2: a 1024x1024 global view, plus InternVL-style 768x768 local
-// tiles when the image is larger than a tile in either dimension.
-struct mtmd_image_preprocessor_deepseekocr2 : mtmd_image_preprocessor {
-    static constexpr int base_size = 1024; // global view
-    static constexpr int tile_size = 768;  // local tile
-    static constexpr int min_tiles = 2;
-    static constexpr int max_tiles = 6;
-
-    mtmd_image_preprocessor_deepseekocr2(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preprocessor_deepseekocr(const clip_ctx * ctx)
+        : mtmd_image_preprocessor(ctx),
+            fuse_row(clip_get_projector_type(ctx) == PROJECTOR_TYPE_DEEPSEEKOCR),
+          base_size(hparams.image_size),
+          tile_size(hparams.preproc_tile_size),
+          min_tiles(hparams.preproc_min_tiles),
+          max_tiles(hparams.preproc_max_tiles) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 
 private:
-    static std::vector<clip_image_size> get_target_ratios();
-    static clip_image_size              find_closest_aspect_ratio(
-        float                                aspect_ratio,
-        const std::vector<clip_image_size> & target_ratios,
-        int                                  width,
-        int                                  height);
+    bool fuse_row; // v1 fuses a tile-row into one image; v2 keeps tiles separate
+    int base_size; // global view
+    int tile_size; // each tile
+    int min_tiles;
+    int max_tiles;
+
+    std::vector<clip_image_size> get_target_ratios() const;
+    clip_image_size find_closest_aspect_ratio(
+            float aspect_ratio,
+            const std::vector<clip_image_size> & target_ratios,
+            int width, int height) const;
 };
 
 // custom image preprocessing for Step3VL

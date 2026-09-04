@@ -1,13 +1,8 @@
 name: UI (self-hosted)
 
 # these are the same as ui.yml, but with self-hosted runners
-#
-# the qvac runners carry Playwright's OS libraries but no browsers and no
-# shared /ms-playwright, so each job installs Chromium itself. `npx playwright`
-# resolves the @playwright/test that `npm ci` just installed, which keeps the
-# browser build matched to tools/ui/package.json without pinning a version here.
-# Chromium only: playwright.config.ts defines a single chromium project, and the
-# vitest browser projects pin chromium too.
+# the jobs are lighter because they don't need to install Node.js or Playwright browsers
+# the runner has pre-installed Playwright browsers for @playwright/test (1.56.1) at /ms-playwright/
 
 on:
   workflow_dispatch:

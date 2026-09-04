@@ -7,7 +7,6 @@
 #include <ctime>
 #include <fstream>
 #include <memory>
-#include <sstream>
 #include <streambuf>
 #include <string>
 #include <thread>
@@ -56,52 +55,44 @@ struct file_entry {
     std::unique_ptr<std::basic_streambuf<char>>    streambuf;
 };
 
-std::vector<file_entry> load_files_into_streambuf(const char * const model_path) {
-    std::vector<file_entry> files;
+// Parse a split-GGUF path like "<base>-00001-of-00003.gguf" into its base
+// prefix, and (optionally) the total file count encoded before the extension.
+static std::string parse_split_base_path(const std::string & path, int * total_files = nullptr) {
+    int file_no = 0;
+    int n_split = 0;
 
-    // Extract pattern from first file path
-    std::string path(model_path);
-
-    // Split by '-'
-    std::vector<std::string> parts;
-    std::stringstream        ss(path);
-    std::string              item;
-    while (std::getline(ss, item, '-')) {
-        parts.push_back(item);
-    }
-
-    // Split the last part by '.'
-    std::string last_part = parts.back();
-    parts.pop_back();
-    size_t dot_pos = last_part.find('.');
-    if (dot_pos != std::string::npos) {
-        parts.push_back(last_part.substr(0, dot_pos));
-        parts.push_back(last_part.substr(dot_pos + 1));  // extension
-    } else {
-        parts.push_back(last_part);
-    }
-
-    // Check if we have enough parts
-    if (parts.size() < 4) {
+    const size_t postfix_len = strlen("-00001-of-00003.gguf");
+    if (path.size() < postfix_len ||
+        sscanf(path.c_str() + path.size() - postfix_len, "-%05d-of-%05d.gguf", &file_no, &n_split) != 2) {
         fprintf(stderr, "Model path does not contain expected pattern\n");
         exit(EXIT_FAILURE);
     }
 
-    // Get total files from [-2] position (before the extension)
-    int total_files = std::stoi(parts[parts.size() - 2]);
-
-    // Get base path by joining all parts except -start-of-end.gguf
-    std::string base_path;
-    for (size_t i = 0; i < parts.size() - 4; i++) {
-        if (i > 0) {
-            base_path += "-";
-        }
-        base_path += parts[i];
+    std::vector<char> buf(path.size() + 1, 0);
+    const int ret = llama_split_prefix(buf.data(), buf.size(), path.c_str(), file_no - 1, n_split);
+    if (!ret) {
+        fprintf(stderr, "Model path does not contain expected pattern\n");
+        exit(EXIT_FAILURE);
     }
 
-    for (int i = 1; i <= total_files; i++) {
+    if (total_files != nullptr) {
+        *total_files = n_split;
+    }
+    return std::string(buf.data(), ret);
+}
+
+std::vector<file_entry> load_files_into_streambuf(const char * const model_path) {
+    std::vector<file_entry> files;
+
+    int         total_files = 0;
+    std::string base_path   = parse_split_base_path(model_path, &total_files);
+
+    for (int i = 0; i < total_files; i++) {
         char numbered_path[1024];
-        snprintf(numbered_path, sizeof(numbered_path), "%s-%05d-of-%05d.gguf", base_path.c_str(), i, total_files);
+        if (!llama_split_path(numbered_path, sizeof(numbered_path), base_path.c_str(), i, total_files)) {
+            fprintf(stderr, "Failed to build split path for %s\n", base_path.c_str());
+            exit(EXIT_FAILURE);
+        }
 
         files.push_back({ numbered_path, load_file_into_streambuf(numbered_path) });
     }
@@ -110,41 +101,7 @@ std::vector<file_entry> load_files_into_streambuf(const char * const model_path)
 }
 
 file_entry load_tensor_list_file(const char * const model_path) {
-    std::string path(model_path);
-
-    // Split by '-'
-    std::vector<std::string> parts;
-    std::stringstream        ss(path);
-    std::string              item;
-    while (std::getline(ss, item, '-')) {
-        parts.push_back(item);
-    }
-
-    // Split the last part by '.'
-    std::string last_part = parts.back();
-    parts.pop_back();
-    size_t dot_pos = last_part.find('.');
-    if (dot_pos != std::string::npos) {
-        parts.push_back(last_part.substr(0, dot_pos));
-        parts.push_back(last_part.substr(dot_pos + 1));  // extension
-    } else {
-        parts.push_back(last_part);
-    }
-
-    // Check if we have enough parts
-    if (parts.size() < 4) {
-        fprintf(stderr, "Model path does not contain expected pattern\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Get base path by joining all parts except -start-of-end.gguf
-    std::string base_path;
-    for (size_t i = 0; i < parts.size() - 4; i++) {
-        if (i > 0) {
-            base_path += "-";
-        }
-        base_path += parts[i];
-    }
+    std::string base_path = parse_split_base_path(model_path);
 
     // Construct tensor list file path
     std::string tensor_list_path = base_path + ".tensors.txt";

@@ -604,11 +604,7 @@ static int ggml_backend_metal_default_n_cb(void) {
         return n_cb > 0 ? n_cb : 1;
     }
 
-#if defined(__APPLE__) && defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__)
-    return 2;
-#else
     return 1;
-#endif
 }
 
 ggml_backend_t ggml_backend_metal_init(void) {
@@ -692,9 +688,13 @@ static enum ggml_backend_dev_type ggml_backend_metal_device_get_type(ggml_backen
 }
 
 static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
     props->name        = ggml_backend_metal_device_get_name(dev);
     props->description = ggml_backend_metal_device_get_description(dev);
     props->type        = ggml_backend_metal_device_get_type(dev);
+
+    props->memory_unified = ggml_metal_device_get_props(ctx_dev)->has_unified_memory;
 
     ggml_backend_metal_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
