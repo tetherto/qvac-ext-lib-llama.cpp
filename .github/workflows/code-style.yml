@@ -14,8 +14,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
   model-naming:
-    runs-on: qvac-ubuntu2404-x64
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64 }}
     steps:
       - uses: actions/checkout@v6
       - name: Check model naming conventions
