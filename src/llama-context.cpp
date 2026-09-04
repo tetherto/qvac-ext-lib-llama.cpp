@@ -268,9 +268,10 @@ llama_context::llama_context(
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
 
-    cparams.op_offload     = params.op_offload;
-    cparams.kv_unified     = params.kv_unified;
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.op_offload       = params.op_offload;
+    cparams.kv_unified       = params.kv_unified;
+    cparams.prefetch_weights = params.prefetch_weights;
+    cparams.moe_cache_size   = params.moe_cache_size;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -640,6 +641,7 @@ void llama_context::sched_reserve() {
     auto create_sched = [&](bool parallel) {
         sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+        ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.prefetch_weights);
         if (moe_cache) {
             ggml_backend_sched_set_moe_cache(
                 sched.get(),
@@ -3764,6 +3766,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.prefetch_weights            =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
