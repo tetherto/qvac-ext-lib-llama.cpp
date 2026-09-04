@@ -165,11 +165,56 @@ constexpr int ggml_cuda_highest_compiled_arch_impl(const int arch, const int cur
 constexpr int ggml_cuda_highest_compiled_arch(const int arch) {
     return ggml_cuda_highest_compiled_arch_impl(arch, 0, __CUDA_ARCH_LIST__);
 }
+
+// The -1 below is what lets registration skip a device. Upstream ggml aborts
+// there instead, so a resync of the impl above must not drop it silently.
+static_assert(ggml_cuda_highest_compiled_arch_impl(750, 0, 800, 860, 890) == -1,
+              "a device below every compiled arch must resolve to -1 so registration can skip it");
+static_assert(ggml_cuda_highest_compiled_arch_impl(800, 0, 800, 860, 890) == 800,
+              "a device matching the compiled floor must resolve to that floor");
+static_assert(ggml_cuda_highest_compiled_arch_impl(890, 0, 800, 860, 890) == 890,
+              "a device with an exact compiled arch must resolve to it");
+static_assert(ggml_cuda_highest_compiled_arch_impl(1200, 0, 800, 860, 890) == 890,
+              "a device above every compiled arch must resolve to the highest compiled one");
 #else
 static int ggml_cuda_highest_compiled_arch(const int arch) {
     return arch;
 }
 #endif // __CUDA_ARCH_LIST__
+
+// QVAC-23763: refuse a device below the build's compiled floor, so it never
+// reaches ggml_backend_dev_count() and consumers fall through to the next
+// backend. See tetherto/qvac#4171.
+//
+// Floor test, not a loadability test: __CUDA_ARCH_LIST__ cannot tell -real from
+// -virtual, so this assumes the lowest entry is virtual and the driver can JIT
+// forward from its PTX.
+//
+// One-sided, and deliberately so. A cc ABOVE every entry resolves to the highest
+// compiled arch, which is > 0, so it is kept. That is right only when the
+// highest entry is virtual, and the same -real/-virtual blindness that makes
+// this a floor test means the condition cannot be checked here. Rejecting above
+// the ceiling instead would break the stock build, whose list ends in 90-virtual
+// precisely so that newer cards JIT forward.
+//
+// So an all-real list still aborts at the first launch for a card above its
+// ceiling, exactly as it did before this guard. Not hypothetical in this repo:
+// .github/workflows/build-cuda-ubuntu.yml builds with
+// -DCMAKE_CUDA_ARCHITECTURES=89-real, a single real arch with no PTX at all, so
+// under that build an sm_120 device passes here and then fails with
+// cudaErrorNoKernelImageForDevice. Any size-trimmed consumer arch list has the
+// same exposure at its top end.
+//
+// Closing that direction needs a real loadability probe (a no-op kernel launch,
+// or cudaFuncGetAttributes, treating cudaErrorNoKernelImageForDevice as "skip")
+// rather than an arch-list comparison. Out of scope here: this guard covers the
+// below-floor case, which is the one QVAC-23763 hit.
+static bool ggml_cuda_compiled_code_available(const int cc) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return true;
+    }
+    return ggml_cuda_highest_compiled_arch(cc) > 0;
+}
 
 // ---------------------------------------------------------------------------------------------------------
 

@@ -120,7 +120,12 @@ struct ggml_backend_registry {
 
     ggml_backend_registry() {
 #ifdef GGML_USE_CUDA
+    // Add runtime disable check
+    if (getenv("GGML_DISABLE_CUDA") == nullptr) {
         register_backend(ggml_backend_cuda_reg());
+    } else {
+        GGML_LOG_DEBUG("CUDA backend disabled by GGML_DISABLE_CUDA environment variable\n");
+    }
 #endif
 #ifdef GGML_USE_METAL
         register_backend(ggml_backend_metal_reg());
@@ -648,7 +653,19 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("blas", silent, dir_path);
     ggml_backend_load_best("zendnn", silent, dir_path);
     ggml_backend_load_best("cann", silent, dir_path);
-    ggml_backend_load_best("cuda", silent, dir_path);
+    // QVAC-23763: the static path above is compiled out of DL builds, so the
+    // check is repeated here; this is where it actually fires on linux and
+    // android.
+    //
+    // GGML_DISABLE_VULKAN has no equivalent guard here, so on a DL build it is
+    // a no-op. That is pre-existing and not changed by this commit, but the two
+    // env vars now behave differently on the same build, which is worth knowing
+    // before assuming they are siblings.
+    if (getenv("GGML_DISABLE_CUDA") == nullptr) {
+        ggml_backend_load_best("cuda", silent, dir_path);
+    } else {
+        GGML_LOG_DEBUG("CUDA backend disabled by GGML_DISABLE_CUDA environment variable\n");
+    }
     ggml_backend_load_best("hip", silent, dir_path);
     ggml_backend_load_best("metal", silent, dir_path);
     ggml_backend_load_best("rpc", silent, dir_path);
