@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 #include <unordered_map>
@@ -216,9 +217,14 @@ struct llama_moe_cache::impl {
         if (backend == nullptr || buft == nullptr) {
             throw std::runtime_error("MoE cache requires a backend");
         }
-        const enum ggml_backend_dev_type device_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+        const ggml_backend_dev_t backend_device = ggml_backend_get_device(backend);
+        const enum ggml_backend_dev_type device_type = ggml_backend_dev_type(backend_device);
         if (device_type != GGML_BACKEND_DEVICE_TYPE_GPU && device_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
             throw std::runtime_error("MoE cache requires a GPU backend");
+        }
+        const ggml_backend_reg_t backend_reg = ggml_backend_dev_backend_reg(backend_device);
+        if (backend_reg != nullptr && std::strcmp(ggml_backend_reg_name(backend_reg), "OpenCL") == 0) {
+            throw std::runtime_error("MoE cache does not support OpenCL tensor uploads");
         }
         if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
