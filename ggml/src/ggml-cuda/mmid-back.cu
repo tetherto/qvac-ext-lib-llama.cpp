@@ -1,4 +1,5 @@
 #include "mmid-back.cuh"
+#include "convert.cuh"
 
 #include <type_traits>
 
@@ -103,7 +104,7 @@ mul_mat_id_back_b_cuda(const AType   * GGML_CUDA_RESTRICT data_a, // as       [K
                        const int32_t * GGML_CUDA_RESTRICT data_i, // ids      [n_used, n_tok]
                              float   * GGML_CUDA_RESTRICT data_d, // grad_b   [K, dst_ne1, n_tok]
                        const ggml_cuda_mul_mat_id_back_b_kargs p) {
-    
+
     const uint32_t slot = blockIdx.x;
     const uint32_t t    = blockIdx.y;
 
@@ -172,7 +173,7 @@ launch_mul_mat_id_back_b(const void * data_a,
 }
 
 void ggml_cuda_op_mul_mat_id_back_a(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    
+
     const ggml_tensor * grad_out = dst->src[0];
     const ggml_tensor * b        = dst->src[1];
     const ggml_tensor * ids      = dst->src[2];
@@ -201,7 +202,7 @@ void ggml_cuda_op_mul_mat_id_back_a(ggml_backend_cuda_context & ctx, ggml_tensor
     const ggml_cuda_mul_mat_id_back_a_kargs args = {
         .K       = (uint32_t)dst->ne[0],
         .n_used  = (uint32_t)ids->ne[0],
-        .n_tok   = (uint32_t)ids->ne[1], 
+        .n_tok   = (uint32_t)ids->ne[1],
         .g_nb1   = (uint32_t)(grad_out->nb[1] / g_type_size),
         .g_nb2   = (uint32_t)(grad_out->nb[2] / g_type_size),
         .b_nb1   = (uint32_t)(b->nb[1] / b_type_size),
@@ -213,7 +214,7 @@ void ggml_cuda_op_mul_mat_id_back_a(ggml_backend_cuda_context & ctx, ggml_tensor
     cudaStream_t stream = ctx.stream();
 #define LAUNCH_MMID_BACK_A(broadcast_b) \
     launch_mul_mat_id_back_a<broadcast_b>(data_grad, data_b, data_i, data_d, stream, N, n_expert, args)
-    
+
     if (b_ne1 == 1) {
         LAUNCH_MMID_BACK_A(true);
     } else {
@@ -240,6 +241,18 @@ void ggml_cuda_op_mul_mat_id_back_b(ggml_backend_cuda_context & ctx, ggml_tensor
     // the quantized path derives block indices from K/N, so `as` must be contiguous
     GGML_ASSERT(ggml_blck_size(as->type) == 1 || ggml_is_contiguous(as));
 
+    cudaStream_t stream = ctx.stream();
+
+    const bool as_native = as->type == GGML_TYPE_F32 || as->type == GGML_TYPE_Q8_0;
+    ggml_cuda_pool_alloc<float> as_f32_alloc(ctx.pool());
+    if (!as_native) {
+        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(as->type);
+        GGML_ASSERT(to_fp32 != nullptr && "mul_mat_id_back_b: no CUDA dequantizer for src0 type");
+        as_f32_alloc.alloc(ggml_nelements(as));
+        to_fp32(as->data, as_f32_alloc.ptr, ggml_nelements(as), stream);
+        data_a = as_f32_alloc.ptr;
+    }
+
     const uint32_t as_type_size  = ggml_type_size(as->type);
     const uint32_t as_blck_size  = ggml_blck_size(as->type);
     const uint32_t g_type_size   = ggml_type_size(grad_out->type);
@@ -248,8 +261,12 @@ void ggml_cuda_op_mul_mat_id_back_b(ggml_backend_cuda_context & ctx, ggml_tensor
 
     // f32 path reads `as` with element strides; the quantized path computes
     // block indices from K/N directly and ignores these.
-    const uint32_t as_nb1 = (as_blck_size == 1) ? (uint32_t)(as->nb[1] / as_type_size) : 0;
-    const uint32_t as_nb2 = (as_blck_size == 1) ? (uint32_t)(as->nb[2] / as_type_size) : 0;
+    uint32_t as_nb1 = (as_blck_size == 1) ? (uint32_t)(as->nb[1] / as_type_size) : 0;
+    uint32_t as_nb2 = (as_blck_size == 1) ? (uint32_t)(as->nb[2] / as_type_size) : 0;
+    if (!as_native) {
+        as_nb1 = (uint32_t)as->ne[0];
+        as_nb2 = (uint32_t)(as->ne[0] * as->ne[1]);
+    }
 
     const ggml_cuda_mul_mat_id_back_b_kargs args = {
         .K        = (uint32_t)dst->ne[0],
@@ -265,7 +282,6 @@ void ggml_cuda_op_mul_mat_id_back_b(ggml_backend_cuda_context & ctx, ggml_tensor
         .d_nb1    = (uint32_t)(dst->nb[1] / d_type_size),
         .d_nb2    = (uint32_t)(dst->nb[2] / d_type_size),
     };
-    cudaStream_t stream = ctx.stream();
 #define LAUNCH_MMID_BACK_B(A_TYPE) \
     launch_mul_mat_id_back_b<A_TYPE>(data_a, data_grad, data_i, data_d, stream, args)
 
@@ -277,7 +293,8 @@ void ggml_cuda_op_mul_mat_id_back_b(ggml_backend_cuda_context & ctx, ggml_tensor
         LAUNCH_MMID_BACK_B(float);
         break;
     default:
-        GGML_ABORT("unsupported type for mul_mat_id_back_b: %s", ggml_type_name(as->type));
+        LAUNCH_MMID_BACK_B(float);
+        break;
     }
 #undef LAUNCH_MMID_BACK_B
 }
