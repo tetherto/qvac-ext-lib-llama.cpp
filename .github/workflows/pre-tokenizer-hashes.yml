@@ -10,10 +10,12 @@ on:
             - 'conversion/base.py'
             - 'convert_hf_to_gguf_update.py'
 
-# QVAC addition: one run per PR/branch; a newer push or dispatch supersedes the
-# in-flight run. See QVAC-24627.
+# QVAC addition: dedupe per PR and per branch, so a newer push supersedes the
+# in-flight run (this workflow has no workflow_dispatch trigger). The default
+# branch is exempt on purpose — master pushes must not cancel each other.
+# See QVAC-24627.
 concurrency:
-    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
     cancel-in-progress: true
 
 jobs:
