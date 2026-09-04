@@ -22,8 +22,10 @@ on:
       'ggml/src/ggml-virtgpu/**'
     ]
 
+# QVAC divergence from upstream: group per PR/branch, not run_id, so pushes and
+# dispatches supersede each other too. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:

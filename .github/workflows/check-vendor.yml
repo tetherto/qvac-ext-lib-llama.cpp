@@ -17,6 +17,12 @@ on:
       'scripts/sync_vendor.py'
     ]
 
+# QVAC addition: one run per PR/branch; a newer push or dispatch supersedes the
+# in-flight run. See QVAC-24627.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   runner_names:
     permissions:
