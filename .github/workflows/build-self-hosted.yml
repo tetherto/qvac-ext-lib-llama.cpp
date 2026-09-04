@@ -60,8 +60,14 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  runner_names:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-runner-names.yml
+
   gpu-cuda:
-    runs-on: qvac-ubuntu2204-x64-gpu
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
       - name: Clone
@@ -96,7 +102,8 @@ jobs:
           GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm:
-    runs-on: qvac-ubuntu2204-x64-gpu
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
       - name: Clone
@@ -110,7 +117,8 @@ jobs:
           GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm2:
-    runs-on: qvac-ubuntu2204-x64-gpu
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64_gpu }}
 
     steps:
       - name: Clone
@@ -124,7 +132,8 @@ jobs:
           GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-nvidia:
-    runs-on: qvac-ubuntu2404-x64-gpu
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2404_x64_gpu }}
 
     steps:
       - name: Clone
@@ -197,7 +206,8 @@ jobs:
   #         GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-metal:
-    runs-on: qvac-macos26-arm64-gpu
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
       - name: Clone
@@ -210,7 +220,8 @@ jobs:
           GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-webgpu-apple:
-    runs-on: qvac-macos26-arm64-gpu
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
       - name: Clone
@@ -237,7 +248,8 @@ jobs:
             bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-apple:
-    runs-on: qvac-macos26-arm64-gpu
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_macos26_arm64_gpu }}
 
     steps:
       - name: Clone
@@ -323,7 +335,8 @@ jobs:
           GG_BUILD_OPENVINO=1 GGML_OPENVINO_DEVICE=GPU GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   cpu-x64-high-perf:
-    runs-on: qvac-ubuntu2204-x64
+    needs: runner_names
+    runs-on: ${{ needs.runner_names.outputs.qvac_ubuntu2204_x64 }}
 
     steps:
       - name: Clone
