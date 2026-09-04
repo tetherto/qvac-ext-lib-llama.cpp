@@ -36,8 +36,15 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
   LLAMA_ARG_LOG_VERBOSITY: 10
 
+# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
+# re-dispatch supersedes the in-flight run. The default branch deliberately
+# keeps upstream's run_id behaviour. Two reasons here: the dispatch takes a
+# `sha` input for bisecting, and these jobs run pytest against llama-server
+# subprocesses on persistent self-hosted runners with no `if: always()`
+# teardown — a cancel mid-pytest can orphan a server holding its port and GPU
+# memory and break the next run on that runner. See QVAC-24627.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
   cancel-in-progress: true
 
 jobs:
