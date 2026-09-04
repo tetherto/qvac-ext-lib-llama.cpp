@@ -805,6 +805,7 @@ struct ggml_backend_sched_moe_cache_entry {
     struct ggml_tensor * ids;
     struct ggml_tensor * ids_copy;
     void * handle;
+    bool active;
 };
 
 struct ggml_backend_sched {
@@ -1479,7 +1480,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     ggml_backend_t backend = sched->backends[cur_backend_id];
                     struct ggml_tensor * cached_tensor = NULL;
                     void * cache_handle = NULL;
-                    bool cache_resolved =
+                    bool cache_bound =
                         j == 0 &&
                         node->op == GGML_OP_MUL_MAT_ID &&
                         original_ids != NULL &&
@@ -1492,18 +1493,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // A batched MUL_MAT_ID can select any expert in the bank. Only use the
                     // persistent cache when it can pin a complete layer working set; smaller
                     // caches retain the selected-slice fallback used before cache support.
-                    if (cache_resolved && original_ids->ne[1] > 1 && cached_tensor->ne[2] < src->ne[2]) {
-                        cache_resolved = false;
-                    }
+                    const bool cache_active = cache_bound &&
+                        !(original_ids->ne[1] > 1 && cached_tensor->ne[2] < src->ne[2]);
 
-                    GGML_ASSERT(!cache_resolved || cached_tensor != NULL);
-                    GGML_ASSERT(!cache_resolved || cached_tensor->buffer != NULL);
-                    GGML_ASSERT(!cache_resolved || cached_tensor->ne[0] == src->ne[0]);
-                    GGML_ASSERT(!cache_resolved || cached_tensor->ne[1] == src->ne[1]);
-                    GGML_ASSERT(!cache_resolved || cached_tensor->ne[2] >= original_ids->ne[0]);
-                    GGML_ASSERT(!cache_resolved || tensor_id_copy(src_id, cur_backend_id, 0) == NULL);
+                    GGML_ASSERT(!cache_bound || cached_tensor != NULL);
+                    GGML_ASSERT(!cache_bound || cached_tensor->buffer != NULL);
+                    GGML_ASSERT(!cache_bound || cached_tensor->ne[0] == src->ne[0]);
+                    GGML_ASSERT(!cache_bound || cached_tensor->ne[1] == src->ne[1]);
+                    GGML_ASSERT(!cache_bound || cached_tensor->ne[2] >= original_ids->ne[0]);
+                    GGML_ASSERT(!cache_bound || tensor_id_copy(src_id, cur_backend_id, 0) == NULL);
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
-                        if (cache_resolved) {
+                        if (cache_active) {
                             tensor_id_copy(src_id, cur_backend_id, 0) = cached_tensor;
                             SET_CAUSE(cached_tensor, "4.moe");
                         } else {
@@ -1524,22 +1524,25 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                         split->inputs[n_inputs] = src;
                     }
-                    if (cache_resolved) {
+                    if (cache_bound) {
                         GGML_ASSERT(cache_entry == NULL);
                         cache_entry = ggml_backend_sched_moe_cache_entry_add(sched);
                         cache_entry->split_id = i_split;
                         cache_entry->input = src;
                         cache_entry->ids = original_ids;
                         cache_entry->handle = cache_handle;
-                        ggml_set_output(original_ids); // keep logical IDs alive until scheduler remapping
+                        cache_entry->active = cache_active;
                         cache_entry->ids_copy = ggml_dup_tensor_layout(sched->ctx, original_ids);
                         ggml_format_name(cache_entry->ids_copy, "%s#%s#moe_cache",
                             ggml_backend_name(backend), original_ids->name);
+                        if (cache_active) {
+                            ggml_set_output(original_ids); // keep logical IDs alive until scheduler remapping
+                        }
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
-            if (cache_entry != NULL) {
+            if (cache_entry != NULL && cache_entry->active) {
                 node->src[2] = cache_entry->ids_copy;
             }
         }
@@ -1729,7 +1732,7 @@ static struct ggml_backend_sched_moe_cache_entry * ggml_backend_sched_moe_cache_
         ggml_backend_sched_t sched, int split_id, const struct ggml_tensor * input) {
     for (int i = 0; i < sched->n_moe_cache_entries; ++i) {
         struct ggml_backend_sched_moe_cache_entry * entry = &sched->moe_cache_entries[i];
-        if (entry->split_id == split_id && entry->input == input) {
+        if (entry->active && entry->split_id == split_id && entry->input == input) {
             return entry;
         }
     }
