@@ -154,6 +154,8 @@ extern "C" {
         bool buffer_from_host_ptr;
         // event synchronization
         bool events;
+        // dedicated copy stream for compute/transfer overlap
+        bool copy_stream;
     };
 
     // all the device properties
@@ -377,6 +379,9 @@ extern "C" {
             ggml_backend_sched_moe_cache_begin_callback    begin,
             ggml_backend_sched_moe_cache_prepare_callback  prepare,
             void *                                         user_data);
+
+    // Enable async weight prefetching to overlap CPU->GPU transfers with compute
+    GGML_API void                 ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool enabled);
 
     //
     // Meta backend
