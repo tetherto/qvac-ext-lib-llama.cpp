@@ -37,11 +37,18 @@ static_assert(std::is_trivially_copyable_v<ggml_cuda_mul_mat_id_back_b_kargs>);
 
 template < const bool broadcast_b >
 static __global__ void
-mul_mat_id_back_a_cuda(const float   * GGML_CUDA_RESTRICT data_g, // grad_out [N, n_used, n_tok]
-                       const float   * GGML_CUDA_RESTRICT data_b, // b        [K, b_ne1, n_tok]
-                       const int32_t * GGML_CUDA_RESTRICT data_i, // ids      [n_used, n_tok]
-                             float   * GGML_CUDA_RESTRICT data_d, // grad_as  [K, N, n_expert]
+mul_mat_id_back_a_cuda(const float   * data_g_ptr, // grad_out [N, n_used, n_tok]
+                       const float   * data_b_ptr, // b        [K, b_ne1, n_tok]
+                       const int32_t * data_i_ptr, // ids      [n_used, n_tok]
+                             float   * data_d_ptr, // grad_as  [K, N, n_expert]
                        const ggml_cuda_mul_mat_id_back_a_kargs args) {
+    // no __restrict__ on the parameters: nvcc's generated launch stub for a
+    // kernel passed to ggml_cuda_kernel_launch does not match restrict-qualified
+    // parameters when clang is the host compiler (same workaround as getrows.cu)
+    const float   * GGML_CUDA_RESTRICT data_g = data_g_ptr;
+    const float   * GGML_CUDA_RESTRICT data_b = data_b_ptr;
+    const int32_t * GGML_CUDA_RESTRICT data_i = data_i_ptr;
+          float   * GGML_CUDA_RESTRICT data_d = data_d_ptr;
     const uint32_t n = blockIdx.x;
     const uint32_t e = blockIdx.y;
 
@@ -99,11 +106,16 @@ mmid_read_as(const block_q8_0 * GGML_CUDA_RESTRICT data_a,
 // with e = ids[t][u].
 template < typename AType >
 static __global__ void
-mul_mat_id_back_b_cuda(const AType   * GGML_CUDA_RESTRICT data_a, // as       [K, N, n_expert]
-                       const float   * GGML_CUDA_RESTRICT data_g, // grad_out [N, n_used, n_tok]
-                       const int32_t * GGML_CUDA_RESTRICT data_i, // ids      [n_used, n_tok]
-                             float   * GGML_CUDA_RESTRICT data_d, // grad_b   [K, dst_ne1, n_tok]
+mul_mat_id_back_b_cuda(const AType   * data_a_ptr, // as       [K, N, n_expert]
+                       const float   * data_g_ptr, // grad_out [N, n_used, n_tok]
+                       const int32_t * data_i_ptr, // ids      [n_used, n_tok]
+                             float   * data_d_ptr, // grad_b   [K, dst_ne1, n_tok]
                        const ggml_cuda_mul_mat_id_back_b_kargs p) {
+    // see mul_mat_id_back_a_cuda for why the parameters carry no __restrict__
+    const AType   * GGML_CUDA_RESTRICT data_a = data_a_ptr;
+    const float   * GGML_CUDA_RESTRICT data_g = data_g_ptr;
+    const int32_t * GGML_CUDA_RESTRICT data_i = data_i_ptr;
+          float   * GGML_CUDA_RESTRICT data_d = data_d_ptr;
 
     const uint32_t slot = blockIdx.x;
     const uint32_t t    = blockIdx.y;
