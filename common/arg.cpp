@@ -4,6 +4,7 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
+#include "ggml-rpc.h"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
 #include "log.h"
@@ -25,6 +26,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -312,6 +314,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TBQ3_0,
+    GGML_TYPE_TBQ4_0,
+    GGML_TYPE_PQ3_0,
+    GGML_TYPE_PQ4_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -1176,7 +1182,36 @@ static void add_rpc_devices(const std::string & servers) {
     if (!ggml_backend_rpc_add_server_fn) {
         throw std::invalid_argument("failed to find RPC add server function");
     }
-    for (const auto & server : rpc_servers) {
+    typedef bool (*ggml_backend_rpc_prefetch_connection_t)(const char * endpoint);
+    ggml_backend_rpc_prefetch_connection_t ggml_backend_rpc_prefetch_connection_fn = (ggml_backend_rpc_prefetch_connection_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_prefetch_connection");
+    if (!ggml_backend_rpc_prefetch_connection_fn) {
+        throw std::invalid_argument("failed to find RPC prefetch connection function");
+    }
+    std::vector<uint8_t> prefetch_ok(rpc_servers.size(), false);
+    std::vector<std::thread> prefetch_threads;
+    std::atomic<size_t> next_server(0);
+    const size_t n_prefetch_threads = std::min(rpc_servers.size(), (size_t) GGML_RPC_MAX_SERVERS);
+    prefetch_threads.reserve(n_prefetch_threads);
+    for (size_t i = 0; i < n_prefetch_threads; i++) {
+        prefetch_threads.emplace_back([&]() {
+            while (true) {
+                size_t server = next_server++;
+                if (server >= rpc_servers.size()) {
+                    break;
+                }
+                prefetch_ok[server] = ggml_backend_rpc_prefetch_connection_fn(rpc_servers[server].c_str());
+            }
+        });
+    }
+    for (auto & thread : prefetch_threads) {
+        thread.join();
+    }
+    for (size_t i = 0; i < rpc_servers.size(); i++) {
+        if (!prefetch_ok[i]) {
+            LOG_WRN("failed to connect to RPC server %s\n", rpc_servers[i].c_str());
+            continue;
+        }
+        const auto & server = rpc_servers[i];
         auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
         ggml_backend_register(reg);
     }
@@ -2616,6 +2651,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
     add_opt(common_arg(
+        {"--mmproj-backend"}, "NAME",
+        "GPU backend for multimodal projector (e.g. CUDA, Metal, Vulkan)\n"
+        "if not specified, will use MTMD_BACKEND_DEVICE env var or default GPU backend",
+        [](common_params & params, const std::string & value) {
+            params.mmproj_backend = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {
@@ -2639,12 +2682,54 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
     add_opt(common_arg(
+        {"--image-tile-mode"}, "MODE",
+        "tile encoding mode for multi-tile vision models (e.g. Qwen3VL):\n"
+        "  batched    - all tiles in one forward pass\n"
+        "  sequential - tiles encoded one-by-one (default)\n"
+        "  disabled   - tiling disabled, single tile only",
+        [](common_params & params, const std::string & value) {
+            if (value == "batched")         { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_BATCHED; }
+            else if (value == "sequential") { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_SEQUENTIAL; }
+            else if (value == "disabled")   { params.image_tile_mode = COMMON_IMAGE_TILE_MODE_DISABLED; }
+            else { throw std::invalid_argument("unknown --image-tile-mode: " + value + " (use batched, sequential, or disabled)"); }
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_TILE_MODE"));
+    add_opt(common_arg(
         {"--mtmd-batch-max-tokens"}, "N",
         string_format("maximum number of image tokens per batch when encoding images (default: %d)", params.mtmd_batch_max_tokens),
         [](common_params & params, int value) {
             params.mtmd_batch_max_tokens = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTMD_BATCH_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--image-max-tiles"}, "N",
+        "maximum number of tiles for multi-tile vision models (e.g. Qwen3VL), overrides the\n"
+        "value from the GGUF; use when the GGUF lacks the key or the model default is wrong\n"
+        "for your model size (Qwen3VL defaults to 4, too low for 8B+ variants)",
+        [](common_params & params, int value) {
+            if (value < 1)   { throw std::invalid_argument("--image-max-tiles must be >= 1"); }
+            if (value > 256) { throw std::invalid_argument("--image-max-tiles must be <= 256"); }
+            params.image_max_tiles = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TILES"));
+    add_opt(common_arg(
+        {"--image-no-upscale"}, "on|off",
+        "in idefics3-style preprocessing, round an image's long side up to a whole number of\n"
+        "slices and cap it, instead of always stretching it to the cap; overrides the value\n"
+        "from the GGUF. Small images then stay small and become far fewer slices. This is\n"
+        "what separates the VisionPsy Flash checkpoint from the base one, whose mmprojs are\n"
+        "otherwise indistinguishable, so a Flash checkpoint run without it is silently\n"
+        "running base preprocessing",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.image_no_upscale = 1;
+            } else if (is_falsey(value)) {
+                params.image_no_upscale = 0;
+            } else {
+                throw std::invalid_argument("unknown --image-no-upscale: " + value + " (use on or off)");
+            }
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_NO_UPSCALE"));
     if (params.is_gen_docs || llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",
@@ -2701,6 +2786,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
     add_opt(common_arg(
+        {"--tensor-read-lazy"}, "MODE",
+        "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
+        "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
+        "- auto: on, but only for tensors larger than 4 GiB\n"
+        "- off: always keep them resident",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "on")   { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_ON;   }
+            else if (value == "auto") { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; }
+            else if (value == "off")  { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;  }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_TENSOR_READ_LAZY"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"
@@ -2744,6 +2842,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache-mib"}, "N",
+        "persistent GPU MoE expert cache size in MiB (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_size = size_t(value) * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
